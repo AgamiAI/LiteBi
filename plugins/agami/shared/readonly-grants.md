@@ -11,7 +11,7 @@ agami only ever runs **read-only SELECT** queries against your datasource: query
 
 ## What the role does and does not guarantee
 
-The read-only role is the **primary, non-bypassable** guarantee of **integrity and confinement**: SELECT-only means **no write / DDL / `COPY` / file access / server-side network call / cross-database reach** — and that holds even if the app-layer guard were bypassed. It does **not** bound a **runaway** query (a recursive CTE or cartesian join), and it does **not** stop schema/metadata **recon**: a per-statement **timeout + result-row cap**, and **recon-function denial + error-text sanitizing**, are enforced **app-side at the executor**, not by the role. So don't read "read-only" as "time-bounded" — the role confines *what* a query can touch, the app layer bounds *how much* it can consume.
+The read-only role is the **primary, non-bypassable** guarantee of **integrity and confinement**: SELECT-only means **no write / DDL / `COPY` / file access / server-side network call / cross-database reach** — and that holds even if the app-layer guard were bypassed. It does **not** bound a **runaway** query (a recursive CTE or cartesian join), and it does **not** stop schema/metadata **recon**. Those are the **app layer's** job, not the role's: the executor caps the **result-row count**, and query-resource limits (statement timeout) plus recon/error-text hardening are enforced above the grant, not by it. So don't read "read-only" as "time-bounded" — the role confines *what* a query can touch; bounding *how much* it consumes is handled app-side.
 
 ## Creating the role
 
