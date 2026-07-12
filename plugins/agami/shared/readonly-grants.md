@@ -32,6 +32,16 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT SELECT ON TABLES TO agami_ro;
 
 (Redshift uses the same statements. `<schema>` defaults to `public` if you didn't set one.)
 
+> **Optional hardening (PostgreSQL ≤ 14 / Redshift).** A fresh role inherits `CREATE` on schema `public`
+> and `TEMP` on the database from the built-in `PUBLIC` role — so, strictly, it could create *new* objects
+> (it still can't read or modify your existing data). To make it pure SELECT-only, once per database:
+> ```sql
+> REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+> REVOKE TEMP ON DATABASE <db> FROM PUBLIC;
+> ```
+> Note these affect **every** non-owner role on that database, not just `agami_ro`. PostgreSQL 15+ already
+> drops the public-schema `CREATE` default. Optional, not required (per the SELECT-only baseline).
+
 ## MySQL / MariaDB
 
 ```sql
