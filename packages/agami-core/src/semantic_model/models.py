@@ -652,7 +652,7 @@ class Organization(_Base):
     # domain glossary: term -> one-line definition (e.g. "MRR": "monthly recurring revenue").
     # Enrichment fills this from decoded abbreviations + choice-field legends; org_draft
     # renders it into datasource.md's "Key terminology", and it feeds NL→SQL as context.
-    # The structured home means it survives an datasource.md regeneration (a prose section
+    # The structured home means it survives a datasource.md regeneration (a prose section
     # the LLM has to remember to write does not).
     key_terminology: dict[str, str] = Field(default_factory=dict)
 

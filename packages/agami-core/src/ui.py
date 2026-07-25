@@ -320,7 +320,7 @@ def _md_inline(s: str) -> str:
 def md(text: str) -> str:
     """A tiny, SAFE markdown subset for the domain-context doc — **escape-first**, so any raw HTML in
     the source is inert. Supports headings, bold/italic, inline + fenced code, bullet/numbered lists,
-    and http(s) links. Not a full renderer; just enough for an datasource.md."""
+    and http(s) links. Not a full renderer; just enough for a datasource.md."""
     if not text:
         return ""
     out: list[str] = []

@@ -163,7 +163,7 @@ Else: is the correction about a BUSINESS TERM specific to this database's domain
     in Stripe" — what the data fundamentally doesn't include)
    → org_context. A term → `cli set-terminology` (the structured `key_terminology`
      glossary). A higher-level narrative ("we don't track refunds…", "who the users
-     are") → an datasource.md prose line. See the `org_context` edit section for both.
+     are") → a datasource.md prose line. See the `org_context` edit section for both.
        → org_context is for ABSTRACT business concepts not tied to one specific
          column. A correction tied to a specific column belongs in field_metadata,
          NOT here. Re-check the first rule of the tree before landing here.
@@ -177,7 +177,7 @@ Else: pure SQL syntax / typo with no domain knowledge implied
 
 1. **Per-column rule → datasource.md.** "`CUSTOMERS.STATUS` values normalize to Active" is NOT domain context — it's a column-value mapping. Route to `field_metadata` (`choice_field`).
 2. **Per-column rule → examples.yaml notes.** This skill never writes to `examples.yaml.notes[]` (that path lives in agami-connect Phase 6d). If you find yourself wanting to write "the order total can be negative" as a note on example #12, route it to `field_metadata` on the actual column instead — the lesson applies to every future query, not just to one example.
-3. **Dumping a column-fact into a prose file (or USER_MEMORY).** "Amounts are in INR → show ₹" is a fact about the `amount` column → a `caveat`/`value_transform` on that column (org-wide, structured, in the shared model) — NOT a USER_MEMORY line and NOT an datasource.md prose rule. Route data-facts to the column/table; reserve the prose files for cross-cutting conventions (datasource.md) and personal tics (USER_MEMORY). Don't reflexively ask — classify; ask only when personal-vs-org is genuinely unclear.
+3. **Dumping a column-fact into a prose file (or USER_MEMORY).** "Amounts are in INR → show ₹" is a fact about the `amount` column → a `caveat`/`value_transform` on that column (org-wide, structured, in the shared model) — NOT a USER_MEMORY line and NOT a datasource.md prose rule. Route data-facts to the column/table; reserve the prose files for cross-cutting conventions (datasource.md) and personal tics (USER_MEMORY). Don't reflexively ask — classify; ask only when personal-vs-org is genuinely unclear.
 4. **Display preference → prose without changing SQL.** If the correction is "always format like X," ALSO modify the seed example's SQL to demonstrate the formatting (so future answers actually apply it, not just describe it).
 
 ### Diff-based hints (look at SQL changes for classification clues)
@@ -318,7 +318,7 @@ The user's bullet should be self-contained — anyone reading USER_MEMORY.md sho
   ```
   The key is the term; the value is a **self-contained** definition (understandable without the original conversation). It merges by default — existing terms are never lost. **Never** hand-append `- "term" = definition` lines to datasource.md; that's the old prose home and is wrong now.
 - **A higher-level narrative** — what the data represents, who the users are, what's *not* in this database. Append a sentence/paragraph to `<artifacts_dir>/<profile>/datasource.md` under `# About this database` (create it with the starter if missing — `cli org-draft "$ROOT" > "$ROOT/datasource.md"`). This file is the human narrative **only** — no `term = definition` lines, no model facts.
-- **A cross-cutting display/formatting convention** (a currency symbol or number grouping everyone querying this DB should see) is a *presentation* preference, not domain meaning: route it to `user_preference` → `USER_MEMORY.md`, or — when it's really a fact about one column (units/currency) — to that column's `caveat`/`value_transform`. Do **not** invent an datasource.md "conventions" heading; the file is narrative-only.
+- **A cross-cutting display/formatting convention** (a currency symbol or number grouping everyone querying this DB should see) is a *presentation* preference, not domain meaning: route it to `user_preference` → `USER_MEMORY.md`, or — when it's really a fact about one column (units/currency) — to that column's `caveat`/`value_transform`. Do **not** invent a datasource.md "conventions" heading; the file is narrative-only.
 
 **Show the user the diff** (Phase 4b) before writing. `set-terminology` is validated (reverts on failure); datasource.md prose is free-form (no validation).
 

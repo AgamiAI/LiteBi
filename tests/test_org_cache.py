@@ -83,7 +83,7 @@ def test_resolved_org_id_reads_minted_uuid_from_org_yaml(monkeypatch, tmp_path):
     # F14: with no env override, the id is the uuid minted into a profile's datasource.yaml (deployment-scoped
     # scan of the artifacts dir — the active profile need not be named).
     (tmp_path / "acme").mkdir()
-    (tmp_path / "acme" / "datasource.yaml").write_text("org_id: abc123def\norganization: Acme\n")
+    (tmp_path / "acme" / "datasource.yaml").write_text("org_id: abc123def\ndatasource: Acme\n")
     monkeypatch.delenv("AGAMI_ORG_ID", raising=False)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     tools.resolved_org_id.cache_clear()
@@ -93,7 +93,7 @@ def test_resolved_org_id_reads_minted_uuid_from_org_yaml(monkeypatch, tmp_path):
 def test_env_override_beats_org_yaml(monkeypatch, tmp_path):
     # AGAMI_ORG_ID always wins (explicit operator/multi-tenant override).
     (tmp_path / "acme").mkdir()
-    (tmp_path / "acme" / "datasource.yaml").write_text("org_id: from-file\norganization: Acme\n")
+    (tmp_path / "acme" / "datasource.yaml").write_text("org_id: from-file\ndatasource: Acme\n")
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("AGAMI_ORG_ID", "from-env")
     tools.resolved_org_id.cache_clear()

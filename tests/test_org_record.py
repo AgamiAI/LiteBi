@@ -147,7 +147,7 @@ def test_refresh_datasources_tracks_profiles_on_disk(tmp_path):
     OR.set_org_fields(tmp_path, name="Acme")  # a record with authored company content
     for prof in ("crm", "erp"):
         (tmp_path / prof).mkdir()
-        (tmp_path / prof / "datasource.yaml").write_text(f"org_id: x\norganization: {prof}\n")
+        (tmp_path / prof / "datasource.yaml").write_text(f"org_id: x\ndatasource: {prof}\n")
 
     rec = OR.refresh_datasources(tmp_path)
     assert rec.datasources == ["crm", "erp"]  # sorted, rebuilt from the profile dirs on disk

@@ -174,7 +174,7 @@ def compose_org_context(
     source_narratives: "list[str] | None" = None,
 ) -> str:
     """Two-level org context (F15 / ACE-069). Renders the shared COMPANY block ONCE from the ``OrgRecord``
-    (name/description + the root ``datasource.md`` narrative + display conventions + company glossary),
+    (name/description + the root ``organization.md`` narrative + display conventions + company glossary),
     then each datasource's model-derived ontology under its own heading. Single-source passes one
     ontology; a FEDERATED question passes several — the company block still renders exactly once, and each
     source keeps its own vocabulary (so "Account" resolves per source).

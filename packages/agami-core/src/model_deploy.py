@@ -187,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             if not loaded:
                 print(
                     f"model_deploy: no model found under {artifacts_dir} "
-                    "(a datasource is a subdir with an datasource.yaml).",
+                    "(a datasource is a subdir with a datasource.yaml).",
                     file=sys.stderr,
                 )
                 return 1

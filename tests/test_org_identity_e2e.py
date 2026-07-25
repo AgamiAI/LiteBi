@@ -82,7 +82,7 @@ def test_ensure_org_id_cli_mints_into_copied_model(tmp_path, capsys):
 
     prof = tmp_path / "agami-example"
     prof.mkdir()
-    (prof / "datasource.yaml").write_text("organization: Acme Store\nversion: 1\n")
+    (prof / "datasource.yaml").write_text("datasource: Acme Store\nversion: 1\n")
 
     assert cli.main(["ensure-org-id", str(prof)]) == 0
     minted = capsys.readouterr().out.strip()
@@ -97,7 +97,7 @@ def test_legacy_profile_without_org_id_resolves_local(tmp_path, monkeypatch):
     # A pre-F14 datasource.yaml (no org_id key) still loads and resolves to the 'local' sentinel — no crash,
     # no forced mint at serve time (serve is read-only; minting happens only at connect/build).
     (tmp_path / "old").mkdir()
-    (tmp_path / "old" / "datasource.yaml").write_text("organization: legacy\nversion: 1\n")
+    (tmp_path / "old" / "datasource.yaml").write_text("datasource: legacy\nversion: 1\n")
     assert loader.load_org_id(tmp_path / "old") is None
     assert loader.load_organization(tmp_path / "old").org_id is None
 
