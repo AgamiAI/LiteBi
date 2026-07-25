@@ -10,7 +10,7 @@ is the source of truth a host installs against — bumping it is what invalidate
 user's plugin cache (see [CONTRIBUTING.md](CONTRIBUTING.md)). Each released section
 below corresponds to one such version.
 
-## [Unreleased]
+## [0.5.0] — 2026-07-25
 
 ### Changed
 
