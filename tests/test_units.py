@@ -95,9 +95,9 @@ def test_resolve_result_units_traces_aggregates(tmp_path):
     # under an alias; COUNT and ratios do not become currency
     pytest.importorskip("sqlglot")
     from semantic_model import runtime as RT
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _currency_model(tmp_path)
-    org = load_organization(tmp_path)
+    org = load_datasource(tmp_path)
     # named results carry the unit by name (+ a positional #0 key alongside)
     assert RT.resolve_result_units(org, "SELECT SUM(amount) AS total FROM loans")["total"] == "INR"
     assert RT.resolve_result_units(org, "SELECT AVG(amount) AS a FROM loans")["a"] == "INR"
@@ -115,7 +115,7 @@ def test_resolve_result_units_dimensional_ratios(tmp_path):
     pytest.importorskip("sqlglot")
     import yaml
     from semantic_model import runtime as RT
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _currency_model(tmp_path)
     # add a second currency col + a percent col
     t = tmp_path / "subject_areas" / "s" / "tables" / "loans.yaml"
@@ -123,7 +123,7 @@ def test_resolve_result_units_dimensional_ratios(tmp_path):
     doc["columns"] += [{"name": "fee", "type": "decimal", "unit": "INR"},
                        {"name": "npa_pct", "type": "decimal", "unit": "percent"}]
     t.write_text(yaml.safe_dump(doc))
-    org = load_organization(tmp_path)
+    org = load_datasource(tmp_path)
     R = lambda s: RT.resolve_result_units(org, s)
     assert R("SELECT SUM(amount)/COUNT(*) AS avg_ticket FROM loans")["avg_ticket"] == "INR"
     assert R("SELECT amount*1.18 AS with_tax FROM loans")["with_tax"] == "INR"
@@ -157,7 +157,7 @@ def test_resolve_result_units_emits_date_format_token(tmp_path):
     pytest.importorskip("sqlglot")
     import yaml
     from semantic_model import runtime as RT
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     (tmp_path / "datasources" / "c").mkdir(parents=True)
     (tmp_path / "subject_areas" / "s" / "tables").mkdir(parents=True)
     (tmp_path / "datasource.yaml").write_text(yaml.safe_dump({
@@ -172,7 +172,7 @@ def test_resolve_result_units_emits_date_format_token(tmp_path):
         "name": "orders", "schema": "public", "storage_connection": "c", "grain": ["id"], "description": "o",
         "columns": [{"name": "id", "type": "integer", "primary_key": True},
                     {"name": "created_ts", "type": "integer", "date_format": "epoch_s", "timezone": "UTC"}]}))
-    org = load_organization(tmp_path)
+    org = load_datasource(tmp_path)
     assert RT.resolve_result_units(org, "SELECT created_ts FROM orders")["created_ts"] == "epoch_s"
     # propagates through MAX (the last timestamp is still that encoding)
     assert RT.resolve_result_units(org, "SELECT MAX(created_ts) AS last FROM orders")["last"] == "epoch_s"
@@ -186,7 +186,7 @@ def test_format_table_applies_units_by_position():
 
 def test_unit_round_trips_on_column_and_surfaces_in_context(tmp_path):
     import yaml
-    from semantic_model.loader import get_table_context, load_organization
+    from semantic_model.loader import get_table_context, load_datasource
     root = tmp_path
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
@@ -202,7 +202,7 @@ def test_unit_round_trips_on_column_and_surfaces_in_context(tmp_path):
         "name": "orders", "schema": "public", "storage_connection": "c", "grain": ["id"], "description": "o",
         "columns": [{"name": "id", "type": "integer", "primary_key": True},
                     {"name": "amount", "type": "decimal", "unit": "INR"}]}))
-    org = load_organization(root)
+    org = load_datasource(root)
     assert org.subject_areas[0].defined_table("orders").get_column("amount").unit == "INR"
     ctx = get_table_context(org, ["orders"], area="s")
     amount = next(c for c in ctx["tables"]["orders"]["columns"] if c["name"] == "amount")

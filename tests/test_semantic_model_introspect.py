@@ -242,7 +242,7 @@ def test_introspect_writes_canonical_tree_and_loads_back(tmp_path):
                             artifacts_dir=tmp_path, dry_run=False)
     root = tmp_path / "shop"
     assert (root / "datasource.yaml").exists()
-    reloaded = L.load_organization(root)
+    reloaded = L.load_datasource(root)
     assert V.validate(reloaded).ok
     assert {t.name for sa in reloaded.subject_areas for t in sa.tables_defined} == {"customers", "orders"}
 
@@ -651,7 +651,7 @@ def test_same_named_tables_in_two_schemas_both_survive(tmp_path):
     assert (root / "subject_areas" / "crm" / "tables" / "products.yaml").exists()
     # reload from disk -> still 4 tables (write+read round-trips without loss)
     from semantic_model import loader as L
-    reloaded = L.load_organization(root)
+    reloaded = L.load_datasource(root)
     assert sum(len(sa.tables_defined) for sa in reloaded.subject_areas) == 4
     # the probed join binds within billing (same-schema), not across to crm.products
     bil = next(sa for sa in reloaded.subject_areas if sa.name == "billing")
@@ -821,7 +821,7 @@ def test_introspect_append_merges_batches(tmp_path):
     I.introspect("shop", "postgres", runner=_append_runner, artifacts_dir=tmp_path,
                  tables=["public.order_items"], append=True)
 
-    org = L.load_organization(tmp_path / "shop")
+    org = L.load_datasource(tmp_path / "shop")
     tnames = {t.name for sa in org.subject_areas for t in sa.tables_defined}
     assert tnames == {"orders", "customers", "order_items"}   # union — nothing lost, no re-query
     allrels = [r for sa in org.subject_areas for r in sa.relationships] + list(org.cross_subject_area_relationships)
@@ -837,6 +837,6 @@ def test_introspect_append_relisting_table_no_duplicate(tmp_path):
     # batch 2 re-lists orders (already built) + adds order_items
     I.introspect("shop", "postgres", runner=_append_runner, artifacts_dir=tmp_path,
                  tables=["public.orders", "public.order_items"], append=True)
-    org = L.load_organization(tmp_path / "shop")
+    org = L.load_datasource(tmp_path / "shop")
     names = [t.name for sa in org.subject_areas for t in sa.tables_defined]
     assert sorted(names) == ["customers", "order_items", "orders"]   # each table exactly once

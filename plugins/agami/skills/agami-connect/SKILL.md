@@ -477,7 +477,7 @@ This is the union-rescan that makes Case 2 work: adding `billing` to a model tha
 
 Example to say BEFORE introspecting: *"Found 70 tables across 18 schemas. I'll model the **52** in the 16 ServiceNow module schemas. **Excluding:** `public` (17 — `accounts`/`opportunities`/`leads`… looks like a separate Salesforce dataset; onboard it as its own profile if you want it) and `pg_auto_copy` (1 — Redshift system). Good?"* A user who said "all" must SEE the delta up front — never discover later that 19 tables never made it in. This is mandatory whenever discovered-count ≠ scanned-count.
 
-### 1.4 — Organization context (MANDATORY — ALWAYS ASK)
+### 1.4 — Datasource context (MANDATORY — ALWAYS ASK)
 
 Two levels: a **company** description written **once** at the deployment root and shared by every datasource, and a **per-database** narrative for the datasource being connected now. The skill never decides yes/skip for the user; "don't ask clarifying questions" does NOT cancel this — it's required state-gathering. Ask **A** then **B**.
 

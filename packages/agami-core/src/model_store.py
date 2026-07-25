@@ -1,10 +1,10 @@
 """Serve the semantic model from the DB — the read path + the deploy-time writer.
 
-The model-loader seam is just "produce an `Organization`": the file adapter is
-`semantic_model.loader.load_organization(root)`; this is the DB adapter, which rebuilds the
-**identical** `Organization` from rows so every downstream tool (get_datasource_schema incl.
-sizing, the receipt) is untouched. YAML stays the source of truth — `write_organization` seeds the
-rows from a YAML-loaded `Organization` at deploy time (the `deploy_semantic_model.py` path).
+The model-loader seam is just "produce an `Datasource`": the file adapter is
+`semantic_model.loader.load_datasource(root)`; this is the DB adapter, which rebuilds the
+**identical** `Datasource` from rows so every downstream tool (get_datasource_schema incl.
+sizing, the receipt) is untouched. YAML stays the source of truth — `write_datasource` seeds the
+rows from a YAML-loaded `Datasource` at deploy time (the `deploy_semantic_model.py` path).
 
 Each object is stored as its key/structural columns + a `doc` (the object's `model_dump`), so the
 rebuild is lossless without enumerating every pydantic field. The parent docs exclude their child
@@ -18,10 +18,10 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from semantic_model.models import Organization, OrgRecord
+from semantic_model.models import Datasource, OrgRecord
 from store import Store
 
-# The per-datasource model tables write_organization clears before a re-seed (so a redeploy
+# The per-datasource model tables write_datasource clears before a re-seed (so a redeploy
 # reproduces the served model rather than appending duplicates / hitting PK conflicts). Must stay in
 # sync with migrations/core/001_serving.sql's serving tables; examples/memory/model_version are
 # re-seeded by their own writers, so they're not in this list.
@@ -46,10 +46,10 @@ def _est_rows(table_doc: dict[str, Any]) -> int | None:
     return ph.get("estimated_row_count") if isinstance(ph, dict) else None
 
 
-def write_organization(
-    store: Store, datasource: str, org: Organization, org_id: str = DEFAULT_ORG
+def write_datasource(
+    store: Store, datasource: str, org: Datasource, org_id: str = DEFAULT_ORG
 ) -> None:
-    """(Re)seed the serving rows for `datasource` from a loaded Organization. Idempotent — clears
+    """(Re)seed the serving rows for `datasource` from a loaded Datasource. Idempotent — clears
     the datasource's existing model rows first, so re-running the deploy reproduces the served model."""
     for tbl in _MODEL_TABLES:
         # Scoped by org as well as datasource. Without the org predicate one tenant's redeploy would
@@ -58,10 +58,10 @@ def write_organization(
             f"DELETE FROM {tbl} WHERE org_id = ? AND datasource = ?", (org_id, datasource)
         )
 
-    org_doc = org.model_dump(mode="json", exclude={"subject_areas"})
+    ds_doc = org.model_dump(mode="json", exclude={"subject_areas"})
     store.execute(
         "INSERT INTO datasource_model (org_id, datasource, description, doc) VALUES (?, ?, ?, ?)",
-        (org_id, datasource, org.description or None, json.dumps(org_doc)),
+        (org_id, datasource, org.description or None, json.dumps(ds_doc)),
     )
 
     for sa in org.subject_areas:
@@ -111,16 +111,16 @@ def write_organization(
     store.commit()
 
 
-def load_organization(
+def load_datasource(
     store: Store, datasource: str, org_id: str = DEFAULT_ORG
-) -> Organization | None:
-    """Rebuild the Organization for `datasource` from rows, or None if it isn't seeded."""
+) -> Datasource | None:
+    """Rebuild the Datasource for `datasource` from rows, or None if it isn't seeded."""
     org_rows = store.query(
         "SELECT doc FROM datasource_model WHERE org_id = ? AND datasource = ?", (org_id, datasource)
     )
     if not org_rows:
         return None
-    org_doc: dict[str, Any] = json.loads(org_rows[0]["doc"])
+    ds_doc: dict[str, Any] = json.loads(org_rows[0]["doc"])
 
     subject_areas = []
     for sa_row in store.query(
@@ -145,8 +145,8 @@ def load_organization(
             ]
         subject_areas.append(sa_doc)
 
-    org_doc["subject_areas"] = subject_areas
-    return Organization.model_validate(org_doc)
+    ds_doc["subject_areas"] = subject_areas
+    return Datasource.model_validate(ds_doc)
 
 
 def list_datasources(store: Store, org_id: str = DEFAULT_ORG) -> list[str]:
@@ -161,7 +161,7 @@ def list_datasources(store: Store, org_id: str = DEFAULT_ORG) -> list[str]:
 def model_table_counts(store: Store, org_id: str = DEFAULT_ORG) -> dict[str, int]:
     """`{datasource: table_count}` for the org's served datasources, in ONE grouped query — so the
     datasource listing sizes itself without a per-datasource round trip (no N+1) and without
-    rebuilding the whole Organization. A datasource with no modeled tables simply won't appear in
+    rebuilding the whole Datasource. A datasource with no modeled tables simply won't appear in
     the map; the caller defaults it to 0."""
     rows = store.query(
         "SELECT datasource, count(*) AS n FROM model_table WHERE org_id = ? GROUP BY datasource",

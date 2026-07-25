@@ -70,7 +70,7 @@ password = mypassword
 The model is a **provider-portable, standard-concepts hierarchy** that any LLM can traverse to build reliable SQL against any backend:
 
 ```
-Organization (datasource.yaml)
+Datasource (datasource.yaml)
 ├─ Storage Connections[]   (physical: host/creds/dialect — datasources/<conn>/storage.yaml)
 └─ Subject Areas[]         (logical — the primary unit the LLM consumes; cap ~20-30 tables)
    ├─ tables[]             (TableRefs into storage connections; expose_column_groups scopes wide tables)

@@ -21,7 +21,7 @@ from store import Store
 def _default_org() -> str:
     """The org to deploy under when the caller names none. A CLI has no request, so it calls the SAME
     resolver the server's read path uses (`tools.resolved_org_id`: AGAMI_ORG_ID -> the minted uuid in
-    datasource.yaml -> 'local') — the two MUST agree, or the model is written under one org and read under
+    organization.yaml -> 'local') — the two MUST agree, or the model is written under one org and read under
     another and the server sees no model (F14 / ACE-056)."""
     from tools import resolved_org_id  # lazy: keeps the deploy CLI's import surface small
 
@@ -43,7 +43,7 @@ def _backfill_org_id(store: Store, org_id: str) -> None:
     (F14 / ACE-057). Runs once at boot, right after migrations, so an EXISTING deployment that ran
     under 'local' before this feature adopts its minted id instead of orphaning those rows.
 
-    Why an UPDATE-move and not a re-seed: `model_store.write_organization`'s redeploy DELETE is scoped
+    Why an UPDATE-move and not a re-seed: `model_store.write_datasource`'s redeploy DELETE is scoped
     to (org_id, datasource), so re-deploying under a NEW org_id would leave the old 'local' serving
     rows behind (doubled); the runtime tables are append-only and can only be corrected by an UPDATE.
     Idempotent + safe: a no-op when the target is still 'local' (a pre-F14 / un-minted deployment), and
@@ -71,7 +71,7 @@ def deploy_one(store: Store, datasource: str, profile_dir: Path, org_id: str | N
 
     org_id = org_id if org_id is not None else _default_org()
     # --- read + parse everything first (where malformed input fails, before any write) ---
-    org = loader.load_organization(profile_dir)
+    org = loader.load_datasource(profile_dir)
     # Examples live per subject area (prompt_examples/<area>/examples.yaml); tag each with its area so the
     # served row carries it (write_examples reads ex["area"]). A malformed examples file for one area is
     # skipped with a warning, not fatal — examples are best-effort few-shots, not the model itself, and a bad
@@ -89,7 +89,7 @@ def deploy_one(store: Store, datasource: str, profile_dir: Path, org_id: str | N
     version = newest_version(profile_dir) or "deployed"
 
     # --- then write (version last, so its presence marks a completed deploy) ---
-    model_store.write_organization(store, datasource, org, org_id=org_id)
+    model_store.write_datasource(store, datasource, org, org_id=org_id)
     # Always write examples (even []) so a redeploy after REMOVING examples actually clears the stale rows —
     # write_examples is clear-then-insert, so an empty list replaces the datasource's examples with none.
     model_store.write_examples(store, datasource, examples, org_id=org_id)

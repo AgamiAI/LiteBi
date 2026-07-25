@@ -1,6 +1,6 @@
 """Unit tests for semantic_model/validator.py — one happy + one failure per rule.
 
-Each test builds a minimal Organization that isolates a single rule.
+Each test builds a minimal Datasource that isolates a single rule.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def _conn(name="c"):
 
 
 def _org(area, conn="c", **kw):
-    return m.Organization(datasource="O", storage_connections=[_conn(conn)],
+    return m.Datasource(datasource="O", storage_connections=[_conn(conn)],
                           subject_areas=[area], **kw)
 
 
@@ -84,7 +84,7 @@ def test_table_ref_resolves_org_wide():
                       tables_defined=[t])
     b = m.SubjectArea(name="B", tables=[m.TableRef(storage_connection="c", schema="s", table="shared")],
                       tables_defined=[])
-    org = m.Organization(datasource="O", storage_connections=[_conn()], subject_areas=[a, b])
+    org = m.Datasource(datasource="O", storage_connections=[_conn()], subject_areas=[a, b])
     res = v.validate(org)
     assert "orphan_table_ref" not in _codes(res)
 
@@ -284,7 +284,7 @@ def test_cross_area_entity_collision_warns():
                            tables_defined=[rr],
                            entities=[m.Entity(name="Account",
                                               maps_to=[m.EntityMapping(table="rev", column="id", primary=True)])])
-    org = m.Organization(datasource="O", storage_connections=[_conn()],
+    org = m.Datasource(datasource="O", storage_connections=[_conn()],
                          subject_areas=[area_a, area_b])
     res = v.validate(org)
     assert "cross_area_entity_collision" in _codes(res)
@@ -308,7 +308,7 @@ def test_executable_mismatch_on_cross_edge():
     edge = m.CrossSubjectAreaRelationship(from_table="a", to_table="b", from_column="x", to_column="y",
                                           relationship="many_to_one", executable="same_engine",
                                           from_subject_area="A", to_subject_area="B")
-    org = m.Organization(datasource="O",
+    org = m.Datasource(datasource="O",
                          storage_connections=[_conn("c1"), _conn("c2")],
                          subject_areas=[area_a, area_b],
                          cross_subject_area_relationships=[edge])

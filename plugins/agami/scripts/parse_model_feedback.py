@@ -48,7 +48,7 @@ from pathlib import Path
 
 _LIST_KEYS = {"exclude tables", "include tables", "exclude columns", "include columns"}
 _JSON_KEYS = {"curate-ops", "new-metrics", "key-terminology", "example-edits", "new-examples"}
-_KEYS = _LIST_KEYS | _JSON_KEYS | {"profile", "signed-off-by", "organization-md"}
+_KEYS = _LIST_KEYS | _JSON_KEYS | {"profile", "signed-off-by", "datasource-md"}
 _TABLE_QNAME = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
 _COLUMN_QNAME = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
 
@@ -89,7 +89,7 @@ def parse(text: str) -> tuple[dict, list, dict | None]:
     needs: dict | None = None
     ops: list = []
     data: dict = {"profile": None, "ops": ops, "new_metrics_by_area": {},
-                  "examples_by_area": {}, "key_terminology": None, "organization_md": None,
+                  "examples_by_area": {}, "key_terminology": None, "datasource_md": None,
                   "signer": None, "role": None}
 
     if "profile" in sec:
@@ -124,7 +124,7 @@ def parse(text: str) -> tuple[dict, list, dict | None]:
                 entry["column"] = parts[2]
             ops.append(entry)
 
-    for jk in ("curate-ops", "new-metrics", "key-terminology", "example-edits", "new-examples", "organization-md"):
+    for jk in ("curate-ops", "new-metrics", "key-terminology", "example-edits", "new-examples", "datasource-md"):
         if jk not in sec:
             continue
         try:
@@ -155,8 +155,8 @@ def parse(text: str) -> tuple[dict, list, dict | None]:
                 data["examples_by_area"].setdefault(area, []).append(ex)
         elif jk == "key-terminology":
             data["key_terminology"] = parsed
-        elif jk == "organization-md":
-            data["organization_md"] = parsed  # JSON-encoded string → the full datasource.md text
+        elif jk == "datasource-md":
+            data["datasource_md"] = parsed  # JSON-encoded string → the full datasource.md text
 
     if bad_targets:
         needs = {"kind": "malformed_targets", "targets": bad_targets,

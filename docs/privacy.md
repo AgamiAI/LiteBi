@@ -45,7 +45,7 @@ Every byte agami reads or writes stays on your machine:
 - **Config** (`<artifacts_dir>/local/.config`) — `active_profile`, `tool_paths`, `reviewer_email`, `reviewer_role` (the artifacts-dir location lives in the `~/.config/agami/path` pointer)
 - **Semantic model** (`datasource.yaml` + the `subject_areas/<area>/` tree under `<artifacts_dir>/<profile>/`; default `<artifacts_dir>` is `~/agami-artifacts/`)
 - **Examples library** (`<artifacts_dir>/<profile>/examples.yaml`)
-- **Organization context** (`<artifacts_dir>/<profile>/datasource.md`) — your description of what the database represents, domain terminology
+- **Datasource context** (`<artifacts_dir>/<profile>/datasource.md`) — your description of what the database represents, domain terminology
 - **User memory** (`<artifacts_dir>/USER_MEMORY.md`) — your cross-database preferences
 - **Query results** (everything the assistant shows you)
 - **Query log** (`<artifacts_dir>/local/query_log.jsonl`) — your personal record of every query you ran

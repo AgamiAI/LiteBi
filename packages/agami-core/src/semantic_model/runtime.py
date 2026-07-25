@@ -1,7 +1,7 @@
 """Runtime traversal for the agami semantic-model-v2 path.
 
 Implements the design doc's "Traversal" + "Runtime walkthrough" primitives as
-pure functions over a parsed `Organization` model, so they're equally usable from
+pure functions over a parsed `Datasource` model, so they're equally usable from
 the MCP server (`mcp_server.py`) and the skill CLI, and fully unit-testable
 without a live database. Anything that needs to touch the DB (entity probing) is
 injected as a `probe` callable — the caller wires in a real prober; tests pass a
@@ -45,9 +45,9 @@ except ImportError:  # pragma: no cover
 
 from .models import (
     Column,
+    Datasource,
     Entity,
     Metric,
-    Organization,
     Relationship,
 )
 from .models import (
@@ -93,7 +93,7 @@ def _parse_sql(sql: str) -> "exp.Expression | None":
         return None
 
 
-def build_guard_context(sql: str, org: Organization) -> "GuardContext | None":
+def build_guard_context(sql: str, org: Datasource) -> "GuardContext | None":
     """Parse `sql` once and build each guard index once, so the _model_safety battery shares
     them instead of every guard redoing the work (audit P2 / ACE-045). Returns None when sqlglot
     is unavailable: every guard then short-circuits to allow before it touches the context, so
@@ -122,7 +122,7 @@ ENUM_MAX_CARDINALITY = 50
 # ---------------------------------------------------------------------------
 
 
-def list_subject_areas(org: Organization) -> list[dict[str, Any]]:
+def list_subject_areas(org: Datasource) -> list[dict[str, Any]]:
     """Compact listing for area selection — also the one-call model map. The counts
     tell a caller the whole shape of each area (and where things live: relationships
     and entities/metrics are area-level, not per-table) without reading any YAML."""
@@ -180,7 +180,7 @@ def is_high_confidence(matches: list[ExampleMatch]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _area_entities(org: Organization, area: Optional[str]) -> list[tuple[Optional[str], Entity]]:
+def _area_entities(org: Datasource, area: Optional[str]) -> list[tuple[Optional[str], Entity]]:
     out: list[tuple[Optional[str], Entity]] = []
     for sa in org.subject_areas:
         if area and sa.name != area:
@@ -193,7 +193,7 @@ def _area_entities(org: Organization, area: Optional[str]) -> list[tuple[Optiona
 
 
 def resolve_entities(
-    query: str, org: Organization, *, area: Optional[str] = None, top_k: int = 5
+    query: str, org: Datasource, *, area: Optional[str] = None, top_k: int = 5
 ) -> list[dict[str, Any]]:
     """Lexically match query terms to entity name / plural / other_names."""
     q = query.lower()
@@ -226,7 +226,7 @@ def resolve_entities(
 
 
 def resolve_metrics(
-    query: str, org: Organization, *, area: Optional[str] = None, top_k: int = 5
+    query: str, org: Datasource, *, area: Optional[str] = None, top_k: int = 5
 ) -> list[dict[str, Any]]:
     from . import derived as _D
 
@@ -285,7 +285,7 @@ class IdentifyResult:
 
 def identify_entity(
     literal: str,
-    org: Organization,
+    org: Datasource,
     *,
     area: Optional[str] = None,
     probe: Optional[Prober] = None,
@@ -437,7 +437,7 @@ class SensitiveCheckResult:
                 "reason": self.reason, "suggestion": self.suggestion}
 
 
-def _sensitive_by_table(org: Organization) -> tuple[dict[str, set[str]], set[str]]:
+def _sensitive_by_table(org: Datasource) -> tuple[dict[str, set[str]], set[str]]:
     """(table name -> {sensitive column names}, union of all sensitive column names)."""
     by_table: dict[str, set[str]] = {}
     allnames: set[str] = set()
@@ -498,7 +498,7 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     return []
 
 
-def check_sensitive_projection(sql: str, org: Organization,
+def check_sensitive_projection(sql: str, org: Datasource,
                                ctx: "GuardContext | None" = None) -> SensitiveCheckResult:
     """Refuse a query that PROJECTS a `sensitive` column's raw values; allow the
     column in COUNT, filters, GROUP BY, and joins. Degrades to allow when sqlglot
@@ -586,7 +586,7 @@ class TableScopeResult:
                 "reason": self.reason, "suggestion": self.suggestion}
 
 
-def check_table_scope(sql: str, org: Organization,
+def check_table_scope(sql: str, org: Datasource,
                       ctx: "GuardContext | None" = None) -> TableScopeResult:
     """Refuse a query that references a table not declared in the semantic model.
 
@@ -713,7 +713,7 @@ class ColumnScopeResult:
                 "reason": self.reason, "suggestion": self.suggestion}
 
 
-def check_column_scope(sql: str, org: Organization,
+def check_column_scope(sql: str, org: Datasource,
                        ctx: "GuardContext | None" = None) -> ColumnScopeResult:
     """Refuse a query that references a column not declared on the table it binds to.
 
@@ -850,7 +850,7 @@ def check_column_scope(sql: str, org: Organization,
     )
 
 
-def _cardinality_index(org: Organization) -> list[Relationship]:
+def _cardinality_index(org: Datasource) -> list[Relationship]:
     rels: list[Relationship] = []
     for sa in org.subject_areas:
         rels.extend(sa.relationships)
@@ -881,7 +881,7 @@ def _many_side_facing_one(rels: list[Relationship], table: str, dim: str) -> boo
     return False
 
 
-def pre_flight_check(sql: str, org: Organization,
+def pre_flight_check(sql: str, org: Datasource,
                      ctx: "GuardContext | None" = None) -> PreFlightResult:
     """Detect fan-trap / chasm-trap and decide rewrite-vs-refuse-vs-allow.
 
@@ -910,7 +910,7 @@ def pre_flight_check(sql: str, org: Organization,
     return PreFlightResult(None, "allow", sql, reason="no fan/chasm or aggregation issue in any arm")
 
 
-def _preflight_select(tree: "exp.Select", org: Organization, sql: str, allow_rewrite: bool,
+def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewrite: bool,
                       ctx: "GuardContext | None" = None) -> PreFlightResult:
     """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT. `sql` is that
     select's own text (used for the join rewrite + messages). When `allow_rewrite` is
@@ -1020,7 +1020,7 @@ def _preflight_select(tree: "exp.Select", org: Organization, sql: str, allow_rew
 # ---------------------------------------------------------------------------
 
 
-def _column_index(org: Organization) -> dict[str, dict[str, Column]]:
+def _column_index(org: Datasource) -> dict[str, dict[str, Column]]:
     """bare table name -> {column name -> Column}."""
     idx: dict[str, dict[str, Column]] = {}
     for sa in org.subject_areas:
@@ -1053,7 +1053,7 @@ def _bare_aggregate_column(agg: "exp.AggFunc") -> Optional["exp.Column"]:
     return None
 
 
-def _semi_additive_columns(org: Organization) -> dict[tuple[str, str], "Metric"]:
+def _semi_additive_columns(org: Datasource) -> dict[tuple[str, str], "Metric"]:
     """(table, column) -> the semi-additive Metric that SUMs it (declares
     non_additive_dimensions). Keyed by (table, column) — NOT bare column name — so two
     tables that both have a `balance` don't cross-contaminate. The table is the binding's
@@ -1102,7 +1102,7 @@ def _groups_by_time(tree: "exp.Select", scope: dict[str, str],
 
 
 def _check_aggregation_semantics(
-    tree: "exp.Select", org: Organization, scope: dict[str, str], sql: str,
+    tree: "exp.Select", org: Datasource, scope: dict[str, str], sql: str,
     ctx: "GuardContext | None" = None,
 ) -> Optional[PreFlightResult]:
     colidx = ctx.column_index if ctx is not None else _column_index(org)
@@ -1220,7 +1220,7 @@ def build_receipt(
     return receipt
 
 
-def _model_table_index(org: Organization) -> dict[str, tuple]:
+def _model_table_index(org: Datasource) -> dict[str, tuple]:
     """bare table name -> (Table, area_name). First occurrence wins (a cross-schema
     name clash is rare and the relationships now carry schema to disambiguate)."""
     idx: dict[str, tuple] = {}
@@ -1235,7 +1235,7 @@ def _norm_sql(s: Optional[str]) -> str:
 
 
 def assemble_receipt(
-    org: Organization,
+    org: Datasource,
     sql: str,
     *,
     model_version: Optional[str] = None,
@@ -1499,7 +1499,7 @@ def _drop_fanout_joins(sql: str, drop_tables: set[str]) -> Optional[str]:
 
 def apply_default_filters(
     sql: str,
-    org: Organization,
+    org: Datasource,
     *,
     area: Optional[str] = None,
     params: Optional[dict[str, str]] = None,
@@ -1594,7 +1594,7 @@ def _term_score(query_lower: str, name: str) -> float:
     return 0.0
 
 
-def resolve_result_units(org: Organization, sql: str) -> dict[str, str]:
+def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
     """Map each SELECT output column -> display unit, **tracing the SQL** (not matching
     names): an aggregate/expression over a column inherits that column's unit, so
     `SUM(amount) AS total_outstanding` correctly resolves to amount's currency — the

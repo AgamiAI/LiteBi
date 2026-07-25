@@ -40,7 +40,7 @@ def _scope_org():
     orders = _t("orders", [("id", "integer"), ("amount", "decimal"),
                            ("customer_id", "integer"), ("status", "string")])
     customers = _t("customers", [("id", "integer"), ("name", "string"), ("region", "string")])
-    return m.Organization(datasource="Shop",
+    return m.Datasource(datasource="Shop",
                           subject_areas=[m.SubjectArea(name="sales",
                               tables_defined=[orders, customers])])
 

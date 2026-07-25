@@ -332,7 +332,7 @@ def test_mcp_receipt_equals_shared_assembler(monkeypatch, tmp_path):
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
     from semantic_model import loader as L
     from semantic_model import runtime as RT
-    shared = RT.assemble_receipt(L.load_organization(root), SQL)
+    shared = RT.assemble_receipt(L.load_datasource(root), SQL)
     mcp = _resolve_receipt(profile, SQL)
     for key in ("tables_used", "relationships", "metrics", "assumptions", "warnings"):
         assert mcp[key] == shared[key], key

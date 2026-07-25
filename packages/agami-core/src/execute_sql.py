@@ -867,7 +867,7 @@ def _hosted() -> bool:
 def _resolve_guard_model(profile: str):
     """Resolve the semantic model for the safety pass, mirroring `tools._load_org` (ACE-051): from
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
-    on-disk YAML (local). Returns an `Organization` or None if neither is available.
+    on-disk YAML (local). Returns an `Datasource` or None if neither is available.
 
     The DB import is lazy AND env-guarded on purpose: the local executor runs from a stdlib-lean
     mirror that does not ship `store`/`model_store`, so we only reach for them when a DB is set.
@@ -881,7 +881,7 @@ def _resolve_guard_model(profile: str):
     # itself, not a diagnostic line.
     if _hosted():
         try:
-            from model_store import load_organization as _load_db
+            from model_store import load_datasource as _load_db
             from store import Store
 
             store = Store.from_env()
@@ -898,7 +898,7 @@ def _resolve_guard_model(profile: str):
     root = Path(os.environ.get("AGAMI_ARTIFACTS_DIR") or (Path.home() / "agami-artifacts")) / profile
     if (root / "datasource.yaml").exists():
         try:
-            return L.load_organization(root)
+            return L.load_datasource(root)
         except Exception:
             pass  # unparseable/absent on disk -> None (hosted then fails closed)
     return None

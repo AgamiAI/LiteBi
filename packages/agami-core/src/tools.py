@@ -205,7 +205,7 @@ def check_read_only(sql: str) -> str | None:
 
 
 def _load_org(profile: str):
-    """Lazily load the semantic model for a profile, producing an `Organization`. Two backends
+    """Lazily load the semantic model for a profile, producing an `Datasource`. Two backends
     behind one seam: when AGAMI_DB_URL is set the hosted server reads it from the DB; otherwise the
     local skill reads the YAML files (unchanged). Raises a clear error if the model deps (pydantic)
     aren't importable or there's no model for the profile."""
@@ -213,7 +213,7 @@ def _load_org(profile: str):
 
     store = Store.from_env()
     if store is not None:
-        from model_store import load_organization as _load_db
+        from model_store import load_datasource as _load_db
 
         try:
             org = _load_db(store, profile, org_id=_current_org_id())
@@ -234,7 +234,7 @@ def _load_org(profile: str):
             f"No semantic model at {root}/datasource.yaml. Run the agami-connect skill to "
             f"introspect this database."
         )
-    return L.load_organization(root)
+    return L.load_datasource(root)
 
 
 def _resolve_units(profile: str, sql: str) -> dict[str, str]:
@@ -358,7 +358,7 @@ _ORG_CACHE_LOCK = threading.Lock()
 
 def get_cached_org(profile: str):
     """Load the semantic model for `profile`, cached per process and keyed (org, datasource, version).
-    Reuses one Organization across the loads within a query AND across queries, until the model version
+    Reuses one Datasource across the loads within a query AND across queries, until the model version
     changes; a cache miss falls back to a fresh `_load_org`."""
     version = _model_version(profile)  # cheap: one DB row / dir listing, not a full model load
     if version is None:
@@ -387,7 +387,7 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
     datasource.md, USER_MEMORY.md, the deployment ``OrgRecord``, and the company narrative. Under the DB
     backend all of it is read on a SINGLE connection — this is a hot tool path, so open ``Store`` once, not
     per-source; with no DB configured it falls back to file reads (a DB deploy reads no files at runtime).
-    Returns ``(org_md, user_md, record | None, company_md)``; missing pieces come back empty/``None`` so the
+    Returns ``(datasource_md, user_md, record | None, company_md)``; missing pieces come back empty/``None`` so the
     two-level composition degrades cleanly."""
     from store import Store
 

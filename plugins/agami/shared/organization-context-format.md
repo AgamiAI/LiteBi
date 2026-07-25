@@ -70,7 +70,7 @@ The user replaces the comment with real prose, or leaves it — agami works eith
 
 ## When the skill loads it
 
-- **`query-database`** — Phase 1d.2 runs `cli org-context`, injecting the combined narrative + derived summary under `## Organization context`, ahead of `## User memory`.
+- **`query-database`** — Phase 1d.2 runs `cli org-context`, injecting the combined narrative + derived summary under `## Datasource context`, ahead of `## User memory`.
 - **`connect`** — enrichment uses the narrative (if any) as a domain prior for descriptions; writes the glossary to `key_terminology`; writes the starter on the skip path.
 
 If there's no narrative and no model, the context is empty — never an error.

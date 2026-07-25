@@ -47,8 +47,8 @@ def _area_with_n_rels(name: str, n: int) -> m.SubjectArea:
     return m.SubjectArea(name=name, tables=refs, tables_defined=[a, b], relationships=rels)
 
 
-def _org(*areas) -> m.Organization:
-    return m.Organization(datasource="O",
+def _org(*areas) -> m.Datasource:
+    return m.Datasource(datasource="O",
                           storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                           subject_areas=list(areas))
 

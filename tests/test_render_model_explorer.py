@@ -127,7 +127,7 @@ def test_manifest_surfaces_full_model(profile_dir):
          "confidence": "confirmed", "signed_off_by": "agami_introspect",
          "signed_off_role": "system", "signed_off_at": "t"}]}))
     m = build_manifest(profile_dir, "test")
-    assert "MRR = monthly recurring revenue" in m["organization_md"]
+    assert "MRR = monthly recurring revenue" in m["datasource_md"]
     assert any(e["name"] == "customer" and e["maps_to"] == ["customers.id"] for e in m["entities"])
     assert any(x["question"] == "how many orders" for x in m["examples"])
     # the fixture's orders→customers FK relationship is surfaced

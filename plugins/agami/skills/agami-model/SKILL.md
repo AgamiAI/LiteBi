@@ -11,7 +11,7 @@ You are running the unified **model + trust** surface — one dashboard to brows
 
 This skill orchestrates:
 
-1. **Render** — invoke `render_model_explorer.py` to walk every YAML and write a self-contained HTML artifact at `<artifacts_dir>/local/model/<profile>/<ts>.html`. The Python script does the YAML reading — **no LLM tokens spent on the walk**. The dashboard has tabs: **Organization · Review · Subject areas · Tables · Metrics · Entities · Joins · Examples · Queued**. The **Review** tab is the sign-off queue (the old `/agami-review`); pass `--initial-tab review` to open on it.
+1. **Render** — invoke `render_model_explorer.py` to walk every YAML and write a self-contained HTML artifact at `<artifacts_dir>/local/model/<profile>/<ts>.html`. The Python script does the YAML reading — **no LLM tokens spent on the walk**. The dashboard has tabs: **Datasource · Review · Subject areas · Tables · Metrics · Entities · Joins · Examples · Queued**. The **Review** tab is the sign-off queue (the old `/agami-review`); pass `--initial-tab review` to open on it.
 2. **Open + wait** — auto-open the file, end the turn, wait for the user to come back with a "Generate feedback for Claude" block (exclude/include, approve/reject, edits, new metrics, org edit).
 3. **Apply** — for each batch, run `semantic_model.cli curate` with an ops JSON. The engine flips review_state / stamps sign-off, runs the validator, reverts via git on failure, appends to `curation_log.jsonl`, and commits.
 4. **Re-render** — render to a new timestamped file and re-open. Wait for the next batch.
@@ -74,7 +74,7 @@ Set `initial_tab=review` when `$ARGUMENTS` was `review`/`preseed`/`rule1` (Phase
 Model dashboard rendered — <N> schema(s) · <M> tables · <K> fields · <R> to review.
 <artifacts_dir>/local/model/<profile>/<ts>.html
 
-Tabs: Organization · Review · Subject areas · Tables · Metrics · Entities ·
+Tabs: Datasource · Review · Subject areas · Tables · Metrics · Entities ·
 Joins · Examples · Queued. Live search + status filters per tab.
 • Review tab — the sign-off queue: Approve / Reject the metrics (must be
   signed off before queries use them), entities, and inferred joins, with a
@@ -107,7 +107,7 @@ End the turn. Wait for the user.
 
 ## Phase 2: Parse the chat back-channel
 
-The user pastes the dashboard's "Generate feedback" block. **Don't hand-parse it** — pipe it to the parser, which handles the whole grammar (the `profile:` line, the `exclude/include tables|columns:` lists, and the `curate-ops` / `new-metrics` / `new-examples` / `example-edits` / `key-terminology` / `organization-md` JSON blocks) and translates the exclude/include lists into curate ops:
+The user pastes the dashboard's "Generate feedback" block. **Don't hand-parse it** — pipe it to the parser, which handles the whole grammar (the `profile:` line, the `exclude/include tables|columns:` lists, and the `curate-ops` / `new-metrics` / `new-examples` / `example-edits` / `key-terminology` / `datasource-md` JSON blocks) and translates the exclude/include lists into curate ops:
 
 ```bash
 parse_model_feedback.py --block-file <pasted>
@@ -119,7 +119,7 @@ It prints `{data, anomalies, needs_judgment}`:
 - `data.new_metrics_by_area` — `{area: [metric…]}` → one `sm add "$ROOT" --kind metric --area <area> --file <json>` per area.
 - `data.examples_by_area` — edited + new NL→SQL examples `{area: [example…]}` → one `sm add-example "$ROOT" --area <area> --file <json>` per area (dedups by question).
 - `data.key_terminology` — the complete glossary object → `sm set-terminology "$ROOT" --file <json> --replace`.
-- `data.organization_md` — the full datasource.md text (already decoded) → **Write** it to `<artifacts_dir>/<profile>/datasource.md` (overwrite; human narrative only).
+- `data.datasource_md` — the full datasource.md text (already decoded) → **Write** it to `<artifacts_dir>/<profile>/datasource.md` (overwrite; human narrative only).
 - `data.signer` / `data.role` — the curator identity for `--signer`/`--role` on every approve. **Persist** them into `<artifacts_dir>/local/.config` (`reviewer_email`/`reviewer_role`; preserve other keys, `chmod 600`) so future sessions don't re-ask; if absent on an approve-bearing batch, fall back to `.config`, then the Phase 0 ask.
 
 **If `needs_judgment` is set, stop and ask** — `malformed_targets` (a table without its `<area>.` prefix → *"Tables need a schema prefix — `sales.STG_LEADS`, not `STG_LEADS`. Did you mean that?"*) or `unparseable_json` (re-copy that block from the dashboard). Don't apply a partial block.

@@ -1,6 +1,6 @@
 """agami semantic model — provider-portable, standard-concepts hierarchy.
 
-This is **the** agami semantic model: a hierarchy of Organization → Storage
+This is **the** agami semantic model: a hierarchy of Datasource → Storage
 Connection (physical) + Subject Area (logical) → Table / Entity / Metric /
 Relationship, with provider-portable declarative fields (default_filters,
 value_transform, caveats, value_pattern, sensitive, cardinality, …) so that any

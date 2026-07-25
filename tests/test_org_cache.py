@@ -29,7 +29,7 @@ def test_loads_once_then_serves_warm(monkeypatch):
     first = tools.get_cached_org("sales")
     second = tools.get_cached_org("sales")
     assert calls["load"] == 1  # query #2 served warm from the cache
-    assert first is second  # the same cached Organization object
+    assert first is second  # the same cached Datasource object
 
 
 def test_reloads_after_version_bump(monkeypatch):

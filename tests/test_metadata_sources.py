@@ -151,7 +151,7 @@ def test_generated_ops_apply_and_stamp_metadata(tmp_path):
     assert res.validated and not res.errors, res.as_dict()
     assert len(res.applied) == 3
 
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     incident = next(t for sa in org.subject_areas for t in sa.tables_defined if t.name == "incident")
     cols = {c.name: c for c in incident.columns}
     assert cols["severity"].choice_field == {"1": "High", "2": "Medium", "3": "Low"}
@@ -177,7 +177,7 @@ def test_inheritance_inherited_reference_applies_to_all_children():
                           tables_defined=[tbl("incident", ["assignment_group"]),
                                           tbl("problem", ["assignment_group"])])
     sysa = mm.SubjectArea(name="sys", description="d", tables_defined=[tbl("sys_user_group", [])])
-    org = mm.Organization(datasource="o", version=1, subject_areas=[itsm, sysa])
+    org = mm.Datasource(datasource="o", version=1, subject_areas=[itsm, sysa])
     specs = [{"from_table": t.name, "from_column": c.name, "to_table": decls[c.name.lower()]}
              for sa in org.subject_areas for t in sa.tables_defined for c in t.columns
              if c.name.lower() in decls]
@@ -195,7 +195,7 @@ def test_route_references_intra_cross_and_skips_unmodelled():
                         columns=[mm.Column(name="id", type="integer", primary_key=True)])
     itsm = mm.SubjectArea(name="itsm", description="d", tables_defined=[tbl("incident"), tbl("problem")])
     sysa = mm.SubjectArea(name="sys", description="d", tables_defined=[tbl("sys_user")])
-    org = mm.Organization(datasource="o", version=1, subject_areas=[itsm, sysa])
+    org = mm.Datasource(datasource="o", version=1, subject_areas=[itsm, sysa])
     specs = [
         {"from_table": "incident", "from_column": "problem_id", "to_table": "problem"},   # intra (itsm)
         {"from_table": "incident", "from_column": "caller_id", "to_table": "sys_user"},    # cross (itsm→sys)
@@ -278,7 +278,7 @@ def test_cmd_enrich_metadata_applies_from_canned_db(tmp_path, monkeypatch):
         ["enrich-metadata", str(tmp_path), "--profile", "servicenow", "--db-type", "redshift"])
     assert ns.func(ns) == 0
 
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     incident = next(t for sa in org.subject_areas for t in sa.tables_defined if t.name == "incident")
     cols = {c.name: c for c in incident.columns}
     assert cols["severity"].choice_field == {"1": "High", "2": "Medium", "3": "Low"}
@@ -322,7 +322,7 @@ def test_enrich_metadata_drops_unverified_preset_reference(tmp_path, monkeypatch
     ns = cli.build_parser().parse_args(
         ["enrich-metadata", str(tmp_path), "--profile", "servicenow", "--db-type", "redshift"])
     assert ns.func(ns) == 0
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     assert not [r for r in org.cross_subject_area_relationships if r.to_table == "sys_user"]
 
 
@@ -342,7 +342,7 @@ def test_verified_references_unverified_when_table_too_big():
                                 + [mm.Column(name=c, type="integer") for c in cols])
     itsm = mm.SubjectArea(name="itsm", description="d", tables_defined=[tbl("incident", ["caller_id"], big)])
     sysa = mm.SubjectArea(name="sys", description="d", tables_defined=[tbl("sys_user", [])])
-    org = mm.Organization(datasource="o", version=1, subject_areas=[itsm, sysa])
+    org = mm.Datasource(datasource="o", version=1, subject_areas=[itsm, sysa])
     probed = {"n": 0}
 
     def runner(sql):

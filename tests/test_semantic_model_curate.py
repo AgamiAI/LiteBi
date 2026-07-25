@@ -73,7 +73,7 @@ def _write_model(root: Path, *, git: bool = True) -> None:
 
 def test_review_queue_partitions_rule1_rule2(tmp_path):
     _write_model(tmp_path, git=False)
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     q = curate.review_queue(org)
     assert q["counts"]["rule_1"] == 1  # the proposed metric
     assert q["counts"]["rule_2"] == 1  # the inferred relationship
@@ -83,7 +83,7 @@ def test_review_queue_partitions_rule1_rule2(tmp_path):
 
 def test_model_tree_shows_columns_and_state(tmp_path):
     _write_model(tmp_path, git=False)
-    org = loader.load_organization(tmp_path, include_rejected=True)
+    org = loader.load_datasource(tmp_path, include_rejected=True)
     tree = curate.model_tree(org)
     orders = next(t for t in tree["subject_areas"][0]["tables"] if t["table"] == "orders")
     assert orders["review_state"] == "approved"
@@ -96,10 +96,10 @@ def test_exclude_table_hides_from_runtime(tmp_path):
     res = curate.apply(tmp_path, [{"op": "exclude", "kind": "table",
                                    "area": "sales", "name": "orders"}])
     assert res.validated and res.applied
-    runtime = loader.load_organization(tmp_path)  # drops rejected
+    runtime = loader.load_datasource(tmp_path)  # drops rejected
     assert not any(t.name == "orders" for sa in runtime.subject_areas for t in sa.tables_defined)
     # still visible with include_rejected (so the explorer can toggle it back)
-    full = loader.load_organization(tmp_path, include_rejected=True)
+    full = loader.load_datasource(tmp_path, include_rejected=True)
     assert any(t.name == "orders" for sa in full.subject_areas for t in sa.tables_defined)
 
 
@@ -107,7 +107,7 @@ def test_include_restores(tmp_path):
     _write_model(tmp_path)
     curate.apply(tmp_path, [{"op": "exclude", "kind": "table", "area": "sales", "name": "orders"}])
     curate.apply(tmp_path, [{"op": "include", "kind": "table", "area": "sales", "name": "orders"}])
-    runtime = loader.load_organization(tmp_path)
+    runtime = loader.load_datasource(tmp_path)
     assert any(t.name == "orders" for sa in runtime.subject_areas for t in sa.tables_defined)
 
 
@@ -116,7 +116,7 @@ def test_exclude_column(tmp_path):
     res = curate.apply(tmp_path, [{"op": "exclude", "kind": "table", "area": "sales",
                                    "name": "orders", "column": "ssn"}])
     assert res.validated
-    orders = loader.load_organization(tmp_path).subject_areas[0].defined_table("orders")
+    orders = loader.load_datasource(tmp_path).subject_areas[0].defined_table("orders")
     assert not any(c.name == "ssn" for c in orders.columns)
 
 
@@ -126,7 +126,7 @@ def test_approve_metric_records_signoff(tmp_path):
                                    "name": "order_count", "at": "2026-06-09T00:00:00Z"}],
                        signer="reviewer@example.com", role="cto")
     assert res.validated
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     mm = org.subject_areas[0].metrics[0]
     assert mm.review_state == "approved" and mm.signed_off_by == "reviewer@example.com"
     # no longer in the Rule 1 queue
@@ -139,7 +139,7 @@ def test_approve_relationship(tmp_path):
                                    "name": "orders->customers", "at": "2026-06-09T00:00:00Z"}],
                        signer="reviewer@example.com", role="cto")
     assert res.validated
-    rel = loader.load_organization(tmp_path).subject_areas[0].relationships[0]
+    rel = loader.load_datasource(tmp_path).subject_areas[0].relationships[0]
     assert rel.review_state == "approved" and rel.signed_off_by == "reviewer@example.com"
 
 
@@ -155,7 +155,7 @@ def test_edit_relationship_on_clause(tmp_path):
          "field": "to_column", "value": None},
     ])
     assert res.validated, res.errors
-    rel = loader.load_organization(tmp_path).subject_areas[0].relationships[0]
+    rel = loader.load_datasource(tmp_path).subject_areas[0].relationships[0]
     assert rel.on and "CAST" in rel.on
 
 
@@ -174,7 +174,7 @@ def test_approve_resolves_slugged_metric_name(tmp_path):
                                    "name": "total event sales", "at": "2026-06-12T00:00:00Z"}],
                        signer="x@y.com", role="cto")
     assert res.applied and not res.skipped, res.skipped
-    m2 = next(x for x in loader.load_organization(tmp_path).subject_areas[0].metrics
+    m2 = next(x for x in loader.load_datasource(tmp_path).subject_areas[0].metrics
               if x.name == "total event sales")
     assert m2.review_state == "approved"
 
@@ -191,7 +191,7 @@ def test_edit_op_auto_resolves_area_when_omitted(tmp_path):
     res = curate.apply(tmp_path, [{"op": "edit", "kind": "table", "name": "orders",
                                    "field": "description", "value": "all orders", "source": "ai"}])
     assert res.validated and res.applied and not res.skipped, res.skipped
-    orders = loader.load_organization(tmp_path).subject_areas[0].defined_table("orders")
+    orders = loader.load_datasource(tmp_path).subject_areas[0].defined_table("orders")
     assert orders.description == "all orders"
     assert orders.description_source == "ai_unvalidated"  # source:"ai" stamped
 

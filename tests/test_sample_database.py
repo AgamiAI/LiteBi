@@ -82,7 +82,7 @@ def test_customer_names_are_unique(db):
 def test_full_name_is_not_sensitive():
     """full_name is the display label for a customer — it must be queryable; only
     email/phone are sensitive."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     cols = {c.name: c for area in org.subject_areas for t in area.tables_defined for c in t.columns if t.name == "customers"}
     assert cols["full_name"].sensitive is False
     assert cols["email"].sensitive is True
@@ -90,7 +90,7 @@ def test_full_name_is_not_sensitive():
 
 
 def test_model_validates():
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     res = V.validate(org)
     assert res.ok, res.errors
 
@@ -99,7 +99,7 @@ def test_context_surfaces_row_counts():
     """The answer receipt's '≈N rows' provenance reads performance_hints.estimated_row_count
     from the assembled context. Regression guard for the 'rows unknown' bug, where the
     context/bundle include-list dropped performance_hints even though the model had it."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     # the compound context fetch (default include)
     ctx = L.get_table_context(org, ["subscriptions", "plans"], area="agami-example")
     assert ctx["tables"]["subscriptions"]["performance_hints"]["estimated_row_count"] == 400
@@ -112,7 +112,7 @@ def test_context_surfaces_row_counts():
 def test_revenue_metric_is_signed_off():
     """The committed model ships signed-off metrics, so demo answers carry no
     'not reviewed' warning."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     metrics = {m.name: m for area in org.subject_areas for m in area.metrics}
     assert "revenue" in metrics
     assert metrics["revenue"].review_state == "approved"
@@ -121,7 +121,7 @@ def test_revenue_metric_is_signed_off():
 def test_fan_trap_is_refused():
     """Summing the order-grain total across the line-item join double-counts —
     the pre-flight must refuse it. This is the headline demo."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     sql = (
         "SELECT cat.name, SUM(o.total_amount) FROM orders o "
         "JOIN order_items oi ON oi.order_id = o.id "
@@ -134,7 +134,7 @@ def test_fan_trap_is_refused():
 
 
 def test_chasm_trap_is_refused():
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     sql = (
         "SELECT c.id, SUM(o.total_amount), SUM(s.id) FROM customers c "
         "JOIN orders o ON o.customer_id = c.id "
@@ -206,7 +206,7 @@ def test_correct_revenue_by_category(db):
 
 def test_sensitive_projection_refuses_raw():
     """Projecting a raw sensitive value (bare, aliased, via *, or via MIN/MAX) is refused."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     for sql in [
         "SELECT email FROM customers",
         "SELECT * FROM customers",
@@ -219,7 +219,7 @@ def test_sensitive_projection_refuses_raw():
 
 def test_sensitive_projection_allows_aggregate_filter_and_nonsensitive():
     """COUNT/COUNT(DISTINCT), WHERE-only use, and non-sensitive columns are allowed."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     for sql in [
         "SELECT COUNT(DISTINCT email) FROM customers",
         "SELECT COUNT(email) FROM customers",
@@ -234,7 +234,7 @@ def test_sensitive_projection_refuses_set_operation_arm():
     """A sensitive column projected in ANY set-operation arm is refused. A UNION parses
     to exp.SetOperation (not exp.Select), so a gate that only inspects the root SELECT
     would let `SELECT id … UNION SELECT email …` slip PII straight past the gate."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     for sql in [
         "SELECT id FROM customers UNION SELECT email FROM customers",
         "SELECT full_name FROM customers UNION ALL SELECT email FROM customers",
@@ -247,7 +247,7 @@ def test_sensitive_projection_refuses_set_operation_arm():
 def test_sensitive_projection_allows_union_of_nonsensitive():
     """A set operation whose every arm projects only non-sensitive columns still passes —
     the arm-walking fix must not over-refuse a clean UNION."""
-    org = L.load_organization(MODEL_DIR)
+    org = L.load_datasource(MODEL_DIR)
     sql = "SELECT id FROM customers UNION SELECT country FROM customers"
     assert RT.check_sensitive_projection(sql, org).action == "allow", sql
 

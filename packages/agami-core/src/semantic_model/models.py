@@ -2,7 +2,7 @@
 
 Hierarchy (see the design doc's "The new hierarchy" section):
 
-    Organization
+    Datasource
     ├─ description
     ├─ storage_connections[]        (physical — host, port, creds, dialect)
     ├─ subject_areas[]              (logical — the primary semantic unit)
@@ -627,11 +627,11 @@ class SubjectArea(_Base):
 
 
 # ---------------------------------------------------------------------------
-# Organization (top level)
+# Datasource (top level)
 # ---------------------------------------------------------------------------
 
 
-class Organization(_Base):
+class Datasource(_Base):
     # Locally-minted, globally-unique deployment identity (F14 / ACE-056): a uuid4 hex minted ONCE at
     # agami-connect and persisted in datasource.yaml, then immutable. Optional/None so pre-F14 datasource.yaml files
     # (which have no org_id key) still load under the model's `extra="forbid"` policy. Never transmitted;
@@ -677,8 +677,8 @@ class Organization(_Base):
 
 
 # ---------------------------------------------------------------------------
-# Organization record (F15 / ACE-067) — the deployment-level company record that
-# sits ABOVE the per-datasource Organization models. One per artifacts dir.
+# Company record (F15 / ACE-067) — the deployment-level company record (OrgRecord) that
+# sits ABOVE the per-datasource Datasource models. One per artifacts dir.
 # ---------------------------------------------------------------------------
 
 
@@ -707,7 +707,7 @@ class OrgRecord(_Base):
     description: Optional[str] = None
     fiscal_year_start_month: Optional[int] = None
     display_conventions: DisplayConventions = Field(default_factory=DisplayConventions)
-    # Company-wide glossary: term -> one-line definition. Same shape as Organization.key_terminology
+    # Company-wide glossary: term -> one-line definition. Same shape as Datasource.key_terminology
     # (the established glossary type), but scoped to the COMPANY rather than a single datasource.
     glossary: dict[str, str] = Field(default_factory=dict)
     # The datasources (profile names) attached under this org. Auto-maintained: rebuilt from the profile
@@ -717,7 +717,7 @@ class OrgRecord(_Base):
     @field_validator("fiscal_year_start_month")
     @classmethod
     def _fy_month(cls, v: Optional[int]) -> Optional[int]:
-        # Same 1..12 bound as Organization, but None is allowed (an unauthored record has no fiscal year).
+        # Same 1..12 bound as Datasource, but None is allowed (an unauthored record has no fiscal year).
         if v is not None and not 1 <= v <= 12:
             raise ValueError("fiscal_year_start_month must be 1..12")
         return v
@@ -754,7 +754,7 @@ __all__ = [
     "Relationship",
     "CrossSubjectAreaRelationship",
     "SubjectArea",
-    "Organization",
+    "Datasource",
     "DisplayConventions",
     "OrgRecord",
     # constants

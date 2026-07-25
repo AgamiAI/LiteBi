@@ -109,7 +109,7 @@ def test_curator_can_edit_aggregation(tmp_path):
         "column": "amount", "field": "aggregation", "value": "averageable",
     }])
     assert not res.errors, res.errors
-    reloaded = __import__("semantic_model.loader", fromlist=["load_organization"]).load_organization(root)
+    reloaded = __import__("semantic_model.loader", fromlist=["load_datasource"]).load_datasource(root)
     t = reloaded.subject_areas[0].defined_table("orders")
     assert t.get_column("amount").aggregation == "averageable"
 

@@ -21,13 +21,13 @@ if str(PKG_SRC) not in sys.path:
 
 import tools  # noqa: E402
 from semantic_model import build, loader  # noqa: E402
-from semantic_model.models import Organization  # noqa: E402
+from semantic_model.models import Datasource  # noqa: E402
 
 _HEX = set("0123456789abcdef")
 
 
-def _minimal_org(name: str = "acme") -> Organization:
-    return Organization(datasource=name)
+def _minimal_org(name: str = "acme") -> Datasource:
+    return Datasource(datasource=name)
 
 
 def test_write_tree_mints_uuid4_and_is_immutable(tmp_path):
@@ -38,7 +38,7 @@ def test_write_tree_mints_uuid4_and_is_immutable(tmp_path):
     assert minted and len(minted) == 32 and set(minted) <= _HEX  # a uuid4 hex, minted locally
 
     # load -> mutate -> rewrite: the id is preserved, never re-minted (immutability guarantee).
-    org = loader.load_organization(prof)
+    org = loader.load_datasource(prof)
     assert org.org_id == minted
     org.description = "edited"
     build.write_tree(org, prof)
@@ -99,7 +99,7 @@ def test_legacy_profile_without_org_id_resolves_local(tmp_path, monkeypatch):
     (tmp_path / "old").mkdir()
     (tmp_path / "old" / "datasource.yaml").write_text("datasource: legacy\nversion: 1\n")
     assert loader.load_org_id(tmp_path / "old") is None
-    assert loader.load_organization(tmp_path / "old").org_id is None
+    assert loader.load_datasource(tmp_path / "old").org_id is None
 
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.delenv("AGAMI_ORG_ID", raising=False)

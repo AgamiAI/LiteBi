@@ -168,13 +168,13 @@ def test_review_item_matches_dashboard_contract(tmp_path):
     # carry them, else the card shows no description (bug 2) and the feedback generator
     # omits `by <email> role=` for sign-off (bug 3, which buckets by rule_1).
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     curate.write_items(tmp_path, "s", "metric", [
         {"name": "revenue", "calculation": "Total revenue (USD)",
          "bindings": {"PostgreSQL": "SUM(orders.total)"}, "source_tables": ["orders"],
          "confidence": "inferred", "review_state": "unreviewed"}])
-    org = load_organization(tmp_path, include_rejected=True)
+    org = load_datasource(tmp_path, include_rejected=True)
     m = next(it for it in curate.all_items(org, scope="all") if it["entity_type"] == "metric")
     assert m["rule_1"] is True
     assert any(s["text"] == "Total revenue (USD)" for s in m["signals"])
@@ -188,7 +188,7 @@ def test_review_items_scope_preseed_covers_metrics_and_entities_not_joins(tmp_pa
     # the "curate before examples" gate: seeds depend on metrics + entities, so preseed
     # includes both — but NOT relationships (those stay lazy / auto-approved FKs)
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)  # has a system-approved relationship (auto, FK)
     curate.write_items(tmp_path, "s", "metric", [
         {"name": "rev", "calculation": "sum", "bindings": {"PostgreSQL": "SUM(orders.total)"},
@@ -196,7 +196,7 @@ def test_review_items_scope_preseed_covers_metrics_and_entities_not_joins(tmp_pa
     curate.write_items(tmp_path, "s", "entity", [
         {"name": "order", "plural": "orders", "maps_to": [{"table": "orders", "column": "id", "primary": True}],
          "confidence": "inferred", "review_state": "unreviewed"}])
-    org = load_organization(tmp_path, include_rejected=True)
+    org = load_datasource(tmp_path, include_rejected=True)
     preseed = curate.all_items(org, scope="preseed")
     types = {it["entity_type"] for it in preseed}
     assert "metric" in types and "entity" in types
@@ -208,12 +208,12 @@ def test_review_items_scope_rule1_returns_only_signoff_items(tmp_path):
     # the Phase 4 gate uses --scope rule1 so the rendered count == the sign-off count;
     # no skill-side hand-filtering, no env var. rule1 = metrics/named-filters in review tab.
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)  # has a system-approved relationship (tab=auto, not in review)
     curate.write_items(tmp_path, "s", "metric", [
         {"name": "Revenue", "calculation": "sum", "bindings": {"PostgreSQL": "SUM(orders.total)"},
          "source_tables": ["orders"], "confidence": "inferred", "review_state": "unreviewed"}])
-    org = load_organization(tmp_path, include_rejected=True)
+    org = load_datasource(tmp_path, include_rejected=True)
     rule1 = curate.all_items(org, scope="rule1")
     assert rule1 and all(it["rule"] == 1 and it["tab"] == "review" for it in rule1)
     assert any(it["entity_type"] == "metric" for it in rule1)
@@ -244,7 +244,7 @@ def test_curate_edit_op_sets_enrichment_fields(tmp_path):
     # enrichment edits (descriptions / caveats / default_filters / value_transform) go
     # through `sm curate` edit ops — not a hand-edited or scripted table YAML
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     res = curate.apply(tmp_path, [
         {"op": "edit", "kind": "table", "area": "s", "name": "orders",
@@ -256,7 +256,7 @@ def test_curate_edit_op_sets_enrichment_fields(tmp_path):
         {"op": "edit", "kind": "table", "area": "s", "name": "orders",
          "column": "total", "field": "value_transform", "value": "ABS(total)"}])
     assert res.validated and len(res.applied) == 4
-    t = load_organization(tmp_path).subject_areas[0].defined_table("orders")
+    t = load_datasource(tmp_path).subject_areas[0].defined_table("orders")
     assert t.caveats == ["Excludes test orders."]
     assert t.default_filters == ["{alias}.deleted_at IS NOT NULL"]
     assert t.description == "One row per order."
@@ -267,7 +267,7 @@ def test_curate_edit_op_sets_structured_fields(tmp_path):
     # the model-explorer's structured editors emit list/object edit-ops; curate applies
     # them (caveats list, entity maps_to, relationship cardinality)
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     # _model has an entity? no — add one + use the existing rel/columns
     (tmp_path / "subject_areas" / "s" / "entities").mkdir(parents=True, exist_ok=True)
@@ -283,7 +283,7 @@ def test_curate_edit_op_sets_structured_fields(tmp_path):
         {"op": "edit", "kind": "relationship", "area": "s", "name": "order_items->orders",
          "field": "relationship", "value": "one_to_many"}])
     assert res.validated and len(res.applied) == 3
-    sa = load_organization(tmp_path).subject_areas[0]
+    sa = load_datasource(tmp_path).subject_areas[0]
     assert sa.defined_table("orders").get_column("total").caveats == ["excludes refunds", "net of tax"]
     assert [(m.table, m.column) for m in next(e for e in sa.entities if e.name == "buyer").maps_to] == [("order_items", "order_id")]
     assert next(r for r in sa.relationships if r.from_table == "order_items").relationship == "one_to_many"
@@ -381,9 +381,9 @@ def test_coverage_flags_tables_enrichment_skipped(tmp_path):
     # the enrichment-completeness check: a freshly-introspected model has 0 column
     # descriptions, so every table reads as "enrichment never ran" → ok:false.
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
-    cov = curate.column_coverage(load_organization(tmp_path, include_rejected=True))
+    cov = curate.column_coverage(load_datasource(tmp_path, include_rejected=True))
     assert cov["ok"] is False
     assert set(cov["unenriched_tables"]) == {"orders", "order_items"}
     assert cov["totals"]["described"] == 0
@@ -393,7 +393,7 @@ def test_coverage_ok_when_each_table_has_some_descriptions(tmp_path):
     # ok flips true once each table has >=1 described/ai_unknown column — self-evident
     # columns (id, order_id) legitimately stay blank and do NOT hold the gate.
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     curate.apply(tmp_path, [
         {"op": "edit", "kind": "table", "area": "s", "name": "orders", "column": "total",
@@ -402,7 +402,7 @@ def test_coverage_ok_when_each_table_has_some_descriptions(tmp_path):
          "field": "description_source", "value": "ai_unknown"},
         {"op": "edit", "kind": "table", "area": "s", "name": "order_items", "column": "qty",
          "field": "description", "value": "quantity ordered"}])
-    cov = curate.column_coverage(load_organization(tmp_path, include_rejected=True))
+    cov = curate.column_coverage(load_datasource(tmp_path, include_rejected=True))
     assert cov["ok"] is True and cov["unenriched_tables"] == []
     assert cov["totals"]["described"] == 2 and cov["totals"]["ai_unknown"] == 1
 
@@ -614,9 +614,9 @@ def test_apply_reverts_writes_without_git_on_validation_failure(tmp_path):
     # apply()'s revert must NOT depend on a git repo (the artifacts dir usually isn't one).
     # A batch whose later op makes the model invalid rolls back the earlier valid write too.
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)  # not a git repo
-    before = load_organization(tmp_path).subject_areas[0].defined_table("orders").description
+    before = load_datasource(tmp_path).subject_areas[0].defined_table("orders").description
     res = curate.apply(tmp_path, [
         {"op": "edit", "kind": "table", "area": "s", "name": "orders",
          "field": "description", "value": "CHANGED"},                     # valid, writes
@@ -624,7 +624,7 @@ def test_apply_reverts_writes_without_git_on_validation_failure(tmp_path):
          "column": "total", "field": "type", "value": "not_a_type"},      # makes the model unloadable
     ])
     assert not res.validated and res.applied == []
-    after = load_organization(tmp_path).subject_areas[0].defined_table("orders").description
+    after = load_datasource(tmp_path).subject_areas[0].defined_table("orders").description
     assert after == before == "o"   # the first write was rolled back despite no git
 
 
@@ -633,7 +633,7 @@ def test_column_groups_edit_reconciles_stale_expose(tmp_path):
     # named the OLD groups must be reconciled, else the model fails validation.
     import yaml as y
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     tp = tmp_path / "subject_areas" / "s" / "tables" / "orders.yaml"
     td = y.safe_load(tp.read_text())
@@ -652,20 +652,20 @@ def test_column_groups_edit_reconciles_stale_expose(tmp_path):
     assert res.validated and res.applied
     tr = next(t for t in y.safe_load(sap.read_text())["tables"] if t["table"] == "orders")
     assert not tr.get("expose_column_groups")   # stale exposes reconciled away (new set covers all)
-    assert set(load_organization(tmp_path).subject_areas[0].defined_table("orders").column_groups) == {"identity", "rest"}
+    assert set(load_datasource(tmp_path).subject_areas[0].defined_table("orders").column_groups) == {"identity", "rest"}
 
 
 def test_set_terminology_writes_glossary_to_org_yaml(tmp_path):
     # the packaged path for the decoded-abbreviation legend: writes datasource.yaml key_terminology,
     # validates, merges over existing terms (so a re-run doesn't clobber a human's edits).
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     terms = tmp_path / "terms.json"
     terms.write_text(json.dumps({"MRR": "monthly recurring revenue", "ARR": "annual recurring revenue"}))
     rc, out = _run(["set-terminology", str(tmp_path), "--file", str(terms)])
     d = json.loads(out)
     assert rc == 0 and d["validated"] and d["applied"]
-    assert load_organization(tmp_path).key_terminology == {
+    assert load_datasource(tmp_path).key_terminology == {
         "MRR": "monthly recurring revenue", "ARR": "annual recurring revenue"}
 
 
@@ -673,13 +673,13 @@ def test_curate_edit_sets_semantic_column_groups(tmp_path):
     # the column-group refinement write path: enrichment overwrites the engine's prefix
     # buckets with named semantic groups via a normal curate edit op.
     from semantic_model import curate
-    from semantic_model.loader import load_organization
+    from semantic_model.loader import load_datasource
     _model(tmp_path)
     res = curate.apply(tmp_path, [{"op": "edit", "kind": "table", "area": "s", "name": "orders",
                                    "field": "column_groups",
                                    "value": {"identity": ["id"], "lifecycle": ["deleted_at"], "money": ["total"]}}])
     assert res.validated and res.applied
-    t = load_organization(tmp_path).subject_areas[0].defined_table("orders")
+    t = load_datasource(tmp_path).subject_areas[0].defined_table("orders")
     assert t.column_groups == {"identity": ["id"], "lifecycle": ["deleted_at"], "money": ["total"]}
 
 

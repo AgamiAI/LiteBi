@@ -32,8 +32,8 @@ import yaml
 
 from . import validator as V
 from .loader import _read_yaml as _load
-from .loader import load_organization
-from .models import CrossSubjectAreaRelationship, Entity, Metric, Organization, Relationship
+from .loader import load_datasource
+from .models import CrossSubjectAreaRelationship, Datasource, Entity, Metric, Relationship
 
 # Process-lived incremental-validation cache (ACE-046). Every curation write re-validates the whole
 # model; keyed by (area content + table registry) so an enrichment run — which edits one area at a
@@ -54,7 +54,7 @@ def _needs_review(obj) -> bool:
     return getattr(obj, "review_state", "approved") in ("unreviewed", "stale")
 
 
-def review_queue(org: Organization) -> dict[str, Any]:
+def review_queue(org: Datasource) -> dict[str, Any]:
     """Build the review queue. Rule 1 (metrics — block at runtime until signed off)
     is surfaced separately from Rule 2 (relationships / entities — lazy)."""
     rule1: list[dict] = []
@@ -99,7 +99,7 @@ def _tab(obj) -> str:
     return "manual"
 
 
-def all_items(org: Organization, *, scope: str = "all") -> list[dict]:
+def all_items(org: Datasource, *, scope: str = "all") -> list[dict]:
     """Every curatable entry (metric / relationship / entity), tab-classified, for
     the 4-tab review dashboard (For Review · Auto · Manual · Rejected). Tables and
     columns are curated in the model explorer, not here.
@@ -161,7 +161,7 @@ _SELF_EVIDENT_NAME_RE = re.compile(
 _MEANINGFUL_BLANK_TOLERANCE = 2
 
 
-def column_coverage(org: Organization) -> dict:
+def column_coverage(org: Datasource) -> dict:
     """Per-table column-description coverage — the enrichment-completeness check.
 
     The signal is **table-level**, which keeps it conflict-free with the skill's
@@ -249,7 +249,7 @@ def column_coverage(org: Organization) -> dict:
     }
 
 
-def unlabeled_choice_fields(org: Organization) -> dict:
+def unlabeled_choice_fields(org: Datasource) -> dict:
     """Coded columns whose `choice_field` skeleton still has BLANK labels — introspection
     seeded `{value: ""}` and the enrichment hasn't filled the meanings yet. The enrichment
     checks this (like `column_coverage`) to confirm the value-enum decode actually ran;
@@ -273,7 +273,7 @@ def unlabeled_choice_fields(org: Organization) -> dict:
             "ok": not cols}
 
 
-def sensitive_columns(org: Organization) -> dict:
+def sensitive_columns(org: Datasource) -> dict:
     """Every column introspection (or a curator) flagged `sensitive` and hasn't excluded —
     the PII the agami-connect curate gate uses to decide whether to open the explorer.
     Deterministic + resumable (a turn-boundary-safe count, unlike remembering the
@@ -289,7 +289,7 @@ def sensitive_columns(org: Organization) -> dict:
     return {"count": len(cols), "columns": cols}
 
 
-def suspected_sensitive_columns(org: Organization) -> dict:
+def suspected_sensitive_columns(org: Datasource) -> dict:
     """Columns the strict flag may have MISSED — `build.suspected_pii` matches the name but the
     column isn't marked `sensitive` (e.g. `first_name` in a non-PII-named table). Surfaced so a
     PII review catches false NEGATIVES, not just confirms hits. Excludes already-sensitive and
@@ -358,7 +358,7 @@ def _entity_item(area: Optional[str], ent) -> dict:
             "maps_to": maps, **_trust(ent)}
 
 
-def model_tree(org: Organization) -> dict[str, Any]:
+def model_tree(org: Datasource) -> dict[str, Any]:
     """Browsable tree for the model explorer: area → table → columns, each with its
     review_state so the UI can show what's excluded. Load the org with
     include_rejected=True to see excluded entries here."""
@@ -423,12 +423,12 @@ def set_key_terminology(root: str | Path, terms: dict, *, merge: bool = True) ->
     Empty terms/definitions are dropped."""
     root = Path(root)
     res = ApplyResult()
-    orgp = root / "datasource.yaml"
-    if not orgp.exists():
-        res.errors.append(f"no datasource.yaml at {orgp}")
+    dsp = root / "datasource.yaml"
+    if not dsp.exists():
+        res.errors.append(f"no datasource.yaml at {dsp}")
         return res
-    prior = orgp.read_text(encoding="utf-8")
-    odoc = _load(orgp) or {}
+    prior = dsp.read_text(encoding="utf-8")
+    odoc = _load(dsp) or {}
     existing = odoc.get("key_terminology") or {}
     if not isinstance(existing, dict):
         existing = {}
@@ -439,17 +439,17 @@ def set_key_terminology(root: str | Path, terms: dict, *, merge: bool = True) ->
         odoc["key_terminology"] = merged
     else:
         odoc.pop("key_terminology", None)
-    _dump(orgp, odoc)
+    _dump(dsp, odoc)
     try:
-        vres = V.validate(load_organization(root, include_rejected=True), cache=_VALIDATION_CACHE)
+        vres = V.validate(load_datasource(root, include_rejected=True), cache=_VALIDATION_CACHE)
         res.validated = vres.ok
         if not vres.ok:
             res.errors = vres.errors
-            orgp.write_text(prior, encoding="utf-8")    # revert, git-independent
+            dsp.write_text(prior, encoding="utf-8")    # revert, git-independent
             return res
     except Exception as e:
         res.errors.append(f"validation failed to run: {e}")
-        orgp.write_text(prior, encoding="utf-8")
+        dsp.write_text(prior, encoding="utf-8")
         return res
     res.applied = [f"key_terminology: {len(merged)} term(s)"]
     res.committed = _git_commit(root, f"terminology: {len(merged)} term(s)")
@@ -478,7 +478,7 @@ def apply(root: str | Path, ops: list[dict], *, signer: Optional[str] = None,
 
     # validate the whole model after the batch
     try:
-        org = load_organization(root, include_rejected=True)
+        org = load_datasource(root, include_rejected=True)
         vres = V.validate(org, cache=_VALIDATION_CACHE)
         res.validated = vres.ok
         if not vres.ok:
@@ -632,16 +632,16 @@ def _apply_one(root: Path, op: dict, signer, role,
                 return path
         # Cross-area (cross-schema / cross-datasource) join — it lives at the org level, not
         # in an area's relationships.yaml. Fall back to datasource.yaml's cross_subject_area_relationships.
-        orgp = root / "datasource.yaml"
-        _snapshot(backups, orgp)
-        odoc = _load(orgp) or {}
+        dsp = root / "datasource.yaml"
+        _snapshot(backups, dsp)
+        odoc = _load(dsp) or {}
         crels = odoc.get("cross_subject_area_relationships", [])
         chit = next((r for r in crels if r.get("from_table") == frm and r.get("to_table") == to), None)
         if chit is None:
             raise ValueError(f"relationship {name} not found in {path} or org cross-area relationships")
         _set_trust(chit, op, new_state, signer, role)
-        _dump(orgp, odoc)
-        return orgp
+        _dump(dsp, odoc)
+        return dsp
 
     raise ValueError(f"unknown kind {kind!r}")
 
@@ -781,7 +781,7 @@ def write_items(root: str | Path, area: str, kind: str, items: list[dict],
 
     # validate the whole model; revert the batch on any failure
     try:
-        vres = V.validate(load_organization(root, include_rejected=True), cache=_VALIDATION_CACHE)
+        vres = V.validate(load_datasource(root, include_rejected=True), cache=_VALIDATION_CACHE)
         res.validated = vres.ok
         if not vres.ok:
             res.errors = vres.errors
@@ -849,7 +849,7 @@ def add_relationships(root: str | Path, *, intra: Optional[dict[str, list[dict]]
     if not res.applied:
         return res
     try:
-        vres = V.validate(load_organization(root, include_rejected=True), cache=_VALIDATION_CACHE)
+        vres = V.validate(load_datasource(root, include_rejected=True), cache=_VALIDATION_CACHE)
         res.validated = vres.ok
         if not vres.ok:
             res.errors = vres.errors

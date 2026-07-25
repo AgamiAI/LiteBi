@@ -40,7 +40,7 @@ def _org():
     rels = [m.Relationship(from_table="orders", to_table="customers",
                            from_column="customer_id", to_column="id",
                            relationship="many_to_one")]
-    return m.Organization(
+    return m.Datasource(
         datasource="Shop",
         subject_areas=[m.SubjectArea(name="sales", tables_defined=[customers, orders],
                                      relationships=rels)],

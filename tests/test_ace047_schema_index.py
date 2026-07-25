@@ -31,7 +31,7 @@ def _ref(table: str) -> m.TableRef:
     return m.TableRef(storage_connection="c", schema="public", table=table)
 
 
-def _org_with_clash_and_fallback() -> m.Organization:
+def _org_with_clash_and_fallback() -> m.Datasource:
     # alpha defines a table literally named "orders"; beta defines one named "sales.orders" (bare
     # "orders") — a name clash resolved by scan order. gamma REFERENCES orders (defined in alpha)
     # via a TableRef but doesn't define it — the multi-area fallback case.
@@ -40,7 +40,7 @@ def _org_with_clash_and_fallback() -> m.Organization:
                          tables_defined=[_tbl("sales.orders")])
     gamma = m.SubjectArea(name="gamma", tables=[_ref("customers"), _ref("orders")],
                           tables_defined=[_tbl("customers")])
-    return m.Organization(datasource="O",
+    return m.Datasource(datasource="O",
                           storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                           subject_areas=[alpha, beta, gamma])
 
@@ -67,7 +67,7 @@ def test_index_matches_linear_with_duplicate_area_names():
     # returns the FIRST area of that name — so the index's per-area maps must be first-wins too.
     a1 = m.SubjectArea(name="sales", tables=[_ref("only_first")], tables_defined=[_tbl("only_first")])
     a2 = m.SubjectArea(name="sales", tables=[_ref("only_second")], tables_defined=[_tbl("only_second")])
-    org = m.Organization(datasource="O",
+    org = m.Datasource(datasource="O",
                          storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                          subject_areas=[a1, a2])
     idx = L.build_table_index(org)

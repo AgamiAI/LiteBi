@@ -29,13 +29,13 @@ if str(PKG_SRC) not in sys.path:
 import tools  # noqa: E402
 from semantic_model import build, loader  # noqa: E402
 from semantic_model import org_record as OR  # noqa: E402
-from semantic_model.models import DisplayConventions, Organization, OrgRecord  # noqa: E402
+from semantic_model.models import Datasource, DisplayConventions, OrgRecord  # noqa: E402
 
 _HEX = set("0123456789abcdef")
 
 
-def _minimal_org(name: str = "acme") -> Organization:
-    return Organization(datasource=name)
+def _minimal_org(name: str = "acme") -> Datasource:
+    return Datasource(datasource=name)
 
 
 def test_ensure_org_record_mints_once_into_organization_yaml(tmp_path):
@@ -129,7 +129,7 @@ def test_org_record_roundtrips_structured_content_losslessly(tmp_path):
 def test_bare_record_is_valid_and_fiscal_year_bounds_enforced():
     assert OrgRecord(org_id="x").fiscal_year_start_month is None  # id-only record validates
     with pytest.raises(ValueError):
-        OrgRecord(org_id="x", fiscal_year_start_month=13)  # same 1..12 bound as Organization
+        OrgRecord(org_id="x", fiscal_year_start_month=13)  # same 1..12 bound as Datasource
 
 
 def test_set_org_fields_mints_then_updates_only_passed_fields(tmp_path):

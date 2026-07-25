@@ -64,7 +64,7 @@ def test_catalog_coded_column_gets_choice_skeleton(tmp_path):
 def test_unlabeled_choice_fields_reports_then_clears(tmp_path):
     org, _ = I.introspect("sn", "postgres", runner=_catalog_runner, artifacts_dir=tmp_path)
     root = tmp_path / "sn"
-    rep = C.unlabeled_choice_fields(__import__("semantic_model.loader", fromlist=["load_organization"]).load_organization(root, include_rejected=True))
+    rep = C.unlabeled_choice_fields(__import__("semantic_model.loader", fromlist=["load_datasource"]).load_datasource(root, include_rejected=True))
     assert rep["count"] == 1 and rep["ok"] is False
     assert rep["unlabeled"][0]["column"] == "severity"
 
@@ -74,6 +74,6 @@ def test_unlabeled_choice_fields_reports_then_clears(tmp_path):
                           "column": "severity", "field": "choice_field",
                           "value": {"1": "High", "2": "Medium", "3": "Low"}}])
     assert not res.errors, res.errors
-    org2 = __import__("semantic_model.loader", fromlist=["load_organization"]).load_organization(root)
+    org2 = __import__("semantic_model.loader", fromlist=["load_datasource"]).load_datasource(root)
     assert org2.subject_areas[0].defined_table("incident").get_column("severity").choice_field == {"1": "High", "2": "Medium", "3": "Low"}
     assert C.unlabeled_choice_fields(org2)["ok"] is True

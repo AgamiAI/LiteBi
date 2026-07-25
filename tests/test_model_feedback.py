@@ -79,11 +79,11 @@ def test_examples_orgmd_and_slash_signer():
         "signed-off-by: bob@x.com / data_lead\n"
         'example-edits: [{"area":"sales","question":"q1","sql":"SELECT 1"}]\n'
         'new-examples: [{"area":"ops","question":"q2","sql":"SELECT 2"}]\n'
-        'organization-md: "About this DB.\\nMRR = monthly recurring revenue."\n'
+        'datasource-md: "About this DB.\\nMRR = monthly recurring revenue."\n'
         "done\n"
     )
     data, _, needs = F.parse(block)
     assert needs is None
     assert (data["signer"], data["role"]) == ("bob@x.com", "data_lead")
     assert set(data["examples_by_area"]) == {"sales", "ops"}
-    assert data["organization_md"].startswith("About this DB.")
+    assert data["datasource_md"].startswith("About this DB.")

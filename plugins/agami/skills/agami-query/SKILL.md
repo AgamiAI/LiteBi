@@ -125,11 +125,11 @@ This file holds free-form **user preferences across every database** (default fi
 
 Run `cli org-context "$ROOT"` — it returns the **full** domain context for this database in one block: the human's datasource.md narrative (HTML comments stripped) **plus** the model-derived summary that the file does NOT contain — subject areas, conventions, and the **decoded glossary** (`key_terminology` + enum legends), assembled fresh from the structured model. Don't `Read` datasource.md by hand: the file holds only the human narrative; the glossary and summary live in the model, and this command is the one that combines them. If there's no model, treat as empty — never error. See [`shared/organization-context-format.md`](../../shared/organization-context-format.md).
 
-Inject the result into the SQL-generation prompt in Phase 2b under `## Organization context`, **before** the `## User memory` section — domain knowledge precedes display preferences in the LLM's reading order.
+Inject the result into the SQL-generation prompt in Phase 2b under `## Datasource context`, **before** the `## User memory` section — domain knowledge precedes display preferences in the LLM's reading order.
 
 Order in Phase 2b prompt:
 1. Schema context (tables / columns / relationships / metrics from the semantic model)
-2. `## Organization context` ← from `cli org-context` (narrative + derived summary + glossary)
+2. `## Datasource context` ← from `cli org-context` (narrative + derived summary + glossary)
 3. `## User memory (preferences and policies)` ← from USER_MEMORY.md
 4. Few-shot examples
 5. The user's question
@@ -225,7 +225,7 @@ For a single profile, follow the **examples-first canonical loop** — the subje
 2. **Schema context** — the `get_table_context` output for the chosen tables (columns + types + caveats + value_transforms), the area's relationships (rendered as `from.col → to.col [cardinality]`), and the area's metrics (`<name>: <binding> -- <calculation>` + synonyms). `default_filters` need not be enumerated — `execute_sql` auto-applies them (step below) — but DO honor any caveats.
 
    **Unreviewed metrics are USED, not refused.** When the question names a metric whose `review_state ≠ approved`, still use its binding and answer — do NOT block or refuse on it. The trust layer surfaces it as a **warning on the receipt** (Phase 4e.iii.5: *"Used metric `X` which has not been signed off"*), not a hard gate. The loader already drops only `rejected` metrics; an `unreviewed`/`proposed` one is yours to use, with the warning carrying the honesty. (Same for unreviewed joins/entities and `stale` entries — warn, never refuse.)
-3. **Organization context** — `datasource.md` (step 1d.2), heading `## Organization context`. Binding domain context.
+3. **Datasource context** — `datasource.md` (step 1d.2), heading `## Datasource context`. Binding domain context.
 4. **User memory** — `USER_MEMORY.md` (step 1d.1), heading `## User memory (preferences and policies)`.
 5. **Few-shot examples** — the ranked matches from step 2.
 6. **User question.**

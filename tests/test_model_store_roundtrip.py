@@ -1,8 +1,8 @@
 """Serve the model from the DB — golden parity with the file loader (Slice C).
 
-Two proofs: (1) writing then loading an Organization through the DB is lossless for every object
+Two proofs: (1) writing then loading an Datasource through the DB is lossless for every object
 type; (2) a model loaded from YAML files, seeded to the DB, and re-loaded from a *fresh* connection
-yields the identical Organization — and tools._load_org / get_datasource_schema serve from the DB
+yields the identical Datasource — and tools._load_org / get_datasource_schema serve from the DB
 (files absent) when AGAMI_DB_URL is set.
 """
 
@@ -17,7 +17,7 @@ pytest.importorskip("pydantic")
 import model_store  # noqa: E402
 import tools  # noqa: E402
 from semantic_model import loader as L  # noqa: E402
-from semantic_model.models import Organization  # noqa: E402
+from semantic_model.models import Datasource  # noqa: E402
 from store import Store  # noqa: E402
 
 FULL_ORG = {
@@ -68,11 +68,11 @@ FULL_ORG = {
 
 
 def test_db_roundtrip_is_lossless_for_every_object_type():
-    org = Organization.model_validate(FULL_ORG)
+    org = Datasource.model_validate(FULL_ORG)
     s = Store.connect("sqlite://")
     s.run_migrations()
-    model_store.write_organization(s, "main", org)
-    rebuilt = model_store.load_organization(s, "main")
+    model_store.write_datasource(s, "main", org)
+    rebuilt = model_store.load_datasource(s, "main")
     assert rebuilt is not None
     assert rebuilt.model_dump(mode="json") == org.model_dump(mode="json")
     s.close()
@@ -81,16 +81,16 @@ def test_db_roundtrip_is_lossless_for_every_object_type():
 def test_load_missing_datasource_returns_none():
     s = Store.connect("sqlite://")
     s.run_migrations()
-    assert model_store.load_organization(s, "nope") is None
+    assert model_store.load_datasource(s, "nope") is None
     s.close()
 
 
 def test_reseed_replaces_rows():
     s = Store.connect("sqlite://")
     s.run_migrations()
-    org = Organization.model_validate(FULL_ORG)
-    model_store.write_organization(s, "main", org)
-    model_store.write_organization(s, "main", org)  # idempotent re-seed, not a duplicate
+    org = Datasource.model_validate(FULL_ORG)
+    model_store.write_datasource(s, "main", org)
+    model_store.write_datasource(s, "main", org)  # idempotent re-seed, not a duplicate
     assert len(s.query("SELECT name FROM subject_area WHERE datasource='main'")) == 1
     s.close()
 
@@ -157,18 +157,18 @@ def _write_file_model(root):
 def test_file_model_seeds_to_db_and_tools_serve_from_it(tmp_path, monkeypatch):
     art = tmp_path / "art"
     _write_file_model(art / "main")
-    file_org = L.load_organization(art / "main")
+    file_org = L.load_datasource(art / "main")
 
     db_url = "sqlite://" + str(tmp_path / "agami.db")
     s = Store.connect(db_url)
     s.run_migrations()
-    model_store.write_organization(s, "main", file_org)
+    model_store.write_datasource(s, "main", file_org)
     s.commit()
     s.close()
 
-    # a fresh connection (a "second instance") rebuilds the identical Organization
+    # a fresh connection (a "second instance") rebuilds the identical Datasource
     s2 = Store.connect(db_url)
-    db_org = model_store.load_organization(s2, "main")
+    db_org = model_store.load_datasource(s2, "main")
     s2.close()
     assert db_org.model_dump(mode="json") == file_org.model_dump(mode="json")
 
@@ -220,15 +220,15 @@ def test_tools_serve_memory_and_version_from_db_no_files(tmp_path, monkeypatch):
     monkeypatch.setenv("AGAMI_DB_URL", db_url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "does-not-exist"))
     assert tools._model_version("main") == "v-deadbeef"
-    org_md, user_md, _, _ = tools._context_sources("main", tools._current_org_id())
-    assert "Widgets co." in org_md and user_md == "exclude test users"
+    datasource_md, user_md, _, _ = tools._context_sources("main", tools._current_org_id())
+    assert "Widgets co." in datasource_md and user_md == "exclude test users"
 
 
 def _seed_org(tmp_path, monkeypatch, org_dict) -> None:
     db_url = "sqlite://" + str(tmp_path / "agami.db")
     s = Store.connect(db_url)
     s.run_migrations()
-    model_store.write_organization(s, "main", Organization.model_validate(org_dict))
+    model_store.write_datasource(s, "main", Datasource.model_validate(org_dict))
     s.close()
     monkeypatch.setenv("AGAMI_DB_URL", db_url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "none"))

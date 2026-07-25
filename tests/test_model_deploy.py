@@ -61,7 +61,7 @@ def test_deploy_loads_model_and_round_trips(tmp_path):
     _write_model(arts, "demo")
     store = _store(tmp_path)
     loaded = model_deploy.deploy_models(store, arts)
-    org = model_store.load_organization(store, "demo")
+    org = model_store.load_datasource(store, "demo")
     store.close()
     assert loaded == ["demo"]
     assert org is not None and org.datasource == "acme"
@@ -158,7 +158,7 @@ def test_main_deploys_all_then_a_named_datasource(tmp_path, monkeypatch):
     assert model_deploy.main([]) == 0  # deploy every model under the dir (migrates first, then loads)
     assert model_deploy.main(["demo"]) == 0  # deploy a named datasource
     store = Store.connect("sqlite://" + str(tmp_path / "m.db"))
-    org = model_store.load_organization(store, "demo")
+    org = model_store.load_datasource(store, "demo")
     store.close()
     assert org is not None and org.datasource == "acme"
 
@@ -181,7 +181,7 @@ def test_malformed_examples_file_is_skipped_not_fatal(tmp_path):
     )
     store = _store(tmp_path)
     loaded = model_deploy.deploy_models(store, arts)  # must not raise
-    org = model_store.load_organization(store, "demo")
+    org = model_store.load_datasource(store, "demo")
     n_examples = _count(store, "prompt_example", "demo")
     store.close()
     assert loaded == ["demo"] and org is not None  # the model deployed despite the bad examples file

@@ -1,6 +1,6 @@
 """The admin read-only Model explorer.
 
-A pure projection of the served model (`load_organization`) + domain docs (`load_memory`): the
+A pure projection of the served model (`load_datasource`) + domain docs (`load_memory`): the
 overview / area landing / table page render the served tree; it is admin-gated, read-only (a GET
 only), never leaks `storage_config`, and escapes operator-authored text.
 """
@@ -26,7 +26,7 @@ import mcp_http  # noqa: E402
 import model_store  # noqa: E402
 import ui  # noqa: E402
 import user_store  # noqa: E402
-from semantic_model.models import Organization  # noqa: E402
+from semantic_model.models import Datasource  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 from store import Store  # noqa: E402
 
@@ -193,7 +193,7 @@ GROUPED_ORG = {
 def _seed(url, datasource="SALES_DATA", org=ORG):
     s = Store.connect(url)
     s.run_migrations()
-    model_store.write_organization(s, datasource, Organization.model_validate(org))
+    model_store.write_datasource(s, datasource, Datasource.model_validate(org))
     s.close()
 
 

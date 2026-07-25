@@ -21,7 +21,7 @@ from .models import (
     DEEP_TABLE_COLUMN_THRESHOLD,
     Column,
     CrossSubjectAreaRelationship,
-    Organization,
+    Datasource,
     Relationship,
     SubjectArea,
     Table,
@@ -505,7 +505,7 @@ def ensure_org_id(out: Path, existing: Optional[str] = None, *, dry_run: bool = 
 
 
 def write_tree(
-    org: Organization,
+    org: Datasource,
     out: Path,
     *,
     examples_by_area: Optional[dict[str, list[dict]]] = None,

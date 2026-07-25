@@ -20,7 +20,7 @@ from semantic_model import models as m  # noqa: E402
 def _org(cols):
     t = m.Table(name="users", schema="public", storage_connection="c", grain=["id"], columns=cols)
     sa = m.SubjectArea(name="area", description="d", tables_defined=[t])
-    return m.Organization(datasource="o", version=1, subject_areas=[sa])
+    return m.Datasource(datasource="o", version=1, subject_areas=[sa])
 
 
 def test_counts_flagged_pii():
@@ -50,7 +50,7 @@ def test_sensitive_columns_under_excluded_table_not_counted():
                 columns=[m.Column(name="email", type="string", sensitive=True),
                          m.Column(name="ssn", type="string", sensitive=True)])
     sa = m.SubjectArea(name="area", description="d", tables_defined=[t])
-    org = m.Organization(datasource="o", version=1, subject_areas=[sa])
+    org = m.Datasource(datasource="o", version=1, subject_areas=[sa])
     assert C.sensitive_columns(org)["count"] == 0
 
 

@@ -737,7 +737,7 @@ async def admin_set_status(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 # Admin console — Model tab (read-only model explorer)
 #
-# A pure projection of the served model (`model_store.load_organization`) + the domain docs
+# A pure projection of the served model (`model_store.load_datasource`) + the domain docs
 # (`load_memory`) — the SAME tree every MCP tool reads, so there is zero drift and no second store.
 # Read-only by construction: the only route is a GET (see `routes()`), there is no write path, and
 # `storage_connections[].storage_config` (hosts/credentials) is NEVER rendered. The catalog idiom (a
@@ -1254,10 +1254,10 @@ def model_context_html(
 ) -> str:
     """The Domain-context page — the deployed datasource.md rendered as (safe) markdown."""
     tree = _model_tree_html(org, datasource, datasources, active_view="context")
-    org_md = memory.get("datasource")
+    datasource_md = memory.get("datasource")
     doc = (
-        f'<div class="context">{ui.md(org_md)}</div>'
-        if org_md
+        f'<div class="context">{ui.md(datasource_md)}</div>'
+        if datasource_md
         else '<p class="lead">No domain context (datasource.md) deployed for this datasource.</p>'
     )
     content = (
@@ -1291,7 +1291,7 @@ async def admin_model(request: Request) -> Response:
         datasource = request.query_params.get("datasource") or datasources[0]
         if datasource not in datasources:  # an unknown/stale datasource param → the first served
             datasource = datasources[0]
-        org = model_store.load_organization(store, datasource, org_id=org_id)
+        org = model_store.load_datasource(store, datasource, org_id=org_id)
         if org is None:
             return HTMLResponse(model_empty_html(datasource, datasources, **chrome))
         view = request.query_params.get("view")
