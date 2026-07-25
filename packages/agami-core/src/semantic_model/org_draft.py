@@ -119,7 +119,7 @@ def compose_context(human_md: str, org: "Organization") -> str:
 
 
 def _company_block(record: "OrgRecord", narrative: str) -> str:
-    """The shared COMPANY context (F15): name/description + the root datasource.md narrative +
+    """The shared COMPANY context (F15): name/description + the root organization.md narrative +
     company-wide display conventions + the company glossary. Rendered ONCE above every datasource."""
     lines: list[str] = [f"# {record.name or 'Company'} — company context", ""]
     if record.description:

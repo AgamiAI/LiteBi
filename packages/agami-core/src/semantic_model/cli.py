@@ -145,7 +145,7 @@ def cmd_org_draft(args) -> int:
 
 def cmd_org_context(args) -> int:
     # The full domain context for the LLM, two-level (F15 / ACE-069): the shared COMPANY block from the
-    # deployment record (<artifacts_dir>/organization.yaml + the root datasource.md), then this
+    # deployment record (<artifacts_dir>/organization.yaml + the root organization.md), then this
     # datasource's source-specific narrative + model-derived summary. With no record it degrades to the
     # pre-F15 per-profile assembly (byte-identical). This is what the query path injects as context.
     from . import org_draft

@@ -3,7 +3,7 @@
 One ``OrgRecord`` lives at ``<artifacts_dir>/organization.yaml`` — ABOVE the per-profile
 ``<artifacts_dir>/<profile>/datasource.yaml`` models — and holds the company-wide facts (name, description,
 fiscal year, display conventions, glossary) that would otherwise be duplicated into every profile's
-``datasource.yaml`` and drift. The company narrative lives beside it at ``<artifacts_dir>/datasource.md``.
+``datasource.yaml`` and drift. The company narrative lives beside it at ``<artifacts_dir>/organization.md``.
 
 This module owns:
 
@@ -29,7 +29,7 @@ from .models import OrgRecord
 # The record and the company narrative both sit at the artifacts-dir ROOT (one deployment = one company),
 # NOT under a profile dir — that is the whole point: written once, shared by every datasource.
 RECORD_FILENAME = "organization.yaml"
-NARRATIVE_FILENAME = "datasource.md"
+NARRATIVE_FILENAME = "organization.md"
 
 
 def record_path(artifacts_dir: str | Path) -> Path:

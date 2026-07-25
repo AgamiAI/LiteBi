@@ -481,15 +481,15 @@ Example to say BEFORE introspecting: *"Found 70 tables across 18 schemas. I'll m
 
 Two levels: a **company** description written **once** at the deployment root and shared by every datasource, and a **per-database** narrative for the datasource being connected now. The skill never decides yes/skip for the user; "don't ask clarifying questions" does NOT cancel this — it's required state-gathering. Ask **A** then **B**.
 
-**A. Company context — ask ONCE, on the first onboard into this deployment.** Decide "already authored" by content, not by file existence: treat it as done only if the root `<artifacts_dir>/datasource.md` exists **or** the root `<artifacts_dir>/organization.yaml` already has a non-empty `name`/`description`. If neither, this is the first onboard → ask:
+**A. Company context — ask ONCE, on the first onboard into this deployment.** Decide "already authored" by content, not by file existence: treat it as done only if the root `<artifacts_dir>/organization.md` exists **or** the root `<artifacts_dir>/organization.yaml` already has a non-empty `name`/`description`. If neither, this is the first onboard → ask:
 > What's your **company/organization** called, and a sentence or two on what it does? It's shared across every database you connect here and improves NL→SQL. (e.g. what the company/product is, what "MRR" or "active user" means company-wide.)
 
 On an answer, do **BOTH** of these (not one — the record write is what populates `organization.yaml`):
 1. **Run this command** to write the company `name` + a short `description` into the record (this is the ONLY thing that fills those fields — a file write alone will not):
    `bash "$AGAMI_PLUGIN_ROOT/scripts/sm" set-org "<artifacts_dir>" --name "<company name>" --description "<one-line summary>"`
-2. **Write** the fuller paragraph to the **root** `<artifacts_dir>/datasource.md` under `# About this company` (**narrative prose ONLY** — no model facts).
+2. **Write** the fuller paragraph to the **root** `<artifacts_dir>/organization.md` under `# About this company` (**narrative prose ONLY** — no model facts).
 
-Then confirm both landed: `<artifacts_dir>/organization.yaml` now shows `name:`/`description:`, and `<artifacts_dir>/datasource.md` exists.
+Then confirm both landed: `<artifacts_dir>/organization.yaml` now shows `name:`/`description:`, and `<artifacts_dir>/organization.md` exists.
 
 `Skip` → leave the company context empty (the composition simply omits the company block). Mention that richer company context (conventions, glossary) can be added later in `/agami-model`. On a **subsequent** onboard (company context already authored) **do NOT re-ask** — narrate *"Sharing the **`<company>`** context you set earlier."*
 
