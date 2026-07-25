@@ -1,6 +1,6 @@
 """Serve the semantic model from the DB — the read path + the deploy-time writer.
 
-The model-loader seam is just "produce an `Datasource`": the file adapter is
+The model-loader seam is just "produce a `Datasource`": the file adapter is
 `semantic_model.loader.load_datasource(root)`; this is the DB adapter, which rebuilds the
 **identical** `Datasource` from rows so every downstream tool (get_datasource_schema incl.
 sizing, the receipt) is untouched. YAML stays the source of truth — `write_datasource` seeds the

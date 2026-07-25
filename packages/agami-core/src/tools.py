@@ -205,7 +205,7 @@ def check_read_only(sql: str) -> str | None:
 
 
 def _load_org(profile: str):
-    """Lazily load the semantic model for a profile, producing an `Datasource`. Two backends
+    """Lazily load the semantic model for a profile, producing a `Datasource`. Two backends
     behind one seam: when AGAMI_DB_URL is set the hosted server reads it from the DB; otherwise the
     local skill reads the YAML files (unchanged). Raises a clear error if the model deps (pydantic)
     aren't importable or there's no model for the profile."""

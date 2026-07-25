@@ -77,7 +77,7 @@ def _read_yaml(path: Path) -> Any:
 
 
 def load_datasource(root: str | Path, *, include_rejected: bool = False) -> Datasource:
-    """Parse a v2 profile directory into an Datasource model.
+    """Parse a v2 profile directory into a Datasource model.
 
     By default, entries the curator excluded (`review_state: rejected`) are dropped
     so the runtime never sees them. Pass `include_rejected=True` for the curation

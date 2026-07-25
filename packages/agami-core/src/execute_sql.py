@@ -867,7 +867,7 @@ def _hosted() -> bool:
 def _resolve_guard_model(profile: str):
     """Resolve the semantic model for the safety pass, mirroring `tools._load_org` (ACE-051): from
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
-    on-disk YAML (local). Returns an `Datasource` or None if neither is available.
+    on-disk YAML (local). Returns a `Datasource` or None if neither is available.
 
     The DB import is lazy AND env-guarded on purpose: the local executor runs from a stdlib-lean
     mirror that does not ship `store`/`model_store`, so we only reach for them when a DB is set.

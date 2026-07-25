@@ -1,6 +1,6 @@
 """Serve the model from the DB — golden parity with the file loader (Slice C).
 
-Two proofs: (1) writing then loading an Datasource through the DB is lossless for every object
+Two proofs: (1) writing then loading a Datasource through the DB is lossless for every object
 type; (2) a model loaded from YAML files, seeded to the DB, and re-loaded from a *fresh* connection
 yields the identical Datasource — and tools._load_org / get_datasource_schema serve from the DB
 (files absent) when AGAMI_DB_URL is set.

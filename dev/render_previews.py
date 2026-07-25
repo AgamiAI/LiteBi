@@ -127,8 +127,8 @@ write("07-admin-activity.html", admin.activity_tab_html(model_store.list_session
 # tools read (load_datasource), so the previews can't drift from production. Neutral demo data only.
 from semantic_model.models import Datasource  # noqa: E402
 
-_MODEL_ORG = {
-    "organization": "acme",
+_MODEL_DS = {
+    "datasource": "acme",
     "version": 1,
     "description": "Acme Commerce — the deployed semantic model.",
     "fiscal_year_start_month": 1,
@@ -248,16 +248,16 @@ _MODEL_ORG = {
          "from_subject_area": "Sales", "to_subject_area": "Catalog"},
     ],
 }
-_ORG_MD = (
+_DS_MD = (
     "# About Acme Commerce\n\n"
     "Acme sells direct-to-consumer goods online. Every checkout writes an **orders** row.\n\n"
     "## Key terms\n\n"
     "- **Net revenue** excludes cancelled orders and nets refunds.\n"
     "- A **member** has a row in the loyalty table — not just anyone who checked out.\n"
 )
-model_store.write_datasource(_s, "SALES_DATA", Datasource.model_validate(_MODEL_ORG))
-model_store.write_datasource(_s, "MARKETING", Datasource.model_validate(_MODEL_ORG))  # → picker
-model_store.write_memory(_s, "SALES_DATA", organization=_ORG_MD)
+model_store.write_datasource(_s, "SALES_DATA", Datasource.model_validate(_MODEL_DS))
+model_store.write_datasource(_s, "MARKETING", Datasource.model_validate(_MODEL_DS))  # → picker
+model_store.write_memory(_s, "SALES_DATA", datasource_doc=_DS_MD)
 model_store.write_model_version(_s, "SALES_DATA", "a1f4c39c0b2e", created_at="2026-06-27T09:00:00Z")
 _dss = model_store.list_datasources(_s)
 _org = model_store.load_datasource(_s, "SALES_DATA")
