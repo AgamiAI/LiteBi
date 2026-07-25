@@ -76,8 +76,8 @@ def _currency_model(root):
     import yaml
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (root / "datasources" / "c" / "storage.yaml").write_text(
@@ -160,8 +160,8 @@ def test_resolve_result_units_emits_date_format_token(tmp_path):
     from semantic_model.loader import load_organization
     (tmp_path / "datasources" / "c").mkdir(parents=True)
     (tmp_path / "subject_areas" / "s" / "tables").mkdir(parents=True)
-    (tmp_path / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (tmp_path / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (tmp_path / "datasources" / "c" / "storage.yaml").write_text(
@@ -190,8 +190,8 @@ def test_unit_round_trips_on_column_and_surfaces_in_context(tmp_path):
     root = tmp_path
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (root / "datasources" / "c" / "storage.yaml").write_text(

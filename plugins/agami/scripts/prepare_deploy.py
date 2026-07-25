@@ -81,7 +81,7 @@ def _widen_one(path: Path) -> None:
 def _grant_world_read(root: Path) -> None:
     """`chmod -R a+rX` over the staged model. The deployed container runs as uid 10001, not the operator
     who owns these files, and mounts them read-only — without this the boot-time model load fails
-    "Permission denied" on ORGANIZATION.md and the container crash-loops. Only non-secret model files
+    "Permission denied" on datasource.md and the container crash-loops. Only non-secret model files
     reach here (`local/` is excluded from staging).
 
     Uses `os.walk(followlinks=False)` — NOT `rglob("**")`, which follows directory symlinks on Python
@@ -135,7 +135,7 @@ def _merge_env(existing: str, template: str, image_tag: str | None) -> tuple[str
 
 def _stage_ignore(artifacts: Path, datasources: list[str] | None):
     """A `copytree` ignore callable: always drop `local/` (secrets never ship), and — when `datasources`
-    is given — also drop any TOP-LEVEL profile dir (a dir with an `org.yaml`) not in the chosen set.
+    is given — also drop any TOP-LEVEL profile dir (a dir with an `datasource.yaml`) not in the chosen set.
     Install-global files (e.g. `USER_MEMORY.md`) and non-profile entries are always kept. Default
     (`datasources is None`) stages every model, preserving prior behavior."""
     chosen = set(datasources) if datasources else None
@@ -147,7 +147,7 @@ def _stage_ignore(artifacts: Path, datasources: list[str] | None):
             if chosen is not None:
                 for name in names:
                     d = artifacts / name
-                    if name not in chosen and d.is_dir() and (d / "org.yaml").is_file():
+                    if name not in chosen and d.is_dir() and (d / "datasource.yaml").is_file():
                         drop.add(name)
         return drop
 
@@ -193,7 +193,7 @@ def prepare(args: argparse.Namespace) -> tuple[str, int]:
         datasources = getattr(args, "datasources", None)
         dslist = [s.strip() for s in datasources.split(",") if s.strip()] if datasources else None
         if dslist:
-            available = {d.name for d in artifacts.iterdir() if d.is_dir() and (d / "org.yaml").is_file()}
+            available = {d.name for d in artifacts.iterdir() if d.is_dir() and (d / "datasource.yaml").is_file()}
             unknown = [d for d in dslist if d not in available]
             # Fail fast if NONE of the requested datasources exist — a modelless bundle would only break
             # later at runtime. If SOME are unknown, warn (stderr keeps the stdout status line clean) and
@@ -207,7 +207,7 @@ def prepare(args: argparse.Namespace) -> tuple[str, int]:
             chosen = set(dslist)
             if staged.exists():
                 for d in staged.iterdir():
-                    if d.name in chosen or not (d / "org.yaml").is_file():
+                    if d.name in chosen or not (d / "datasource.yaml").is_file():
                         continue  # keep chosen models + non-model entries (e.g. USER_MEMORY.md)
                     if d.is_symlink():
                         d.unlink()  # a symlinked model: drop the link, never rmtree its target

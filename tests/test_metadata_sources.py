@@ -120,8 +120,8 @@ def test_detect_preset_and_usable_sources():
 def _incident_model(root: Path) -> None:
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "itsm" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "sn", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "sn", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/itsm"],
     }))
@@ -177,7 +177,7 @@ def test_inheritance_inherited_reference_applies_to_all_children():
                           tables_defined=[tbl("incident", ["assignment_group"]),
                                           tbl("problem", ["assignment_group"])])
     sysa = mm.SubjectArea(name="sys", description="d", tables_defined=[tbl("sys_user_group", [])])
-    org = mm.Organization(organization="o", version=1, subject_areas=[itsm, sysa])
+    org = mm.Organization(datasource="o", version=1, subject_areas=[itsm, sysa])
     specs = [{"from_table": t.name, "from_column": c.name, "to_table": decls[c.name.lower()]}
              for sa in org.subject_areas for t in sa.tables_defined for c in t.columns
              if c.name.lower() in decls]
@@ -195,7 +195,7 @@ def test_route_references_intra_cross_and_skips_unmodelled():
                         columns=[mm.Column(name="id", type="integer", primary_key=True)])
     itsm = mm.SubjectArea(name="itsm", description="d", tables_defined=[tbl("incident"), tbl("problem")])
     sysa = mm.SubjectArea(name="sys", description="d", tables_defined=[tbl("sys_user")])
-    org = mm.Organization(organization="o", version=1, subject_areas=[itsm, sysa])
+    org = mm.Organization(datasource="o", version=1, subject_areas=[itsm, sysa])
     specs = [
         {"from_table": "incident", "from_column": "problem_id", "to_table": "problem"},   # intra (itsm)
         {"from_table": "incident", "from_column": "caller_id", "to_table": "sys_user"},    # cross (itsm→sys)
@@ -218,8 +218,8 @@ def _servicenow_model(root: Path) -> None:
     (root / "datasources" / "c").mkdir(parents=True)
     for area in ("itsm", "sys"):
         (root / "subject_areas" / area / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "sn", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "sn", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/itsm", "subject_areas/sys"],
     }))
@@ -342,7 +342,7 @@ def test_verified_references_unverified_when_table_too_big():
                                 + [mm.Column(name=c, type="integer") for c in cols])
     itsm = mm.SubjectArea(name="itsm", description="d", tables_defined=[tbl("incident", ["caller_id"], big)])
     sysa = mm.SubjectArea(name="sys", description="d", tables_defined=[tbl("sys_user", [])])
-    org = mm.Organization(organization="o", version=1, subject_areas=[itsm, sysa])
+    org = mm.Organization(datasource="o", version=1, subject_areas=[itsm, sysa])
     probed = {"n": 0}
 
     def runner(sql):

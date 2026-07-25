@@ -87,7 +87,7 @@ def cmd_snapshot(args) -> int:
 
 
 def cmd_ensure_org_id(args) -> int:
-    """Mint + persist the deployment org_id into <root>/org.yaml if absent (F14 / ACE-056; relocated
+    """Mint + persist the deployment org_id into <root>/datasource.yaml if absent (F14 / ACE-056; relocated
     by F15 / ACE-067), then print it. Idempotent — an already-minted id is returned unchanged. The
     introspect/curate paths mint inline via write_tree; this command is for paths that write a model
     WITHOUT them — e.g. agami-connect's sample copy (6A) drops a prebuilt model that carries no id.
@@ -97,7 +97,7 @@ def cmd_ensure_org_id(args) -> int:
 
     from . import build
     root = Path(args.root)
-    org_path = root / "org.yaml"
+    org_path = root / "datasource.yaml"
     doc = L._read_yaml(org_path) or {}
     existing = doc.get("org_id")
     oid = build.ensure_org_id(root, existing or None)
@@ -134,7 +134,7 @@ def cmd_areas(args) -> int:
 
 
 def cmd_org_draft(args) -> int:
-    # A human-narrative STARTER for ORGANIZATION.md (skip path) — a prompt only, no model
+    # A human-narrative STARTER for datasource.md (skip path) — a prompt only, no model
     # facts. Those are derived at read time (see `org-context`), so they never get baked into
     # the editable prose file where a human could clobber them.
     from . import org_draft
@@ -145,14 +145,14 @@ def cmd_org_draft(args) -> int:
 
 def cmd_org_context(args) -> int:
     # The full domain context for the LLM, two-level (F15 / ACE-069): the shared COMPANY block from the
-    # deployment record (<artifacts_dir>/organization.yaml + the root ORGANIZATION.md), then this
+    # deployment record (<artifacts_dir>/organization.yaml + the root datasource.md), then this
     # datasource's source-specific narrative + model-derived summary. With no record it degrades to the
     # pre-F15 per-profile assembly (byte-identical). This is what the query path injects as context.
     from . import org_draft
     from . import org_record as OR
     root = Path(args.root)
     org = L.load_organization(root, include_rejected=False)
-    src_md = root / "ORGANIZATION.md"
+    src_md = root / "datasource.md"
     source_narrative = src_md.read_text(encoding="utf-8") if src_md.exists() else ""
     art = root.parent  # the artifacts dir holds the deployment-level record + company narrative
     record = OR.load_org_record(art)
@@ -326,7 +326,7 @@ def cmd_sensitive(args) -> int:
 
 
 def cmd_set_terminology(args) -> int:
-    """Write the org-level domain glossary (term -> definition) onto org.yaml's
+    """Write the org-level domain glossary (term -> definition) onto datasource.yaml's
     `key_terminology` — the decoded-abbreviation legend enrichment produces. Merges by
     default (layers over a human's edits); --replace overwrites. Validated + committed."""
     from . import curate
@@ -1100,7 +1100,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.set_defaults(func=cmd_snapshot)
 
-    sp = sub.add_parser("ensure-org-id", help="mint + persist the deployment org_id into org.yaml if absent (e.g. after copying a sample model)")
+    sp = sub.add_parser("ensure-org-id", help="mint + persist the deployment org_id into datasource.yaml if absent (e.g. after copying a sample model)")
     sp.add_argument("root")
     sp.set_defaults(func=cmd_ensure_org_id)
 
@@ -1125,7 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.set_defaults(func=cmd_areas)
 
-    sp = sub.add_parser("org-draft", help="print a human-narrative STARTER for ORGANIZATION.md (prompt only, no facts)")
+    sp = sub.add_parser("org-draft", help="print a human-narrative STARTER for datasource.md (prompt only, no facts)")
     sp.add_argument("root")
     sp.set_defaults(func=cmd_org_draft)
 
@@ -1197,7 +1197,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.set_defaults(func=cmd_sensitive)
 
-    sp = sub.add_parser("set-terminology", help="write the org domain glossary (term→definition) onto org.yaml key_terminology")
+    sp = sub.add_parser("set-terminology", help="write the org domain glossary (term→definition) onto datasource.yaml key_terminology")
     sp.add_argument("root")
     sp.add_argument("--file", required=True, help="JSON object {term: definition, ...} (or {key_terminology: {...}})")
     sp.add_argument("--replace", action="store_true", help="replace the glossary instead of merging over it")
@@ -1367,7 +1367,7 @@ def main(argv=None) -> int:
         # callers fold the "does a model exist?" check into their first real command
         # (e.g. `sm areas`) instead of a separate filesystem probe. Exit 3 = "no model
         # here — run agami-connect"; distinct from validation errors (1) and usage (2).
-        if "org.yaml" in str(e):
+        if "datasource.yaml" in str(e):
             _print_json({"error": "no_model", "detail": str(e)})
             return 3
         raise

@@ -375,7 +375,7 @@ def model_tree(org: Organization) -> dict[str, Any]:
                             for c in t.columns],
             })
         areas.append({"area": sa.name, "description": sa.description, "tables": tables})
-    return {"organization": org.organization, "subject_areas": areas}
+    return {"datasource": org.datasource, "subject_areas": areas}
 
 
 # ---------------------------------------------------------------------------
@@ -414,18 +414,18 @@ def _snapshot(backups: "dict[Path, Optional[str]]", path: Path) -> None:
 
 
 def set_key_terminology(root: str | Path, terms: dict, *, merge: bool = True) -> "ApplyResult":
-    """Write the org-level domain glossary (term -> definition) onto org.yaml's
+    """Write the org-level domain glossary (term -> definition) onto datasource.yaml's
     `key_terminology`. Validated + git-committed like every other write; the prior
-    org.yaml is restored on validation failure (no git dependency for the revert).
+    datasource.yaml is restored on validation failure (no git dependency for the revert).
 
     `merge=True` (default) layers `terms` over the existing glossary — so an
     enrichment pass adds without clobbering a human's edits; `merge=False` replaces.
     Empty terms/definitions are dropped."""
     root = Path(root)
     res = ApplyResult()
-    orgp = root / "org.yaml"
+    orgp = root / "datasource.yaml"
     if not orgp.exists():
-        res.errors.append(f"no org.yaml at {orgp}")
+        res.errors.append(f"no datasource.yaml at {orgp}")
         return res
     prior = orgp.read_text(encoding="utf-8")
     odoc = _load(orgp) or {}
@@ -631,8 +631,8 @@ def _apply_one(root: Path, op: dict, signer, role,
                 _dump(path, {"relationships": rels})
                 return path
         # Cross-area (cross-schema / cross-datasource) join — it lives at the org level, not
-        # in an area's relationships.yaml. Fall back to org.yaml's cross_subject_area_relationships.
-        orgp = root / "org.yaml"
+        # in an area's relationships.yaml. Fall back to datasource.yaml's cross_subject_area_relationships.
+        orgp = root / "datasource.yaml"
         _snapshot(backups, orgp)
         odoc = _load(orgp) or {}
         crels = odoc.get("cross_subject_area_relationships", [])

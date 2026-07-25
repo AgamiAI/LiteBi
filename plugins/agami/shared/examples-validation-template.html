@@ -354,7 +354,7 @@
       <div class="gn-label">📝 A note for the whole model — <strong>say it once; it applies to every example</strong></div>
       <textarea id="global-note" rows="2"
         placeholder="Anything cross-cutting — a unit, a filter, a business rule, a display convention.&#10;e.g. amounts are in INR · always exclude test accounts · status 'X' means cancelled"></textarea>
-      <div class="gn-hint">Claude files this in the right place in the model (a column unit/caveat, <code>ORGANIZATION.md</code>, or your prefs) — you don't repeat it per example.</div>
+      <div class="gn-hint">Claude files this in the right place in the model (a column unit/caveat, <code>datasource.md</code>, or your prefs) — you don't repeat it per example.</div>
     </div>
 
     <div id="items"></div>
@@ -1022,7 +1022,7 @@
         lines.push(`<<<`);
       });
       // One model-wide note (said once, not per example) — Claude classifies it and writes
-      // it to the right place in the model (column unit/caveat, ORGANIZATION.md, or prefs).
+      // it to the right place in the model (column unit/caveat, datasource.md, or prefs).
       const gn = globalNote();
       if (gn) {
         lines.push(`note all >>>`);

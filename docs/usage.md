@@ -37,7 +37,7 @@ $ /agami-connect
 
 [Phase 3: validate + write]
   ✓ Validator passed (semantic-model schema + trust block)
-  ✓ Wrote the model under ~/agami-artifacts/main/ (org.yaml + subject_areas/…)
+  ✓ Wrote the model under ~/agami-artifacts/main/ (datasource.yaml + subject_areas/…)
   ✓ Snapshot pinned at .snapshots/45f0fefa2403/
   ✓ git init + initial commit
 
@@ -178,7 +178,7 @@ what the correction is actually fixing:
 | SQL pattern (join columns, aggregation expression, filter shape) | `examples.yaml` as a new few-shot example |
 | Per-column meaning, unit, sign convention, or value normalization (Male/MALE/T → "Male") | The column's `description` / `choice_field` / `caveats` in its table YAML |
 | Cross-DB display preference (format counts with commas, default time window) | `USER_MEMORY.md` (+ updates the seed example's SQL to demonstrate the formatting) |
-| Abstract business concept tied to this DB ("gold tier means lifetime spend > $10k") | `ORGANIZATION.md` |
+| Abstract business concept tied to this DB ("gold tier means lifetime spend > $10k") | `datasource.md` |
 | Reusable aggregation that didn't exist before ("MRR = SUM(price) WHERE plan_type='subscription'") | New `metric` in the semantic model (sign-off required — Rule 1) |
 
 The classifier surfaces its decision before writing, so you can override if it

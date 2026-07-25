@@ -29,8 +29,8 @@ def _write_model(root: Path, *, git: bool = True) -> None:
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
     (root / "subject_areas" / "sales" / "metrics").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "shop", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "shop", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/sales"],
     }))
@@ -219,8 +219,8 @@ def test_edit_op_ambiguous_area_errors_clearly(tmp_path):
 
 
 def test_approve_cross_area_relationship_writes_org_yaml(tmp_path):
-    """A cross-schema/cross-area join lives in org.yaml (not an area's relationships.yaml),
-    so approving it must update org.yaml via the org-level fallback."""
+    """A cross-schema/cross-area join lives in datasource.yaml (not an area's relationships.yaml),
+    so approving it must update datasource.yaml via the org-level fallback."""
     root = tmp_path
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "datasources" / "c" / "storage.yaml").write_text(
@@ -233,8 +233,8 @@ def test_approve_cross_area_relationship_writes_org_yaml(tmp_path):
             "name": tbl, "schema": area, "storage_connection": "c", "grain": ["id"], "description": tbl,
             "columns": [{"name": "id", "type": "integer", "primary_key": True},
                         {"name": "customer_id", "type": "integer"}]}))
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "shop", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "shop", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/billing", "subject_areas/crm"],
         "cross_subject_area_relationships": [{
@@ -250,17 +250,17 @@ def test_approve_cross_area_relationship_writes_org_yaml(tmp_path):
                                "name": "invoices->customers", "at": "2026-06-12T00:00:00Z"}],
                        signer="reviewer@example.com", role="data_lead")
     assert res.validated and res.applied and not res.skipped, res.skipped
-    o = yaml.safe_load((root / "org.yaml").read_text())
+    o = yaml.safe_load((root / "datasource.yaml").read_text())
     cr = o["cross_subject_area_relationships"][0]
     assert cr["review_state"] == "approved" and cr["signed_off_by"] == "reviewer@example.com"
 
-    # editing a cross-area join's field also persists to org.yaml (the UI edit path) —
+    # editing a cross-area join's field also persists to datasource.yaml (the UI edit path) —
     # not just approve/reject. So cross joins are as editable as regular joins.
     res2 = curate.apply(root, [{"op": "edit", "kind": "relationship", "area": "billing",
                                 "name": "invoices->customers", "field": "description",
                                 "value": "invoice to its CRM account"}])
     assert res2.validated and res2.applied and not res2.skipped, res2.skipped
-    cr2 = yaml.safe_load((root / "org.yaml").read_text())["cross_subject_area_relationships"][0]
+    cr2 = yaml.safe_load((root / "datasource.yaml").read_text())["cross_subject_area_relationships"][0]
     assert cr2["description"] == "invoice to its CRM account"
 
 

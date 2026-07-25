@@ -117,8 +117,8 @@ def test_coexists_with_a_hosted_shape_row():
 def _write_profile(root: Path, datasource: str) -> None:
     d = root / datasource
     d.mkdir(parents=True, exist_ok=True)
-    (d / "org.yaml").write_text(
-        f"organization: acme\nversion: 1\ndescription: {datasource} model.\n"
+    (d / "datasource.yaml").write_text(
+        f"datasource: acme\nversion: 1\ndescription: {datasource} model.\n"
         "storage_connections:\n  - name: warehouse\n    storage_type: PostgreSQL\nsubject_areas: []\n"
     )
 
@@ -142,7 +142,7 @@ def test_deploy_writes_one_org_row_and_two_datasource_rows_on_one_org_id(tmp_pat
     org_rows = s.query("SELECT org_id FROM organization")
     ds_rows = s.query("SELECT org_id, datasource FROM datasource_model ORDER BY datasource")
     company_mem = s.query(
-        "SELECT content FROM memory WHERE org_id = ? AND datasource = '' AND kind = 'organization'",
+        "SELECT content FROM memory WHERE org_id = ? AND datasource = '' AND kind = 'datasource'",
         ("deployorg",),
     )
     deployed_record = MS.load_organization_record(s, "deployorg")

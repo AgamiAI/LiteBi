@@ -928,7 +928,7 @@ def model_overview_html(
     )
     content = (
         '<div class="crumbs">Model</div>'
-        f'<div class="h1row"><h1>{ui.esc(org.organization)}</h1>'
+        f'<div class="h1row"><h1>{ui.esc(org.datasource)}</h1>'
         '<span class="readonly-pill">Read-only · edit in Claude</span></div>'
         f'<p class="lead">{ui.esc(org.description or "The deployed semantic model.")}</p>'
         f'<div class="statrow">{stats}</div>'
@@ -1252,18 +1252,18 @@ def model_relationships_html(
 def model_context_html(
     org: Any, memory: dict[str, str], datasource: str, datasources: list[str], **chrome: str
 ) -> str:
-    """The Domain-context page — the deployed ORGANIZATION.md rendered as (safe) markdown."""
+    """The Domain-context page — the deployed datasource.md rendered as (safe) markdown."""
     tree = _model_tree_html(org, datasource, datasources, active_view="context")
-    org_md = memory.get("organization")
+    org_md = memory.get("datasource")
     doc = (
         f'<div class="context">{ui.md(org_md)}</div>'
         if org_md
-        else '<p class="lead">No domain context (ORGANIZATION.md) deployed for this datasource.</p>'
+        else '<p class="lead">No domain context (datasource.md) deployed for this datasource.</p>'
     )
     content = (
         f'<div class="crumbs"><a href="{_model_url(datasource)}">{ui.esc(datasource)}</a>'
         '<span class="sep">/</span>Domain context</div><h1>Domain context</h1>'
-        '<p class="lead">The deployed ORGANIZATION.md — the domain notes Claude reads as context. '
+        '<p class="lead">The deployed datasource.md — the domain notes Claude reads as context. '
         f"Read-only.</p>{doc}"
     )
     return _model_shell(content, tree, **chrome)

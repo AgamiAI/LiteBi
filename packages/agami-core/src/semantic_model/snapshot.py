@@ -109,7 +109,7 @@ def write_snapshot(root: str | os.PathLike) -> str | None:
     `model_version`), or None if there's no model / on any error (best-effort)."""
     try:
         root = Path(root)
-        if not (root / "org.yaml").exists():
+        if not (root / "datasource.yaml").exists():
             return None  # not a model root — nothing to snapshot
         # One pass: the hash (to name the dir) and the manifest shas (written only on a new dir)
         # come from a single read of each file, not two.

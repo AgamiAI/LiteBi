@@ -30,7 +30,7 @@ def _org() -> m.Organization:
         return m.Table(name=name, schema="public", storage_connection="c", grain=["id"],
                        description=name, columns=[m.Column(name="id", type="integer")])
     return m.Organization(
-        organization="Shop",
+        datasource="Shop",
         subject_areas=[m.SubjectArea(name="sales", tables_defined=[_t("orders"), _t("customers")])],
     )
 
@@ -49,8 +49,8 @@ def _write_disk(root: Path) -> None:
     import yaml
 
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(
-        yaml.safe_dump({"organization": "Shop", "version": 1, "subject_areas": ["subject_areas/sales"]})
+    (root / "datasource.yaml").write_text(
+        yaml.safe_dump({"datasource": "Shop", "version": 1, "subject_areas": ["subject_areas/sales"]})
     )
     (root / "subject_areas" / "sales" / "subject_area.yaml").write_text(
         yaml.safe_dump({"name": "sales", "tables": [

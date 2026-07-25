@@ -9,7 +9,7 @@
   NOTE: the placeholder names here are written WITHOUT their double-brace
   wrappers on purpose — the renderer does a blanket string replace, and if a
   real "{{...}}" token appeared inside this comment the substituted MANIFEST
-  JSON (which can carry an HTML comment-close sequence from ORGANIZATION.md)
+  JSON (which can carry an HTML comment-close sequence from datasource.md)
   would close this comment early and dump raw JSON into the page. Keep them bare.
 
   Per-render placeholders (always substituted in the body below):
@@ -417,7 +417,7 @@
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px;
     }
     .org-rendered strong { font-weight: 600; }
-    /* Rich-text editor for ORGANIZATION.md (edit the formatted text, no Markdown symbols) */
+    /* Rich-text editor for datasource.md (edit the formatted text, no Markdown symbols) */
     .rt-toolbar { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 18px 8px; }
     .rt-editor { min-height: 360px; border: 1px solid var(--border); border-radius: 8px;
       background: var(--bg-elev); margin: 0 18px; outline: none; }
@@ -687,7 +687,7 @@
     // exampleEdits[qname] = {area, question, sql, source, status}
     // newMetrics[]   = {area, name, description, calculation, binding, unit, other_names[], source_tables[]}
     // newExamples[]  = {area, question, sql}   (human-added NL→SQL examples)
-    // orgEdit        = new ORGANIZATION.md text | null
+    // orgEdit        = new datasource.md text | null
     const pending = {};
     const ops = {};
     const edits = {};
@@ -695,7 +695,7 @@
     const newMetrics = [];
     const newExamples = [];
     let orgEdit = null;
-    let orgRaw = false;   // ORGANIZATION.md editor mode: false = rich text, true = raw Markdown
+    let orgRaw = false;   // datasource.md editor mode: false = rich text, true = raw Markdown
     let termEdits = null; // edited curated glossary {term: def} | null — written back via set-terminology
 
     const editOpen = new Set();        // qnames whose inline edit form is expanded
@@ -2463,9 +2463,9 @@
         '<strong>What is this?</strong> This note tells agami about <em>your</em> business — what the company or product is, ' +
         'what your words mean, and how your numbers are defined (for example, what counts as an "active customer"). ' +
         'agami reads it with every question, so answers use your own words and definitions. ' +
-        'Edit it here, or in the file <code>ORGANIZATION.md</code> inside your agami folder.' }));
+        'Edit it here, or in the file <code>datasource.md</code> inside your agami folder.' }));
       if (searchQ && !md.toLowerCase().includes(searchQ)) {
-        root.appendChild(el('div', { class: 'empty-state', text: `ORGANIZATION.md doesn't match "${searchQ}".` }));
+        root.appendChild(el('div', { class: 'empty-state', text: `datasource.md doesn't match "${searchQ}".` }));
         setSearchCounts('');
         return;
       }
@@ -2475,7 +2475,7 @@
         const wrap = el('div', { class: 'edit-form', style: 'border-top:none;' });
         if (orgRaw) {
           // Power-user escape hatch: edit the raw Markdown directly.
-          wrap.appendChild(labelLine('ORGANIZATION.md (raw Markdown)'));
+          wrap.appendChild(labelLine('datasource.md (raw Markdown)'));
           const ta = textarea(md, 22); ta.style.minHeight = '360px'; wrap.appendChild(ta);
           const bar = el('div', { class: 'card-actions' });
           bar.appendChild(btnSm('Save', () => { orgEdit = ta.value; editOpen.delete(ORG); renderAll(); }, 'primary'));
@@ -2484,7 +2484,7 @@
           wrap.appendChild(bar);
         } else {
           // Rich-text editor: edit the formatted text directly — no Markdown symbols.
-          wrap.appendChild(labelLine('Edit ORGANIZATION.md'));
+          wrap.appendChild(labelLine('Edit datasource.md'));
           wrap.appendChild(el('div', { class: 'field-hint', style: 'padding:0 0 8px;',
             text: 'Type like a normal document. Use the buttons for a section heading, bold, or a bullet list. agami saves it for you.' }));
           const tb = el('div', { class: 'rt-toolbar' });
@@ -2507,7 +2507,7 @@
         card.appendChild(el('div', { class: 'org-rendered', html: renderMarkdown(md) }));
         const a = el('div', { class: 'card-actions' });
         a.appendChild(el('button', { type: 'button', class: orgEdit !== null ? 'queued-edit' : '',
-          onclick: () => { editOpen.add(ORG); renderAll(); } }, orgEdit !== null ? '✎ Edited (queued) — edit again' : 'Edit ORGANIZATION.md'));
+          onclick: () => { editOpen.add(ORG); renderAll(); } }, orgEdit !== null ? '✎ Edited (queued) — edit again' : 'Edit datasource.md'));
         card.appendChild(a);
       }
       root.appendChild(card);
@@ -2640,7 +2640,7 @@
       // org edit
       if (orgEdit !== null) {
         const g = el('div', { class: 'queue-group' }); g.appendChild(el('h3', { text: 'Organization context' }));
-        g.appendChild(queueRow('edit', 'edit', 'ORGANIZATION.md edited', () => { orgEdit = null; }));
+        g.appendChild(queueRow('edit', 'edit', 'datasource.md edited', () => { orgEdit = null; }));
         groups.push(g);
       }
       // glossary edit
@@ -2746,7 +2746,7 @@
       // the In-schema/Cross-schema bar is Joins-tab only; renderJoinsTab decides whether to show it
       if (activeTab !== 'joins') document.getElementById('join-type-bar').style.display = 'none';
       // search placeholder per tab
-      const ph = { organization: 'Search ORGANIZATION.md…', review: 'Search the review queue…',
+      const ph = { organization: 'Search datasource.md…', review: 'Search the review queue…',
                    areas: 'Search subject areas…',
                    tables: 'Search tables, fields, descriptions…',
                    metrics: 'Search metrics…', entities: 'Search entities…', joins: 'Search joins…',

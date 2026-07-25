@@ -278,7 +278,7 @@ def introspect(
     # edits to lose); the relationship pass below rebuilds across the union, prior edges kept.
     prev_rels: list[Relationship] = []
     skip_keys: set = set()
-    if append and not dry_run and (out / "org.yaml").exists():
+    if append and not dry_run and (out / "datasource.yaml").exists():
         from .loader import load_organization
         prev = load_organization(out, include_rejected=True)
         batch_names = {t.name for t in built}
@@ -324,7 +324,7 @@ def introspect(
         storage_config={"profile": profile, "credentials_ref": "<artifacts_dir>/local/credentials"},
     )
     org = Organization(
-        organization=profile,
+        datasource=profile,
         version=1,
         storage_connections=[storage],
         subject_areas=areas,

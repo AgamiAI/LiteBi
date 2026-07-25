@@ -633,11 +633,11 @@ class SubjectArea(_Base):
 
 class Organization(_Base):
     # Locally-minted, globally-unique deployment identity (F14 / ACE-056): a uuid4 hex minted ONCE at
-    # agami-connect and persisted in org.yaml, then immutable. Optional/None so pre-F14 org.yaml files
+    # agami-connect and persisted in datasource.yaml, then immutable. Optional/None so pre-F14 datasource.yaml files
     # (which have no org_id key) still load under the model's `extra="forbid"` policy. Never transmitted;
     # it only travels the day the operator exports their own DB — see F14's no-egress invariant.
     org_id: Optional[str] = None
-    organization: str
+    datasource: str  # this datasource's display name (used as the model title in the explorer/context)
     version: int = 1
     description: str = ""
     fiscal_year_start_month: int = 1
@@ -651,8 +651,8 @@ class Organization(_Base):
     cross_subject_area_metrics: list[Metric] = Field(default_factory=list)
     # domain glossary: term -> one-line definition (e.g. "MRR": "monthly recurring revenue").
     # Enrichment fills this from decoded abbreviations + choice-field legends; org_draft
-    # renders it into ORGANIZATION.md's "Key terminology", and it feeds NL→SQL as context.
-    # The structured home means it survives an ORGANIZATION.md regeneration (a prose section
+    # renders it into datasource.md's "Key terminology", and it feeds NL→SQL as context.
+    # The structured home means it survives an datasource.md regeneration (a prose section
     # the LLM has to remember to write does not).
     key_terminology: dict[str, str] = Field(default_factory=dict)
 
@@ -697,8 +697,8 @@ class OrgRecord(_Base):
     """The deployment-level company record (F15). Written ONCE at ``<artifacts_dir>/organization.yaml``
     and shared across every datasource under the deployment, so company-wide facts (name, description,
     fiscal year, display conventions, glossary) live in one place instead of drifting across each
-    profile's ``org.yaml``. ``org_id`` is F14's deployment identity, relocated here from the per-profile
-    ``org.yaml`` (minted once, immutable, deployment-scoped — the value is preserved, never re-minted).
+    profile's ``datasource.yaml``. ``org_id`` is F14's deployment identity, relocated here from the per-profile
+    ``datasource.yaml`` (minted once, immutable, deployment-scoped — the value is preserved, never re-minted).
     Every non-id field is optional so a bare record (id only) validates; company content is authored
     later by onboarding/curation."""
 

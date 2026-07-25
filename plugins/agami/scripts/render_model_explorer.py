@@ -66,7 +66,7 @@ def build_manifest(profile_dir: Path, profile: str) -> dict:
     examples_out: list[dict] = []
     areas_out: list[dict] = []
 
-    org_md_path = profile_dir / "ORGANIZATION.md"
+    org_md_path = profile_dir / "datasource.md"
     organization_md = org_md_path.read_text(encoding="utf-8") if org_md_path.exists() else ""
     import re as _re
 
@@ -248,7 +248,7 @@ def render(*, title: str, profile: str, manifest: dict) -> str:
     logo_light = LOGO_LIGHT_PATH.read_text() if LOGO_LIGHT_PATH.exists() else ""
     theme_css = (SHARED_DIR / "theme.css").read_text()
 
-    # The manifest embeds arbitrary model text (descriptions, ORGANIZATION.md, SQL).
+    # The manifest embeds arbitrary model text (descriptions, datasource.md, SQL).
     # Escape `</` so a `</script>` in that text can't terminate the <script> block that
     # holds `const manifest = …` (JS unescapes `<\/` back to `</`). The template's doc
     # comment carries no real `{{…}}` tokens, so a `-->` in the text can't close it.

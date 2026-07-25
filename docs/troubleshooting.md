@@ -59,7 +59,7 @@ rm -rf ~/.claude/plugins/cache/agami-skills   # only if you also installed our e
 # 3. Remove your data (only if you're sure you don't want it back)
 #    Snapshot files are intentionally immutable — chmod first so rm can delete them.
 chmod -R u+w ~/agami-artifacts 2>/dev/null
-rm -rf ~/agami-artifacts                      # semantic model, examples, ORGANIZATION.md, USER_MEMORY.md, .snapshots/, .git/
+rm -rf ~/agami-artifacts                      # semantic model, examples, datasource.md, USER_MEMORY.md, .snapshots/, .git/
 rm -rf <artifacts_dir>/local                  # credentials, .config, charts, exports, review + examples-validation dashboards
 
 # 4. Restart Claude Code (full quit, not just close window)

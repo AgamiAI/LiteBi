@@ -31,7 +31,7 @@ def _scope_org():
     def _t(name):
         return m.Table(name=name, schema="public", storage_connection="c", grain=["id"],
                        description=name, columns=[m.Column(name="id", type="integer")])
-    return m.Organization(organization="Shop",
+    return m.Organization(datasource="Shop",
                           subject_areas=[m.SubjectArea(name="sales",
                               tables_defined=[_t("orders"), _t("customers")])])
 
@@ -89,7 +89,7 @@ def test_case_insensitive_match():
 
 
 def test_empty_model_allows():
-    org = m.Organization(organization="Empty", subject_areas=[m.SubjectArea(name="s")])
+    org = m.Organization(datasource="Empty", subject_areas=[m.SubjectArea(name="s")])
     assert rt.check_table_scope("SELECT * FROM anything", org).action == "allow"
 
 

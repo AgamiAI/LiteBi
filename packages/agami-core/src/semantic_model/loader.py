@@ -4,7 +4,7 @@ On-disk tree (design doc's "Storage layout on disk"), rooted at the profile dir
 ``<artifacts_dir>/<profile>/``:
 
     <root>/
-      org.yaml                                 # org desc + storage_connections + subject_areas refs
+      datasource.yaml                                 # org desc + storage_connections + subject_areas refs
       datasources/<connection>/storage.yaml    # physical: storage_type, storage_config
       subject_areas/<name>/
         subject_area.yaml                      # desc, default_time_window, tables (TableRefs)
@@ -84,9 +84,9 @@ def load_organization(root: str | Path, *, include_rejected: bool = False) -> Or
     tools (agami-model), which must show excluded entries to toggle them.
     """
     root = Path(root)
-    org_path = root / "org.yaml"
+    org_path = root / "datasource.yaml"
     if not org_path.exists():
-        raise FileNotFoundError(f"no org.yaml at {org_path}")
+        raise FileNotFoundError(f"no datasource.yaml at {org_path}")
     org_doc: dict[str, Any] = _read_yaml(org_path) or {}
 
     # storage connections — inline list OR refs into datasources/<c>/storage.yaml
@@ -115,7 +115,7 @@ def load_organization(root: str | Path, *, include_rejected: bool = False) -> Or
 
     org = Organization(
         org_id=org_doc.get("org_id"),  # F14: minted uuid4 (None for pre-F14 files)
-        organization=org_doc.get("organization", root.name),
+        datasource=org_doc.get("datasource", root.name),
         version=org_doc.get("version", 1),
         description=org_doc.get("description", ""),
         fiscal_year_start_month=org_doc.get("fiscal_year_start_month", 1),
@@ -130,14 +130,14 @@ def load_organization(root: str | Path, *, include_rejected: bool = False) -> Or
 
 
 def load_org_id(root: str | Path) -> str | None:
-    """Return the minted org_id recorded in ``<root>/org.yaml``, or ``None`` if the file is absent
+    """Return the minted org_id recorded in ``<root>/datasource.yaml``, or ``None`` if the file is absent
     or predates F14 (no ``org_id`` key). This is the serve-time identity read (F14 / ACE-056).
 
     Deliberately read-only and lenient — unlike ``load_organization`` it never raises on a missing
     file — so the single-tenant resolver can fall through to its ``"local"`` default. Reads only the
     top-level key; it does NOT build the full pydantic model (identity resolution runs per process,
     not per query, so it stays cheap)."""
-    org_path = Path(root) / "org.yaml"
+    org_path = Path(root) / "datasource.yaml"
     if not org_path.exists():
         return None
     doc = _read_yaml(org_path) or {}
@@ -146,11 +146,11 @@ def load_org_id(root: str | Path) -> str | None:
 
 
 def deployment_org_id(artifacts_dir: str | Path) -> str | None:
-    """The deployment-wide org identity: the first ``org_id`` found across ``<artifacts_dir>/*/org.yaml``,
+    """The deployment-wide org identity: the first ``org_id`` found across ``<artifacts_dir>/*/datasource.yaml``,
     or ``None`` if no profile carries one (F14 / ACE-056, the *deployment-scoped* rule).
 
     A deployment is ONE tenant even with several datasource profiles, so the minted id is shared across
-    every profile's ``org.yaml``. Resolving by scanning the artifacts dir (rather than one 'active'
+    every profile's ``datasource.yaml``. Resolving by scanning the artifacts dir (rather than one 'active'
     profile) means the deploy stamp and the serve resolver agree even when ``AGAMI_PROFILE`` is unset and
     the real model lives under a named profile (e.g. ``northpeak_salesforce``, not ``default``). Read-only;
     never raises. Profiles are expected to agree; the first (sorted) is returned deterministically."""
@@ -279,7 +279,7 @@ def _load_subject_area(sa_dir: Path, include_rejected: bool = False) -> SubjectA
 
 def _load_cross_rels(root: Path, org_doc: dict) -> list[CrossSubjectAreaRelationship]:
     out: list[CrossSubjectAreaRelationship] = []
-    # inline on org.yaml
+    # inline on datasource.yaml
     for r in org_doc.get("cross_subject_area_relationships", []) or []:
         out.append(CrossSubjectAreaRelationship(**r))
     # or a sidecar file

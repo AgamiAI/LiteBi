@@ -83,10 +83,10 @@ def _write_model(
                     )
                 )
         area_paths.append(f"subject_areas/{a}")
-    (root / "org.yaml").write_text(
+    (root / "datasource.yaml").write_text(
         yaml.safe_dump(
             {
-                "organization": "acme",
+                "datasource": "acme",
                 "version": 1,
                 "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
                 "subject_areas": area_paths,

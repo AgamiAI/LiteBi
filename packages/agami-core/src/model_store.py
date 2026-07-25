@@ -171,14 +171,14 @@ def model_table_counts(store: Store, org_id: str = DEFAULT_ORG) -> dict[str, int
 
 
 # ---------------------------------------------------------------------------
-# Memory (ORGANIZATION.md / USER_MEMORY.md) + model_version — served from the DB too, so a DB-only
+# Memory (datasource.md / USER_MEMORY.md) + model_version — served from the DB too, so a DB-only
 # deploy reads NO files at runtime (get_datasource_schema's domain context + the receipt's version
 # pin come from these tables, not disk).
 # ---------------------------------------------------------------------------
 
 
-# ORGANIZATION.md is per-datasource; USER_MEMORY.md is cross-datasource (mirroring the file layout:
-# <artifacts_dir>/<profile>/ORGANIZATION.md vs <artifacts_dir>/USER_MEMORY.md), so it is stored once
+# datasource.md is per-datasource; USER_MEMORY.md is cross-datasource (mirroring the file layout:
+# <artifacts_dir>/<profile>/datasource.md vs <artifacts_dir>/USER_MEMORY.md), so it is stored once
 # under this sentinel datasource rather than duplicated per datasource. It is still keyed by org — one
 # row PER ORG, not one per install, or one tenant's user memory would be served to another's.
 _GLOBAL_DATASOURCE = ""
@@ -188,21 +188,21 @@ def write_memory(
     store: Store,
     datasource: str,
     *,
-    organization: str | None = None,
+    datasource_doc: str | None = None,
     user: str | None = None,
     org_id: str = DEFAULT_ORG,
 ) -> None:
-    """Seed the domain-context docs. `organization` is per-datasource; `user` is cross-datasource but
+    """Seed the domain-context docs. `datasource_doc` is per-datasource; `user` is cross-datasource but
     still per-org (the empty-datasource sentinel row). Pass either/both; each replaces its row."""
-    if organization is not None:
+    if datasource_doc is not None:
         store.execute(
-            "DELETE FROM memory WHERE org_id = ? AND datasource = ? AND kind = 'organization'",
+            "DELETE FROM memory WHERE org_id = ? AND datasource = ? AND kind = 'datasource'",
             (org_id, datasource),
         )
         store.execute(
             "INSERT INTO memory (org_id, datasource, kind, content) "
-            "VALUES (?, ?, 'organization', ?)",
-            (org_id, datasource, organization),
+            "VALUES (?, ?, 'datasource', ?)",
+            (org_id, datasource, datasource_doc),
         )
     if user is not None:
         store.execute(
@@ -217,10 +217,10 @@ def write_memory(
 
 
 def load_memory(store: Store, datasource: str, org_id: str = DEFAULT_ORG) -> dict[str, str]:
-    """{'organization': <per-datasource ORGANIZATION.md>, 'user': <the org's USER_MEMORY.md>} —
+    """{'datasource': <per-datasource datasource.md>, 'user': <the org's USER_MEMORY.md>} —
     missing keys absent."""
     out: dict[str, str] = {}
-    for kind, ds in (("organization", datasource), ("user", _GLOBAL_DATASOURCE)):
+    for kind, ds in (("datasource", datasource), ("user", _GLOBAL_DATASOURCE)):
         rows = store.query(
             "SELECT content FROM memory WHERE org_id = ? AND datasource = ? AND kind = ?",
             (org_id, ds, kind),

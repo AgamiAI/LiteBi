@@ -1,4 +1,4 @@
-"""Tests for semantic_model/org_draft.py — the factual ORGANIZATION.md draft, and the
+"""Tests for semantic_model/org_draft.py — the factual datasource.md draft, and the
 render_model_explorer fallback that uses it so the file is never blank."""
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ def _model(root):
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
     (root / "subject_areas" / "s" / "metrics").mkdir(parents=True)
     (root / "subject_areas" / "s" / "entities").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "acme", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "acme", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (root / "datasources" / "c" / "storage.yaml").write_text(
@@ -138,18 +138,18 @@ def test_set_key_terminology_merges_then_replaces(tmp_path):
 def test_explorer_org_md_is_human_only_derived_is_a_separate_field(tmp_path):
     from render_model_explorer import build_manifest
     _model(tmp_path)
-    # no ORGANIZATION.md → editable field is the human STARTER (prompt only, NO facts)...
+    # no datasource.md → editable field is the human STARTER (prompt only, NO facts)...
     m = build_manifest(tmp_path, "acme")
     assert "About this database" in m["organization_md"]
     assert "Subject areas" not in m["organization_md"]      # facts never in the editable file
     # ...and the model-derived facts live in their own read-only field
     assert "Subject areas" in m["derived_context_md"] and "sales" in m["derived_context_md"]
     # a comments-only file is still "blank" → starter; facts stay separate
-    (tmp_path / "ORGANIZATION.md").write_text("<!-- nothing here yet -->\n")
+    (tmp_path / "datasource.md").write_text("<!-- nothing here yet -->\n")
     m2 = build_manifest(tmp_path, "acme")
     assert "About this database" in m2["organization_md"] and "Subject areas" in m2["derived_context_md"]
     # a real human file is left as-is in the editable field; facts still separate
-    (tmp_path / "ORGANIZATION.md").write_text("# About\nWe are a lending startup.")
+    (tmp_path / "datasource.md").write_text("# About\nWe are a lending startup.")
     m3 = build_manifest(tmp_path, "acme")
     assert m3["organization_md"] == "# About\nWe are a lending startup."
     assert "Subject areas" in m3["derived_context_md"]

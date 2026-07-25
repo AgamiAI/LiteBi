@@ -241,7 +241,7 @@ def test_introspect_writes_canonical_tree_and_loads_back(tmp_path):
     org, rep = I.introspect("shop", "postgres", runner=_catalog_runner,
                             artifacts_dir=tmp_path, dry_run=False)
     root = tmp_path / "shop"
-    assert (root / "org.yaml").exists()
+    assert (root / "datasource.yaml").exists()
     reloaded = L.load_organization(root)
     assert V.validate(reloaded).ok
     assert {t.name for sa in reloaded.subject_areas for t in sa.tables_defined} == {"customers", "orders"}
@@ -256,7 +256,7 @@ def test_legacy_model_backed_up_on_reonboard(tmp_path):
     I.introspect("shop", "postgres", runner=_catalog_runner, artifacts_dir=tmp_path, dry_run=False)
     assert (root / ".legacy_backup" / "index.yaml").exists()
     assert (root / ".legacy_backup" / "PUBLIC" / "_schema.yaml").exists()
-    assert (root / "org.yaml").exists()  # new model written at root
+    assert (root / "datasource.yaml").exists()  # new model written at root
 
 
 # ---------------------------------------------------------------------------

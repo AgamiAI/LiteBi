@@ -29,7 +29,7 @@ from semantic_model.models import (  # noqa: E402
 
 def _org(name: str, area: str, account_means: str) -> Organization:
     return Organization(
-        organization=name,
+        datasource=name,
         subject_areas=[SubjectArea(name=area, description=f"{area} area")],
         key_terminology={"Account": account_means},
     )

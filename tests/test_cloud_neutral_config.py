@@ -188,7 +188,7 @@ def test_db_backed_serve_needs_no_artifacts_dir(tmp_path, monkeypatch):
         "main",
         Organization.model_validate(
             {
-                "organization": "acme",
+                "datasource": "acme",
                 "version": 1,
                 "subject_areas": [
                     {"name": "sales", "metrics": [{"name": "revenue", "calculation": "sum"}]}

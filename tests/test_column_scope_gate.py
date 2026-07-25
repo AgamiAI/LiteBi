@@ -35,7 +35,7 @@ def _scope_org():
     orders = _t("orders", [("id", "integer"), ("amount", "decimal"),
                            ("customer_id", "integer"), ("status", "string")])
     customers = _t("customers", [("id", "integer"), ("name", "string"), ("region", "string")])
-    return m.Organization(organization="Shop",
+    return m.Organization(datasource="Shop",
                           subject_areas=[m.SubjectArea(name="sales",
                               tables_defined=[orders, customers])])
 
@@ -154,7 +154,7 @@ def test_case_insensitive_match():
 # --- column-scope: degrade-to-allow ----------------------------------------
 
 def test_column_empty_model_allows():
-    org = m.Organization(organization="Empty", subject_areas=[m.SubjectArea(name="s")])
+    org = m.Organization(datasource="Empty", subject_areas=[m.SubjectArea(name="s")])
     assert rt.check_column_scope("SELECT anything FROM whatever", org).action == "allow"
 
 

@@ -30,7 +30,7 @@ def _org(columns, metrics=None, table="facts"):
                 columns=columns)
     sa = m.SubjectArea(name="area", description="d", tables_defined=[t],
                        metrics=metrics or [])
-    return m.Organization(organization="o", version=1, subject_areas=[sa])
+    return m.Organization(datasource="o", version=1, subject_areas=[sa])
 
 
 # --- #2 aggregation-class enforcement --------------------------------------
@@ -124,7 +124,7 @@ def test_semi_additive_is_table_scoped_no_cross_table_misfire():
                     bindings={"PostgreSQL": "SUM(balance)"}, source_tables=["facts"],
                     non_additive_dimensions=["time"], semi_additive_agg="last")
     sa = m.SubjectArea(name="area", description="d", tables_defined=[facts, ledger], metrics=[semi])
-    org = m.Organization(organization="o", version=1, subject_areas=[sa])
+    org = m.Organization(datasource="o", version=1, subject_areas=[sa])
     # ledger.balance is NOT the semi-additive one → allowed
     r = RT.pre_flight_check("SELECT entry_date, SUM(balance) FROM ledger GROUP BY entry_date", org)
     assert r.action == "allow"

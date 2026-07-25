@@ -9,7 +9,7 @@ backend.
 
 Layout on disk (the canonical profile format, rooted at `<artifacts_dir>/<profile>/`):
 
-    org.yaml                                 # org desc + storage_connections + subject_areas
+    datasource.yaml                                 # org desc + storage_connections + subject_areas
     datasources/<connection>/storage.yaml    # physical: storage_type, storage_config
     subject_areas/<name>/
       subject_area.yaml                      # desc, default_time_window, tables (TableRefs)

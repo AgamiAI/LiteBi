@@ -23,7 +23,7 @@ def _org(metric):
                     m.Column(name="id", type="integer", primary_key=True),
                     m.Column(name="cost", type="decimal")])
     sa = m.SubjectArea(name="s", tables_defined=[t], metrics=[metric])
-    return m.Organization(organization="t", subject_areas=[sa])
+    return m.Organization(datasource="t", subject_areas=[sa])
 
 
 # --- binding column check ---------------------------------------------------

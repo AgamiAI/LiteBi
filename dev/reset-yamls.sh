@@ -4,7 +4,7 @@
 # hand-written docs, or the git audit trail.
 #
 # What gets nuked (default):
-#   <artifacts_dir>/<profile>/org.yaml                   (model root)
+#   <artifacts_dir>/<profile>/datasource.yaml                   (model root)
 #   <artifacts_dir>/<profile>/datasources/               (storage connections)
 #   <artifacts_dir>/<profile>/subject_areas/             (tables/entities/metrics/relationships)
 #   <artifacts_dir>/<profile>/prompt_examples/           (NL→SQL example library)
@@ -16,7 +16,7 @@
 #   <artifacts_dir>/local/credentials         DB connection details
 #   <artifacts_dir>/local/.config             reviewer email, role, etc.
 #   <artifacts_dir>/USER_MEMORY.md            cross-DB preferences
-#   <artifacts_dir>/<profile>/ORGANIZATION.md domain context the user wrote
+#   <artifacts_dir>/<profile>/datasource.md domain context the user wrote
 #   <artifacts_dir>/<profile>/.git/           audit trail of past curator edits
 #   <artifacts_dir>/<profile>/.legacy_backup/ legacy (v1) model backed up on upgrade
 #   <artifacts_dir>/<profile>/curation_log.jsonl
@@ -29,7 +29,7 @@
 # Usage:
 #   dev/reset-yamls.sh                                       # default profile, soft reset
 #   dev/reset-yamls.sh acme                                # specific profile, soft reset
-#   dev/reset-yamls.sh acme --hard                         # also drop ORGANIZATION.md + .git/ + logs
+#   dev/reset-yamls.sh acme --hard                         # also drop datasource.md + .git/ + logs
 #   dev/reset-yamls.sh acme --clean-renders                # also drop <artifacts_dir>/local/<kind>/acme/* (this profile only)
 #   dev/reset-yamls.sh acme --clean-renders-all            # wipe legacy flat-layout files + every profile
 #   dev/reset-yamls.sh acme --hard --clean-renders         # full per-profile wipe
@@ -94,7 +94,7 @@ action() {
 }
 
 echo "Resetting YAMLs in $PROFILE_DIR (profile: $PROFILE)"
-echo "  mode: $([[ $HARD -eq 1 ]] && echo 'hard (drops ORGANIZATION.md, .git/, logs)' || echo 'soft (keeps ORGANIZATION.md, .git/, logs)')"
+echo "  mode: $([[ $HARD -eq 1 ]] && echo 'hard (drops datasource.md, .git/, logs)' || echo 'soft (keeps datasource.md, .git/, logs)')"
 if [[ $CLEAN_RENDERS_ALL -eq 1 ]]; then
   echo "  also cleaning <artifacts_dir>/local/{charts,review,examples-validation,model,exports}/ (ALL profiles + legacy)"
 elif [[ $CLEAN_RENDERS -eq 1 ]]; then
@@ -109,7 +109,7 @@ if [[ -d "$PROFILE_DIR/.snapshots" ]]; then
   action "chmod -R u+w '$PROFILE_DIR/.snapshots'"
 fi
 
-# 1. Top-level YAML files (org.yaml, etc.)
+# 1. Top-level YAML files (datasource.yaml, etc.)
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   action "rm -f '$f'"
@@ -132,9 +132,9 @@ if [[ -d "$PROFILE_DIR/.snapshots" ]]; then
   action "rm -rf '$PROFILE_DIR/.snapshots'"
 fi
 
-# 4. Hard reset extras: ORGANIZATION.md, the audit trail (.git/), and logs.
+# 4. Hard reset extras: datasource.md, the audit trail (.git/), and logs.
 if [[ $HARD -eq 1 ]]; then
-  action "rm -f '$PROFILE_DIR/ORGANIZATION.md'"
+  action "rm -f '$PROFILE_DIR/datasource.md'"
   action "rm -rf '$PROFILE_DIR/.git'"
   action "rm -f '$PROFILE_DIR/curation_log.jsonl'"
   action "rm -f '$PROFILE_DIR/corrections.jsonl'"
@@ -186,7 +186,7 @@ fi
 if [[ $HARD -eq 0 ]]; then
   echo ""
   echo "Preserved in soft mode (would be dropped on --hard):"
-  [[ -f "$PROFILE_DIR/ORGANIZATION.md" ]] && echo "  $PROFILE_DIR/ORGANIZATION.md"
+  [[ -f "$PROFILE_DIR/datasource.md" ]] && echo "  $PROFILE_DIR/datasource.md"
   [[ -d "$PROFILE_DIR/.git" ]] && echo "  $PROFILE_DIR/.git                       (audit trail)"
   [[ -f "$PROFILE_DIR/curation_log.jsonl" ]] && echo "  $PROFILE_DIR/curation_log.jsonl"
   [[ -f "$PROFILE_DIR/corrections.jsonl" ]] && echo "  $PROFILE_DIR/corrections.jsonl"

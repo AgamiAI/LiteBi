@@ -99,14 +99,14 @@ CREATE TABLE prompt_example (
     PRIMARY KEY (org_id, datasource, id)
 );
 
--- Domain-context docs. kind='organization' (ORGANIZATION.md) is per-datasource; kind='user'
+-- Domain-context docs. kind='datasource' (datasource.md) is per-datasource; kind='user'
 -- (USER_MEMORY.md) is cross-datasource, stored once under datasource='' (the empty sentinel) — but
 -- still PER ORG, so one tenant's user memory can't reach another's. Mirrors the file layout
--- (<artifacts_dir>/<profile>/ORGANIZATION.md vs <artifacts_dir>/USER_MEMORY.md).
+-- (<artifacts_dir>/<profile>/datasource.md vs <artifacts_dir>/USER_MEMORY.md).
 CREATE TABLE memory (
     org_id     TEXT NOT NULL DEFAULT 'local',
     datasource TEXT NOT NULL,      -- '' for the per-org user-memory row
-    kind       TEXT NOT NULL,      -- 'organization' (per-datasource) | 'user' (per-org, cross-datasource)
+    kind       TEXT NOT NULL,      -- 'datasource' (per-datasource) | 'user' (per-org, cross-datasource)
     content    TEXT,
     PRIMARY KEY (org_id, datasource, kind)
 );

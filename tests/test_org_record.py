@@ -35,7 +35,7 @@ _HEX = set("0123456789abcdef")
 
 
 def _minimal_org(name: str = "acme") -> Organization:
-    return Organization(organization=name)
+    return Organization(datasource=name)
 
 
 def test_ensure_org_record_mints_once_into_organization_yaml(tmp_path):
@@ -72,12 +72,12 @@ def test_second_profile_shares_the_record_id_without_a_sibling_scan(tmp_path, mo
 
 
 def test_legacy_lift_preserves_a_pre_record_org_id_idempotently(tmp_path):
-    # A post-F14 / pre-F15 deployment keeps its id in a profile's org.yaml and has no record yet.
+    # A post-F14 / pre-F15 deployment keeps its id in a profile's datasource.yaml and has no record yet.
     # ensure_org_record LIFTS that id up (never re-mints), and is idempotent on re-run.
     prof = tmp_path / "northpeak_salesforce"
     prof.mkdir()
-    (prof / "org.yaml").write_text(
-        yaml.safe_dump({"org_id": "legacyid0000", "organization": "acme"}), encoding="utf-8"
+    (prof / "datasource.yaml").write_text(
+        yaml.safe_dump({"org_id": "legacyid0000", "datasource": "acme"}), encoding="utf-8"
     )
     assert OR.load_org_record(tmp_path) is None
 
@@ -97,8 +97,8 @@ def test_resolver_reads_the_record_then_falls_back_to_legacy_then_local(tmp_path
     # (b) a legacy per-profile id, still no record -> the legacy scan resolves it.
     prof = tmp_path / "old"
     prof.mkdir()
-    (prof / "org.yaml").write_text(
-        yaml.safe_dump({"org_id": "legacyid0000", "organization": "x"}), encoding="utf-8"
+    (prof / "datasource.yaml").write_text(
+        yaml.safe_dump({"org_id": "legacyid0000", "datasource": "x"}), encoding="utf-8"
     )
     tools.resolved_org_id.cache_clear()
     assert tools.resolved_org_id() == "legacyid0000"
@@ -147,7 +147,7 @@ def test_refresh_datasources_tracks_profiles_on_disk(tmp_path):
     OR.set_org_fields(tmp_path, name="Acme")  # a record with authored company content
     for prof in ("crm", "erp"):
         (tmp_path / prof).mkdir()
-        (tmp_path / prof / "org.yaml").write_text(f"org_id: x\norganization: {prof}\n")
+        (tmp_path / prof / "datasource.yaml").write_text(f"org_id: x\norganization: {prof}\n")
 
     rec = OR.refresh_datasources(tmp_path)
     assert rec.datasources == ["crm", "erp"]  # sorted, rebuilt from the profile dirs on disk

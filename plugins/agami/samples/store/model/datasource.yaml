@@ -1,4 +1,4 @@
-organization: agami-example
+datasource: agami-example
 version: 1
 description: Acme Store — a synthetic online retailer (sample dataset) with two sides, one-time commerce and recurring subscriptions, for trying agami without connecting a real database.
 fiscal_year_start_month: 1

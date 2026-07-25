@@ -26,8 +26,8 @@ from semantic_model import cli  # noqa: E402
 def _model(root: Path) -> None:
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (root / "datasources" / "c" / "storage.yaml").write_text(
@@ -434,7 +434,7 @@ def test_seed_examples_passes_when_columns_described(tmp_path, monkeypatch):
 
 
 def test_no_model_root_exits_3_cleanly(tmp_path):
-    # an empty root has no org.yaml — the CLI returns a clean no_model signal (exit 3),
+    # an empty root has no datasource.yaml — the CLI returns a clean no_model signal (exit 3),
     # not a traceback, so callers fold the existence check into their first real call
     rc, out = _run(["areas", str(tmp_path)])
     assert rc == 3
@@ -656,7 +656,7 @@ def test_column_groups_edit_reconciles_stale_expose(tmp_path):
 
 
 def test_set_terminology_writes_glossary_to_org_yaml(tmp_path):
-    # the packaged path for the decoded-abbreviation legend: writes org.yaml key_terminology,
+    # the packaged path for the decoded-abbreviation legend: writes datasource.yaml key_terminology,
     # validates, merges over existing terms (so a re-run doesn't clobber a human's edits).
     from semantic_model.loader import load_organization
     _model(tmp_path)

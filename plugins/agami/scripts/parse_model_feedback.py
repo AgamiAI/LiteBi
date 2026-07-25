@@ -156,7 +156,7 @@ def parse(text: str) -> tuple[dict, list, dict | None]:
         elif jk == "key-terminology":
             data["key_terminology"] = parsed
         elif jk == "organization-md":
-            data["organization_md"] = parsed  # JSON-encoded string → the full ORGANIZATION.md text
+            data["organization_md"] = parsed  # JSON-encoded string → the full datasource.md text
 
     if bad_targets:
         needs = {"kind": "malformed_targets", "targets": bad_targets,

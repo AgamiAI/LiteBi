@@ -31,7 +31,7 @@ def _metric(name, binding, *, base=None, calc="x", tables=("orders",)):
 
 def _org(metrics):
     sa = m.SubjectArea(name="sales", description="d", metrics=metrics)
-    return m.Organization(organization="o", version=1, subject_areas=[sa])
+    return m.Organization(datasource="o", version=1, subject_areas=[sa])
 
 
 # --- resolver ---------------------------------------------------------------

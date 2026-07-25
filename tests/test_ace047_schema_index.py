@@ -40,7 +40,7 @@ def _org_with_clash_and_fallback() -> m.Organization:
                          tables_defined=[_tbl("sales.orders")])
     gamma = m.SubjectArea(name="gamma", tables=[_ref("customers"), _ref("orders")],
                           tables_defined=[_tbl("customers")])
-    return m.Organization(organization="O",
+    return m.Organization(datasource="O",
                           storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                           subject_areas=[alpha, beta, gamma])
 
@@ -67,7 +67,7 @@ def test_index_matches_linear_with_duplicate_area_names():
     # returns the FIRST area of that name — so the index's per-area maps must be first-wins too.
     a1 = m.SubjectArea(name="sales", tables=[_ref("only_first")], tables_defined=[_tbl("only_first")])
     a2 = m.SubjectArea(name="sales", tables=[_ref("only_second")], tables_defined=[_tbl("only_second")])
-    org = m.Organization(organization="O",
+    org = m.Organization(datasource="O",
                          storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                          subject_areas=[a1, a2])
     idx = L.build_table_index(org)
@@ -123,8 +123,8 @@ def _write_model(root: Path, n_areas: int, tables_per_area: int, *, wide: bool, 
         (root / "subject_areas" / a / "subject_area.yaml").write_text(
             yaml.safe_dump({"name": a, "description": f"area {a}", "tables": refs}))
         area_paths.append(f"subject_areas/{a}")
-    (root / "org.yaml").write_text(yaml.safe_dump(
-        {"organization": "acme", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump(
+        {"datasource": "acme", "version": 1,
          "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
          "subject_areas": area_paths}))
 

@@ -21,7 +21,7 @@ from semantic_model.models import Organization  # noqa: E402
 from store import Store  # noqa: E402
 
 FULL_ORG = {
-    "organization": "acme",
+    "datasource": "acme",
     "version": 1,
     "description": "Acme Inc.",
     "fiscal_year_start_month": 4,
@@ -142,10 +142,10 @@ def _write_file_model(root):
             }
         )
     )
-    (root / "org.yaml").write_text(
+    (root / "datasource.yaml").write_text(
         yaml.safe_dump(
             {
-                "organization": "acme",
+                "datasource": "acme",
                 "version": 1,
                 "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
                 "subject_areas": ["subject_areas/sales"],
@@ -194,11 +194,11 @@ def test_memory_and_model_version_round_trip():
     s = Store.connect("sqlite://")
     s.run_migrations()
     model_store.write_memory(
-        s, "main", organization="# About\nAcme sells widgets.", user="prefer USD"
+        s, "main", datasource_doc="# About\nAcme sells widgets.", user="prefer USD"
     )
     model_store.write_model_version(s, "main", "v-abc123", created_at="2026-06-25T00:00:00Z")
     assert model_store.load_memory(s, "main") == {
-        "organization": "# About\nAcme sells widgets.",
+        "datasource": "# About\nAcme sells widgets.",
         "user": "prefer USD",
     }
     assert model_store.newest_model_version(s, "main") == "v-abc123"
@@ -212,7 +212,7 @@ def test_tools_serve_memory_and_version_from_db_no_files(tmp_path, monkeypatch):
     s = Store.connect(db_url)
     s.run_migrations()
     model_store.write_memory(
-        s, "main", organization="# Acme\nWidgets co.", user="exclude test users"
+        s, "main", datasource_doc="# Acme\nWidgets co.", user="exclude test users"
     )
     model_store.write_model_version(s, "main", "v-deadbeef")
     s.close()
@@ -246,7 +246,7 @@ def test_metric_name_collision_keeps_both_metrics(tmp_path, monkeypatch):
         tmp_path,
         monkeypatch,
         {
-            "organization": "acme",
+            "datasource": "acme",
             "version": 1,
             "subject_areas": [
                 {"name": "sales", "metrics": [{"name": "revenue", "calculation": "gross"}]},
@@ -268,7 +268,7 @@ def test_index_floor_sheds_full_metrics_and_flags_truncated(tmp_path, monkeypatc
         tmp_path,
         monkeypatch,
         {
-            "organization": "acme",
+            "datasource": "acme",
             "version": 1,
             "subject_areas": [{"name": "a", "metrics": metrics}],
         },

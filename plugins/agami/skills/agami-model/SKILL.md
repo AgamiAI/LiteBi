@@ -1,7 +1,7 @@
 ---
 name: agami-model
-description: "The single dashboard for the active profile's semantic model — browse, curate, AND sign off the trust layer in one surface. Browse every subject area, table, field, metric, entity, and join with live search; edit descriptions/metrics/entities/joins; exclude tables/columns you don't want queried; add new metrics; edit ORGANIZATION.md. Its **Review tab** is the trust-layer sign-off queue: approve / reject the AI-proposed metrics (Rule 1 — a query using an unsigned metric still answers but carries a warning until it's approved), entities, and inferred joins (Rule 2 — lazy, usable while unreviewed). Every action is queued, submitted back to Claude as one feedback block, applied via the curation engine, and gated by the validator before it touches the YAML. (This skill absorbed the former `/agami-review`.)"
-when_to_use: "Use for BOTH model curation and trust review. Curation: 'open the model explorer', 'show me the model', 'browse my tables', 'exclude a table', 'remove this column', 'I don't want PII columns', 'add a metric', 'edit ORGANIZATION.md', '/agami-model'. Review / sign-off: 'open the review dashboard', 'review my model', 'what needs review', 'sign off the metrics', 'approve the metrics', 'walk the review queue', '/agami-review' (now folded in here) — or after agami-connect's Phase 4 sign-off gate or Phase 7 summary prompts to review or inspect the model. Also use when the user replies to a previously-rendered dashboard with a back-channel block (exclude tables: … / curate-ops: … / new-metrics: … / done)."
+description: "The single dashboard for the active profile's semantic model — browse, curate, AND sign off the trust layer in one surface. Browse every subject area, table, field, metric, entity, and join with live search; edit descriptions/metrics/entities/joins; exclude tables/columns you don't want queried; add new metrics; edit datasource.md. Its **Review tab** is the trust-layer sign-off queue: approve / reject the AI-proposed metrics (Rule 1 — a query using an unsigned metric still answers but carries a warning until it's approved), entities, and inferred joins (Rule 2 — lazy, usable while unreviewed). Every action is queued, submitted back to Claude as one feedback block, applied via the curation engine, and gated by the validator before it touches the YAML. (This skill absorbed the former `/agami-review`.)"
+when_to_use: "Use for BOTH model curation and trust review. Curation: 'open the model explorer', 'show me the model', 'browse my tables', 'exclude a table', 'remove this column', 'I don't want PII columns', 'add a metric', 'edit datasource.md', '/agami-model'. Review / sign-off: 'open the review dashboard', 'review my model', 'what needs review', 'sign off the metrics', 'approve the metrics', 'walk the review queue', '/agami-review' (now folded in here) — or after agami-connect's Phase 4 sign-off gate or Phase 7 summary prompts to review or inspect the model. Also use when the user replies to a previously-rendered dashboard with a back-channel block (exclude tables: … / curate-ops: … / new-metrics: … / done)."
 argument-hint: "[review | preseed | rule1] — open on the sign-off queue; no arg opens the explorer on Tables"
 ---
 
@@ -33,8 +33,8 @@ Trust-spine semantics — three actions on the same `review_state` field:
 
 - **Plan-mode check** — this skill writes YAMLs. If plan mode is active, refuse: *"I can't apply model edits in plan mode — switch to **Auto** or **Edit Automatically** mode (Shift+Tab to cycle) and re-invoke. (You can still inspect a previously-rendered dashboard at `<artifacts_dir>/local/model/<profile>/<ts>.html`.)"* **Do NOT write a plan file. Do NOT call `ExitPlanMode`.**
 - **Resolve `<profile>` and `<artifacts_dir>`** via the standard chain (`AGAMI_PROFILE` → `<artifacts_dir>/local/.config.active_profile` → `default`; `AGAMI_ARTIFACTS_DIR` → `.config.artifacts_dir` → `~/agami-artifacts`).
-  - **A pasted feedback block names its own target.** When applying a block from the dashboard's "Generate feedback for Claude", its first line is `profile: <name>` — that dashboard was rendered for THAT model, so **use it and override the active-profile default.** It prevents applying one dashboard's approvals to whatever happens to be the active profile (a *different* model). If `<artifacts_dir>/<profile>/org.yaml` exists for the named profile, target it directly — don't fall back to `active_profile` or hunt with `find`.
-- **If `<artifacts_dir>/<profile>/org.yaml` doesn't exist**, invoke `agami-connect` and stop — there's no model to explore yet.
+  - **A pasted feedback block names its own target.** When applying a block from the dashboard's "Generate feedback for Claude", its first line is `profile: <name>` — that dashboard was rendered for THAT model, so **use it and override the active-profile default.** It prevents applying one dashboard's approvals to whatever happens to be the active profile (a *different* model). If `<artifacts_dir>/<profile>/datasource.yaml` exists for the named profile, target it directly — don't fall back to `active_profile` or hunt with `find`.
+- **If `<artifacts_dir>/<profile>/datasource.yaml` doesn't exist**, invoke `agami-connect` and stop — there's no model to explore yet.
 - **Verify Python + PyYAML are importable** (the renderer + applier both depend on PyYAML): `python3 -c 'import yaml'`. If not, surface the install hint and stop.
 
 **Scope / initial tab.** Look at `$ARGUMENTS`:
@@ -81,7 +81,7 @@ Joins · Examples · Queued. Live search + status filters per tab.
   one-click "Approve all" for the confident ones.
 • Tables/Metrics/… — browse + edit; Exclude tables/columns you don't want
   queried (a column offers "exclude all N named <col>" to drop it everywhere);
-  add metrics; edit ORGANIZATION.md.
+  add metrics; edit datasource.md.
 Click through, hit "Generate feedback for Claude" at the bottom, paste back here.
 
 You can also type commands directly:
@@ -119,7 +119,7 @@ It prints `{data, anomalies, needs_judgment}`:
 - `data.new_metrics_by_area` — `{area: [metric…]}` → one `sm add "$ROOT" --kind metric --area <area> --file <json>` per area.
 - `data.examples_by_area` — edited + new NL→SQL examples `{area: [example…]}` → one `sm add-example "$ROOT" --area <area> --file <json>` per area (dedups by question).
 - `data.key_terminology` — the complete glossary object → `sm set-terminology "$ROOT" --file <json> --replace`.
-- `data.organization_md` — the full ORGANIZATION.md text (already decoded) → **Write** it to `<artifacts_dir>/<profile>/ORGANIZATION.md` (overwrite; human narrative only).
+- `data.organization_md` — the full datasource.md text (already decoded) → **Write** it to `<artifacts_dir>/<profile>/datasource.md` (overwrite; human narrative only).
 - `data.signer` / `data.role` — the curator identity for `--signer`/`--role` on every approve. **Persist** them into `<artifacts_dir>/local/.config` (`reviewer_email`/`reviewer_role`; preserve other keys, `chmod 600`) so future sessions don't re-ask; if absent on an approve-bearing batch, fall back to `.config`, then the Phase 0 ask.
 
 **If `needs_judgment` is set, stop and ask** — `malformed_targets` (a table without its `<area>.` prefix → *"Tables need a schema prefix — `sales.STG_LEADS`, not `STG_LEADS`. Did you mean that?"*) or `unparseable_json` (re-copy that block from the dashboard). Don't apply a partial block.
@@ -278,7 +278,7 @@ agami: ✓ Applied: 3 columns excluded. Re-rendered.
 ```
 You: I never want agami to use the staging tables
 
-[skill checks ORGANIZATION.md / table names for `_stg` suffix; if
+[skill checks datasource.md / table names for `_stg` suffix; if
  unsure, asks: "I see CUSTOMER_SCORE_STG — anything else? Click
  Exclude on the table cards in the dashboard."]
 

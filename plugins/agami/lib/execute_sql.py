@@ -896,7 +896,7 @@ def _resolve_guard_model(profile: str):
             pass  # DB unreachable/misconfigured -> fall through to disk
 
     root = Path(os.environ.get("AGAMI_ARTIFACTS_DIR") or (Path.home() / "agami-artifacts")) / profile
-    if (root / "org.yaml").exists():
+    if (root / "datasource.yaml").exists():
         try:
             return L.load_organization(root)
         except Exception:
