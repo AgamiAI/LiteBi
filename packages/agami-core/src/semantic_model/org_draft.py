@@ -2,13 +2,13 @@
 
 The architecture deliberately keeps the human's words and the auto-derived facts apart:
 
-* **ORGANIZATION.md** is the human's narrative ONLY (what the company/product is, who the
+* **datasource.md** is the human's narrative ONLY (what the company/product is, who the
   users are). agami never writes facts into it, so there is nothing for a human to
-  accidentally overwrite or delete. `starter_organization_md()` is the blank-path prompt.
+  accidentally overwrite or delete. `starter_datasource_md()` is the blank-path prompt.
 * **The factual context** — shape, subject areas, conventions, and the decoded glossary — is
   `derived_context()`, computed FRESH from the structured model at read time. The glossary
   lives in the structured `key_terminology` field, not inline prose, so it always reaches the
-  LLM regardless of what's in (or missing from) ORGANIZATION.md.
+  LLM regardless of what's in (or missing from) datasource.md.
 
 `compose_context(human_md, org)` assembles the two for a reader (MCP / query skill / explorer):
 the human's narrative, then the derived summary under its own heading. Never a re-listing of
@@ -21,7 +21,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .models import Organization, OrgRecord
+    from .models import Datasource, OrgRecord
 
 
 def _plural(n: int, word: str) -> str:
@@ -47,10 +47,10 @@ def _strip_comments(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
-def derived_context(org: "Organization", *, with_curated_glossary: bool = True) -> str:
+def derived_context(org: "Datasource", *, with_curated_glossary: bool = True) -> str:
     """The model-DERIVED factual context: shape + subject areas + conventions + glossary.
 
-    Computed fresh from the structured model every time and NOT persisted into ORGANIZATION.md
+    Computed fresh from the structured model every time and NOT persisted into datasource.md
     — so there are no fragile markers for a human to clobber, and the glossary always reaches
     the LLM (it no longer depends on a file having been re-rendered). The glossary comes from
     the structured `key_terminology` field + `choice_field` enum legends. Never a re-listing
@@ -65,7 +65,7 @@ def derived_context(org: "Organization", *, with_curated_glossary: bool = True) 
     n_entities = sum(len(sa.entities) for sa in areas) + len(org.cross_subject_area_entities)
 
     lines: list[str] = [
-        f"**{org.organization}** — {_plural(n_tables, 'table')} across {_plural(len(areas), 'subject area')}.",
+        f"**{org.datasource}** — {_plural(n_tables, 'table')} across {_plural(len(areas), 'subject area')}.",
         "",
     ]
     if areas:
@@ -102,12 +102,12 @@ def derived_context(org: "Organization", *, with_curated_glossary: bool = True) 
     return "\n".join(lines).strip()
 
 
-def compose_context(human_md: str, org: "Organization") -> str:
+def compose_context(human_md: str, org: "Datasource") -> str:
     """Read-time assembly of the full org context: the human's narrative (HTML comments
     stripped) followed by the model-derived summary under its OWN heading. The two parts stay
     SEPARATE — the human's prose is never mixed with auto content, so nothing can be
     accidentally overwritten. Either part may be empty. Used by the MCP, the query skill, and
-    the explorer's Organization view."""
+    the explorer's Datasource view."""
     human = _strip_comments(human_md)
     derived = derived_context(org)
     parts: list[str] = []
@@ -119,7 +119,7 @@ def compose_context(human_md: str, org: "Organization") -> str:
 
 
 def _company_block(record: "OrgRecord", narrative: str) -> str:
-    """The shared COMPANY context (F15): name/description + the root ORGANIZATION.md narrative +
+    """The shared COMPANY context (F15): name/description + the root organization.md narrative +
     company-wide display conventions + the company glossary. Rendered ONCE above every datasource."""
     lines: list[str] = [f"# {record.name or 'Company'} — company context", ""]
     if record.description:
@@ -153,10 +153,10 @@ def _company_block(record: "OrgRecord", narrative: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _source_block(org: "Organization", narrative: str) -> str:
+def _source_block(org: "Datasource", narrative: str) -> str:
     """One datasource's context: its optional source-specific narrative + the model-derived summary,
     under a heading naming the datasource (so a federated answer keeps the vocabularies apart)."""
-    seg = [f"## {org.organization} — datasource context"]
+    seg = [f"## {org.datasource} — datasource context"]
     src = _strip_comments(narrative)
     if src:
         seg.append(src)
@@ -168,19 +168,19 @@ def _source_block(org: "Organization", narrative: str) -> str:
 
 def compose_org_context(
     org_record: "OrgRecord | None",
-    ontologies: "list[Organization]",
+    ontologies: "list[Datasource]",
     *,
     company_narrative: str = "",
     source_narratives: "list[str] | None" = None,
 ) -> str:
     """Two-level org context (F15 / ACE-069). Renders the shared COMPANY block ONCE from the ``OrgRecord``
-    (name/description + the root ``ORGANIZATION.md`` narrative + display conventions + company glossary),
+    (name/description + the root ``organization.md`` narrative + display conventions + company glossary),
     then each datasource's model-derived ontology under its own heading. Single-source passes one
     ontology; a FEDERATED question passes several — the company block still renders exactly once, and each
     source keeps its own vocabulary (so "Account" resolves per source).
 
     ``source_narratives`` (optional, aligned by index to ``ontologies``) carries each datasource's
-    source-specific ``ORGANIZATION.md`` prose; company-wide prose now lives in ``company_narrative`` (the
+    source-specific ``datasource.md`` prose; company-wide prose now lives in ``company_narrative`` (the
     root file), not the per-profile ones.
 
     Graceful degradation: when ``org_record`` is ``None`` this returns exactly today's per-profile
@@ -199,7 +199,7 @@ def compose_org_context(
     return "\n\n".join(p for p in parts if p).strip()
 
 
-def starter_organization_md(org: "Organization") -> str:
+def starter_datasource_md(org: "Datasource") -> str:
     """A human-narrative STARTER for the skip path — never blank. It seeds `# About this
     database` with a one-line factual SUMMARY drawn from the model (org + what the subject
     areas cover) so the section reads as something, then invites the human to make it theirs.
@@ -209,9 +209,9 @@ def starter_organization_md(org: "Organization") -> str:
     areas = list(org.subject_areas)
     n_tables = sum(len(sa.tables_defined) for sa in areas)
     names = [sa.name for sa in areas]
-    lead = f"**{org.organization}** holds {_plural(n_tables, 'table')} across {_plural(len(areas), 'subject area')}"
+    lead = f"**{org.datasource}** holds {_plural(n_tables, 'table')} across {_plural(len(areas), 'subject area')}"
     # Name the areas when they add signal (skip a lone area that just echoes the org name).
-    if names and not (len(names) == 1 and names[0].lower() == org.organization.lower()):
+    if names and not (len(names) == 1 and names[0].lower() == org.datasource.lower()):
         shown = ", ".join(names[:6]) + (f", and {len(names) - 6} more" if len(names) > 6 else "")
         lead += f" covering {shown}."
     else:
@@ -227,7 +227,7 @@ def starter_organization_md(org: "Organization") -> str:
     ])
 
 
-def draft_organization_md(org: "Organization") -> str:
+def draft_datasource_md(org: "Datasource") -> str:
     """Back-compat: the model-derived context as a standalone document (no human prose).
     Prefer compose_context()/derived_context() in new code."""
     return compose_context("", org)
@@ -240,7 +240,7 @@ _MAX_ENUM_VALUES = 10
 _MAX_ENUM_COLS = 25
 
 
-def _key_terminology(lines: list[str], org: "Organization", areas: list,
+def _key_terminology(lines: list[str], org: "Datasource", areas: list,
                      include_curated: bool = True) -> None:
     """Append the glossary: the curated `key_terminology` terms (only when `include_curated`)
     plus auto-derived enum legends from `choice_field` columns. Omitted entirely when there's

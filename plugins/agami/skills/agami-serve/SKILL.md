@@ -33,7 +33,7 @@ Run the detection + ask logic from [`shared/plan-mode-check.md`](../../shared/pl
 ## Phase 0: Preflight
 
 1. **Credentials present** — `<artifacts_dir>/local/credentials` must exist for the active profile. If missing, invoke `/agami-connect` first; the server needs a connection to execute against.
-2. **Model present** — `<artifacts_dir>/<profile>/org.yaml` must exist (so the server has a semantic model to serve). If not, invoke `/agami-connect`.
+2. **Model present** — `<artifacts_dir>/<profile>/datasource.yaml` must exist (so the server has a semantic model to serve). If not, invoke `/agami-connect`.
 3. **Profile** — default to the active profile. If `$ARGUMENTS` names a profile, pass it through as `--profile <name>`.
 
 ## Phase 1: Run the setup helper

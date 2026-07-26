@@ -4,7 +4,7 @@ On-disk tree (design doc's "Storage layout on disk"), rooted at the profile dir
 ``<artifacts_dir>/<profile>/``:
 
     <root>/
-      org.yaml                                 # org desc + storage_connections + subject_areas refs
+      datasource.yaml                                 # org desc + storage_connections + subject_areas refs
       datasources/<connection>/storage.yaml    # physical: storage_type, storage_config
       subject_areas/<name>/
         subject_area.yaml                      # desc, default_time_window, tables (TableRefs)
@@ -17,7 +17,7 @@ On-disk tree (design doc's "Storage layout on disk"), rooted at the profile dir
       cross_subject_area_metrics.yaml          # optional, org-level
       prompt_examples/<subject_area>/examples.yaml
 
-The loader parses the tree into a single `Organization` model (so the validator
+The loader parses the tree into a single `Datasource` model (so the validator
 and runtime work on one in-memory object). It also provides the context-assembly
 functions the runtime depends on:
 
@@ -43,9 +43,9 @@ import yaml
 from .models import (
     Column,
     CrossSubjectAreaRelationship,
+    Datasource,
     Entity,
     Metric,
-    Organization,
     Relationship,
     StorageConnection,
     SubjectArea,
@@ -76,22 +76,22 @@ def _read_yaml(path: Path) -> Any:
         return yaml.safe_load(fh)
 
 
-def load_organization(root: str | Path, *, include_rejected: bool = False) -> Organization:
-    """Parse a v2 profile directory into an Organization model.
+def load_datasource(root: str | Path, *, include_rejected: bool = False) -> Datasource:
+    """Parse a v2 profile directory into a Datasource model.
 
     By default, entries the curator excluded (`review_state: rejected`) are dropped
     so the runtime never sees them. Pass `include_rejected=True` for the curation
     tools (agami-model), which must show excluded entries to toggle them.
     """
     root = Path(root)
-    org_path = root / "org.yaml"
-    if not org_path.exists():
-        raise FileNotFoundError(f"no org.yaml at {org_path}")
-    org_doc: dict[str, Any] = _read_yaml(org_path) or {}
+    datasource_path = root / "datasource.yaml"
+    if not datasource_path.exists():
+        raise FileNotFoundError(f"no datasource.yaml at {datasource_path}")
+    ds_doc: dict[str, Any] = _read_yaml(datasource_path) or {}
 
     # storage connections — inline list OR refs into datasources/<c>/storage.yaml
     connections: list[StorageConnection] = []
-    for sc in org_doc.get("storage_connections", []) or []:
+    for sc in ds_doc.get("storage_connections", []) or []:
         if isinstance(sc, dict) and "ref" in sc:
             ref_path = root / sc["ref"]
             connections.append(StorageConnection(**(_read_yaml(ref_path) or {})))
@@ -106,51 +106,51 @@ def load_organization(root: str | Path, *, include_rejected: bool = False) -> Or
 
     # subject areas — each referenced by directory name
     subject_areas: list[SubjectArea] = []
-    for sa_ref in org_doc.get("subject_areas", []) or []:
+    for sa_ref in ds_doc.get("subject_areas", []) or []:
         sa_dir = root / (sa_ref if isinstance(sa_ref, str) else sa_ref.get("path", ""))
         if not sa_dir.exists():
             # also accept a bare name under subject_areas/
             sa_dir = root / "subject_areas" / str(sa_ref)
         subject_areas.append(_load_subject_area(sa_dir, include_rejected=include_rejected))
 
-    org = Organization(
-        org_id=org_doc.get("org_id"),  # F14: minted uuid4 (None for pre-F14 files)
-        organization=org_doc.get("organization", root.name),
-        version=org_doc.get("version", 1),
-        description=org_doc.get("description", ""),
-        fiscal_year_start_month=org_doc.get("fiscal_year_start_month", 1),
+    org = Datasource(
+        org_id=ds_doc.get("org_id"),  # F14: minted uuid4 (None for pre-F14 files)
+        datasource=ds_doc.get("datasource", root.name),
+        version=ds_doc.get("version", 1),
+        description=ds_doc.get("description", ""),
+        fiscal_year_start_month=ds_doc.get("fiscal_year_start_month", 1),
         storage_connections=connections,
         subject_areas=subject_areas,
-        cross_subject_area_relationships=_load_cross_rels(root, org_doc),
-        cross_subject_area_entities=_load_cross_entities(root, org_doc),
-        cross_subject_area_metrics=_load_cross_metrics(root, org_doc),
-        key_terminology=org_doc.get("key_terminology", {}) or {},
+        cross_subject_area_relationships=_load_cross_rels(root, ds_doc),
+        cross_subject_area_entities=_load_cross_entities(root, ds_doc),
+        cross_subject_area_metrics=_load_cross_metrics(root, ds_doc),
+        key_terminology=ds_doc.get("key_terminology", {}) or {},
     )
     return org
 
 
 def load_org_id(root: str | Path) -> str | None:
-    """Return the minted org_id recorded in ``<root>/org.yaml``, or ``None`` if the file is absent
+    """Return the minted org_id recorded in ``<root>/datasource.yaml``, or ``None`` if the file is absent
     or predates F14 (no ``org_id`` key). This is the serve-time identity read (F14 / ACE-056).
 
-    Deliberately read-only and lenient — unlike ``load_organization`` it never raises on a missing
+    Deliberately read-only and lenient — unlike ``load_datasource`` it never raises on a missing
     file — so the single-tenant resolver can fall through to its ``"local"`` default. Reads only the
     top-level key; it does NOT build the full pydantic model (identity resolution runs per process,
     not per query, so it stays cheap)."""
-    org_path = Path(root) / "org.yaml"
-    if not org_path.exists():
+    datasource_path = Path(root) / "datasource.yaml"
+    if not datasource_path.exists():
         return None
-    doc = _read_yaml(org_path) or {}
+    doc = _read_yaml(datasource_path) or {}
     oid = doc.get("org_id")
     return oid or None
 
 
 def deployment_org_id(artifacts_dir: str | Path) -> str | None:
-    """The deployment-wide org identity: the first ``org_id`` found across ``<artifacts_dir>/*/org.yaml``,
+    """The deployment-wide org identity: the first ``org_id`` found across ``<artifacts_dir>/*/datasource.yaml``,
     or ``None`` if no profile carries one (F14 / ACE-056, the *deployment-scoped* rule).
 
     A deployment is ONE tenant even with several datasource profiles, so the minted id is shared across
-    every profile's ``org.yaml``. Resolving by scanning the artifacts dir (rather than one 'active'
+    every profile's ``datasource.yaml``. Resolving by scanning the artifacts dir (rather than one 'active'
     profile) means the deploy stamp and the serve resolver agree even when ``AGAMI_PROFILE`` is unset and
     the real model lives under a named profile (e.g. ``northpeak_salesforce``, not ``default``). Read-only;
     never raises. Profiles are expected to agree; the first (sorted) is returned deterministically."""
@@ -277,10 +277,10 @@ def _load_subject_area(sa_dir: Path, include_rejected: bool = False) -> SubjectA
     )
 
 
-def _load_cross_rels(root: Path, org_doc: dict) -> list[CrossSubjectAreaRelationship]:
+def _load_cross_rels(root: Path, ds_doc: dict) -> list[CrossSubjectAreaRelationship]:
     out: list[CrossSubjectAreaRelationship] = []
-    # inline on org.yaml
-    for r in org_doc.get("cross_subject_area_relationships", []) or []:
+    # inline on datasource.yaml
+    for r in ds_doc.get("cross_subject_area_relationships", []) or []:
         out.append(CrossSubjectAreaRelationship(**r))
     # or a sidecar file
     f = root / "cross_subject_area_relationships.yaml"
@@ -291,8 +291,8 @@ def _load_cross_rels(root: Path, org_doc: dict) -> list[CrossSubjectAreaRelation
     return out
 
 
-def _load_cross_entities(root: Path, org_doc: dict) -> list[Entity]:
-    out = [Entity(**e) for e in (org_doc.get("cross_subject_area_entities", []) or [])]
+def _load_cross_entities(root: Path, ds_doc: dict) -> list[Entity]:
+    out = [Entity(**e) for e in (ds_doc.get("cross_subject_area_entities", []) or [])]
     f = root / "cross_subject_area_entities.yaml"
     if f.exists():
         doc = _read_yaml(f) or {}
@@ -301,8 +301,8 @@ def _load_cross_entities(root: Path, org_doc: dict) -> list[Entity]:
     return out
 
 
-def _load_cross_metrics(root: Path, org_doc: dict) -> list[Metric]:
-    out = [Metric(**mm) for mm in (org_doc.get("cross_subject_area_metrics", []) or [])]
+def _load_cross_metrics(root: Path, ds_doc: dict) -> list[Metric]:
+    out = [Metric(**mm) for mm in (ds_doc.get("cross_subject_area_metrics", []) or [])]
     f = root / "cross_subject_area_metrics.yaml"
     if f.exists():
         doc = _read_yaml(f) or {}
@@ -351,7 +351,7 @@ class TableIndex:
         return self._pick(self.org_wide, table_name, bare)
 
 
-def build_table_index(org: Organization) -> TableIndex:
+def build_table_index(org: Datasource) -> TableIndex:
     """Build the O(1) name→Table index once per schema call (ACE-047). Scan order (areas, then
     tables) matches `_find_table`, and first-occurrence-wins via setdefault keeps a clash resolving
     identically."""
@@ -374,7 +374,7 @@ def build_table_index(org: Organization) -> TableIndex:
 
 
 def _find_table(
-    org: Organization, table_name: str, area: Optional[str] = None,
+    org: Datasource, table_name: str, area: Optional[str] = None,
     *, index: Optional[TableIndex] = None,
 ) -> Optional[Table]:
     if index is not None:
@@ -402,7 +402,7 @@ def _table_alias(table_name: str) -> str:
 
 
 def collect_default_filters(
-    org: Organization,
+    org: Datasource,
     table_names: Iterable[str],
     *,
     area: Optional[str] = None,
@@ -474,7 +474,7 @@ def _exposed_groups_for(sa: SubjectArea, table_name: str) -> Optional[list[str]]
 
 
 def get_table_context(
-    org: Organization,
+    org: Datasource,
     tables: list[str],
     *,
     area: Optional[str] = None,
@@ -560,7 +560,7 @@ def _column_detail(col: Column, include: list[str]) -> dict[str, Any]:
 
 
 def _relationships_among(
-    org: Organization, tables: list[str], area: Optional[str]
+    org: Datasource, tables: list[str], area: Optional[str]
 ) -> list[dict[str, Any]]:
     names = {_table_alias(t) for t in tables} | set(tables)
     out: list[dict[str, Any]] = []
@@ -578,7 +578,7 @@ def _relationships_among(
     return out
 
 
-def _metrics_for(org: Organization, tables: list[str], area: Optional[str]) -> list[dict[str, Any]]:
+def _metrics_for(org: Datasource, tables: list[str], area: Optional[str]) -> list[dict[str, Any]]:
     names = {_table_alias(t) for t in tables} | set(tables)
     out: list[dict[str, Any]] = []
     areas = [org.subject_area(area)] if area else org.subject_areas
@@ -591,7 +591,7 @@ def _metrics_for(org: Organization, tables: list[str], area: Optional[str]) -> l
     return out
 
 
-def get_subject_area_bundle(org: Organization, area: str) -> dict[str, Any]:
+def get_subject_area_bundle(org: Datasource, area: str) -> dict[str, Any]:
     """One-shot bundle for small subject areas (a few dozen tables)."""
     sa = org.subject_area(area)
     if sa is None:
@@ -624,7 +624,7 @@ def list_prompt_examples(root: str | Path, area: str,
     """Load scope-tagged examples for a subject area (prompt_examples/<area>/examples.yaml).
 
     Examples the curator rejected (`status: rejected`) are dropped by default so the
-    runtime ranker never anchors on them — mirroring how `load_organization` drops
+    runtime ranker never anchors on them — mirroring how `load_datasource` drops
     `review_state: rejected` model entries. Pass `include_rejected=True` for the curation
     view (re-render, dedup, audit), where a rejected example must still be visible.
     """
@@ -639,7 +639,7 @@ def list_prompt_examples(root: str | Path, area: str,
 
 
 __all__ = [
-    "load_organization",
+    "load_datasource",
     "load_org_id",
     "deployment_org_id",
     "collect_default_filters",

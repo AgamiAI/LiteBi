@@ -82,11 +82,11 @@ Read `<artifacts_dir>/local/credentials`. If the file (or the active profile's s
 Resolve `<profile>`: `AGAMI_PROFILE` → `active_profile` in `<artifacts_dir>/local/.config` → `"main"`.
 Resolve `<artifacts_dir>` per [`shared/file-layout.md`](../../shared/file-layout.md#configuring-artifacts_dir): `AGAMI_ARTIFACTS_DIR` → `.config.artifacts_dir` → `$HOME/agami-artifacts`.
 
-The model is the semantic-model tree at `<artifacts_dir>/<profile>/` (`org.yaml` + `subject_areas/<area>/…`). There is no legacy-layout fallback — the model is the only format.
+The model is the semantic-model tree at `<artifacts_dir>/<profile>/` (`datasource.yaml` + `subject_areas/<area>/…`). There is no legacy-layout fallback — the model is the only format.
 
-**Never hand-read OR hand-roll the model.** Don't `cat`/`Read` `org.yaml`, `subject_areas/**`, `tables/*.yaml`, or `relationships.yaml`, and **never write a `python -c` / ad-hoc script to load, dump, or walk the model tree** — that guesses the schema, breaks on a wrong key, and can leak a traceback to the user. The CLI returns the same data structured, and the layout is already known (relationships + entities + metrics live at the **area** level, not inside a table file). `sm areas "$ROOT"` is the **one-call model map**: per area it returns `table_count`, `entity_count`, `metric_count`, `relationship_count` + description — the whole shape in a single call. (Column-level detail → `sm context`; browsable table/column tree → `sm model-tree`.) **When the user asks "what does the model look like" / "show me the model," run `sm model-tree` (or open `/agami-model`) — don't improvise Python.**
+**Never hand-read OR hand-roll the model.** Don't `cat`/`Read` `datasource.yaml`, `subject_areas/**`, `tables/*.yaml`, or `relationships.yaml`, and **never write a `python -c` / ad-hoc script to load, dump, or walk the model tree** — that guesses the schema, breaks on a wrong key, and can leak a traceback to the user. The CLI returns the same data structured, and the layout is already known (relationships + entities + metrics live at the **area** level, not inside a table file). `sm areas "$ROOT"` is the **one-call model map**: per area it returns `table_count`, `entity_count`, `metric_count`, `relationship_count` + description — the whole shape in a single call. (Column-level detail → `sm context`; browsable table/column tree → `sm model-tree`.) **When the user asks "what does the model look like" / "show me the model," run `sm model-tree` (or open `/agami-model`) — don't improvise Python.**
 
-**Don't run a separate existence probe either** (no `ls org.yaml`, and never probe for the plugin's own scripts — `sm`, `execute_sql.py`, `semantic_model/` always ship with the plugin). That same first `sm areas` call doubles as the check: model present → you get the map; absent → the CLI returns `{"error":"no_model"}` with **exit code 3** → invoke `agami-connect` and stop.
+**Don't run a separate existence probe either** (no `ls datasource.yaml`, and never probe for the plugin's own scripts — `sm`, `execute_sql.py`, `semantic_model/` always ship with the plugin). That same first `sm areas` call doubles as the check: model present → you get the map; absent → the CLI returns `{"error":"no_model"}` with **exit code 3** → invoke `agami-connect` and stop.
 
 Drive everything through the CLI — the `sm` wrapper resolves the interpreter + deps. (These granular steps are CLI operations; on the MCP surface they're folded into the smart `get_datasource_schema`, which advertises the 4 product tools — so don't invoke the steps below as MCP tools.)
 
@@ -123,13 +123,13 @@ This file holds free-form **user preferences across every database** (default fi
 
 ### 1d.2 — load domain context
 
-Run `cli org-context "$ROOT"` — it returns the **full** domain context for this database in one block: the human's ORGANIZATION.md narrative (HTML comments stripped) **plus** the model-derived summary that the file does NOT contain — subject areas, conventions, and the **decoded glossary** (`key_terminology` + enum legends), assembled fresh from the structured model. Don't `Read` ORGANIZATION.md by hand: the file holds only the human narrative; the glossary and summary live in the model, and this command is the one that combines them. If there's no model, treat as empty — never error. See [`shared/organization-context-format.md`](../../shared/organization-context-format.md).
+Run `cli org-context "$ROOT"` — it returns the **full** domain context for this database in one block: the human's datasource.md narrative (HTML comments stripped) **plus** the model-derived summary that the file does NOT contain — subject areas, conventions, and the **decoded glossary** (`key_terminology` + enum legends), assembled fresh from the structured model. Don't `Read` datasource.md by hand: the file holds only the human narrative; the glossary and summary live in the model, and this command is the one that combines them. If there's no model, treat as empty — never error. See [`shared/organization-context-format.md`](../../shared/organization-context-format.md).
 
-Inject the result into the SQL-generation prompt in Phase 2b under `## Organization context`, **before** the `## User memory` section — domain knowledge precedes display preferences in the LLM's reading order.
+Inject the result into the SQL-generation prompt in Phase 2b under `## Datasource context`, **before** the `## User memory` section — domain knowledge precedes display preferences in the LLM's reading order.
 
 Order in Phase 2b prompt:
 1. Schema context (tables / columns / relationships / metrics from the semantic model)
-2. `## Organization context` ← from `cli org-context` (narrative + derived summary + glossary)
+2. `## Datasource context` ← from `cli org-context` (narrative + derived summary + glossary)
 3. `## User memory (preferences and policies)` ← from USER_MEMORY.md
 4. Few-shot examples
 5. The user's question
@@ -225,7 +225,7 @@ For a single profile, follow the **examples-first canonical loop** — the subje
 2. **Schema context** — the `get_table_context` output for the chosen tables (columns + types + caveats + value_transforms), the area's relationships (rendered as `from.col → to.col [cardinality]`), and the area's metrics (`<name>: <binding> -- <calculation>` + synonyms). `default_filters` need not be enumerated — `execute_sql` auto-applies them (step below) — but DO honor any caveats.
 
    **Unreviewed metrics are USED, not refused.** When the question names a metric whose `review_state ≠ approved`, still use its binding and answer — do NOT block or refuse on it. The trust layer surfaces it as a **warning on the receipt** (Phase 4e.iii.5: *"Used metric `X` which has not been signed off"*), not a hard gate. The loader already drops only `rejected` metrics; an `unreviewed`/`proposed` one is yours to use, with the warning carrying the honesty. (Same for unreviewed joins/entities and `stale` entries — warn, never refuse.)
-3. **Organization context** — `ORGANIZATION.md` (step 1d.2), heading `## Organization context`. Binding domain context.
+3. **Datasource context** — `datasource.md` (step 1d.2), heading `## Datasource context`. Binding domain context.
 4. **User memory** — `USER_MEMORY.md` (step 1d.1), heading `## User memory (preferences and policies)`.
 5. **Few-shot examples** — the ranked matches from step 2.
 6. **User question.**
@@ -797,7 +797,7 @@ The correction can arrive two ways: the user **types** it, or they paste the blo
 **Where it goes — route with the SAME decision tree as [`agami-save-correction`](../agami-save-correction/SKILL.md) Phase 3 (one source of truth; do NOT re-derive a routing here).** The mechanics:
 
 1. **Floor (always):** the corrected SQL for *this question* lands as a prompt example — `sm add-example "$ROOT" --area <area> --file <json>` (dedups by question, so it replaces). Exactly the onboarding seed behavior. A pure note with no SQL change skips this.
-2. **The learning on top**, routed by the tree — a column's meaning/unit/encoding/value-map → `field_metadata` (`unit` / `value_transform` / `choice_field`); a join fix → `relationship`; a whole-table fact → `table_metadata`; a reusable aggregation → `new_metric`; a per-result caveat tied to this one question → the example's `notes[]`; a cross-cutting display convention for this DB → `ORGANIZATION.md`; a personal stylistic tic → `USER_MEMORY.md`. Model edits go through `sm curate`; build the ops JSON with the **Write tool** (never a heredoc / `python3 -c`).
+2. **The learning on top**, routed by the tree — a column's meaning/unit/encoding/value-map → `field_metadata` (`unit` / `value_transform` / `choice_field`); a join fix → `relationship`; a whole-table fact → `table_metadata`; a reusable aggregation → `new_metric`; a per-result caveat tied to this one question → the example's `notes[]`; a cross-cutting display convention for this DB → `datasource.md`; a personal stylistic tic → `USER_MEMORY.md`. Model edits go through `sm curate`; build the ops JSON with the **Write tool** (never a heredoc / `python3 -c`).
 
 **A shared-model edit needs the user's nod — an example save doesn't.** Saving the corrected SQL as an *example* (the floor) is automatic; it only shapes this question's few-shot. But a **shared-model edit** (a `caveat` / `unit` / `value_transform`, a relationship fix, a description, a new metric) changes how **every** future query reads that column or join — so **state the exact change and get a quick OK before writing it**, e.g. *"I'd add a caveat to `sales.discount_amount`: 'cart-level discount, not pushed to line items — allocate across lines.' Add it?"* This is the same gate `agami-save-correction` enforces ("show a diff before any model mutation") — handling it inline here does **not** drop it.
 
@@ -911,7 +911,7 @@ End with:
 
 | Symptom | Action |
 |---|---|
-| `<artifacts_dir>/<profile>/org.yaml` missing AND `<artifacts_dir>/local/<profile>.yaml` missing | Invoke `connect` |
+| `<artifacts_dir>/<profile>/datasource.yaml` missing AND `<artifacts_dir>/local/<profile>.yaml` missing | Invoke `connect` |
 | Model file fails to parse as YAML | Surface error; tell the user "say 'reload the schema' to re-introspect from your DB" (the agami-connect skill handles it) |
 | `version` ≠ `"0.1.1"` | Warn but proceed; suggest "say 'reload the schema'" to regenerate the model in the latest format |
 | Credentials chmod wrong | Refuse, offer `chmod 600` |

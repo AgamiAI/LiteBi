@@ -30,7 +30,7 @@ def _two_area_org():
     area_b = m.SubjectArea(name="incidents", tables_defined=[own], tables=[
         m.TableRef(storage_connection="c", schema="s", table="incident"),
         m.TableRef(storage_connection="c", schema="s", table="sys_user")])
-    return m.Organization(organization="o", subject_areas=[area_a, area_b])
+    return m.Datasource(datasource="o", subject_areas=[area_a, area_b])
 
 
 def test_find_table_resolves_referenced_table_from_other_area():

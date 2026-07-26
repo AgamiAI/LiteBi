@@ -41,7 +41,7 @@ If plan mode is not active, skip this phase silently and go to Phase 1.
 
 Resolve `<profile>` in this order: `AGAMI_PROFILE` env var → `active_profile` field in `<artifacts_dir>/local/.config` → literal string `"default"` (legacy fallback).
 
-Resolve `<artifacts_dir>` per [`shared/file-layout.md → Configuring artifacts_dir`](../../shared/file-layout.md#configuring-artifacts_dir): `AGAMI_ARTIFACTS_DIR` env var → `<artifacts_dir>/local/.config.artifacts_dir` → default `$HOME/agami-artifacts`. All examples / model / ORGANIZATION.md paths in this skill resolve under `<artifacts_dir>/<profile>/`. USER_MEMORY.md is at `<artifacts_dir>/USER_MEMORY.md` (top-level, cross-database).
+Resolve `<artifacts_dir>` per [`shared/file-layout.md → Configuring artifacts_dir`](../../shared/file-layout.md#configuring-artifacts_dir): `AGAMI_ARTIFACTS_DIR` env var → `<artifacts_dir>/local/.config.artifacts_dir` → default `$HOME/agami-artifacts`. All examples / model / datasource.md paths in this skill resolve under `<artifacts_dir>/<profile>/`. USER_MEMORY.md is at `<artifacts_dir>/USER_MEMORY.md` (top-level, cross-database).
 
 For v1.0 / v1.1 fallback paths (`<artifacts_dir>/local/<profile>.yaml`, `<artifacts_dir>/local/<profile>-examples.yaml`, `<artifacts_dir>/<profile>/`), only read; never write. Migration is agami-connect's job — this skill assumes the user has already migrated by the time they're saving corrections.
 
@@ -99,7 +99,7 @@ Compare the original SQL (from `query_log.jsonl`) to the corrected SQL. Identify
 | Category | What the user did (wrong) | What should have happened |
 |---|---|---|
 | Per-example commentary ("order total can be negative on #12") | Captured in `examples.yaml` `notes[]` | Field description on `ORDERS.TOTAL` (`field_metadata`) |
-| Status normalization (active / ACTIVE / 1 → "Active") | `ORGANIZATION.md` | `agami.choice_field` on `CUSTOMERS.STATUS` (`field_metadata`) |
+| Status normalization (active / ACTIVE / 1 → "Active") | `datasource.md` | `agami.choice_field` on `CUSTOMERS.STATUS` (`field_metadata`) |
 | "Format counts with commas in outputs" | Captured in a markdown file as prose | `user_preference` in `USER_MEMORY.md` AND `TO_CHAR(…)` / aliases IN the seed example's SQL |
 
 The decision tree below corrects these failures. **Walk it top to bottom — first match wins.** Don't fall back to `org_context` as a default; it's the catch-all that produces the wrong outcome in practice.
@@ -148,7 +148,7 @@ Else: is the correction a DISPLAY / FORMATTING / DEFAULT-FILTER preference?
      the table's `default_filters` (model), via `cli curate`.
    - It's a cross-cutting presentation convention not tied to one column — "present
      money with lakh/crore grouping" → `user_preference` → `USER_MEMORY.md` (it's a
-     presentation rule, not domain meaning; ORGANIZATION.md is narrative-only now).
+     presentation rule, not domain meaning; datasource.md is narrative-only now).
    - It's a personal stylistic tic that would hold on ANY database — "I like top-10
      not top-5", "my date format" → `user_preference` → `USER_MEMORY.md`.
    Only when you genuinely can't tell personal vs org-wide → **AskUserQuestion** (the
@@ -163,7 +163,7 @@ Else: is the correction about a BUSINESS TERM specific to this database's domain
     in Stripe" — what the data fundamentally doesn't include)
    → org_context. A term → `cli set-terminology` (the structured `key_terminology`
      glossary). A higher-level narrative ("we don't track refunds…", "who the users
-     are") → an ORGANIZATION.md prose line. See the `org_context` edit section for both.
+     are") → a datasource.md prose line. See the `org_context` edit section for both.
        → org_context is for ABSTRACT business concepts not tied to one specific
          column. A correction tied to a specific column belongs in field_metadata,
          NOT here. Re-check the first rule of the tree before landing here.
@@ -175,9 +175,9 @@ Else: pure SQL syntax / typo with no domain knowledge implied
 
 ### Anti-patterns the LLM keeps producing (do NOT do these)
 
-1. **Per-column rule → ORGANIZATION.md.** "`CUSTOMERS.STATUS` values normalize to Active" is NOT domain context — it's a column-value mapping. Route to `field_metadata` (`choice_field`).
+1. **Per-column rule → datasource.md.** "`CUSTOMERS.STATUS` values normalize to Active" is NOT domain context — it's a column-value mapping. Route to `field_metadata` (`choice_field`).
 2. **Per-column rule → examples.yaml notes.** This skill never writes to `examples.yaml.notes[]` (that path lives in agami-connect Phase 6d). If you find yourself wanting to write "the order total can be negative" as a note on example #12, route it to `field_metadata` on the actual column instead — the lesson applies to every future query, not just to one example.
-3. **Dumping a column-fact into a prose file (or USER_MEMORY).** "Amounts are in INR → show ₹" is a fact about the `amount` column → a `caveat`/`value_transform` on that column (org-wide, structured, in the shared model) — NOT a USER_MEMORY line and NOT an ORGANIZATION.md prose rule. Route data-facts to the column/table; reserve the prose files for cross-cutting conventions (ORGANIZATION.md) and personal tics (USER_MEMORY). Don't reflexively ask — classify; ask only when personal-vs-org is genuinely unclear.
+3. **Dumping a column-fact into a prose file (or USER_MEMORY).** "Amounts are in INR → show ₹" is a fact about the `amount` column → a `caveat`/`value_transform` on that column (org-wide, structured, in the shared model) — NOT a USER_MEMORY line and NOT a datasource.md prose rule. Route data-facts to the column/table; reserve the prose files for cross-cutting conventions (datasource.md) and personal tics (USER_MEMORY). Don't reflexively ask — classify; ask only when personal-vs-org is genuinely unclear.
 4. **Display preference → prose without changing SQL.** If the correction is "always format like X," ALSO modify the seed example's SQL to demonstrate the formatting (so future answers actually apply it, not just describe it).
 
 ### Diff-based hints (look at SQL changes for classification clues)
@@ -225,7 +225,7 @@ Classification: field_metadata
 
 Classification: field_metadata
   → routing to: sales/CUSTOMERS.yaml → fields["STATUS"].agami.choice_field
-  → reasoning: rule says "value normalization mapping (active/ACTIVE/1 → 'Active') belongs in choice_field" — not ORGANIZATION.md.
+  → reasoning: rule says "value normalization mapping (active/ACTIVE/1 → 'Active') belongs in choice_field" — not datasource.md.
 
 Classification: user_preference + seed-example update
   → routing to: USER_MEMORY.md (the prose preference) AND examples.yaml example #N (TO_CHAR in SQL)
@@ -254,7 +254,7 @@ Model edits go through the curation engine (`semantic_model.cli curate "$ROOT" -
 | `field_metadata` | `cli curate` `edit` op(s) on the column (kind: table, + `column`) |
 | `table_metadata` | `cli curate` `edit` op(s) on the table |
 | `new_metric` | Write a new `subject_areas/<area>/metrics/<name>.yaml`, then `cli validate "$ROOT"` |
-| `org_context` | a term → `cli set-terminology` (structured `key_terminology`, validated); a narrative line → append to `ORGANIZATION.md` (no validator) |
+| `org_context` | a term → `cli set-terminology` (structured `key_terminology`, validated); a narrative line → append to `datasource.md` (no validator) |
 | `user_preference` | append to `USER_MEMORY.md` (no validator) |
 
 #### `relationship` edit
@@ -316,15 +316,15 @@ The user's bullet should be self-contained — anyone reading USER_MEMORY.md sho
   printf '{"gold tier": "lifetime spend > $10k"}' > /tmp/agami-term.json
   bash "$AGAMI_PLUGIN_ROOT/scripts/sm" set-terminology "$ROOT" --file /tmp/agami-term.json
   ```
-  The key is the term; the value is a **self-contained** definition (understandable without the original conversation). It merges by default — existing terms are never lost. **Never** hand-append `- "term" = definition` lines to ORGANIZATION.md; that's the old prose home and is wrong now.
-- **A higher-level narrative** — what the data represents, who the users are, what's *not* in this database. Append a sentence/paragraph to `<artifacts_dir>/<profile>/ORGANIZATION.md` under `# About this database` (create it with the starter if missing — `cli org-draft "$ROOT" > "$ROOT/ORGANIZATION.md"`). This file is the human narrative **only** — no `term = definition` lines, no model facts.
-- **A cross-cutting display/formatting convention** (a currency symbol or number grouping everyone querying this DB should see) is a *presentation* preference, not domain meaning: route it to `user_preference` → `USER_MEMORY.md`, or — when it's really a fact about one column (units/currency) — to that column's `caveat`/`value_transform`. Do **not** invent an ORGANIZATION.md "conventions" heading; the file is narrative-only.
+  The key is the term; the value is a **self-contained** definition (understandable without the original conversation). It merges by default — existing terms are never lost. **Never** hand-append `- "term" = definition` lines to datasource.md; that's the old prose home and is wrong now.
+- **A higher-level narrative** — what the data represents, who the users are, what's *not* in this database. Append a sentence/paragraph to `<artifacts_dir>/<profile>/datasource.md` under `# About this database` (create it with the starter if missing — `cli org-draft "$ROOT" > "$ROOT/datasource.md"`). This file is the human narrative **only** — no `term = definition` lines, no model facts.
+- **A cross-cutting display/formatting convention** (a currency symbol or number grouping everyone querying this DB should see) is a *presentation* preference, not domain meaning: route it to `user_preference` → `USER_MEMORY.md`, or — when it's really a fact about one column (units/currency) — to that column's `caveat`/`value_transform`. Do **not** invent a datasource.md "conventions" heading; the file is narrative-only.
 
-**Show the user the diff** (Phase 4b) before writing. `set-terminology` is validated (reverts on failure); ORGANIZATION.md prose is free-form (no validation).
+**Show the user the diff** (Phase 4b) before writing. `set-terminology` is validated (reverts on failure); datasource.md prose is free-form (no validation).
 
 #### `mixed` edit
 
-Apply each individual edit as above. Show the user the combined diff in 4b before validating. If the mix includes a `user_preference` or `org_context`, those parts skip the validator (USER_MEMORY.md / ORGANIZATION.md aren't validated); the semantic-model parts still go through the validator.
+Apply each individual edit as above. Show the user the combined diff in 4b before validating. If the mix includes a `user_preference` or `org_context`, those parts skip the validator (USER_MEMORY.md / datasource.md aren't validated); the semantic-model parts still go through the validator.
 
 ### 4b — show the diff to the user, get approval
 
@@ -343,9 +343,9 @@ Build a unified diff (or a compact "before / after" summary) of the proposed cha
 > - **No** — leave the model as-is, the example is still saved
 > - **Edit first** — let me tweak before applying
 
-For `org_context` / `user_preference` the file is `ORGANIZATION.md` / `USER_MEMORY.md` instead of a schema yaml — same prompt shape, just a different filename.
+For `org_context` / `user_preference` the file is `datasource.md` / `USER_MEMORY.md` instead of a schema yaml — same prompt shape, just a different filename.
 
-Always include the validator step in 4c regardless of which option they pick (since "Yes" still has to validate, except for ORGANIZATION.md / USER_MEMORY.md which aren't validated).
+Always include the validator step in 4c regardless of which option they pick (since "Yes" still has to validate, except for datasource.md / USER_MEMORY.md which aren't validated).
 
 ### 4c — apply with validation (the gate)
 
@@ -368,7 +368,7 @@ Same `{applied, skipped, errors, validated, committed}` contract as above: `vali
 
 There is no override path — a model that fails validation is never persisted; `<artifacts_dir>/<profile>/` is left unchanged. The example library still got the correction (Phase 2 already happened).
 
-For `org_context` / `user_preference` corrections (ORGANIZATION.md / USER_MEMORY.md only): no validator step. Write the file directly with `chmod 600`.
+For `org_context` / `user_preference` corrections (datasource.md / USER_MEMORY.md only): no validator step. Write the file directly with `chmod 600`.
 
 ### 4d — confirmation
 
@@ -403,6 +403,6 @@ Next time someone asks "<question>" or anything similar, I'll use the corrected 
 ## Hard rules
 
 1. **Phase 2 (examples append) always runs.** Even if the user later changes their mind on the model edit, the example is already saved.
-2. **Phase 5 model writes are gated by the validator.** `cli curate` (edits existing entries) and `cli add` (creates a new metric/entity) are the only ways to write inside `<artifacts_dir>/<profile>/`, and both refuse / revert on a validation failure. No exceptions. ORGANIZATION.md and USER_MEMORY.md edits skip the validator (free-form Markdown).
+2. **Phase 5 model writes are gated by the validator.** `cli curate` (edits existing entries) and `cli add` (creates a new metric/entity) are the only ways to write inside `<artifacts_dir>/<profile>/`, and both refuse / revert on a validation failure. No exceptions. datasource.md and USER_MEMORY.md edits skip the validator (free-form Markdown).
 3. **Edits stay valid against the model.** Don't invent fields — the Pydantic models (`packages/agami-core/src/semantic_model/models.py`) forbid unknown keys, so an invalid edit is rejected by the validator. When you can't express a correction within the model shape, fall back to `sql_fix` (example only) and tell the user "I can save this as a few-shot example but it doesn't fit a model edit."
 4. **Show the diff before mutating the model.** The user always gets to see and approve the proposed change.

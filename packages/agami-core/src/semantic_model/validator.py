@@ -51,8 +51,8 @@ except ImportError:  # pragma: no cover - sqlglot is in requirements
 
 from .models import (
     CrossSubjectAreaRelationship,
+    Datasource,
     Entity,
-    Organization,
     Relationship,
     SubjectArea,
     Table,
@@ -147,7 +147,7 @@ def _org_tables_sig(org_tables: dict[str, Table]) -> str:
     return h.hexdigest()
 
 
-def _bound_cache(cache: ValidationCache, org: Organization) -> None:
+def _bound_cache(cache: ValidationCache, org: Datasource) -> None:
     """Cap total cache size for long-lived processes. Evict oldest entries for areas NOT in the
     current model first (insertion order); never evict the current model's areas, so a single large
     model doesn't thrash. Only triggers well past any real model's area count."""
@@ -161,7 +161,7 @@ def _bound_cache(cache: ValidationCache, org: Organization) -> None:
 
 
 def _validate_area(
-    sa: SubjectArea, org: Organization, org_tables: dict[str, Table]
+    sa: SubjectArea, org: Datasource, org_tables: dict[str, Table]
 ) -> list[Finding]:
     """Run one area's per-area rule battery into its own result and return just its findings, so a
     run cache can reuse them verbatim when the area (and the table registry) are unchanged."""
@@ -183,7 +183,7 @@ def _validate_area(
     return ares.findings
 
 
-def validate(org: Organization, *, cache: "ValidationCache | None" = None) -> ValidationResult:
+def validate(org: Datasource, *, cache: "ValidationCache | None" = None) -> ValidationResult:
     """Run every cross-cutting rule. Returns a ValidationResult (never raises on
     a model-level problem — those surface as the model failing to parse upstream).
 
@@ -237,7 +237,7 @@ def _all_tables(sa: SubjectArea) -> dict[str, Table]:
     return {t.name: t for t in sa.tables_defined}
 
 
-def _check_storage_connection_refs(org: Organization, res: ValidationResult) -> None:
+def _check_storage_connection_refs(org: Datasource, res: ValidationResult) -> None:
     known = {sc.name for sc in org.storage_connections}
     for sa in org.subject_areas:
         for ref in sa.tables:
@@ -268,7 +268,7 @@ def _check_subject_area_sizing(sa: SubjectArea, res: ValidationResult) -> None:
         )
 
 
-def _org_tables(org: Organization) -> dict[str, Table]:
+def _org_tables(org: Datasource) -> dict[str, Table]:
     """Every canonical Table across the org, keyed by name (org-wide resolution)."""
     out: dict[str, Table] = {}
     for sa in org.subject_areas:
@@ -420,7 +420,7 @@ def _check_entity_mappings(
 def _check_relationship(
     rel: Relationship,
     sa: SubjectArea,
-    org: Organization,
+    org: Datasource,
     res: ValidationResult,
     *,
     cross: bool,
@@ -465,7 +465,7 @@ def _check_relationship(
 
 
 def _check_cross_relationship(
-    rel: CrossSubjectAreaRelationship, org: Organization, res: ValidationResult
+    rel: CrossSubjectAreaRelationship, org: Datasource, res: ValidationResult
 ) -> None:
     sa_from = org.subject_area(rel.from_subject_area)
     sa_to = org.subject_area(rel.to_subject_area)
@@ -508,7 +508,7 @@ def _check_cross_relationship(
             )
 
 
-def _check_cross_area_entity_collisions(org: Organization, res: ValidationResult) -> None:
+def _check_cross_area_entity_collisions(org: Datasource, res: ValidationResult) -> None:
     """Two areas independently declaring the same entity name (or overlapping
     other_names) with maps_to into different connections/schemas → warning + a
     suggestion to unify in a cross-cutting area."""
@@ -557,7 +557,7 @@ def _check_cross_area_entity_collisions(org: Organization, res: ValidationResult
                     )
 
 
-def _check_metric_backend_neutrality(org: Organization, res: ValidationResult) -> None:
+def _check_metric_backend_neutrality(org: Datasource, res: ValidationResult) -> None:
     """Verification check #4: every metric's `calculation` (prose intent) must be
     non-empty — no metric may depend ONLY on a SQL binding. (models enforces
     non-empty; here we also flag binding-only metrics with placeholder prose.)"""
@@ -573,7 +573,7 @@ def _check_metric_backend_neutrality(org: Organization, res: ValidationResult) -
             )
 
 
-def _check_derived_metrics(org: Organization, res: ValidationResult) -> None:
+def _check_derived_metrics(org: Datasource, res: ValidationResult) -> None:
     """Scorecard #1: a derived metric (one composing others via {base} placeholders)
     must resolve — no cycles, no unknown bases, no illegal second-order nesting. A
     base over a disjoint grain is a warning (inline composition may be wrong; full
@@ -630,7 +630,7 @@ def _binding_column_refs(sql: str) -> set[str]:
     return {c.name.lower() for c in tree.find_all(exp.Column) if c.name}
 
 
-def _check_metric_binding_columns(org: Organization, res: ValidationResult) -> None:
+def _check_metric_binding_columns(org: Datasource, res: ValidationResult) -> None:
     """WARN when a metric's binding references a column that exists on NONE of its source_tables —
     catches a typo'd or renamed column (e.g. `SUM(cst)`) before it fails at query time, which is
     the one thing the hand-edited SQL snippet otherwise has no safety net for.
@@ -735,7 +735,7 @@ def _types_compatible(a: str, b: str) -> bool:
     return frozenset({a, b}) in _COERCIBLE_PAIRS
 
 
-def _entity_targets(org: Organization, area_name: str, ent: Entity) -> set[str]:
+def _entity_targets(org: Datasource, area_name: str, ent: Entity) -> set[str]:
     """Resolve an entity's maps_to into a set of 'connection.schema.table' strings."""
     sa = org.subject_area(area_name)
     out: set[str] = set()

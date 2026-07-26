@@ -28,22 +28,22 @@ from semantic_model import build  # noqa: E402
 from semantic_model import org_record as OR  # noqa: E402
 from semantic_model.cli import main as cli_main  # noqa: E402
 from semantic_model.models import (  # noqa: E402
+    Datasource,
     DisplayConventions,
-    Organization,
     OrgRecord,
     SubjectArea,
 )
 
 
 def _profile(root: Path, name: str, area: str, account_means: str) -> None:
-    org = Organization(
-        organization=name,
+    org = Datasource(
+        datasource=name,
         subject_areas=[SubjectArea(name=area, description=f"{area} area")],
     )
     build.write_tree(org, root / name)
     # key_terminology is written by the enrichment / set-terminology path, not write_tree — inject it so
-    # the source-specific vocabulary ("Account" resolves per source) round-trips through load_organization.
-    org_yaml = root / name / "org.yaml"
+    # the source-specific vocabulary ("Account" resolves per source) round-trips through load_datasource.
+    org_yaml = root / name / "datasource.yaml"
     doc = yaml.safe_load(org_yaml.read_text())
     doc["key_terminology"] = {"Account": account_means}
     org_yaml.write_text(yaml.safe_dump(doc, sort_keys=False))

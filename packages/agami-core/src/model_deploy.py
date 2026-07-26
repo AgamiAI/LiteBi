@@ -21,7 +21,7 @@ from store import Store
 def _default_org() -> str:
     """The org to deploy under when the caller names none. A CLI has no request, so it calls the SAME
     resolver the server's read path uses (`tools.resolved_org_id`: AGAMI_ORG_ID -> the minted uuid in
-    org.yaml -> 'local') — the two MUST agree, or the model is written under one org and read under
+    organization.yaml -> 'local') — the two MUST agree, or the model is written under one org and read under
     another and the server sees no model (F14 / ACE-056)."""
     from tools import resolved_org_id  # lazy: keeps the deploy CLI's import surface small
 
@@ -43,7 +43,7 @@ def _backfill_org_id(store: Store, org_id: str) -> None:
     (F14 / ACE-057). Runs once at boot, right after migrations, so an EXISTING deployment that ran
     under 'local' before this feature adopts its minted id instead of orphaning those rows.
 
-    Why an UPDATE-move and not a re-seed: `model_store.write_organization`'s redeploy DELETE is scoped
+    Why an UPDATE-move and not a re-seed: `model_store.write_datasource`'s redeploy DELETE is scoped
     to (org_id, datasource), so re-deploying under a NEW org_id would leave the old 'local' serving
     rows behind (doubled); the runtime tables are append-only and can only be corrected by an UPDATE.
     Idempotent + safe: a no-op when the target is still 'local' (a pre-F14 / un-minted deployment), and
@@ -57,7 +57,7 @@ def _backfill_org_id(store: Store, org_id: str) -> None:
 
 
 def deploy_one(store: Store, datasource: str, profile_dir: Path, org_id: str | None = None) -> None:
-    """Load one datasource's per-datasource model (org + examples + ORGANIZATION.md + version) from
+    """Load one datasource's per-datasource model (org + examples + datasource.md + version) from
     `profile_dir` into the store. The install-global `USER_MEMORY.md` is handled once per run, separately
     (`_deploy_user_memory`) — it lives at the artifacts ROOT, not per profile.
 
@@ -71,7 +71,7 @@ def deploy_one(store: Store, datasource: str, profile_dir: Path, org_id: str | N
 
     org_id = org_id if org_id is not None else _default_org()
     # --- read + parse everything first (where malformed input fails, before any write) ---
-    org = loader.load_organization(profile_dir)
+    org = loader.load_datasource(profile_dir)
     # Examples live per subject area (prompt_examples/<area>/examples.yaml); tag each with its area so the
     # served row carries it (write_examples reads ex["area"]). A malformed examples file for one area is
     # skipped with a warning, not fatal — examples are best-effort few-shots, not the model itself, and a bad
@@ -84,17 +84,17 @@ def deploy_one(store: Store, datasource: str, profile_dir: Path, org_id: str | N
             print(f"model_deploy: skipping malformed examples for area {sa.name!r}: {e}", file=sys.stderr)
             continue
         examples.extend({**ex, "area": ex.get("area") or sa.name} for ex in area_examples if isinstance(ex, dict))
-    org_md = profile_dir / "ORGANIZATION.md"
-    org_text = org_md.read_text() if org_md.exists() else None
+    datasource_md = profile_dir / "datasource.md"
+    datasource_text = datasource_md.read_text() if datasource_md.exists() else None
     version = newest_version(profile_dir) or "deployed"
 
     # --- then write (version last, so its presence marks a completed deploy) ---
-    model_store.write_organization(store, datasource, org, org_id=org_id)
+    model_store.write_datasource(store, datasource, org, org_id=org_id)
     # Always write examples (even []) so a redeploy after REMOVING examples actually clears the stale rows —
     # write_examples is clear-then-insert, so an empty list replaces the datasource's examples with none.
     model_store.write_examples(store, datasource, examples, org_id=org_id)
     model_store.write_memory(
-        store, datasource, organization=org_text, org_id=org_id
+        store, datasource, datasource_doc=datasource_text, org_id=org_id
     )  # per-datasource
     model_store.write_model_version(store, datasource, version, org_id=org_id)
     store.commit()
@@ -130,20 +130,20 @@ def _deploy_org_record(store: Store, artifacts_dir: Path, org_id: str | None = N
         # (datasource='' sentinel, like USER_MEMORY.md) so the served two-level context can read it.
         narrative = OR.narrative_path(artifacts_dir)
         if narrative.exists():
-            model_store.write_memory(store, "", organization=narrative.read_text(), org_id=org_id)
+            model_store.write_memory(store, "", datasource_doc=narrative.read_text(), org_id=org_id)
 
 
 def deploy_models(store: Store, artifacts_dir: Path, org_id: str | None = None) -> list[str]:
-    """Load every datasource model under `artifacts_dir` (a *directory* with an `org.yaml`) into the store.
+    """Load every datasource model under `artifacts_dir` (a *directory* with an `datasource.yaml`) into the store.
     Returns the datasources loaded. The `local/` dir (gitignored secrets/state) and any non-directory or
-    org.yaml-less entry are skipped — `local/` explicitly, so a stray `local/org.yaml` can't deploy from the
+    datasource.yaml-less entry are skipped — `local/` explicitly, so a stray `local/datasource.yaml` can't deploy from the
     secrets dir."""
     org_id = org_id if org_id is not None else _default_org()
     loaded: list[str] = []
     for prof in sorted(
         p
         for p in artifacts_dir.iterdir()
-        if p.is_dir() and p.name != agami_paths.LOCAL_SUBDIR and (p / "org.yaml").exists()
+        if p.is_dir() and p.name != agami_paths.LOCAL_SUBDIR and (p / "datasource.yaml").exists()
     ):
         deploy_one(store, prof.name, prof, org_id=org_id)
         loaded.append(prof.name)
@@ -174,9 +174,9 @@ def main(argv: list[str] | None = None) -> int:
             loaded: list[str] = []
             for ds in args:
                 prof = artifacts_dir / ds
-                if not (prof / "org.yaml").exists():
+                if not (prof / "datasource.yaml").exists():
                     print(
-                        f"model_deploy: no model for datasource {ds!r} at {prof}/org.yaml",
+                        f"model_deploy: no model for datasource {ds!r} at {prof}/datasource.yaml",
                         file=sys.stderr,
                     )
                     return 1
@@ -187,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             if not loaded:
                 print(
                     f"model_deploy: no model found under {artifacts_dir} "
-                    "(a datasource is a subdir with an org.yaml).",
+                    "(a datasource is a subdir with a datasource.yaml).",
                     file=sys.stderr,
                 )
                 return 1

@@ -1,6 +1,6 @@
 """The admin read-only Model explorer.
 
-A pure projection of the served model (`load_organization`) + domain docs (`load_memory`): the
+A pure projection of the served model (`load_datasource`) + domain docs (`load_memory`): the
 overview / area landing / table page render the served tree; it is admin-gated, read-only (a GET
 only), never leaks `storage_config`, and escapes operator-authored text.
 """
@@ -26,7 +26,7 @@ import mcp_http  # noqa: E402
 import model_store  # noqa: E402
 import ui  # noqa: E402
 import user_store  # noqa: E402
-from semantic_model.models import Organization  # noqa: E402
+from semantic_model.models import Datasource  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 from store import Store  # noqa: E402
 
@@ -37,7 +37,7 @@ ADMIN_PW = "admin-password-localtest"
 
 # A neutral served model — `storage_config` carries a sentinel that must NEVER reach the rendered page.
 ORG = {
-    "organization": "acme",
+    "datasource": "acme",
     "version": 1,
     "description": "Acme Commerce — the deployed model.",
     "fiscal_year_start_month": 1,
@@ -162,7 +162,7 @@ ORG = {
 
 # A model whose table authors `column_groups` — the grouped column view (the other 12%).
 GROUPED_ORG = {
-    "organization": "acme",
+    "datasource": "acme",
     "storage_connections": [{"name": "c", "storage_type": "PostgreSQL"}],
     "subject_areas": [
         {
@@ -193,7 +193,7 @@ GROUPED_ORG = {
 def _seed(url, datasource="SALES_DATA", org=ORG):
     s = Store.connect(url)
     s.run_migrations()
-    model_store.write_organization(s, datasource, Organization.model_validate(org))
+    model_store.write_datasource(s, datasource, Datasource.model_validate(org))
     s.close()
 
 
@@ -464,7 +464,7 @@ def test_md_inline_code_is_literal_not_reparsed():
 def test_context_page_renders_org_md(client, env):
     _seed(env)
     s = Store.connect(env)
-    model_store.write_memory(s, "SALES_DATA", organization="# About\n\nAcme **notes**.")
+    model_store.write_memory(s, "SALES_DATA", datasource_doc="# About\n\nAcme **notes**.")
     s.close()
     _login(client)
     html = client.get("/admin/model?datasource=SALES_DATA&view=context").text
@@ -474,7 +474,7 @@ def test_context_page_renders_org_md(client, env):
 def test_context_page_escapes_doc(client, env):
     _seed(env)
     s = Store.connect(env)
-    model_store.write_memory(s, "SALES_DATA", organization="<script>alert(1)</script>")
+    model_store.write_memory(s, "SALES_DATA", datasource_doc="<script>alert(1)</script>")
     s.close()
     _login(client)
     html = client.get("/admin/model?datasource=SALES_DATA&view=context").text
@@ -491,7 +491,7 @@ def test_context_page_empty_when_no_doc(client, env):
 # --- cross-area (org-level) objects are not dropped --------------------------
 
 CROSS_ORG = {
-    "organization": "acme",
+    "datasource": "acme",
     "storage_connections": [{"name": "c", "storage_type": "PostgreSQL"}],
     "subject_areas": [{"name": "A", "tables": [], "tables_defined": []}],
     "cross_subject_area_metrics": [{"name": "global_rev", "calculation": "sum all"}],
@@ -510,7 +510,7 @@ def test_cross_area_objects_surface_on_overview(client, env):
 # --- cross-area relationships view -------------------------------------------
 
 XREL_ORG = {
-    "organization": "acme",
+    "datasource": "acme",
     "storage_connections": [{"name": "c", "storage_type": "PostgreSQL"}],
     "subject_areas": [
         {"name": "finance", "tables": [], "tables_defined": []},

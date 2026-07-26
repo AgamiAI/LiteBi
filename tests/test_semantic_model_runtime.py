@@ -26,7 +26,7 @@ def _sales_org():
         m.Relationship(from_table="tickets", to_table="customers", from_column="customer_id",
                        to_column="id", relationship="many_to_one"),
     ]
-    return m.Organization(organization="Shop",
+    return m.Datasource(datasource="Shop",
                           subject_areas=[m.SubjectArea(name="sales", relationships=rels)])
 
 
@@ -120,7 +120,7 @@ def _entity_org():
                   maps_to=[m.EntityMapping(table="orders", column="order_no", primary=True)])
     o2 = m.Entity(name="Shipment", value_pattern=r"^SH\w+$",
                   maps_to=[m.EntityMapping(table="shipments", column="ship_no", primary=True)])
-    return m.Organization(organization="Acme",
+    return m.Datasource(datasource="Acme",
                           subject_areas=[m.SubjectArea(name="b", entities=[o1, o2])])
 
 
@@ -168,7 +168,7 @@ def _filter_org():
                          m.Column(name="total", type="decimal"),
                          m.Column(name="tenant_id", type="integer")],
                 default_filters=["{alias}.deleted_at IS NULL"])
-    return m.Organization(organization="S",
+    return m.Datasource(datasource="S",
                           subject_areas=[m.SubjectArea(name="s",
                               tables=[m.TableRef(storage_connection="c", schema="public", table="orders")],
                               tables_defined=[t])])

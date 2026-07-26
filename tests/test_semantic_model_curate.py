@@ -29,8 +29,8 @@ def _write_model(root: Path, *, git: bool = True) -> None:
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
     (root / "subject_areas" / "sales" / "metrics").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "shop", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "shop", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/sales"],
     }))
@@ -73,7 +73,7 @@ def _write_model(root: Path, *, git: bool = True) -> None:
 
 def test_review_queue_partitions_rule1_rule2(tmp_path):
     _write_model(tmp_path, git=False)
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     q = curate.review_queue(org)
     assert q["counts"]["rule_1"] == 1  # the proposed metric
     assert q["counts"]["rule_2"] == 1  # the inferred relationship
@@ -83,7 +83,7 @@ def test_review_queue_partitions_rule1_rule2(tmp_path):
 
 def test_model_tree_shows_columns_and_state(tmp_path):
     _write_model(tmp_path, git=False)
-    org = loader.load_organization(tmp_path, include_rejected=True)
+    org = loader.load_datasource(tmp_path, include_rejected=True)
     tree = curate.model_tree(org)
     orders = next(t for t in tree["subject_areas"][0]["tables"] if t["table"] == "orders")
     assert orders["review_state"] == "approved"
@@ -96,10 +96,10 @@ def test_exclude_table_hides_from_runtime(tmp_path):
     res = curate.apply(tmp_path, [{"op": "exclude", "kind": "table",
                                    "area": "sales", "name": "orders"}])
     assert res.validated and res.applied
-    runtime = loader.load_organization(tmp_path)  # drops rejected
+    runtime = loader.load_datasource(tmp_path)  # drops rejected
     assert not any(t.name == "orders" for sa in runtime.subject_areas for t in sa.tables_defined)
     # still visible with include_rejected (so the explorer can toggle it back)
-    full = loader.load_organization(tmp_path, include_rejected=True)
+    full = loader.load_datasource(tmp_path, include_rejected=True)
     assert any(t.name == "orders" for sa in full.subject_areas for t in sa.tables_defined)
 
 
@@ -107,7 +107,7 @@ def test_include_restores(tmp_path):
     _write_model(tmp_path)
     curate.apply(tmp_path, [{"op": "exclude", "kind": "table", "area": "sales", "name": "orders"}])
     curate.apply(tmp_path, [{"op": "include", "kind": "table", "area": "sales", "name": "orders"}])
-    runtime = loader.load_organization(tmp_path)
+    runtime = loader.load_datasource(tmp_path)
     assert any(t.name == "orders" for sa in runtime.subject_areas for t in sa.tables_defined)
 
 
@@ -116,7 +116,7 @@ def test_exclude_column(tmp_path):
     res = curate.apply(tmp_path, [{"op": "exclude", "kind": "table", "area": "sales",
                                    "name": "orders", "column": "ssn"}])
     assert res.validated
-    orders = loader.load_organization(tmp_path).subject_areas[0].defined_table("orders")
+    orders = loader.load_datasource(tmp_path).subject_areas[0].defined_table("orders")
     assert not any(c.name == "ssn" for c in orders.columns)
 
 
@@ -126,7 +126,7 @@ def test_approve_metric_records_signoff(tmp_path):
                                    "name": "order_count", "at": "2026-06-09T00:00:00Z"}],
                        signer="reviewer@example.com", role="cto")
     assert res.validated
-    org = loader.load_organization(tmp_path)
+    org = loader.load_datasource(tmp_path)
     mm = org.subject_areas[0].metrics[0]
     assert mm.review_state == "approved" and mm.signed_off_by == "reviewer@example.com"
     # no longer in the Rule 1 queue
@@ -139,7 +139,7 @@ def test_approve_relationship(tmp_path):
                                    "name": "orders->customers", "at": "2026-06-09T00:00:00Z"}],
                        signer="reviewer@example.com", role="cto")
     assert res.validated
-    rel = loader.load_organization(tmp_path).subject_areas[0].relationships[0]
+    rel = loader.load_datasource(tmp_path).subject_areas[0].relationships[0]
     assert rel.review_state == "approved" and rel.signed_off_by == "reviewer@example.com"
 
 
@@ -155,7 +155,7 @@ def test_edit_relationship_on_clause(tmp_path):
          "field": "to_column", "value": None},
     ])
     assert res.validated, res.errors
-    rel = loader.load_organization(tmp_path).subject_areas[0].relationships[0]
+    rel = loader.load_datasource(tmp_path).subject_areas[0].relationships[0]
     assert rel.on and "CAST" in rel.on
 
 
@@ -174,7 +174,7 @@ def test_approve_resolves_slugged_metric_name(tmp_path):
                                    "name": "total event sales", "at": "2026-06-12T00:00:00Z"}],
                        signer="x@y.com", role="cto")
     assert res.applied and not res.skipped, res.skipped
-    m2 = next(x for x in loader.load_organization(tmp_path).subject_areas[0].metrics
+    m2 = next(x for x in loader.load_datasource(tmp_path).subject_areas[0].metrics
               if x.name == "total event sales")
     assert m2.review_state == "approved"
 
@@ -191,7 +191,7 @@ def test_edit_op_auto_resolves_area_when_omitted(tmp_path):
     res = curate.apply(tmp_path, [{"op": "edit", "kind": "table", "name": "orders",
                                    "field": "description", "value": "all orders", "source": "ai"}])
     assert res.validated and res.applied and not res.skipped, res.skipped
-    orders = loader.load_organization(tmp_path).subject_areas[0].defined_table("orders")
+    orders = loader.load_datasource(tmp_path).subject_areas[0].defined_table("orders")
     assert orders.description == "all orders"
     assert orders.description_source == "ai_unvalidated"  # source:"ai" stamped
 
@@ -219,8 +219,8 @@ def test_edit_op_ambiguous_area_errors_clearly(tmp_path):
 
 
 def test_approve_cross_area_relationship_writes_org_yaml(tmp_path):
-    """A cross-schema/cross-area join lives in org.yaml (not an area's relationships.yaml),
-    so approving it must update org.yaml via the org-level fallback."""
+    """A cross-schema/cross-area join lives in datasource.yaml (not an area's relationships.yaml),
+    so approving it must update datasource.yaml via the org-level fallback."""
     root = tmp_path
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "datasources" / "c" / "storage.yaml").write_text(
@@ -233,8 +233,8 @@ def test_approve_cross_area_relationship_writes_org_yaml(tmp_path):
             "name": tbl, "schema": area, "storage_connection": "c", "grain": ["id"], "description": tbl,
             "columns": [{"name": "id", "type": "integer", "primary_key": True},
                         {"name": "customer_id", "type": "integer"}]}))
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "shop", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "shop", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/billing", "subject_areas/crm"],
         "cross_subject_area_relationships": [{
@@ -250,17 +250,17 @@ def test_approve_cross_area_relationship_writes_org_yaml(tmp_path):
                                "name": "invoices->customers", "at": "2026-06-12T00:00:00Z"}],
                        signer="reviewer@example.com", role="data_lead")
     assert res.validated and res.applied and not res.skipped, res.skipped
-    o = yaml.safe_load((root / "org.yaml").read_text())
+    o = yaml.safe_load((root / "datasource.yaml").read_text())
     cr = o["cross_subject_area_relationships"][0]
     assert cr["review_state"] == "approved" and cr["signed_off_by"] == "reviewer@example.com"
 
-    # editing a cross-area join's field also persists to org.yaml (the UI edit path) —
+    # editing a cross-area join's field also persists to datasource.yaml (the UI edit path) —
     # not just approve/reject. So cross joins are as editable as regular joins.
     res2 = curate.apply(root, [{"op": "edit", "kind": "relationship", "area": "billing",
                                 "name": "invoices->customers", "field": "description",
                                 "value": "invoice to its CRM account"}])
     assert res2.validated and res2.applied and not res2.skipped, res2.skipped
-    cr2 = yaml.safe_load((root / "org.yaml").read_text())["cross_subject_area_relationships"][0]
+    cr2 = yaml.safe_load((root / "datasource.yaml").read_text())["cross_subject_area_relationships"][0]
     assert cr2["description"] == "invoice to its CRM account"
 
 

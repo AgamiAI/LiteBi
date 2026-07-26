@@ -21,13 +21,13 @@ if str(PKG_SRC) not in sys.path:
 
 import tools  # noqa: E402
 from semantic_model import build, loader  # noqa: E402
-from semantic_model.models import Organization  # noqa: E402
+from semantic_model.models import Datasource  # noqa: E402
 
 _HEX = set("0123456789abcdef")
 
 
-def _minimal_org(name: str = "acme") -> Organization:
-    return Organization(organization=name)
+def _minimal_org(name: str = "acme") -> Datasource:
+    return Datasource(datasource=name)
 
 
 def test_write_tree_mints_uuid4_and_is_immutable(tmp_path):
@@ -38,7 +38,7 @@ def test_write_tree_mints_uuid4_and_is_immutable(tmp_path):
     assert minted and len(minted) == 32 and set(minted) <= _HEX  # a uuid4 hex, minted locally
 
     # load -> mutate -> rewrite: the id is preserved, never re-minted (immutability guarantee).
-    org = loader.load_organization(prof)
+    org = loader.load_datasource(prof)
     assert org.org_id == minted
     org.description = "edited"
     build.write_tree(org, prof)
@@ -76,30 +76,30 @@ def test_deploy_and_serve_resolve_the_same_id(tmp_path, monkeypatch):
 
 
 def test_ensure_org_id_cli_mints_into_copied_model(tmp_path, capsys):
-    # The sample-copy path (agami-connect 6A) drops a prebuilt org.yaml with no id; `sm ensure-org-id`
+    # The sample-copy path (agami-connect 6A) drops a prebuilt datasource.yaml with no id; `sm ensure-org-id`
     # mints one into it. Idempotent: a second run prints the SAME id and doesn't rewrite.
     from semantic_model import cli
 
     prof = tmp_path / "agami-example"
     prof.mkdir()
-    (prof / "org.yaml").write_text("organization: Acme Store\nversion: 1\n")
+    (prof / "datasource.yaml").write_text("datasource: Acme Store\nversion: 1\n")
 
     assert cli.main(["ensure-org-id", str(prof)]) == 0
     minted = capsys.readouterr().out.strip()
     assert minted and len(minted) == 32 and set(minted) <= _HEX
-    assert loader.load_org_id(prof) == minted  # persisted into org.yaml
+    assert loader.load_org_id(prof) == minted  # persisted into datasource.yaml
 
     assert cli.main(["ensure-org-id", str(prof)]) == 0
     assert capsys.readouterr().out.strip() == minted  # idempotent — same id, no re-mint
 
 
 def test_legacy_profile_without_org_id_resolves_local(tmp_path, monkeypatch):
-    # A pre-F14 org.yaml (no org_id key) still loads and resolves to the 'local' sentinel — no crash,
+    # A pre-F14 datasource.yaml (no org_id key) still loads and resolves to the 'local' sentinel — no crash,
     # no forced mint at serve time (serve is read-only; minting happens only at connect/build).
     (tmp_path / "old").mkdir()
-    (tmp_path / "old" / "org.yaml").write_text("organization: legacy\nversion: 1\n")
+    (tmp_path / "old" / "datasource.yaml").write_text("datasource: legacy\nversion: 1\n")
     assert loader.load_org_id(tmp_path / "old") is None
-    assert loader.load_organization(tmp_path / "old").org_id is None
+    assert loader.load_datasource(tmp_path / "old").org_id is None
 
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.delenv("AGAMI_ORG_ID", raising=False)

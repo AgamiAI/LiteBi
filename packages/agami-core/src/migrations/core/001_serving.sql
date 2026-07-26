@@ -1,6 +1,6 @@
 -- agami-core serving schema — the semantic model, served from the DB instead of local YAML files.
 --
--- Shape mirrors the in-memory Organization tree (semantic_model/models.py) under an
+-- Shape mirrors the in-memory Datasource tree (semantic_model/models.py) under an
 -- org -> datasource -> subject-area hierarchy. Each object row carries the structural/key columns
 -- a tool queries on PLUS a `doc` (the object's JSON) so the loader rebuilds the EXACT pydantic
 -- object losslessly — no per-field column sprawl, and YAML stays the source of truth.
@@ -17,10 +17,10 @@
 --   model_version              -> the execute_sql trust receipt's version pin
 --   (list_datasources reads the set of `datasource` rows; execute_sql/log_feedback write runtime rows — 002)
 
--- The root of a datasource's served model (the pydantic Organization: version, glossary, fiscal year,
+-- The root of a datasource's served model (the pydantic Datasource: version, glossary, fiscal year,
 -- storage_connections, cross-subject-area objects). Named `datasource_model`, not `organization` —
 -- `org_id` is just the scoping key here; any registry it points at lives outside this table. This is
--- the MODEL, one row per (org, datasource). model_store.load_organization / write_organization read/
+-- the MODEL, one row per (org, datasource). model_store.load_datasource / write_datasource read/
 -- write it (their names track the pydantic type, not the table).
 CREATE TABLE datasource_model (
     org_id      TEXT NOT NULL DEFAULT 'local',
@@ -77,7 +77,7 @@ CREATE TABLE entity (
 );
 
 -- WITHIN-subject-area relationships only. Cross-subject-area / cross-datasource relationships are
--- org-level (Organization.cross_subject_area_relationships) and ride inside datasource_model.doc — they
+-- org-level (Datasource.cross_subject_area_relationships) and ride inside datasource_model.doc — they
 -- are rebuilt from there, not stored as rows here (which would need a null area, see the NOTE above).
 CREATE TABLE relationship (
     org_id     TEXT NOT NULL DEFAULT 'local',
@@ -99,14 +99,14 @@ CREATE TABLE prompt_example (
     PRIMARY KEY (org_id, datasource, id)
 );
 
--- Domain-context docs. kind='organization' (ORGANIZATION.md) is per-datasource; kind='user'
+-- Domain-context docs. kind='datasource' (datasource.md) is per-datasource; kind='user'
 -- (USER_MEMORY.md) is cross-datasource, stored once under datasource='' (the empty sentinel) — but
 -- still PER ORG, so one tenant's user memory can't reach another's. Mirrors the file layout
--- (<artifacts_dir>/<profile>/ORGANIZATION.md vs <artifacts_dir>/USER_MEMORY.md).
+-- (<artifacts_dir>/<profile>/datasource.md vs <artifacts_dir>/USER_MEMORY.md).
 CREATE TABLE memory (
     org_id     TEXT NOT NULL DEFAULT 'local',
     datasource TEXT NOT NULL,      -- '' for the per-org user-memory row
-    kind       TEXT NOT NULL,      -- 'organization' (per-datasource) | 'user' (per-org, cross-datasource)
+    kind       TEXT NOT NULL,      -- 'datasource' (per-datasource) | 'user' (per-org, cross-datasource)
     content    TEXT,
     PRIMARY KEY (org_id, datasource, kind)
 );

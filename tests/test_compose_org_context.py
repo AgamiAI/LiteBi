@@ -20,16 +20,16 @@ if str(PKG_SRC) not in sys.path:
 
 from semantic_model import org_draft as OD  # noqa: E402
 from semantic_model.models import (  # noqa: E402
+    Datasource,
     DisplayConventions,
-    Organization,
     OrgRecord,
     SubjectArea,
 )
 
 
-def _org(name: str, area: str, account_means: str) -> Organization:
-    return Organization(
-        organization=name,
+def _org(name: str, area: str, account_means: str) -> Datasource:
+    return Datasource(
+        datasource=name,
         subject_areas=[SubjectArea(name=area, description=f"{area} area")],
         key_terminology={"Account": account_means},
     )

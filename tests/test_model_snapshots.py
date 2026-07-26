@@ -29,7 +29,7 @@ from catalog_helpers import col, make_catalog_runner  # noqa: E402
 
 def _mini_model(root: Path) -> None:
     (root / "subject_areas" / "a").mkdir(parents=True, exist_ok=True)
-    (root / "org.yaml").write_text("organization: t\nversion: 1\n", encoding="utf-8")
+    (root / "datasource.yaml").write_text("datasource: t\nversion: 1\n", encoding="utf-8")
     (root / "subject_areas" / "a" / "subject_area.yaml").write_text("name: a\n", encoding="utf-8")
 
 
@@ -39,7 +39,7 @@ def test_hash_is_stable_and_change_sensitive(tmp_path):
     h1 = S.compute_model_hash(r)
     assert len(h1) == 12
     assert S.compute_model_hash(r) == h1  # stable for identical content
-    (r / "org.yaml").write_text("organization: t\nversion: 2\n", encoding="utf-8")
+    (r / "datasource.yaml").write_text("datasource: t\nversion: 2\n", encoding="utf-8")
     assert S.compute_model_hash(r) != h1  # changes when the model changes
 
 
@@ -65,14 +65,14 @@ def test_write_snapshot_idempotent(tmp_path):
 
 
 def test_write_snapshot_noop_without_model(tmp_path):
-    assert S.write_snapshot(tmp_path / "empty") is None  # no org.yaml → no snapshot
+    assert S.write_snapshot(tmp_path / "empty") is None  # no datasource.yaml → no snapshot
 
 
 def test_prune_keeps_last_N(tmp_path):
     r = tmp_path / "prof"
     _mini_model(r)
     for i in range(S.KEEP + 5):
-        (r / "org.yaml").write_text(f"organization: t\nversion: {i}\n", encoding="utf-8")
+        (r / "datasource.yaml").write_text(f"datasource: t\nversion: {i}\n", encoding="utf-8")
         S.write_snapshot(r)
         time.sleep(0.005)  # distinct mtimes so prune order is well-defined
     dirs = [p for p in (r / ".snapshots").iterdir() if p.is_dir()]
@@ -89,7 +89,7 @@ def test_model_version_reader_contract(tmp_path, monkeypatch):
     import tools
     assert tools._model_version("prof") == h1
     time.sleep(0.02)
-    (r / "org.yaml").write_text("organization: t\nversion: 99\n", encoding="utf-8")
+    (r / "datasource.yaml").write_text("datasource: t\nversion: 99\n", encoding="utf-8")
     h2 = S.write_snapshot(r)
     assert h2 != h1
     assert tools._model_version("prof") == h2

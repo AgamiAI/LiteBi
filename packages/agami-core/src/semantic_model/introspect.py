@@ -58,7 +58,7 @@ from . import build
 from . import dialects as D
 from .models import (
     Column,
-    Organization,
+    Datasource,
     PerformanceHints,
     Relationship,
     StorageConnection,
@@ -198,7 +198,7 @@ def introspect(
     bigquery_region: str = "region-us",
     progress_path: Optional[str | Path] = None,
     append: bool = False,
-) -> tuple[Organization, IntrospectReport]:
+) -> tuple[Datasource, IntrospectReport]:
     """Introspect a live DB into the semantic model and (unless dry_run) write the
     canonical tree. `tables` (optional) is the allowlist of `schema.table` to build —
     the prune step's kept set (also the no-catalog case where enumeration is denied).
@@ -278,9 +278,9 @@ def introspect(
     # edits to lose); the relationship pass below rebuilds across the union, prior edges kept.
     prev_rels: list[Relationship] = []
     skip_keys: set = set()
-    if append and not dry_run and (out / "org.yaml").exists():
-        from .loader import load_organization
-        prev = load_organization(out, include_rejected=True)
+    if append and not dry_run and (out / "datasource.yaml").exists():
+        from .loader import load_datasource
+        prev = load_datasource(out, include_rejected=True)
         batch_names = {t.name for t in built}
         for sa in prev.subject_areas:
             for t in sa.tables_defined:
@@ -323,8 +323,8 @@ def introspect(
         storage_type=dialect.name,
         storage_config={"profile": profile, "credentials_ref": "<artifacts_dir>/local/credentials"},
     )
-    org = Organization(
-        organization=profile,
+    org = Datasource(
+        datasource=profile,
         version=1,
         storage_connections=[storage],
         subject_areas=areas,

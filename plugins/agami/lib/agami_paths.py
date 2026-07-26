@@ -12,7 +12,7 @@ agami keeps everything under ONE folder the user chooses (the "artifacts dir"):
         charts/, exports/ # per-query outputs
         model/, review/, examples-validation/   # rendered dashboards
         tunnels/, serve/  # ssh tunnels, the copied MCP server
-      <profile>/          # the committable semantic model (org.yaml + subject_areas/…)
+      <profile>/          # the committable semantic model (datasource.yaml + subject_areas/…)
       USER_MEMORY.md      # committable cross-database preferences
       .gitignore          # ignores local/
 

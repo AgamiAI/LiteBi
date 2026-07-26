@@ -21,7 +21,7 @@ from .models import (
     DEEP_TABLE_COLUMN_THRESHOLD,
     Column,
     CrossSubjectAreaRelationship,
-    Organization,
+    Datasource,
     Relationship,
     SubjectArea,
     Table,
@@ -481,7 +481,7 @@ class WriteReport:
 def ensure_org_id(out: Path, existing: Optional[str] = None, *, dry_run: bool = False) -> str:
     """Idempotent, deployment-scoped resolution of the org identity (F14 / ACE-056; relocated by
     F15 / ACE-067). Returns, in order: ``existing`` (an id the caller already resolved); the org_id
-    already persisted at ``out/org.yaml`` (preserved across re-introspect — the immutability guarantee);
+    already persisted at ``out/datasource.yaml`` (preserved across re-introspect — the immutability guarantee);
     else the DEPLOYMENT record's id (``organization.yaml`` at ``out.parent``), minting the record on
     first use.
 
@@ -505,13 +505,13 @@ def ensure_org_id(out: Path, existing: Optional[str] = None, *, dry_run: bool = 
 
 
 def write_tree(
-    org: Organization,
+    org: Datasource,
     out: Path,
     *,
     examples_by_area: Optional[dict[str, list[dict]]] = None,
     dry_run: bool = False,
 ) -> WriteReport:
-    """Write the canonical on-disk tree (org.yaml + datasources + subject_areas +
+    """Write the canonical on-disk tree (datasource.yaml + datasources + subject_areas +
     optional prompt_examples). Returns the list of files (would-be on dry_run)."""
     examples_by_area = examples_by_area or {}
     rep = WriteReport(out_dir=str(out), dry_run=dry_run)
@@ -524,14 +524,14 @@ def write_tree(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    # F14/F15: the deployment identity is the first key. `ensure_org_id` reads the *previous* org.yaml
+    # F14/F15: the deployment identity is the first key. `ensure_org_id` reads the *previous* datasource.yaml
     # (about to be overwritten) so a re-introspect/curate/snapshot preserves the minted id rather than
     # re-minting — the immutability guarantee — and otherwise takes it from the deployment record
     # (minting the record on first use). Resolved once, honoring dry_run so a preview persists nothing.
     org_id = ensure_org_id(out, org.org_id, dry_run=dry_run)
-    write("org.yaml", _dump({
+    write("datasource.yaml", _dump({
         "org_id": org_id,
-        "organization": org.organization,
+        "datasource": org.datasource,
         "version": org.version,
         "description": org.description,
         "fiscal_year_start_month": org.fiscal_year_start_month,

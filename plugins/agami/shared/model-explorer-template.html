@@ -9,7 +9,7 @@
   NOTE: the placeholder names here are written WITHOUT their double-brace
   wrappers on purpose — the renderer does a blanket string replace, and if a
   real "{{...}}" token appeared inside this comment the substituted MANIFEST
-  JSON (which can carry an HTML comment-close sequence from ORGANIZATION.md)
+  JSON (which can carry an HTML comment-close sequence from datasource.md)
   would close this comment early and dump raw JSON into the page. Keep them bare.
 
   Per-render placeholders (always substituted in the body below):
@@ -24,7 +24,7 @@
     {
       "profile": "main",
       "storage_type": "Snowflake",
-      "organization_md": "# About this database ...",
+      "datasource_md": "# About this database ...",
       "totals": { "schemas": 1, "tables": 14, "fields": 312, "metrics": 4,
                   "entities": 3, "relationships": 9, "examples": 0, "validated": true },
       "schemas":      [ { "name": "sales", "description": "...", "tables": [ ...table... ] } ],
@@ -404,7 +404,7 @@
     pre.code-block.code-editable.empty { font-style: italic; color: var(--muted); opacity: 0.7; }
     pre.code-block.code-editable.edited { box-shadow: inset 3px 0 0 var(--accent); }
 
-    /* Organization markdown rendering */
+    /* Datasource markdown rendering */
     .org-rendered { padding: 4px 18px 14px; font-size: 14px; }
     .org-rendered h1 { font-size: 20px; margin: 16px 0 8px; }
     .org-rendered h2 { font-size: 16px; margin: 18px 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
@@ -417,7 +417,7 @@
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px;
     }
     .org-rendered strong { font-weight: 600; }
-    /* Rich-text editor for ORGANIZATION.md (edit the formatted text, no Markdown symbols) */
+    /* Rich-text editor for datasource.md (edit the formatted text, no Markdown symbols) */
     .rt-toolbar { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 18px 8px; }
     .rt-editor { min-height: 360px; border: 1px solid var(--border); border-radius: 8px;
       background: var(--bg-elev); margin: 0 18px; outline: none; }
@@ -687,15 +687,15 @@
     // exampleEdits[qname] = {area, question, sql, source, status}
     // newMetrics[]   = {area, name, description, calculation, binding, unit, other_names[], source_tables[]}
     // newExamples[]  = {area, question, sql}   (human-added NL→SQL examples)
-    // orgEdit        = new ORGANIZATION.md text | null
+    // dsEdit        = new datasource.md text | null
     const pending = {};
     const ops = {};
     const edits = {};
     const exampleEdits = {};
     const newMetrics = [];
     const newExamples = [];
-    let orgEdit = null;
-    let orgRaw = false;   // ORGANIZATION.md editor mode: false = rich text, true = raw Markdown
+    let dsEdit = null;
+    let dsRaw = false;   // datasource.md editor mode: false = rich text, true = raw Markdown
     let termEdits = null; // edited curated glossary {term: def} | null — written back via set-terminology
 
     const editOpen = new Set();        // qnames whose inline edit form is expanded
@@ -734,7 +734,7 @@
     };
 
     const TABS = [
-      { id: 'organization', label: 'Organization' },
+      { id: 'datasource', label: 'Datasource' },
       { id: 'review',       label: 'Review' },
       { id: 'tables',       label: 'Tables' },
       { id: 'pii',          label: 'PII' },
@@ -2382,7 +2382,7 @@
     }
 
     // =====================================================================
-    // TAB: Organization
+    // TAB: Datasource
     // =====================================================================
     function renderMarkdown(md) {
       const lines = (md || '').replace(/\r\n/g, '\n').split('\n');
@@ -2457,15 +2457,15 @@
       })(rootEl);
       return blocks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
     }
-    function renderOrganizationTab(root) {
-      const md = orgEdit !== null ? orgEdit : (manifest.organization_md || '');
+    function renderDatasourceTab(root) {
+      const md = dsEdit !== null ? dsEdit : (manifest.datasource_md || '');
       root.appendChild(el('div', { class: 'info-banner', html:
         '<strong>What is this?</strong> This note tells agami about <em>your</em> business — what the company or product is, ' +
         'what your words mean, and how your numbers are defined (for example, what counts as an "active customer"). ' +
         'agami reads it with every question, so answers use your own words and definitions. ' +
-        'Edit it here, or in the file <code>ORGANIZATION.md</code> inside your agami folder.' }));
+        'Edit it here, or in the file <code>datasource.md</code> inside your agami folder.' }));
       if (searchQ && !md.toLowerCase().includes(searchQ)) {
-        root.appendChild(el('div', { class: 'empty-state', text: `ORGANIZATION.md doesn't match "${searchQ}".` }));
+        root.appendChild(el('div', { class: 'empty-state', text: `datasource.md doesn't match "${searchQ}".` }));
         setSearchCounts('');
         return;
       }
@@ -2473,18 +2473,18 @@
       const ORG = '__org__';
       if (editOpen.has(ORG)) {
         const wrap = el('div', { class: 'edit-form', style: 'border-top:none;' });
-        if (orgRaw) {
+        if (dsRaw) {
           // Power-user escape hatch: edit the raw Markdown directly.
-          wrap.appendChild(labelLine('ORGANIZATION.md (raw Markdown)'));
+          wrap.appendChild(labelLine('datasource.md (raw Markdown)'));
           const ta = textarea(md, 22); ta.style.minHeight = '360px'; wrap.appendChild(ta);
           const bar = el('div', { class: 'card-actions' });
-          bar.appendChild(btnSm('Save', () => { orgEdit = ta.value; editOpen.delete(ORG); renderAll(); }, 'primary'));
+          bar.appendChild(btnSm('Save', () => { dsEdit = ta.value; editOpen.delete(ORG); renderAll(); }, 'primary'));
           bar.appendChild(btnSm('Cancel', () => { editOpen.delete(ORG); renderAll(); }));
-          bar.appendChild(btnSm('↩ Back to rich text', () => { orgEdit = ta.value; orgRaw = false; renderAll(); }));
+          bar.appendChild(btnSm('↩ Back to rich text', () => { dsEdit = ta.value; dsRaw = false; renderAll(); }));
           wrap.appendChild(bar);
         } else {
           // Rich-text editor: edit the formatted text directly — no Markdown symbols.
-          wrap.appendChild(labelLine('Edit ORGANIZATION.md'));
+          wrap.appendChild(labelLine('Edit datasource.md'));
           wrap.appendChild(el('div', { class: 'field-hint', style: 'padding:0 0 8px;',
             text: 'Type like a normal document. Use the buttons for a section heading, bold, or a bullet list. agami saves it for you.' }));
           const tb = el('div', { class: 'rt-toolbar' });
@@ -2497,17 +2497,17 @@
           wrap.appendChild(tb);
           wrap.appendChild(ed);
           const bar = el('div', { class: 'card-actions' });
-          bar.appendChild(btnSm('Save', () => { orgEdit = htmlToMarkdown(ed); editOpen.delete(ORG); renderAll(); }, 'primary'));
+          bar.appendChild(btnSm('Save', () => { dsEdit = htmlToMarkdown(ed); editOpen.delete(ORG); renderAll(); }, 'primary'));
           bar.appendChild(btnSm('Cancel', () => { editOpen.delete(ORG); renderAll(); }));
-          bar.appendChild(btnSm('⚙ Edit raw Markdown', () => { orgEdit = htmlToMarkdown(ed); orgRaw = true; renderAll(); }));
+          bar.appendChild(btnSm('⚙ Edit raw Markdown', () => { dsEdit = htmlToMarkdown(ed); dsRaw = true; renderAll(); }));
           wrap.appendChild(bar);
         }
         card.appendChild(wrap);
       } else {
         card.appendChild(el('div', { class: 'org-rendered', html: renderMarkdown(md) }));
         const a = el('div', { class: 'card-actions' });
-        a.appendChild(el('button', { type: 'button', class: orgEdit !== null ? 'queued-edit' : '',
-          onclick: () => { editOpen.add(ORG); renderAll(); } }, orgEdit !== null ? '✎ Edited (queued) — edit again' : 'Edit ORGANIZATION.md'));
+        a.appendChild(el('button', { type: 'button', class: dsEdit !== null ? 'queued-edit' : '',
+          onclick: () => { editOpen.add(ORG); renderAll(); } }, dsEdit !== null ? '✎ Edited (queued) — edit again' : 'Edit datasource.md'));
         card.appendChild(a);
       }
       root.appendChild(card);
@@ -2638,9 +2638,9 @@
         groups.push(g);
       }
       // org edit
-      if (orgEdit !== null) {
-        const g = el('div', { class: 'queue-group' }); g.appendChild(el('h3', { text: 'Organization context' }));
-        g.appendChild(queueRow('edit', 'edit', 'ORGANIZATION.md edited', () => { orgEdit = null; }));
+      if (dsEdit !== null) {
+        const g = el('div', { class: 'queue-group' }); g.appendChild(el('h3', { text: 'Datasource context' }));
+        g.appendChild(queueRow('edit', 'edit', 'datasource.md edited', () => { dsEdit = null; }));
         groups.push(g);
       }
       // glossary edit
@@ -2746,7 +2746,7 @@
       // the In-schema/Cross-schema bar is Joins-tab only; renderJoinsTab decides whether to show it
       if (activeTab !== 'joins') document.getElementById('join-type-bar').style.display = 'none';
       // search placeholder per tab
-      const ph = { organization: 'Search ORGANIZATION.md…', review: 'Search the review queue…',
+      const ph = { datasource: 'Search datasource.md…', review: 'Search the review queue…',
                    areas: 'Search subject areas…',
                    tables: 'Search tables, fields, descriptions…',
                    metrics: 'Search metrics…', entities: 'Search entities…', joins: 'Search joins…',
@@ -2771,7 +2771,7 @@
     // ---- Queued totals + footer ----
     function totalQueued() {
       return Object.keys(pending).length + Object.keys(ops).length + Object.keys(edits).length
-           + Object.keys(exampleEdits).length + newMetrics.length + newExamples.length + (orgEdit !== null ? 1 : 0)
+           + Object.keys(exampleEdits).length + newMetrics.length + newExamples.length + (dsEdit !== null ? 1 : 0)
            + (termEdits !== null ? 1 : 0);
     }
     function updateFooter() {
@@ -2801,7 +2801,7 @@
         if (Object.keys(exampleEdits).length) parts.push(`${Object.keys(exampleEdits).length} example`);
         if (newExamples.length) parts.push(`${newExamples.length} new example${newExamples.length === 1 ? '' : 's'}`);
         if (newMetrics.length) parts.push(`${newMetrics.length} new metric${newMetrics.length === 1 ? '' : 's'}`);
-        if (orgEdit !== null) parts.push('org context');
+        if (dsEdit !== null) parts.push('org context');
         if (termEdits !== null) parts.push('glossary');
         sum.innerHTML = '<span class="count">' + total + '</span> queued · ' + parts.join(', ');
         gen.disabled = false;
@@ -2876,7 +2876,7 @@
         lines.push(JSON.stringify(newExamples.map(x => ({
           area: x.area, question: x.question, sql: x.sql, source: 'human', status: 'confirmed' }))));
       }
-      if (orgEdit !== null) lines.push('organization-md: ' + JSON.stringify(orgEdit));
+      if (dsEdit !== null) lines.push('datasource-md: ' + JSON.stringify(dsEdit));
       if (termEdits !== null) lines.push('key-terminology: ' + JSON.stringify(termEdits));
       // Sign-off identity header (first line) — the skill applies approvals with this as --signer/--role.
       if (hasQueuedApprovals() && validEmail(signOff.email)) lines.unshift(`signed-off-by: ${signOff.email} / ${signOffRole()}`);
@@ -2905,7 +2905,7 @@
       Object.keys(ops).forEach(k => delete ops[k]);
       Object.keys(edits).forEach(k => delete edits[k]);
       Object.keys(exampleEdits).forEach(k => delete exampleEdits[k]);
-      newMetrics.length = 0; newExamples.length = 0; orgEdit = null; termEdits = null; addMetricOpen = false; addExampleOpen = false;
+      newMetrics.length = 0; newExamples.length = 0; dsEdit = null; termEdits = null; addMetricOpen = false; addExampleOpen = false;
       editOpen.clear();
       renderAll();
     });
@@ -2933,7 +2933,7 @@
       const root = document.getElementById('tab-content');
       root.innerHTML = '';
       switch (activeTab) {
-        case 'organization': renderOrganizationTab(root); break;
+        case 'datasource': renderDatasourceTab(root); break;
         case 'review': renderReviewTab(root); break;
         case 'areas': renderAreasTab(root); break;
         case 'tables': renderTablesTab(root); break;

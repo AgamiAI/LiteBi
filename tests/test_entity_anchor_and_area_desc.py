@@ -34,8 +34,8 @@ def _area_model(tmp_path):
     root = tmp_path / "p"
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (root / "datasources" / "c" / "storage.yaml").write_text(

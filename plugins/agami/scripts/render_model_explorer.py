@@ -53,7 +53,7 @@ def build_manifest(profile_dir: Path, profile: str) -> dict:
     from semantic_model import build as _B
     from semantic_model import loader as _L
 
-    org = _L.load_organization(profile_dir, include_rejected=True)
+    org = _L.load_datasource(profile_dir, include_rejected=True)
     storage_type = (org.storage_connections[0].storage_type
                     if getattr(org, "storage_connections", None) else "")
     out_schemas: list[dict] = []
@@ -66,17 +66,17 @@ def build_manifest(profile_dir: Path, profile: str) -> dict:
     examples_out: list[dict] = []
     areas_out: list[dict] = []
 
-    org_md_path = profile_dir / "ORGANIZATION.md"
-    organization_md = org_md_path.read_text(encoding="utf-8") if org_md_path.exists() else ""
+    datasource_md_path = profile_dir / "datasource.md"
+    datasource_md = datasource_md_path.read_text(encoding="utf-8") if datasource_md_path.exists() else ""
     import re as _re
 
     from semantic_model import org_draft as _OD
-    # `organization_md` is the human's narrative ONLY — this is what the edit box writes back,
+    # `datasource_md` is the human's narrative ONLY — this is what the edit box writes back,
     # so model facts must never be folded in here (or saving would persist them). If blank,
     # offer the starter prompt. The model-derived summary (subject areas, conventions, decoded
     # glossary) is a SEPARATE read-only field, computed fresh — see `derived_context`.
-    if not _re.sub(r"<!--.*?-->", "", organization_md, flags=_re.DOTALL).strip():
-        organization_md = _OD.starter_organization_md(org)
+    if not _re.sub(r"<!--.*?-->", "", datasource_md, flags=_re.DOTALL).strip():
+        datasource_md = _OD.starter_datasource_md(org)
     # Read-only derived block WITHOUT the curated glossary — that's rendered as an editable
     # panel (the curated key_terminology is a first-class structured field users add/correct).
     derived_context_md = _OD.derived_context(org, with_curated_glossary=False)
@@ -218,7 +218,7 @@ def build_manifest(profile_dir: Path, profile: str) -> dict:
 
     return {
         "profile": profile,
-        "organization_md": organization_md,
+        "datasource_md": datasource_md,
         # model-derived domain summary (read-only in the UI; not part of the editable file)
         "derived_context_md": derived_context_md,
         # the curated glossary (term → definition) — EDITABLE in the explorer, written back
@@ -248,7 +248,7 @@ def render(*, title: str, profile: str, manifest: dict) -> str:
     logo_light = LOGO_LIGHT_PATH.read_text() if LOGO_LIGHT_PATH.exists() else ""
     theme_css = (SHARED_DIR / "theme.css").read_text()
 
-    # The manifest embeds arbitrary model text (descriptions, ORGANIZATION.md, SQL).
+    # The manifest embeds arbitrary model text (descriptions, datasource.md, SQL).
     # Escape `</` so a `</script>` in that text can't terminate the <script> block that
     # holds `const manifest = …` (JS unescapes `<\/` back to `</`). The template's doc
     # comment carries no real `{{…}}` tokens, so a `-->` in the text can't close it.
@@ -285,7 +285,7 @@ def main() -> int:
     p.add_argument("--manifest-out",
                    help="Optional: also dump the raw manifest JSON to this path")
     p.add_argument("--initial-tab", default="auto",
-                   choices=["auto", "organization", "tables", "metrics", "entities",
+                   choices=["auto", "datasource", "tables", "metrics", "entities",
                             "joins", "examples", "review", "queued"],
                    help="Tab the dashboard opens on. 'auto' (default) opens on Review when "
                         "anything needs sign-off, else Tables; 'review' forces the sign-off queue.")

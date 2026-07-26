@@ -43,7 +43,7 @@ from tools import (
 
 
 def test_distill_strips_human_scaffolding_for_llm_context():
-    # ORGANIZATION.md is injected into the model's prompt; the human-only HTML comment
+    # datasource.md is injected into the model's prompt; the human-only HTML comment
     # scaffolding ("auto-generated", "edit freely") is noise the LLM shouldn't see — the
     # MCP path must strip it to match the query skill's read path.
     raw = (
@@ -145,8 +145,8 @@ def test_resolve_units_maps_result_columns(monkeypatch, tmp_path):
     (p / "datasources" / "c").mkdir(parents=True)
     (p / "subject_areas" / "s" / "tables").mkdir(parents=True)
     (p / "subject_areas" / "s" / "metrics").mkdir(parents=True)
-    (p / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (p / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (p / "datasources" / "c" / "storage.yaml").write_text(
@@ -272,8 +272,8 @@ def _write_rich_model(tmp_path):
     (p / "datasources" / "c").mkdir(parents=True)
     (p / "subject_areas" / "s" / "tables").mkdir(parents=True)
     (p / "subject_areas" / "s" / "metrics").mkdir(parents=True)
-    (p / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (p / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (p / "datasources" / "c" / "storage.yaml").write_text(
@@ -332,7 +332,7 @@ def test_mcp_receipt_equals_shared_assembler(monkeypatch, tmp_path):
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
     from semantic_model import loader as L
     from semantic_model import runtime as RT
-    shared = RT.assemble_receipt(L.load_organization(root), SQL)
+    shared = RT.assemble_receipt(L.load_datasource(root), SQL)
     mcp = _resolve_receipt(profile, SQL)
     for key in ("tables_used", "relationships", "metrics", "assumptions", "warnings"):
         assert mcp[key] == shared[key], key

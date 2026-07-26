@@ -31,7 +31,7 @@ def _wide_org():
                        tables=[m.TableRef(storage_connection="c", schema="analytics", table="wide",
                                           expose_column_groups=["metrics", "location"])],
                        tables_defined=[t])
-    return m.Organization(organization="Acme",
+    return m.Datasource(datasource="Acme",
                           storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                           subject_areas=[sa])
 
@@ -87,8 +87,8 @@ def test_disk_round_trip(tmp_path):
     root = tmp_path / ".semantic_v2"
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "area" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "O", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "O", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/area"],
     }))
@@ -106,8 +106,8 @@ def test_disk_round_trip(tmp_path):
     (root / "subject_areas" / "area" / "relationships.yaml").write_text(yaml.safe_dump({
         "relationships": [],
     }))
-    org = L.load_organization(root)
-    assert org.organization == "O"
+    org = L.load_datasource(root)
+    assert org.datasource == "O"
     sa = org.subject_area("area")
     assert sa is not None and sa.defined_table("t").grain == ["id"]
     assert org.storage_connection("c").storage_type == "PostgreSQL"

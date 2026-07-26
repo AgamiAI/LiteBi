@@ -28,7 +28,7 @@ def _col(name, desc=""):
 
 def _org(tables):
     sa = m.SubjectArea(name="a", description="d", tables_defined=tables)
-    return m.Organization(organization="o", version=1, subject_areas=[sa])
+    return m.Datasource(datasource="o", version=1, subject_areas=[sa])
 
 
 def test_self_evident_blanks_are_fine():

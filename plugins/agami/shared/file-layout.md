@@ -25,19 +25,19 @@ Everything in here is either a secret, an auth file derived from a secret, or pe
 
 ## `<artifacts_dir>/` — the committable model — sharable
 
-Everything else in here is non-secret and team-useful. The default location is `~/agami-artifacts/`, but the user picks it during `agami-connect (Phase 0a)` (see "Configuring the artifacts dir" below). The semantic model is a small tree of YAML files under `<artifacts_dir>/<profile>/` — `org.yaml` at the root plus a `subject_areas/<area>/` directory per subject area.
+Everything else in here is non-secret and team-useful. The default location is `~/agami-artifacts/`, but the user picks it during `agami-connect (Phase 0a)` (see "Configuring the artifacts dir" below). The semantic model is a small tree of YAML files under `<artifacts_dir>/<profile>/` — `datasource.yaml` at the root plus a `subject_areas/<area>/` directory per subject area.
 
 | Path | What it is |
 |---|---|
 | `USER_MEMORY.md` | Top-level — cross-database preferences (default filters, currency, display rules). Power users committing this share their tuning with the team. |
-| `<profile>/org.yaml` | Org root: description, the `key_terminology` glossary, storage-connection + subject-area references, and cross-area relationships / entities / metrics |
+| `<profile>/datasource.yaml` | Org root: description, the `key_terminology` glossary, storage-connection + subject-area references, and cross-area relationships / entities / metrics |
 | `<profile>/datasources/<connection>/storage.yaml` | Physical connection metadata (storage type + config; **no secrets** — references, not values) |
 | `<profile>/subject_areas/<area>/subject_area.yaml` | Subject-area definition: name + the tables it exposes (TableRefs, with optional column-group scoping) |
 | `<profile>/subject_areas/<area>/tables/<table>.yaml` | Canonical table (one per file): columns + types, primary-key grain, foreign keys, `column_groups`, choice fields, caveats, performance hints |
 | `<profile>/subject_areas/<area>/metrics/<slug>.yaml`, `entities/<slug>.yaml` | One metric / entity per file |
 | `<profile>/subject_areas/<area>/relationships.yaml` | In-area join edges (cardinality + trust block) |
 | `<profile>/prompt_examples/<area>/examples.yaml` | Per-area NL→SQL few-shot library |
-| `<profile>/ORGANIZATION.md` | Per-profile human narrative (the model-derived summary + glossary are assembled at read time, not stored here) |
+| `<profile>/datasource.md` | Per-profile human narrative (the model-derived summary + glossary are assembled at read time, not stored here) |
 | `<profile>/.snapshots/<hash>/` | Pinned model snapshots — an answer reproduces against the hash it ran on |
 
 **Why a tree of small files rather than one big YAML:** the query path and the explorer lazy-load only what a question (or view) needs — one table's file, not a 1000-table monolith. Git diffs stay small (editing one table's metadata touches one small file), and the model never has to be parsed all at once. Relationships, metrics, and entities live at the **area** level, not inside a table file.
@@ -78,12 +78,12 @@ Scripts import `agami_paths` (the single source of truth): `agami_paths.artifact
 
 ## Migration from a legacy (v1) profile
 
-Older profiles used a per-schema layout (`index.yaml` + `<schema>/_schema.yaml` + per-table files at the profile root). On the first introspect after upgrade, the engine **auto-detects** any such legacy artifacts at the profile root, **moves them into `.legacy_backup/`** (so nothing is silently clobbered and the old model is recoverable), and writes the v2 tree (`org.yaml` + `subject_areas/…`) in their place. It's one-shot per profile and surfaces a one-liner when it happens. `USER_MEMORY.md` and credentials are untouched.
+Older profiles used a per-schema layout (`index.yaml` + `<schema>/_schema.yaml` + per-table files at the profile root). On the first introspect after upgrade, the engine **auto-detects** any such legacy artifacts at the profile root, **moves them into `.legacy_backup/`** (so nothing is silently clobbered and the old model is recoverable), and writes the v2 tree (`datasource.yaml` + `subject_areas/…`) in their place. It's one-shot per profile and surfaces a one-liner when it happens. `USER_MEMORY.md` and credentials are untouched.
 
 ## Why this split exists
 
 Three concrete wins:
 
 1. **Zero credential-leak risk on commit.** Before, accidentally `git add <artifacts_dir>/local/` would commit the password. Now `<artifacts_dir>/local/` is gitignored by default and `<artifacts_dir>/` is the only place anything goes when teams share.
-2. **Team workflows just work.** `cd ~/code/myteam/data && git add agami/` commits everyone's tuned semantic model, examples, ORGANIZATION.md, and USER_MEMORY.md preferences. One command.
+2. **Team workflows just work.** `cd ~/code/myteam/data && git add agami/` commits everyone's tuned semantic model, examples, datasource.md, and USER_MEMORY.md preferences. One command.
 3. **Power users can override per-environment.** Set `AGAMI_ARTIFACTS_DIR=/path/to/staging-models` for an experimental session without touching the global config.

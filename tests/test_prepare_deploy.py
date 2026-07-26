@@ -32,7 +32,7 @@ def _artifacts(tmp_path: Path) -> Path:
     creds.write_text("[demo]\nhost = db.example\n", encoding="utf-8")
     creds.chmod(0o600)
     (art / "demo").mkdir()
-    (art / "demo" / "org.yaml").write_text("name: demo\n", encoding="utf-8")
+    (art / "demo" / "datasource.yaml").write_text("name: demo\n", encoding="utf-8")
     return art
 
 
@@ -65,7 +65,7 @@ def test_prepares_a_complete_bundle(tmp_path):
     assert "build:" not in compose
 
     # The MODEL is staged so the bundle is self-contained + shippable...
-    assert (target / "artifacts" / "demo" / "org.yaml").exists()
+    assert (target / "artifacts" / "demo" / "datasource.yaml").exists()
     # ...but no secret travels: `local/` (credentials + .pgpass) is excluded entirely (creds come from
     # DATASOURCE_URL in agami.env now), so no 600-mode file lands in a shippable bundle or a mounted volume.
     assert not (target / "artifacts" / "local").exists()
@@ -124,13 +124,13 @@ def test_staged_model_is_world_readable(tmp_path):
     world-traversable and every file world-readable, else the boot-time load crashes (issue #1's fix)."""
     art = _artifacts(tmp_path)
     # Simulate a restrictive owner-only source (umask 077); the widening must repair it in the bundle.
-    (art / "demo" / "org.yaml").chmod(0o600)
+    (art / "demo" / "datasource.yaml").chmod(0o600)
     (art / "demo").chmod(0o700)
     target = tmp_path / "bundle"
     prepare_deploy.prepare(_args(target, art))
     prof = target / "artifacts" / "demo"
     assert stat.S_IMODE(prof.stat().st_mode) & 0o005 == 0o005          # dir: others r-x (traversable)
-    assert stat.S_IMODE((prof / "org.yaml").stat().st_mode) & 0o004     # file: others readable
+    assert stat.S_IMODE((prof / "datasource.yaml").stat().st_mode) & 0o004     # file: others readable
 
 
 def test_widen_does_not_chmod_through_a_dir_symlink(tmp_path):
@@ -349,11 +349,11 @@ def test_selective_datasources_stages_only_chosen(tmp_path):
     """`--datasources` stages only the named models; others drop, install-global files always stay."""
     art = _artifacts(tmp_path)  # has model `demo`
     (art / "ops").mkdir()
-    (art / "ops" / "org.yaml").write_text("name: ops\n", encoding="utf-8")
+    (art / "ops" / "datasource.yaml").write_text("name: ops\n", encoding="utf-8")
     (art / "USER_MEMORY.md").write_text("hi\n", encoding="utf-8")
     target = tmp_path / "bundle"
     prepare_deploy.prepare(_args(target, art, datasources="demo"))
-    assert (target / "artifacts" / "demo" / "org.yaml").exists()
+    assert (target / "artifacts" / "demo" / "datasource.yaml").exists()
     assert not (target / "artifacts" / "ops").exists()        # not chosen → dropped
     assert (target / "artifacts" / "USER_MEMORY.md").exists()  # install-global → always staged
 
@@ -365,7 +365,7 @@ def test_unknown_datasource_name_warns_but_does_not_fail(tmp_path, capsys):
     target = tmp_path / "bundle"
     status, code = prepare_deploy.prepare(_args(target, art, datasources="demo,nope"))
     assert code == 0 and status.startswith("PREPARED ")
-    assert (target / "artifacts" / "demo" / "org.yaml").exists()
+    assert (target / "artifacts" / "demo" / "datasource.yaml").exists()
     assert "nope" in capsys.readouterr().err
 
 
@@ -374,7 +374,7 @@ def test_rerun_with_datasources_drops_a_previously_staged_model(tmp_path):
     delete on its own) — else the server would keep serving a model the operator meant to drop."""
     art = _artifacts(tmp_path)  # model `demo`
     (art / "ops").mkdir()
-    (art / "ops" / "org.yaml").write_text("name: ops\n", encoding="utf-8")
+    (art / "ops" / "datasource.yaml").write_text("name: ops\n", encoding="utf-8")
     target = tmp_path / "bundle"
     prepare_deploy.prepare(_args(target, art))                       # first run stages all → demo + ops
     assert (target / "artifacts" / "ops").exists()
@@ -389,14 +389,14 @@ def test_rerun_drops_a_symlinked_datasource_without_touching_its_target(tmp_path
     art = _artifacts(tmp_path)  # model `demo`
     external = tmp_path / "external-ops"
     external.mkdir()
-    (external / "org.yaml").write_text("name: ops\n", encoding="utf-8")
+    (external / "datasource.yaml").write_text("name: ops\n", encoding="utf-8")
     (art / "ops").symlink_to(external, target_is_directory=True)  # a symlinked model in the artifacts dir
     target = tmp_path / "bundle"
     prepare_deploy.prepare(_args(target, art))                       # stages demo + the ops symlink
     status, code = prepare_deploy.prepare(_args(target, art, datasources="demo"))  # drop ops on re-run
     assert code == 0 and status.startswith("UPGRADED ")
     assert not (target / "artifacts" / "ops").exists()               # the staged symlink is gone
-    assert (external / "org.yaml").exists()                          # its target is untouched
+    assert (external / "datasource.yaml").exists()                          # its target is untouched
 
 
 def test_all_unknown_datasources_fails_fast(tmp_path):

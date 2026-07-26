@@ -177,18 +177,18 @@ def test_db_backed_serve_needs_no_artifacts_dir(tmp_path, monkeypatch):
 
     import model_store
     import tools
-    from semantic_model.models import Organization
+    from semantic_model.models import Datasource
     from store import Store
 
     db_url = "sqlite://" + str(tmp_path / "agami.db")
     s = Store.connect(db_url)
     s.run_migrations()
-    model_store.write_organization(
+    model_store.write_datasource(
         s,
         "main",
-        Organization.model_validate(
+        Datasource.model_validate(
             {
-                "organization": "acme",
+                "datasource": "acme",
                 "version": 1,
                 "subject_areas": [
                     {"name": "sales", "metrics": [{"name": "revenue", "calculation": "sum"}]}

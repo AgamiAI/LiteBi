@@ -1,9 +1,9 @@
 """The deployment-level organization record (F15 / ACE-067).
 
 One ``OrgRecord`` lives at ``<artifacts_dir>/organization.yaml`` — ABOVE the per-profile
-``<artifacts_dir>/<profile>/org.yaml`` models — and holds the company-wide facts (name, description,
+``<artifacts_dir>/<profile>/datasource.yaml`` models — and holds the company-wide facts (name, description,
 fiscal year, display conventions, glossary) that would otherwise be duplicated into every profile's
-``org.yaml`` and drift. The company narrative lives beside it at ``<artifacts_dir>/ORGANIZATION.md``.
+``datasource.yaml`` and drift. The company narrative lives beside it at ``<artifacts_dir>/organization.md``.
 
 This module owns:
 
@@ -29,7 +29,7 @@ from .models import OrgRecord
 # The record and the company narrative both sit at the artifacts-dir ROOT (one deployment = one company),
 # NOT under a profile dir — that is the whole point: written once, shared by every datasource.
 RECORD_FILENAME = "organization.yaml"
-NARRATIVE_FILENAME = "ORGANIZATION.md"
+NARRATIVE_FILENAME = "organization.md"
 
 
 def record_path(artifacts_dir: str | Path) -> Path:
@@ -54,10 +54,10 @@ def load_org_record(artifacts_dir: str | Path) -> Optional[OrgRecord]:
 
 def ensure_org_record(artifacts_dir: str | Path) -> OrgRecord:
     """Read the deployment's ``OrgRecord``, or mint a fresh one and persist it. The ``org_id`` mint
-    chokepoint (relocated here from the per-profile ``org.yaml`` — F14's ``ensure_org_id``):
+    chokepoint (relocated here from the per-profile ``datasource.yaml`` — F14's ``ensure_org_id``):
 
       1. an existing ``organization.yaml`` is returned unchanged (mint-once / immutable);
-      2. else, if a profile ``org.yaml`` already carries an id (a post-F14 deployment), that id is
+      2. else, if a profile ``datasource.yaml`` already carries an id (a post-F14 deployment), that id is
          LIFTED up into a new record — never re-minted (preserves F14's immutable value);
       3. else a fresh ``uuid4().hex`` is minted into a new record.
 
@@ -74,7 +74,7 @@ def ensure_org_record(artifacts_dir: str | Path) -> OrgRecord:
 
 def write_org_record(artifacts_dir: str | Path, record: OrgRecord) -> Path:
     """Persist ``record`` to ``<artifacts_dir>/organization.yaml`` (creating the dir if needed) and
-    return the path. Written with the same default permissions as the sibling ``org.yaml`` — the record
+    return the path. Written with the same default permissions as the sibling ``datasource.yaml`` — the record
     holds company context, not secrets, and mode-600 model files are unreadable by the deploy
     container user (a known crash-loop), so this deliberately does NOT ``chmod 600``."""
     path = record_path(artifacts_dir)
@@ -107,12 +107,12 @@ def set_org_fields(
 
 def refresh_datasources(artifacts_dir: str | Path) -> Optional[OrgRecord]:
     """Rebuild the record's ``datasources`` list from the profile directories actually present on disk
-    (each immediate subdir holding an ``org.yaml``), so the list is auto-maintained and can never drift.
+    (each immediate subdir holding an ``datasource.yaml``), so the list is auto-maintained and can never drift.
     Returns ``None`` (and writes nothing) when there is neither a record nor any profile yet; otherwise
     mints the record if needed, updates the list, persists, and returns it."""
     art = Path(artifacts_dir)
     names = (
-        sorted(p.name for p in art.iterdir() if p.is_dir() and (p / "org.yaml").exists())
+        sorted(p.name for p in art.iterdir() if p.is_dir() and (p / "datasource.yaml").exists())
         if art.is_dir()
         else []
     )

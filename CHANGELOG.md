@@ -10,6 +10,18 @@ is the source of truth a host installs against — bumping it is what invalidate
 user's plugin cache (see [CONTRIBUTING.md](CONTRIBUTING.md)). Each released section
 below corresponds to one such version.
 
+## [0.5.0] — 2026-07-25
+
+### Changed
+
+- **Renamed the per-datasource model files** so their names say what they are, now that a
+  company-wide `organization.yaml` exists at the artifacts root. In each profile,
+  `org.yaml` → `datasource.yaml` and `ORGANIZATION.md` → `datasource.md`. The model root's
+  display-name field `organization:` is likewise `datasource:`, and the served per-datasource
+  memory row uses `kind='datasource'`. The company record (`organization.yaml`, `org_id`,
+  tenancy) is unchanged. No on-disk migration is provided — re-run `agami-connect` (or rename
+  the two files by hand) for any pre-existing profile.
+
 ## [0.4.5] — 2026-07-15
 
 Hosted/self-hosted server hardening: a real-wheel packaging fix, a multi-tenancy seam, and an
@@ -293,7 +305,7 @@ result size, and concurrent load grow. Behaviour-preserving unless a note says o
 - **Self-host deploy no longer crash-loops on artifact permissions.** The team
   server runs as a non-root container user; the deploy now stages the model
   **world-readable**, so the boot-time model load can't fail `Permission denied`
-  on `ORGANIZATION.md` under a mismatched host owner.
+  on `datasource.md` under a mismatched host owner.
 - **claude.ai connects to a self-hosted server.** The `/mcp` endpoint no longer
   answers the bare (no-trailing-slash) URL with a `307` redirect that the MCP
   client won't follow — the server normalizes it internally, so `{base}/mcp`

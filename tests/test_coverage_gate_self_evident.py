@@ -34,7 +34,7 @@ def _incident_cols():
 
 
 def _org(tables):
-    return m.Organization(organization="o",
+    return m.Datasource(datasource="o",
                           subject_areas=[m.SubjectArea(name="s", tables_defined=tables)])
 
 

@@ -31,7 +31,7 @@ def _metric(name, binding, *, base=None, inner_grain=None, tables=("orders",)):
 
 def _org(metrics):
     sa = m.SubjectArea(name="sales", description="d", metrics=metrics)
-    return m.Organization(organization="o", version=1, subject_areas=[sa])
+    return m.Datasource(datasource="o", version=1, subject_areas=[sa])
 
 
 def test_synthesizes_avg_daily_revenue_cte():

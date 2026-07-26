@@ -23,19 +23,19 @@ agami's state splits across two directories. See [plugins/agami/shared/file-layo
 | File                                              | Format                                                                                                                                                        | Owner                                                                            |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | `<artifacts_dir>/USER_MEMORY.md`                  | Free-form Markdown — cross-database preferences                                                                                                               | Seeded by `agami-connect` Phase 0a, edited by user or appended by `agami-save-correction` |
-| `<artifacts_dir>/<profile>/org.yaml`              | Org description + storage-connection refs + subject-area refs + cross_subject_area_relationships                                                              | Skill-written, user-editable                                                     |
+| `<artifacts_dir>/<profile>/datasource.yaml`              | Org description + storage-connection refs + subject-area refs + cross_subject_area_relationships                                                              | Skill-written, user-editable                                                     |
 | `<artifacts_dir>/<profile>/datasources/<conn>/storage.yaml` | Storage connection (physical): storage_type + storage_config (env-var refs, never secrets)                                                         | Skill-written, user-editable                                                     |
 | `<artifacts_dir>/<profile>/subject_areas/<area>/subject_area.yaml` | Subject area: description, default_time_window, TableRefs (with optional expose_column_groups)                                              | Skill-written, user-editable                                                     |
 | `<artifacts_dir>/<profile>/subject_areas/<area>/tables/<table>.yaml` | Canonical Table: columns, grain, default_filters, caveats, column_groups, performance_hints                                              | Skill-written, user-editable                                                     |
 | `<artifacts_dir>/<profile>/subject_areas/<area>/{entities,metrics}/<name>.yaml`, `relationships.yaml` | Entities, metrics, and the intra-area FK graph (join cardinality + trust block)             | Skill-written, user-editable                                                     |
 | `<artifacts_dir>/<profile>/prompt_examples/<area>/examples.yaml` | NL→SQL few-shot library (scope-tagged)                                                                                        | Skill-written (seeds) + append-only via `agami-save-correction`                  |
-| `<artifacts_dir>/<profile>/ORGANIZATION.md`       | Free-form Markdown — per-database domain context                                                                                                              | Seeded by `agami-connect`, edited by user or appended by `agami-save-correction` |
+| `<artifacts_dir>/<profile>/datasource.md`       | Free-form Markdown — per-database domain context                                                                                                              | Seeded by `agami-connect`, edited by user or appended by `agami-save-correction` |
 | `<artifacts_dir>/local/cross_profile_relationships.yaml`       | Agami-bespoke YAML — declared JOIN paths across profiles for federation. **Lives in `<artifacts_dir>/local/` because it spans profiles** and isn't tied to one team's repo | User-edited (optional)                                                           |
 
 
 `USER_MEMORY.md` is **distinct** from Claude Code's auto-memory at `~/.claude/projects/<workspace>/memory/MEMORY.md`. The auto-memory is host-managed and project-scoped; `USER_MEMORY.md` is agami-managed, lives in the artifacts dir, and persists across Claude Code hosts (CLI / VS Code extension / Cursor extension) the same way the rest of `<artifacts_dir>/` does.
 
-`USER_MEMORY.md` covers **user preferences that apply across every database** (default time windows, display preferences, exclude rules). The per-database **`ORGANIZATION.md`** at `<artifacts_dir>/<profile>/ORGANIZATION.md` covers **domain knowledge for that specific database** (terminology, key metrics, what the data represents). See [plugins/agami/shared/organization-context-format.md](../plugins/agami/shared/organization-context-format.md).
+`USER_MEMORY.md` covers **user preferences that apply across every database** (default time windows, display preferences, exclude rules). The per-database **`datasource.md`** at `<artifacts_dir>/<profile>/datasource.md` covers **domain knowledge for that specific database** (terminology, key metrics, what the data represents). See [plugins/agami/shared/organization-context-format.md](../plugins/agami/shared/organization-context-format.md).
 
 `<profile>` matches the section name in `<artifacts_dir>/local/credentials` (default: `default`). One *directory* per profile under `<artifacts_dir>/`. The `agami-connect` skill auto-migrates v1.0 (single-file) and v1.1 (under `<artifacts_dir>/local/`) installs on first run after upgrade.
 
@@ -44,7 +44,7 @@ agami's state splits across two directories. See [plugins/agami/shared/file-layo
 Three concrete wins (full design in [shared/file-layout.md](../plugins/agami/shared/file-layout.md)):
 
 1. **Zero credential-leak risk on commit.** `<artifacts_dir>/local/` is gitignored by default; `<artifacts_dir>/` is the only place anything goes when teams share.
-2. **Team workflows just work.** `cd ~/code/myteam/data && git add agami/` commits everyone's tuned semantic model, examples, ORGANIZATION.md, and USER_MEMORY.md preferences.
+2. **Team workflows just work.** `cd ~/code/myteam/data && git add agami/` commits everyone's tuned semantic model, examples, datasource.md, and USER_MEMORY.md preferences.
 3. **Power users override per-environment.** Set `AGAMI_ARTIFACTS_DIR=/path/to/staging-models` for an experimental session.
 
 ---
@@ -70,7 +70,7 @@ password = mypassword
 The model is a **provider-portable, standard-concepts hierarchy** that any LLM can traverse to build reliable SQL against any backend:
 
 ```
-Organization (org.yaml)
+Datasource (datasource.yaml)
 ├─ Storage Connections[]   (physical: host/creds/dialect — datasources/<conn>/storage.yaml)
 └─ Subject Areas[]         (logical — the primary unit the LLM consumes; cap ~20-30 tables)
    ├─ tables[]             (TableRefs into storage connections; expose_column_groups scopes wide tables)
@@ -88,8 +88,8 @@ Every write is gated by the validator at [`packages/agami-core/src/semantic_mode
 ### Worked example — a minimal model on disk
 
 ```yaml
-# org.yaml
-organization: shop
+# datasource.yaml
+datasource: shop
 version: 1
 description: E-commerce shop.
 storage_connections:

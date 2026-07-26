@@ -737,7 +737,7 @@ async def admin_set_status(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 # Admin console — Model tab (read-only model explorer)
 #
-# A pure projection of the served model (`model_store.load_organization`) + the domain docs
+# A pure projection of the served model (`model_store.load_datasource`) + the domain docs
 # (`load_memory`) — the SAME tree every MCP tool reads, so there is zero drift and no second store.
 # Read-only by construction: the only route is a GET (see `routes()`), there is no write path, and
 # `storage_connections[].storage_config` (hosts/credentials) is NEVER rendered. The catalog idiom (a
@@ -928,7 +928,7 @@ def model_overview_html(
     )
     content = (
         '<div class="crumbs">Model</div>'
-        f'<div class="h1row"><h1>{ui.esc(org.organization)}</h1>'
+        f'<div class="h1row"><h1>{ui.esc(org.datasource)}</h1>'
         '<span class="readonly-pill">Read-only · edit in Claude</span></div>'
         f'<p class="lead">{ui.esc(org.description or "The deployed semantic model.")}</p>'
         f'<div class="statrow">{stats}</div>'
@@ -1252,18 +1252,18 @@ def model_relationships_html(
 def model_context_html(
     org: Any, memory: dict[str, str], datasource: str, datasources: list[str], **chrome: str
 ) -> str:
-    """The Domain-context page — the deployed ORGANIZATION.md rendered as (safe) markdown."""
+    """The Domain-context page — the deployed datasource.md rendered as (safe) markdown."""
     tree = _model_tree_html(org, datasource, datasources, active_view="context")
-    org_md = memory.get("organization")
+    datasource_md = memory.get("datasource")
     doc = (
-        f'<div class="context">{ui.md(org_md)}</div>'
-        if org_md
-        else '<p class="lead">No domain context (ORGANIZATION.md) deployed for this datasource.</p>'
+        f'<div class="context">{ui.md(datasource_md)}</div>'
+        if datasource_md
+        else '<p class="lead">No domain context (datasource.md) deployed for this datasource.</p>'
     )
     content = (
         f'<div class="crumbs"><a href="{_model_url(datasource)}">{ui.esc(datasource)}</a>'
         '<span class="sep">/</span>Domain context</div><h1>Domain context</h1>'
-        '<p class="lead">The deployed ORGANIZATION.md — the domain notes Claude reads as context. '
+        '<p class="lead">The deployed datasource.md — the domain notes Claude reads as context. '
         f"Read-only.</p>{doc}"
     )
     return _model_shell(content, tree, **chrome)
@@ -1291,7 +1291,7 @@ async def admin_model(request: Request) -> Response:
         datasource = request.query_params.get("datasource") or datasources[0]
         if datasource not in datasources:  # an unknown/stale datasource param → the first served
             datasource = datasources[0]
-        org = model_store.load_organization(store, datasource, org_id=org_id)
+        org = model_store.load_datasource(store, datasource, org_id=org_id)
         if org is None:
             return HTMLResponse(model_empty_html(datasource, datasources, **chrome))
         view = request.query_params.get("view")

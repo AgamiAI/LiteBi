@@ -127,7 +127,7 @@ For growth rates (QoQ, MoM, YoY):
 
 ## Safety Rules
 
-- **Result-set size policy** — do NOT auto-append `LIMIT 1000` (or any other implicit cap). Queries run unbounded by default. The query-database skill applies a per-org `max_rows` cap (configured in `<org_path>/local/.config.json`) when present, and a per-query "top N" cap when the user explicitly asks for "top N" / "first N" / "limit to N". For all other queries, return the full result set. See [query SKILL.md → Result-set size policy](../skills/agami-query/SKILL.md#result-set-size-policy) for the canonical contract.
+- **Result-set size policy** — do NOT auto-append `LIMIT 1000` (or any other implicit cap). Queries run unbounded by default. The query-database skill applies a per-org `max_rows` cap (configured in `<datasource_path>/local/.config.json`) when present, and a per-query "top N" cap when the user explicitly asks for "top N" / "first N" / "limit to N". For all other queries, return the full result set. See [query SKILL.md → Result-set size policy](../skills/agami-query/SKILL.md#result-set-size-policy) for the canonical contract.
 - Never generate `DROP`, `DELETE`, `TRUNCATE`, `ALTER`, `INSERT`, `UPDATE`, or `CREATE` statements
 - Never include actual credential values in SQL comments or strings
 - Use `NULLIF(denominator, 0)` to guard against division by zero

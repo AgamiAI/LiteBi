@@ -1,10 +1,10 @@
 """Serve the semantic model from the DB — the read path + the deploy-time writer.
 
-The model-loader seam is just "produce an `Organization`": the file adapter is
-`semantic_model.loader.load_organization(root)`; this is the DB adapter, which rebuilds the
-**identical** `Organization` from rows so every downstream tool (get_datasource_schema incl.
-sizing, the receipt) is untouched. YAML stays the source of truth — `write_organization` seeds the
-rows from a YAML-loaded `Organization` at deploy time (the `deploy_semantic_model.py` path).
+The model-loader seam is just "produce a `Datasource`": the file adapter is
+`semantic_model.loader.load_datasource(root)`; this is the DB adapter, which rebuilds the
+**identical** `Datasource` from rows so every downstream tool (get_datasource_schema incl.
+sizing, the receipt) is untouched. YAML stays the source of truth — `write_datasource` seeds the
+rows from a YAML-loaded `Datasource` at deploy time (the `deploy_semantic_model.py` path).
 
 Each object is stored as its key/structural columns + a `doc` (the object's `model_dump`), so the
 rebuild is lossless without enumerating every pydantic field. The parent docs exclude their child
@@ -18,10 +18,10 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from semantic_model.models import Organization, OrgRecord
+from semantic_model.models import Datasource, OrgRecord
 from store import Store
 
-# The per-datasource model tables write_organization clears before a re-seed (so a redeploy
+# The per-datasource model tables write_datasource clears before a re-seed (so a redeploy
 # reproduces the served model rather than appending duplicates / hitting PK conflicts). Must stay in
 # sync with migrations/core/001_serving.sql's serving tables; examples/memory/model_version are
 # re-seeded by their own writers, so they're not in this list.
@@ -46,10 +46,10 @@ def _est_rows(table_doc: dict[str, Any]) -> int | None:
     return ph.get("estimated_row_count") if isinstance(ph, dict) else None
 
 
-def write_organization(
-    store: Store, datasource: str, org: Organization, org_id: str = DEFAULT_ORG
+def write_datasource(
+    store: Store, datasource: str, org: Datasource, org_id: str = DEFAULT_ORG
 ) -> None:
-    """(Re)seed the serving rows for `datasource` from a loaded Organization. Idempotent — clears
+    """(Re)seed the serving rows for `datasource` from a loaded Datasource. Idempotent — clears
     the datasource's existing model rows first, so re-running the deploy reproduces the served model."""
     for tbl in _MODEL_TABLES:
         # Scoped by org as well as datasource. Without the org predicate one tenant's redeploy would
@@ -58,10 +58,10 @@ def write_organization(
             f"DELETE FROM {tbl} WHERE org_id = ? AND datasource = ?", (org_id, datasource)
         )
 
-    org_doc = org.model_dump(mode="json", exclude={"subject_areas"})
+    ds_doc = org.model_dump(mode="json", exclude={"subject_areas"})
     store.execute(
         "INSERT INTO datasource_model (org_id, datasource, description, doc) VALUES (?, ?, ?, ?)",
-        (org_id, datasource, org.description or None, json.dumps(org_doc)),
+        (org_id, datasource, org.description or None, json.dumps(ds_doc)),
     )
 
     for sa in org.subject_areas:
@@ -111,16 +111,16 @@ def write_organization(
     store.commit()
 
 
-def load_organization(
+def load_datasource(
     store: Store, datasource: str, org_id: str = DEFAULT_ORG
-) -> Organization | None:
-    """Rebuild the Organization for `datasource` from rows, or None if it isn't seeded."""
+) -> Datasource | None:
+    """Rebuild the Datasource for `datasource` from rows, or None if it isn't seeded."""
     org_rows = store.query(
         "SELECT doc FROM datasource_model WHERE org_id = ? AND datasource = ?", (org_id, datasource)
     )
     if not org_rows:
         return None
-    org_doc: dict[str, Any] = json.loads(org_rows[0]["doc"])
+    ds_doc: dict[str, Any] = json.loads(org_rows[0]["doc"])
 
     subject_areas = []
     for sa_row in store.query(
@@ -145,8 +145,8 @@ def load_organization(
             ]
         subject_areas.append(sa_doc)
 
-    org_doc["subject_areas"] = subject_areas
-    return Organization.model_validate(org_doc)
+    ds_doc["subject_areas"] = subject_areas
+    return Datasource.model_validate(ds_doc)
 
 
 def list_datasources(store: Store, org_id: str = DEFAULT_ORG) -> list[str]:
@@ -161,7 +161,7 @@ def list_datasources(store: Store, org_id: str = DEFAULT_ORG) -> list[str]:
 def model_table_counts(store: Store, org_id: str = DEFAULT_ORG) -> dict[str, int]:
     """`{datasource: table_count}` for the org's served datasources, in ONE grouped query — so the
     datasource listing sizes itself without a per-datasource round trip (no N+1) and without
-    rebuilding the whole Organization. A datasource with no modeled tables simply won't appear in
+    rebuilding the whole Datasource. A datasource with no modeled tables simply won't appear in
     the map; the caller defaults it to 0."""
     rows = store.query(
         "SELECT datasource, count(*) AS n FROM model_table WHERE org_id = ? GROUP BY datasource",
@@ -171,14 +171,14 @@ def model_table_counts(store: Store, org_id: str = DEFAULT_ORG) -> dict[str, int
 
 
 # ---------------------------------------------------------------------------
-# Memory (ORGANIZATION.md / USER_MEMORY.md) + model_version — served from the DB too, so a DB-only
+# Memory (datasource.md / USER_MEMORY.md) + model_version — served from the DB too, so a DB-only
 # deploy reads NO files at runtime (get_datasource_schema's domain context + the receipt's version
 # pin come from these tables, not disk).
 # ---------------------------------------------------------------------------
 
 
-# ORGANIZATION.md is per-datasource; USER_MEMORY.md is cross-datasource (mirroring the file layout:
-# <artifacts_dir>/<profile>/ORGANIZATION.md vs <artifacts_dir>/USER_MEMORY.md), so it is stored once
+# datasource.md is per-datasource; USER_MEMORY.md is cross-datasource (mirroring the file layout:
+# <artifacts_dir>/<profile>/datasource.md vs <artifacts_dir>/USER_MEMORY.md), so it is stored once
 # under this sentinel datasource rather than duplicated per datasource. It is still keyed by org — one
 # row PER ORG, not one per install, or one tenant's user memory would be served to another's.
 _GLOBAL_DATASOURCE = ""
@@ -188,21 +188,21 @@ def write_memory(
     store: Store,
     datasource: str,
     *,
-    organization: str | None = None,
+    datasource_doc: str | None = None,
     user: str | None = None,
     org_id: str = DEFAULT_ORG,
 ) -> None:
-    """Seed the domain-context docs. `organization` is per-datasource; `user` is cross-datasource but
+    """Seed the domain-context docs. `datasource_doc` is per-datasource; `user` is cross-datasource but
     still per-org (the empty-datasource sentinel row). Pass either/both; each replaces its row."""
-    if organization is not None:
+    if datasource_doc is not None:
         store.execute(
-            "DELETE FROM memory WHERE org_id = ? AND datasource = ? AND kind = 'organization'",
+            "DELETE FROM memory WHERE org_id = ? AND datasource = ? AND kind = 'datasource'",
             (org_id, datasource),
         )
         store.execute(
             "INSERT INTO memory (org_id, datasource, kind, content) "
-            "VALUES (?, ?, 'organization', ?)",
-            (org_id, datasource, organization),
+            "VALUES (?, ?, 'datasource', ?)",
+            (org_id, datasource, datasource_doc),
         )
     if user is not None:
         store.execute(
@@ -217,10 +217,10 @@ def write_memory(
 
 
 def load_memory(store: Store, datasource: str, org_id: str = DEFAULT_ORG) -> dict[str, str]:
-    """{'organization': <per-datasource ORGANIZATION.md>, 'user': <the org's USER_MEMORY.md>} —
+    """{'datasource': <per-datasource datasource.md>, 'user': <the org's USER_MEMORY.md>} —
     missing keys absent."""
     out: dict[str, str] = {}
-    for kind, ds in (("organization", datasource), ("user", _GLOBAL_DATASOURCE)):
+    for kind, ds in (("datasource", datasource), ("user", _GLOBAL_DATASOURCE)):
         rows = store.query(
             "SELECT content FROM memory WHERE org_id = ? AND datasource = ? AND kind = ?",
             (org_id, ds, kind),

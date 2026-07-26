@@ -24,12 +24,12 @@ from store import Store  # noqa: E402
 
 
 def _write_model(root: Path, datasource: str, org_name: str = "acme") -> None:
-    """A minimal but real v2 profile dir: org + one subject area + a table + examples + ORGANIZATION.md."""
+    """A minimal but real v2 profile dir: org + one subject area + a table + examples + datasource.md."""
     d = root / datasource
     (d / "subject_areas" / "Catalog" / "tables").mkdir(parents=True, exist_ok=True)
     (d / "prompt_examples" / "Catalog").mkdir(parents=True, exist_ok=True)
-    (d / "org.yaml").write_text(
-        f"organization: {org_name}\nversion: 1\ndescription: A neutral demo model.\n"
+    (d / "datasource.yaml").write_text(
+        f"datasource: {org_name}\nversion: 1\ndescription: A neutral demo model.\n"
         "storage_connections:\n  - name: warehouse\n    storage_type: PostgreSQL\n"
         "subject_areas:\n  - Catalog\n"
     )
@@ -43,7 +43,7 @@ def _write_model(root: Path, datasource: str, org_name: str = "acme") -> None:
     (d / "prompt_examples" / "Catalog" / "examples.yaml").write_text(
         "examples:\n  - question: how many products?\n    sql: SELECT COUNT(*) FROM products\n"
     )
-    (d / "ORGANIZATION.md").write_text("# Acme\nNeutral demo domain notes.\n")
+    (d / "datasource.md").write_text("# Acme\nNeutral demo domain notes.\n")
 
 
 def _store(tmp_path: Path) -> Store:
@@ -61,10 +61,10 @@ def test_deploy_loads_model_and_round_trips(tmp_path):
     _write_model(arts, "demo")
     store = _store(tmp_path)
     loaded = model_deploy.deploy_models(store, arts)
-    org = model_store.load_organization(store, "demo")
+    org = model_store.load_datasource(store, "demo")
     store.close()
     assert loaded == ["demo"]
-    assert org is not None and org.organization == "acme"
+    assert org is not None and org.datasource == "acme"
     assert [sa.name for sa in org.subject_areas] == ["Catalog"]
     assert [t.name for sa in org.subject_areas for t in sa.tables_defined] == ["products"]
 
@@ -90,7 +90,7 @@ def test_examples_memory_and_version_are_loaded(tmp_path):
     model_deploy.deploy_models(store, arts)
     examples = store.query("SELECT question FROM prompt_example WHERE datasource = ?", ("demo",))
     memory = store.query(
-        "SELECT content FROM memory WHERE datasource = ? AND kind = 'organization'", ("demo",)
+        "SELECT content FROM memory WHERE datasource = ? AND kind = 'datasource'", ("demo",)
     )
     version = store.query("SELECT version FROM model_version WHERE datasource = ?", ("demo",))
     store.close()
@@ -131,7 +131,7 @@ def test_redeploy_clears_removed_examples(tmp_path):
 def test_main_invalid_yaml_exits_one_not_traceback(tmp_path, monkeypatch):
     arts = tmp_path / "artifacts"
     _write_model(arts, "demo")
-    (arts / "demo" / "org.yaml").write_text("organization: [unterminated\n")  # invalid YAML
+    (arts / "demo" / "datasource.yaml").write_text("datasource: [unterminated\n")  # invalid YAML
     monkeypatch.setenv("AGAMI_DB_URL", "sqlite://" + str(tmp_path / "m.db"))
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(arts))
     assert model_deploy.main([]) == 1  # caught → clean exit, not an uncaught traceback
@@ -141,7 +141,7 @@ def test_multiple_datasources_each_load(tmp_path):
     arts = tmp_path / "artifacts"
     _write_model(arts, "demo", org_name="acme")
     _write_model(arts, "demo2", org_name="beta")
-    # a non-model subdir (no org.yaml) must be skipped, not error
+    # a non-model subdir (no datasource.yaml) must be skipped, not error
     (arts / "local").mkdir(parents=True, exist_ok=True)
     (arts / "local" / "credentials").write_text("[demo]\nhost=localhost\n")
     store = _store(tmp_path)
@@ -158,9 +158,9 @@ def test_main_deploys_all_then_a_named_datasource(tmp_path, monkeypatch):
     assert model_deploy.main([]) == 0  # deploy every model under the dir (migrates first, then loads)
     assert model_deploy.main(["demo"]) == 0  # deploy a named datasource
     store = Store.connect("sqlite://" + str(tmp_path / "m.db"))
-    org = model_store.load_organization(store, "demo")
+    org = model_store.load_datasource(store, "demo")
     store.close()
-    assert org is not None and org.organization == "acme"
+    assert org is not None and org.datasource == "acme"
 
 
 def test_main_errors_when_no_model_found(tmp_path, monkeypatch):
@@ -181,7 +181,7 @@ def test_malformed_examples_file_is_skipped_not_fatal(tmp_path):
     )
     store = _store(tmp_path)
     loaded = model_deploy.deploy_models(store, arts)  # must not raise
-    org = model_store.load_organization(store, "demo")
+    org = model_store.load_datasource(store, "demo")
     n_examples = _count(store, "prompt_example", "demo")
     store.close()
     assert loaded == ["demo"] and org is not None  # the model deployed despite the bad examples file
@@ -205,20 +205,20 @@ def test_main_errors_naming_a_missing_datasource(tmp_path, monkeypatch):
     arts.mkdir()
     monkeypatch.setenv("AGAMI_DB_URL", "sqlite://" + str(tmp_path / "m.db"))
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(arts))
-    rc = model_deploy.main(["nope"])  # no nope/org.yaml
+    rc = model_deploy.main(["nope"])  # no nope/datasource.yaml
     assert rc == 1
 
 
 # --- F14 / ACE-056 + ACE-057: minted org_id stamping + backfill --------------------------------
 
 def test_deploy_stamps_minted_org_id(tmp_path, monkeypatch):
-    # A model whose org.yaml carries a minted org_id: deploy resolves it (via _default_org ->
+    # A model whose datasource.yaml carries a minted org_id: deploy resolves it (via _default_org ->
     # tools.resolved_org_id over the artifacts dir) and stamps serving rows with it, not 'local'.
     import tools
 
     arts = tmp_path / "artifacts"
     _write_model(arts, "demo")
-    p = arts / "demo" / "org.yaml"
+    p = arts / "demo" / "datasource.yaml"
     p.write_text("org_id: mintedcafe\n" + p.read_text())
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(arts))
     monkeypatch.delenv("AGAMI_ORG_ID", raising=False)

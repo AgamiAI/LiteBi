@@ -205,7 +205,7 @@ def check_read_only(sql: str) -> str | None:
 
 
 def _load_org(profile: str):
-    """Lazily load the semantic model for a profile, producing an `Organization`. Two backends
+    """Lazily load the semantic model for a profile, producing a `Datasource`. Two backends
     behind one seam: when AGAMI_DB_URL is set the hosted server reads it from the DB; otherwise the
     local skill reads the YAML files (unchanged). Raises a clear error if the model deps (pydantic)
     aren't importable or there's no model for the profile."""
@@ -213,7 +213,7 @@ def _load_org(profile: str):
 
     store = Store.from_env()
     if store is not None:
-        from model_store import load_organization as _load_db
+        from model_store import load_datasource as _load_db
 
         try:
             org = _load_db(store, profile, org_id=_current_org_id())
@@ -229,12 +229,12 @@ def _load_org(profile: str):
     from semantic_model import loader as L  # may raise ImportError (pydantic)
 
     root = resolve_artifacts_dir() / profile
-    if not (root / "org.yaml").exists():
+    if not (root / "datasource.yaml").exists():
         raise FileNotFoundError(
-            f"No semantic model at {root}/org.yaml. Run the agami-connect skill to "
+            f"No semantic model at {root}/datasource.yaml. Run the agami-connect skill to "
             f"introspect this database."
         )
-    return L.load_organization(root)
+    return L.load_datasource(root)
 
 
 def _resolve_units(profile: str, sql: str) -> dict[str, str]:
@@ -289,7 +289,7 @@ def resolved_org_id() -> str:
     The SAME function backs both the deploy-time stamp (``model_deploy._default_org``) and the serve-time
     resolver, so a deployment writes and reads its rows under one identical id.
 
-    F15 relocates the id's home from each profile's ``org.yaml`` up into the one root record, so the
+    F15 relocates the id's home from each profile's ``datasource.yaml`` up into the one root record, so the
     org owns its own identity; the per-profile scan is kept only as the legacy fallback for a deployment
     that has a per-profile id but no record yet (the id is lifted into a record on the next onboard).
     The artifacts-dir scope (not one 'active' profile) is preserved: a deploy with ``AGAMI_PROFILE``
@@ -306,7 +306,7 @@ def resolved_org_id() -> str:
 
         art = resolve_artifacts_dir()
         record = OR.load_org_record(art)  # F15: the record is the home of the id
-        # Legacy fallback: a pre-record deployment still keeps its id in each profile's org.yaml.
+        # Legacy fallback: a pre-record deployment still keeps its id in each profile's datasource.yaml.
         oid = record.org_id if record is not None else L.deployment_org_id(art)
     except Exception:
         oid = None  # missing/legacy record or absent model deps -> single-tenant default
@@ -358,7 +358,7 @@ _ORG_CACHE_LOCK = threading.Lock()
 
 def get_cached_org(profile: str):
     """Load the semantic model for `profile`, cached per process and keyed (org, datasource, version).
-    Reuses one Organization across the loads within a query AND across queries, until the model version
+    Reuses one Datasource across the loads within a query AND across queries, until the model version
     changes; a cache miss falls back to a fresh `_load_org`."""
     version = _model_version(profile)  # cheap: one DB row / dir listing, not a full model load
     if version is None:
@@ -384,10 +384,10 @@ def get_cached_org(profile: str):
 
 def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, str]":
     """Every piece of domain-context text the served schema needs, read in ONE place: the per-datasource
-    ORGANIZATION.md, USER_MEMORY.md, the deployment ``OrgRecord``, and the company narrative. Under the DB
+    datasource.md, USER_MEMORY.md, the deployment ``OrgRecord``, and the company narrative. Under the DB
     backend all of it is read on a SINGLE connection — this is a hot tool path, so open ``Store`` once, not
     per-source; with no DB configured it falls back to file reads (a DB deploy reads no files at runtime).
-    Returns ``(org_md, user_md, record | None, company_md)``; missing pieces come back empty/``None`` so the
+    Returns ``(datasource_md, user_md, record | None, company_md)``; missing pieces come back empty/``None`` so the
     two-level composition degrades cleanly."""
     from store import Store
 
@@ -396,18 +396,18 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
         from model_store import load_memory, load_organization_record
 
         try:
-            mem = load_memory(store, profile, org_id=org_id)  # per-datasource ORGANIZATION.md + USER_MEMORY.md
+            mem = load_memory(store, profile, org_id=org_id)  # per-datasource datasource.md + USER_MEMORY.md
             record = load_organization_record(store, org_id)  # the deployment company record
             company = load_memory(store, "", org_id=org_id)  # company narrative rides the datasource='' row
         finally:
             store.close()
-        return mem.get("organization") or "", mem.get("user"), record, (company.get("organization") or "")
+        return mem.get("datasource") or "", mem.get("user"), record, (company.get("datasource") or "")
 
     from semantic_model import org_record as OR
 
     art = resolve_artifacts_dir()
     return (
-        _read_text(art / profile / "ORGANIZATION.md") or "",
+        _read_text(art / profile / "datasource.md") or "",
         _read_text(art / "USER_MEMORY.md"),
         OR.load_org_record(art),
         _read_text(OR.narrative_path(art)) or "",
@@ -466,7 +466,7 @@ def tool_list_datasources(_args: dict[str, Any]) -> str:
             {
                 "datasources": [],
                 "note": "No models deployed to this server yet. Load one with the deploy's model "
-                "loader (model_deploy scans <artifacts_dir>/*/org.yaml).",
+                "loader (model_deploy scans <artifacts_dir>/*/datasource.yaml).",
             },
             indent=2,
         )
@@ -489,7 +489,7 @@ def tool_list_datasources(_args: dict[str, Any]) -> str:
                 "datasource": profile,
                 "database_type": _db_type_for(profile, creds),
                 "table_count": table_count,
-                "model_present": (pdir / "org.yaml").exists(),
+                "model_present": (pdir / "datasource.yaml").exists(),
                 "is_active": profile == active,
             }
         )
@@ -522,7 +522,7 @@ def _read_text(path: Path) -> str | None:
 
 
 def _distill_for_llm(text: str | None) -> str:
-    """Strip the human-only scaffolding from a context doc (ORGANIZATION.md / USER_MEMORY.md)
+    """Strip the human-only scaffolding from a context doc (datasource.md / USER_MEMORY.md)
     before it goes into the model's prompt. These files serve two readers: a human editing
     them (who wants the `<!-- edit freely … -->` prompts) and the LLM reading them as query
     context (for whom those prompts are noise — or worse, a "this was auto-generated" aside it
@@ -769,7 +769,7 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
     `get_table_context` for the named tables (an explicit scope is respected — no downgrade).
     `query="<question>"` lexically ranks metrics so the client never ingests the whole catalog;
     `metric_index` (name->description for EVERY metric) + `large_tables` are always present.
-    Plus ORGANIZATION.md / USER_MEMORY.md domain context.
+    Plus datasource.md / USER_MEMORY.md domain context.
     """
     profile = resolve_profile(args.get("datasource"))
     try:
@@ -846,9 +846,9 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
             )
 
     parts = [json.dumps(result, indent=2, default=str)]
-    # Domain context = the human's ORGANIZATION.md narrative + the model-DERIVED summary
+    # Domain context = the human's datasource.md narrative + the model-DERIVED summary
     # (subject areas, conventions, decoded glossary) assembled fresh from the structured model.
-    # Source (ORGANIZATION.md / USER_MEMORY.md text) comes from the DB under the DB backend, files
+    # Source (datasource.md / USER_MEMORY.md text) comes from the DB under the DB backend, files
     # otherwise — so a DB-only deploy reads no files at runtime.
     from semantic_model import org_draft as _OD
 
@@ -1361,7 +1361,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "budget; `dataset_names=[...]` returns full get_table_context (columns scoped by "
             "expose_column_groups, default_filters, relationships, caveats, value_transforms, "
             "metrics) for the named tables; `query` ranks metrics so you don't ingest the whole "
-            "catalog (`metric_index` lists every metric regardless). Plus ORGANIZATION.md / "
+            "catalog (`metric_index` lists every metric regardless). Plus datasource.md / "
             "USER_MEMORY.md context. Use metric `calculation`/`bindings` VERBATIM."
         ),
         "inputSchema": {

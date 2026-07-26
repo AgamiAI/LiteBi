@@ -24,13 +24,13 @@ import execute_sql  # noqa: E402
 from semantic_model import models as m  # noqa: E402
 
 
-def _org() -> m.Organization:
+def _org() -> m.Datasource:
     """A model declaring exactly two tables: orders, customers."""
     def _t(name):
         return m.Table(name=name, schema="public", storage_connection="c", grain=["id"],
                        description=name, columns=[m.Column(name="id", type="integer")])
-    return m.Organization(
-        organization="Shop",
+    return m.Datasource(
+        datasource="Shop",
         subject_areas=[m.SubjectArea(name="sales", tables_defined=[_t("orders"), _t("customers")])],
     )
 
@@ -41,7 +41,7 @@ def _seed_db(url: str, ds: str = "acme") -> None:
 
     s = Store.connect(url)
     s.run_migrations()
-    model_store.write_organization(s, ds, _org())
+    model_store.write_datasource(s, ds, _org())
     s.close()
 
 
@@ -49,8 +49,8 @@ def _write_disk(root: Path) -> None:
     import yaml
 
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(
-        yaml.safe_dump({"organization": "Shop", "version": 1, "subject_areas": ["subject_areas/sales"]})
+    (root / "datasource.yaml").write_text(
+        yaml.safe_dump({"datasource": "Shop", "version": 1, "subject_areas": ["subject_areas/sales"]})
     )
     (root / "subject_areas" / "sales" / "subject_area.yaml").write_text(
         yaml.safe_dump({"name": "sales", "tables": [

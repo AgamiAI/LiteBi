@@ -106,15 +106,15 @@ def _build_auth_provider() -> AuthProvider:
 
 def _build_org_resolver() -> SingleTenantOrgResolver:
     """The OSS default tenancy: single-tenant, one configured org. The id is the F14 minted uuid
-    resolved by `tools.resolved_org_id()` (AGAMI_ORG_ID env -> org.yaml -> "local") — the SAME
+    resolved by `tools.resolved_org_id()` (AGAMI_ORG_ID env -> organization.yaml -> "local") — the SAME
     resolution the deploy stamp uses, so writes and reads agree. Multi-tenant is a future change at
     the *schema* layer plus an authz check — not a resolver swap, so the seam lives here now."""
     org_id = resolved_org_id()
     # Load-bearing for a hand-rolled DB-only deploy: log the resolved id + where it came from, so an
-    # operator can see "org_id=local (default)" and realize org.yaml/AGAMI_ORG_ID isn't reaching the
+    # operator can see "org_id=local (default)" and realize organization.yaml/AGAMI_ORG_ID isn't reaching the
     # server (see F14's documented residual risk).
     source = "env" if os.environ.get("AGAMI_ORG_ID", "").strip() else (
-        "default" if org_id == "local" else "org.yaml"
+        "default" if org_id == "local" else "organization.yaml"
     )
     _log.info("single-tenant org_id=%s (source=%s)", org_id, source)
     return SingleTenantOrgResolver(Org(id=org_id))

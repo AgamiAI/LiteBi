@@ -47,8 +47,8 @@ def _area_with_n_rels(name: str, n: int) -> m.SubjectArea:
     return m.SubjectArea(name=name, tables=refs, tables_defined=[a, b], relationships=rels)
 
 
-def _org(*areas) -> m.Organization:
-    return m.Organization(organization="O",
+def _org(*areas) -> m.Datasource:
+    return m.Datasource(datasource="O",
                           storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                           subject_areas=list(areas))
 
@@ -89,7 +89,7 @@ def test_memoized_validation_verdict_is_unchanged():
 
 def _mini_model(root: Path) -> None:
     (root / "subject_areas" / "a").mkdir(parents=True, exist_ok=True)
-    (root / "org.yaml").write_text("organization: t\nversion: 1\n", encoding="utf-8")
+    (root / "datasource.yaml").write_text("datasource: t\nversion: 1\n", encoding="utf-8")
     (root / "subject_areas" / "a" / "subject_area.yaml").write_text("name: a\n", encoding="utf-8")
     (root / "subject_areas" / "a" / "note.yaml").write_text("k: v\n", encoding="utf-8")
 
@@ -287,8 +287,8 @@ def _write_two_area_model(root: Path) -> None:
     """A real on-disk two-area model (sales, crm), each one valid table — the shape curate writes to.
     Kept minimal so it validates cleanly and an enrichment write to one area is a real edit."""
     (root / "datasources" / "c").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "shop", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "shop", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/sales", "subject_areas/crm"],
     }))

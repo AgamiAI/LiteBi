@@ -69,7 +69,7 @@ def cmd_validate(args) -> int:
     # exclusion as orphan_table_ref — even though curate passed and the runtime is fine.
     # A GENUINE orphan (a ref to a never-defined table) still fails, since no YAML
     # exists for it even with rejected included.
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     res = V.validate(org)
     print(V.format_result(res))
     return 0 if res.ok else 1
@@ -87,7 +87,7 @@ def cmd_snapshot(args) -> int:
 
 
 def cmd_ensure_org_id(args) -> int:
-    """Mint + persist the deployment org_id into <root>/org.yaml if absent (F14 / ACE-056; relocated
+    """Mint + persist the deployment org_id into <root>/datasource.yaml if absent (F14 / ACE-056; relocated
     by F15 / ACE-067), then print it. Idempotent — an already-minted id is returned unchanged. The
     introspect/curate paths mint inline via write_tree; this command is for paths that write a model
     WITHOUT them — e.g. agami-connect's sample copy (6A) drops a prebuilt model that carries no id.
@@ -97,19 +97,19 @@ def cmd_ensure_org_id(args) -> int:
 
     from . import build
     root = Path(args.root)
-    org_path = root / "org.yaml"
-    doc = L._read_yaml(org_path) or {}
+    datasource_path = root / "datasource.yaml"
+    doc = L._read_yaml(datasource_path) or {}
     existing = doc.get("org_id")
     oid = build.ensure_org_id(root, existing or None)
     if oid != existing:
         doc["org_id"] = oid
-        org_path.write_text(build._dump(doc), encoding="utf-8")
+        datasource_path.write_text(build._dump(doc), encoding="utf-8")
     print(oid)
     return 0
 
 
 def cmd_context(args) -> int:
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     out = L.get_table_context(
         org,
         args.tables,
@@ -122,37 +122,37 @@ def cmd_context(args) -> int:
 
 
 def cmd_bundle(args) -> int:
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     _print_json(L.get_subject_area_bundle(org, args.area))
     return 0
 
 
 def cmd_areas(args) -> int:
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     _print_json(RT.list_subject_areas(org))
     return 0
 
 
 def cmd_org_draft(args) -> int:
-    # A human-narrative STARTER for ORGANIZATION.md (skip path) — a prompt only, no model
+    # A human-narrative STARTER for datasource.md (skip path) — a prompt only, no model
     # facts. Those are derived at read time (see `org-context`), so they never get baked into
     # the editable prose file where a human could clobber them.
     from . import org_draft
-    org = L.load_organization(args.root, include_rejected=False)
-    sys.stdout.write(org_draft.starter_organization_md(org))
+    org = L.load_datasource(args.root, include_rejected=False)
+    sys.stdout.write(org_draft.starter_datasource_md(org))
     return 0
 
 
 def cmd_org_context(args) -> int:
     # The full domain context for the LLM, two-level (F15 / ACE-069): the shared COMPANY block from the
-    # deployment record (<artifacts_dir>/organization.yaml + the root ORGANIZATION.md), then this
+    # deployment record (<artifacts_dir>/organization.yaml + the root organization.md), then this
     # datasource's source-specific narrative + model-derived summary. With no record it degrades to the
     # pre-F15 per-profile assembly (byte-identical). This is what the query path injects as context.
     from . import org_draft
     from . import org_record as OR
     root = Path(args.root)
-    org = L.load_organization(root, include_rejected=False)
-    src_md = root / "ORGANIZATION.md"
+    org = L.load_datasource(root, include_rejected=False)
+    src_md = root / "datasource.md"
     source_narrative = src_md.read_text(encoding="utf-8") if src_md.exists() else ""
     art = root.parent  # the artifacts dir holds the deployment-level record + company narrative
     record = OR.load_org_record(art)
@@ -194,7 +194,7 @@ def cmd_examples(args) -> int:
 
 
 def cmd_preflight(args) -> int:
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     result = RT.pre_flight_check(args.sql, org)
     _print_json(result.as_dict())
     return 0
@@ -208,7 +208,7 @@ def cmd_prepare(args) -> int:
     sql = args.sql
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     pf = RT.pre_flight_check(sql, org)
     if pf.risk and pf.action == "refuse":
         _print_json({"action": "refuse", "risk": pf.risk, "reason": pf.reason,
@@ -240,7 +240,7 @@ def cmd_receipt(args) -> int:
     sql = args.sql
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     pf = RT.pre_flight_check(sql, org)
     applied = json.loads(args.applied_filters) if args.applied_filters else None
     receipt = RT.assemble_receipt(
@@ -256,14 +256,14 @@ def cmd_receipt(args) -> int:
 
 def cmd_review_queue(args) -> int:
     from . import curate
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     _print_json(curate.review_queue(org))
     return 0
 
 
 def cmd_review_items(args) -> int:
     from . import curate
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     _print_json(curate.all_items(org, scope=args.scope))
     return 0
 
@@ -274,7 +274,7 @@ def cmd_curate_gate(args) -> int:
     skill running `sm sensitive` + `sm review-items --scope preseed` and branching by
     hand. Turn-boundary-safe (same answer on a fresh run or a resume)."""
     from . import curate
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     pii = curate.sensitive_columns(org).get("count", 0)
     preseed = len(curate.all_items(org, scope="preseed"))
     _print_json({"pii_count": pii, "preseed_count": preseed,
@@ -284,7 +284,7 @@ def cmd_curate_gate(args) -> int:
 
 def cmd_model_tree(args) -> int:
     from . import curate
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     _print_json(curate.model_tree(org))
     return 0
 
@@ -294,7 +294,7 @@ def cmd_coverage(args) -> int:
     The skill runs this at the end of Phase 2 (and reports it in the Phase 7 summary):
     `ok: false` with untouched columns means enrichment skipped the column pass."""
     from . import curate
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     _print_json(curate.column_coverage(org))
     return 0
 
@@ -304,7 +304,7 @@ def cmd_choice_coverage(args) -> int:
     runs this to confirm the value-enum decode ran — `ok: false` means coded columns are
     missing their {code:label} maps (the generator can't translate 'high' → 1 without them)."""
     from . import curate
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     _print_json(curate.unlabeled_choice_fields(org))
     return 0
 
@@ -316,7 +316,7 @@ def cmd_sensitive(args) -> int:
     uses this count to decide whether to open the explorer (so the gate stops re-opening
     once the user has excluded the flagged columns)."""
     from . import curate
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     flagged = curate.sensitive_columns(org)
     suspected = curate.suspected_sensitive_columns(org)
     # `count`/`columns` keep their meaning (flagged PII — the gate signal); `suspected` is the
@@ -326,7 +326,7 @@ def cmd_sensitive(args) -> int:
 
 
 def cmd_set_terminology(args) -> int:
-    """Write the org-level domain glossary (term -> definition) onto org.yaml's
+    """Write the org-level domain glossary (term -> definition) onto datasource.yaml's
     `key_terminology` — the decoded-abbreviation legend enrichment produces. Merges by
     default (layers over a human's edits); --replace overwrites. Validated + committed."""
     from . import curate
@@ -359,7 +359,7 @@ def cmd_approve_queue(args) -> int:
     self-stamped `approve` op, and applies via curate.apply. `--kind` narrows to one item
     type; `--dry-run` prints the ops without touching the model."""
     from . import curate
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     queue = curate.review_queue(org)
     kinds = set(args.kind) if args.kind else None
     ops = [{"op": "approve", "kind": it["kind"], "area": it["area"],
@@ -415,7 +415,7 @@ def cmd_suggest_units(args) -> int:
     `discount`. Skips columns that already carry a `unit`. Emits
     {money_columns: [{area, table, column, type}]} for the caller to confirm + apply."""
     from . import build as B
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     numeric = {"integer", "decimal", "float"}
     money = []
     for sa in org.subject_areas:
@@ -438,7 +438,7 @@ def cmd_set_units(args) -> int:
     if not unit:
         _print_json({"set": 0, "error": "pass --currency <ISO> or --unit <name>"})
         return 1
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     numeric = {"integer", "decimal", "float"}
     explicit = set(args.columns or [])
     ops = []
@@ -473,7 +473,7 @@ def cmd_suggest_metrics(args) -> int:
     from . import curate
     from . import dialects as D
     from . import introspect as INTRO
-    org = L.load_organization(args.root)
+    org = L.load_datasource(args.root)
     conn_type = {sc.name: sc.storage_type for sc in org.storage_connections}
     default_type = org.storage_connections[0].storage_type if org.storage_connections else "PostgreSQL"
     _dcache: dict = {}
@@ -649,7 +649,7 @@ def cmd_seed_examples(args) -> int:
     the whole Phase-5 mechanical loop in one call (no throwaway validate-and-write script)."""
     from . import curate
     from .introspect import make_execute_sql_runner
-    org = L.load_organization(args.root, include_rejected=True)
+    org = L.load_datasource(args.root, include_rejected=True)
     # Gate 1 — enrichment completeness (NOT bypassable): every kept column must be described
     # or explicitly ai_unknown. Catches a model that enriched tables but skipped columns.
     block = _coverage_gate(org)
@@ -699,7 +699,7 @@ def cmd_seed_validate(args) -> int:
     # answer — a column with unit: INR shows ₹ here too, not a bare number. If the model
     # can't load, fall back to raw cells (no regression).
     try:
-        fmt_org = L.load_organization(args.root)
+        fmt_org = L.load_datasource(args.root)
     except Exception:
         fmt_org = None
     items: list[dict] = []
@@ -804,10 +804,10 @@ def cmd_enrich_metadata(args) -> int:
     from . import dialects as D
     from . import introspect as INTRO
     from . import metadata_sources as MS
-    from .loader import load_organization
+    from .loader import load_datasource
 
     root = Path(args.root).expanduser()
-    org = load_organization(root)
+    org = load_datasource(root)
     model_tables = [t.name for sa in org.subject_areas for t in sa.tables_defined]
     valid = {(t.name.lower(), c.name.lower())
              for sa in org.subject_areas for t in sa.tables_defined for c in t.columns}
@@ -1100,7 +1100,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.set_defaults(func=cmd_snapshot)
 
-    sp = sub.add_parser("ensure-org-id", help="mint + persist the deployment org_id into org.yaml if absent (e.g. after copying a sample model)")
+    sp = sub.add_parser("ensure-org-id", help="mint + persist the deployment org_id into datasource.yaml if absent (e.g. after copying a sample model)")
     sp.add_argument("root")
     sp.set_defaults(func=cmd_ensure_org_id)
 
@@ -1125,7 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.set_defaults(func=cmd_areas)
 
-    sp = sub.add_parser("org-draft", help="print a human-narrative STARTER for ORGANIZATION.md (prompt only, no facts)")
+    sp = sub.add_parser("org-draft", help="print a human-narrative STARTER for datasource.md (prompt only, no facts)")
     sp.add_argument("root")
     sp.set_defaults(func=cmd_org_draft)
 
@@ -1197,7 +1197,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.set_defaults(func=cmd_sensitive)
 
-    sp = sub.add_parser("set-terminology", help="write the org domain glossary (term→definition) onto org.yaml key_terminology")
+    sp = sub.add_parser("set-terminology", help="write the org domain glossary (term→definition) onto datasource.yaml key_terminology")
     sp.add_argument("root")
     sp.add_argument("--file", required=True, help="JSON object {term: definition, ...} (or {key_terminology: {...}})")
     sp.add_argument("--replace", action="store_true", help="replace the glossary instead of merging over it")
@@ -1367,7 +1367,7 @@ def main(argv=None) -> int:
         # callers fold the "does a model exist?" check into their first real command
         # (e.g. `sm areas`) instead of a separate filesystem probe. Exit 3 = "no model
         # here — run agami-connect"; distinct from validation errors (1) and usage (2).
-        if "org.yaml" in str(e):
+        if "datasource.yaml" in str(e):
             _print_json({"error": "no_model", "detail": str(e)})
             return 3
         raise

@@ -1,6 +1,6 @@
 """agami semantic model — provider-portable, standard-concepts hierarchy.
 
-This is **the** agami semantic model: a hierarchy of Organization → Storage
+This is **the** agami semantic model: a hierarchy of Datasource → Storage
 Connection (physical) + Subject Area (logical) → Table / Entity / Metric /
 Relationship, with provider-portable declarative fields (default_filters,
 value_transform, caveats, value_pattern, sensitive, cardinality, …) so that any
@@ -9,7 +9,7 @@ backend.
 
 Layout on disk (the canonical profile format, rooted at `<artifacts_dir>/<profile>/`):
 
-    org.yaml                                 # org desc + storage_connections + subject_areas
+    datasource.yaml                                 # org desc + storage_connections + subject_areas
     datasources/<connection>/storage.yaml    # physical: storage_type, storage_config
     subject_areas/<name>/
       subject_area.yaml                      # desc, default_time_window, tables (TableRefs)

@@ -33,8 +33,8 @@ def profile_dir(tmp_path):
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
     (root / "subject_areas" / "sales" / "metrics").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "test", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "test", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/sales"],
     }))
@@ -120,14 +120,14 @@ def test_manifest_surfaces_full_model(profile_dir):
     (profile_dir / "prompt_examples" / "sales").mkdir(parents=True, exist_ok=True)
     (profile_dir / "prompt_examples" / "sales" / "examples.yaml").write_text(yaml.safe_dump([
         {"question": "how many orders", "sql": "SELECT COUNT(*) FROM orders", "source": "seed"}]))
-    (profile_dir / "ORGANIZATION.md").write_text("# About\nA shop. MRR = monthly recurring revenue.")
+    (profile_dir / "datasource.md").write_text("# About\nA shop. MRR = monthly recurring revenue.")
     (area / "relationships.yaml").write_text(yaml.safe_dump({"relationships": [
         {"from_table": "orders", "from_column": "customer_id", "to_table": "customers",
          "to_column": "id", "relationship": "many_to_one", "review_state": "approved",
          "confidence": "confirmed", "signed_off_by": "agami_introspect",
          "signed_off_role": "system", "signed_off_at": "t"}]}))
     m = build_manifest(profile_dir, "test")
-    assert "MRR = monthly recurring revenue" in m["organization_md"]
+    assert "MRR = monthly recurring revenue" in m["datasource_md"]
     assert any(e["name"] == "customer" and e["maps_to"] == ["customers.id"] for e in m["entities"])
     assert any(x["question"] == "how many orders" for x in m["examples"])
     # the fixture's orders→customers FK relationship is surfaced
@@ -159,8 +159,8 @@ def test_manifest_carries_table_description_source_ai_unknown(tmp_path):
     root = tmp_path / "p"
     (root / "datasources" / "c").mkdir(parents=True)
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
-    (root / "org.yaml").write_text(yaml.safe_dump({
-        "organization": "p", "version": 1,
+    (root / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "p", "version": 1,
         "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
         "subject_areas": ["subject_areas/s"]}))
     (root / "datasources" / "c" / "storage.yaml").write_text(

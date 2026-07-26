@@ -4,33 +4,33 @@ Free-form Markdown file holding **cross-database user preferences and policies**
 
 This is **separate** from the auto-memory file at `~/.claude/projects/<workspace>/memory/MEMORY.md` (Claude Code's auto-memory, which is host-managed and project-scoped). USER_MEMORY.md is **agami-managed**, lives alongside `credentials` and the per-profile directories, and persists across Claude Code hosts (CLI / VS Code extension / Cursor extension) the same way credentials do.
 
-USER_MEMORY.md is also **separate from `<artifacts_dir>/<profile>/ORGANIZATION.md`**:
+USER_MEMORY.md is also **separate from `<artifacts_dir>/<profile>/datasource.md`**:
 
 | File | Scope | Examples |
 |---|---|---|
 | `<artifacts_dir>/USER_MEMORY.md` | **Cross-database** preferences (one global file) | "default time window: last 30 days", "exclude test users with email matching @example.com", "show currency as EUR" |
-| `<artifacts_dir>/<profile>/ORGANIZATION.md` | **Per-database** domain context (one per profile) | "MRR = monthly recurring revenue", "active user = signed in within 30 days", "fiscal year starts October" |
+| `<artifacts_dir>/<profile>/datasource.md` | **Per-database** domain context (one per profile) | "MRR = monthly recurring revenue", "active user = signed in within 30 days", "fiscal year starts October" |
 
-The skill loads both on every query. USER_MEMORY answers *how should I display / filter results, no matter which database*; ORGANIZATION.md answers *what does the data mean for this specific database*. Keep only your **personal** display tics here — a currency/unit fact ("amounts are in INR") attaches to the column in the shared model, and a database-wide presentation convention goes in that database's `ORGANIZATION.md`. agami classifies these for you, asking about scope only when it's genuinely unclear.
+The skill loads both on every query. USER_MEMORY answers *how should I display / filter results, no matter which database*; datasource.md answers *what does the data mean for this specific database*. Keep only your **personal** display tics here — a currency/unit fact ("amounts are in INR") attaches to the column in the shared model, and a database-wide presentation convention goes in that database's `datasource.md`. agami classifies these for you, asking about scope only when it's genuinely unclear.
 
 ## What goes in here (USER_MEMORY)
 
 - **Default filters** the user always wants applied across every database (e.g. "exclude test users where email matches `%@example.com`")
-- **Display preferences that are personal to you** (date format you like, "always show top 10 not top 5"). A currency symbol / units everyone querying a database should get is a column fact (→ the model) or a database-wide convention (→ that DB's `ORGANIZATION.md`), not a personal pref.
+- **Display preferences that are personal to you** (date format you like, "always show top 10 not top 5"). A currency symbol / units everyone querying a database should get is a column fact (→ the model) or a database-wide convention (→ that DB's `datasource.md`), not a personal pref.
 - **Hard avoids that apply broadly** (don't query rows where `is_test = true`)
 
-If the preference is database-specific (e.g. "in this finance DB, always join orders to invoices"), it belongs in the semantic model (a column/table fact) or in `ORGANIZATION.md`, not here.
+If the preference is database-specific (e.g. "in this finance DB, always join orders to invoices"), it belongs in the semantic model (a column/table fact) or in `datasource.md`, not here.
 
 ## What does NOT go in here
 
 - **Connection details** → `<artifacts_dir>/local/credentials`
-- **Schema knowledge** (table descriptions, FK relationships, column types, choice fields, metrics) → the semantic model under `<artifacts_dir>/<profile>/` (`org.yaml` + `subject_areas/<area>/…`)
-- **Domain vocabulary specific to one database** ("MRR means…", "gold tier means…") → `<artifacts_dir>/<profile>/ORGANIZATION.md`
+- **Schema knowledge** (table descriptions, FK relationships, column types, choice fields, metrics) → the semantic model under `<artifacts_dir>/<profile>/` (`datasource.yaml` + `subject_areas/<area>/…`)
+- **Domain vocabulary specific to one database** ("MRR means…", "gold tier means…") → `<artifacts_dir>/<profile>/datasource.md`
 - **Specific question→SQL examples** → `<artifacts_dir>/<profile>/prompt_examples/<area>/examples.yaml` (few-shot library)
 - **Connection-method choice / reviewer identity** → `<artifacts_dir>/local/.config`
 - **Email opt-in state** → `<artifacts_dir>/local/.optins`
 
-`agami-save-correction/SKILL.md` classifies each correction and routes the knowledge to the right file. A `user_preference` correction lands here. An `org_context` correction lands in ORGANIZATION.md. Other kinds land in the per-schema yamls (per the table in save-correction).
+`agami-save-correction/SKILL.md` classifies each correction and routes the knowledge to the right file. A `user_preference` correction lands here. An `org_context` correction lands in datasource.md. Other kinds land in the per-schema yamls (per the table in save-correction).
 
 ## Default seed (written by `agami-connect/SKILL.md` on first run)
 
@@ -51,7 +51,7 @@ Edit by hand, or ask the skill to "remember" something during a conversation
 -->
 
 ## Naming and synonyms
-<!-- Domain vocabulary that isn't already in the model / ORGANIZATION.md glossary.
+<!-- Domain vocabulary that isn't already in the model / datasource.md glossary.
      - "active" means is_active = true AND status = 'live'
      - "MRR" = SUM(price) WHERE plan_type = 'subscription'
 -->

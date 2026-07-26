@@ -160,13 +160,13 @@ def test_cross_relationship_requires_areas():
     assert ok.from_subject_area == "A"
 
 
-# --- Organization ---
+# --- Datasource ---
 
 
 def test_org_happy_and_accessors():
     t = m.Table(name="t", schema="s", storage_connection="c", grain=["id"], description="d",
                 columns=[_col("id")])
-    org = m.Organization(organization="O",
+    org = m.Datasource(datasource="O",
                          storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
                          subject_areas=[m.SubjectArea(name="sa", tables_defined=[t])])
     assert org.subject_area("sa").defined_table("t") is t
@@ -175,4 +175,4 @@ def test_org_happy_and_accessors():
 
 def test_org_bad_fiscal_month_rejected():
     with pytest.raises(ValidationError):
-        m.Organization(organization="O", fiscal_year_start_month=13)
+        m.Datasource(datasource="O", fiscal_year_start_month=13)

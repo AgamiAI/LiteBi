@@ -40,7 +40,7 @@ Automatically** mode (Shift+Tab) and re-invoke me."* **DO NOT** write a plan fil
 1. **Resolve the environment** — `python3 "$AGAMI_PLUGIN_ROOT/scripts/connect_resolve.py"` prints JSON;
    read `data.artifacts_dir` (the local model dir) and `data.interpreter.python3` (call it `$PY` — the
    interpreter that has the agami-core package; use it for `deploy_preflight`).
-2. **Model present** — `<artifacts_dir>/<active_profile>/org.yaml` must exist. If there's no model yet,
+2. **Model present** — `<artifacts_dir>/<active_profile>/datasource.yaml` must exist. If there's no model yet,
    stop and invoke `/agami-connect` first — the deployed server has nothing to serve without one.
 
 ## Phase 1: Gather the hard floor, then write the bundle
@@ -56,7 +56,7 @@ Ask only these (everything else is defaulted or generated). Prefer one compact e
    managed `postgresql://…` URL is a **credential**, so do **not** collect it in chat — after the bundle
    is written, the user sets `APP_DATABASE_URL` in `agami.env` themselves (the same hand-off as the password).
 4. **Which datasource(s)?** — list the models in the artifacts dir (one per profile:
-   `<artifacts_dir>/<profile>/org.yaml`). If there's exactly one, use it silently. If there's **more than
+   `<artifacts_dir>/<profile>/datasource.yaml`). If there's exactly one, use it silently. If there's **more than
    one**, ask: *"You have N datasources — `<names>`. Deploy all, or pick?"* Pass the chosen set as
    `--datasources a,b` (omit to deploy all). The server serves **every** datasource you stage, and each needs
    its own DSN (Phase 2).
