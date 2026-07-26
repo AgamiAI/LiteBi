@@ -36,6 +36,22 @@ def test_real_migrations_create_all_tables_on_empty_db():
     s.close()
 
 
+def test_organization_registry_table_exists():
+    # F15 / ACE-068: the one company-level row, keyed on org_id ALONE (not (org_id, datasource)). Its
+    # columns are a superset of agami-hosted's tenant `organization` table so one physical table serves
+    # both; `doc` carries a DEFAULT so hosted's INSERT (which omits it) still satisfies NOT NULL.
+    s = Store.connect("sqlite://")
+    ran = s.run_migrations()
+    assert "013_organization.sql" in ran
+    assert "organization" in _tables(s)
+    cols = {r["name"] for r in s.query("PRAGMA table_info(organization)")}
+    assert {"org_id", "org_name", "description", "doc", "created_at"} == cols
+    # keyed on org_id alone
+    pk = [r["name"] for r in s.query("PRAGMA table_info(organization)") if r["pk"]]
+    assert pk == ["org_id"]
+    s.close()
+
+
 def test_oauth_tables_exist():
     # The OAuth provider owns these: oauth_client (registered clients) + oauth_state (authorization
     # codes bound to their PKCE challenge + redirect + the authenticated username).

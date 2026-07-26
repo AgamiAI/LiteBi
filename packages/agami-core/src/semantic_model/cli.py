@@ -87,11 +87,12 @@ def cmd_snapshot(args) -> int:
 
 
 def cmd_ensure_org_id(args) -> int:
-    """Mint + persist the deployment org_id into <root>/org.yaml if absent (F14 / ACE-056), then
-    print it. Idempotent — an already-minted id is returned unchanged. The introspect/curate paths
-    mint inline via write_tree; this command is for paths that write a model WITHOUT them — e.g.
-    agami-connect's sample copy (6A) drops a prebuilt model that carries no id. Deployment-scoped:
-    adopts a sibling profile's id if one exists, so multi-datasource stays one tenant."""
+    """Mint + persist the deployment org_id into <root>/org.yaml if absent (F14 / ACE-056; relocated
+    by F15 / ACE-067), then print it. Idempotent — an already-minted id is returned unchanged. The
+    introspect/curate paths mint inline via write_tree; this command is for paths that write a model
+    WITHOUT them — e.g. agami-connect's sample copy (6A) drops a prebuilt model that carries no id.
+    Deployment-scoped: the id now comes from the root ``organization.yaml`` record (minted on first
+    use), so every profile in the dir resolves the same one — no sibling scan."""
     from pathlib import Path
 
     from . import build
@@ -143,14 +144,40 @@ def cmd_org_draft(args) -> int:
 
 
 def cmd_org_context(args) -> int:
-    # The full domain context for the LLM: the human's ORGANIZATION.md narrative (comments
-    # stripped) + the model-derived summary (subject areas, conventions, decoded glossary),
-    # assembled fresh. This is what the query path injects as `## Organization context`.
+    # The full domain context for the LLM, two-level (F15 / ACE-069): the shared COMPANY block from the
+    # deployment record (<artifacts_dir>/organization.yaml + the root ORGANIZATION.md), then this
+    # datasource's source-specific narrative + model-derived summary. With no record it degrades to the
+    # pre-F15 per-profile assembly (byte-identical). This is what the query path injects as context.
     from . import org_draft
-    org = L.load_organization(args.root, include_rejected=False)
-    org_md = Path(args.root) / "ORGANIZATION.md"
-    human = org_md.read_text(encoding="utf-8") if org_md.exists() else ""
-    sys.stdout.write(org_draft.compose_context(human, org))
+    from . import org_record as OR
+    root = Path(args.root)
+    org = L.load_organization(root, include_rejected=False)
+    src_md = root / "ORGANIZATION.md"
+    source_narrative = src_md.read_text(encoding="utf-8") if src_md.exists() else ""
+    art = root.parent  # the artifacts dir holds the deployment-level record + company narrative
+    record = OR.load_org_record(art)
+    comp_md = OR.narrative_path(art)
+    company_narrative = comp_md.read_text(encoding="utf-8") if comp_md.exists() else ""
+    sys.stdout.write(
+        org_draft.compose_org_context(
+            record, [org], company_narrative=company_narrative, source_narratives=[source_narrative]
+        )
+    )
+    return 0
+
+
+def cmd_set_org(args) -> int:
+    # Write the human-authored company fields (name / short description) into the deployment-level
+    # organization record. Onboarding calls this after asking the company question, so the record
+    # carries more than just its org_id. Only the flags passed are updated; others are left as-is.
+    from . import org_record as OR
+
+    record = OR.set_org_fields(
+        args.artifacts_dir, name=args.name, description=args.description
+    )
+    _print_json(
+        {"org_id": record.org_id, "name": record.name, "description": record.description}
+    )
     return 0
 
 
@@ -1105,6 +1132,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("org-context", help="print the full domain context (human narrative + model-derived summary + glossary) for the LLM")
     sp.add_argument("root")
     sp.set_defaults(func=cmd_org_context)
+
+    sp = sub.add_parser("set-org", help="write the company name / description into the deployment organization record")
+    sp.add_argument("artifacts_dir")
+    sp.add_argument("--name", default=None)
+    sp.add_argument("--description", default=None)
+    sp.set_defaults(func=cmd_set_org)
 
     sp = sub.add_parser("examples", help="rank prompt examples for a query")
     sp.add_argument("root")

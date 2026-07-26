@@ -478,24 +478,30 @@ class WriteReport:
     files_written: list[str] = field(default_factory=list)
 
 
-def ensure_org_id(out: Path, existing: Optional[str] = None) -> str:
-    """Idempotent, deployment-scoped mint of the org identity (F14 / ACE-056). Returns, in order:
-    ``existing`` (an id the caller already resolved); the org_id already persisted at ``out/org.yaml``
-    (preserved across re-introspect — the immutability guarantee); an id already minted for a SIBLING
-    profile in the same artifacts dir (``out.parent``) — so a company with several datasources stays
-    ONE tenant rather than fragmenting; else a freshly minted ``uuid4().hex``. Pure-local — a uuid4
-    plus (later) a file write, no network egress; a random uuid4 is globally unique with no
-    coordinator, the only option under no-egress."""
+def ensure_org_id(out: Path, existing: Optional[str] = None, *, dry_run: bool = False) -> str:
+    """Idempotent, deployment-scoped resolution of the org identity (F14 / ACE-056; relocated by
+    F15 / ACE-067). Returns, in order: ``existing`` (an id the caller already resolved); the org_id
+    already persisted at ``out/org.yaml`` (preserved across re-introspect — the immutability guarantee);
+    else the DEPLOYMENT record's id (``organization.yaml`` at ``out.parent``), minting the record on
+    first use.
+
+    F15 relocated the id's home from the profiles up into the one root record, which is now the
+    deployment-scoped consistency mechanism — so the old "adopt a sibling profile's id" scan is GONE:
+    a second profile reads the same id straight from the record instead of scanning siblings. Pure-local
+    (a uuid4 minted on-box, no coordinator — the only option under F14's no-egress invariant). On
+    ``dry_run`` nothing is persisted: a preview reads an existing record or surfaces a throwaway id."""
     from uuid import uuid4  # local generation only — no egress (F14 invariant)
 
-    from . import loader
+    from . import loader, org_record
 
-    return (
-        existing
-        or loader.load_org_id(out)
-        or loader.deployment_org_id(out.parent)  # adopt the deployment's id (deployment-scoped)
-        or uuid4().hex
-    )
+    resolved = existing or loader.load_org_id(out)
+    if resolved:
+        return resolved
+    if dry_run:
+        # Preview: never mint/persist a record. Use an existing one if present, else a throwaway id.
+        record = org_record.load_org_record(out.parent)
+        return record.org_id if record is not None else uuid4().hex
+    return org_record.ensure_org_record(out.parent).org_id
 
 
 def write_tree(
@@ -518,11 +524,13 @@ def write_tree(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-    # F14: the deployment identity is the first key. `ensure_org_id` reads the *previous* org.yaml
-    # (about to be overwritten) so a re-introspect/curate/snapshot preserves the minted id rather
-    # than re-minting — the immutability guarantee, centralized on the one write chokepoint.
+    # F14/F15: the deployment identity is the first key. `ensure_org_id` reads the *previous* org.yaml
+    # (about to be overwritten) so a re-introspect/curate/snapshot preserves the minted id rather than
+    # re-minting — the immutability guarantee — and otherwise takes it from the deployment record
+    # (minting the record on first use). Resolved once, honoring dry_run so a preview persists nothing.
+    org_id = ensure_org_id(out, org.org_id, dry_run=dry_run)
     write("org.yaml", _dump({
-        "org_id": ensure_org_id(out, org.org_id),
+        "org_id": org_id,
         "organization": org.organization,
         "version": org.version,
         "description": org.description,
@@ -560,8 +568,11 @@ def write_tree(
                   _dump({"examples": examples_by_area[sa.name]}))
     if not dry_run:
         # Stamp the model_version pin for the freshly-written model (best-effort).
-        from . import snapshot
+        from . import org_record, snapshot
         snapshot.write_snapshot(out)
+        # Keep the deployment record's datasource list in sync with what's actually on disk — this
+        # profile was just written, so rebuild the list from the profile dirs (auto-maintained, no drift).
+        org_record.refresh_datasources(out.parent)
     return rep
 
 

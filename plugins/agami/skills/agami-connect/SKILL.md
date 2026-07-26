@@ -34,14 +34,15 @@ Seed (one task per major phase, in order):
 
 ```
 1. Preflight: credentials check + tool detection
-2. Discover & prune: list tables + columns, user prunes what they don't need
-3. Introspect the KEPT tables → semantic model (engine: grain, FK cardinality)
-4. Enrich: descriptions, entities, metrics (LLM, validated into the model)
-5. Curate before examples: exclude columns/tables + sign off metrics & entities
-6. Generate seed NL→SQL examples (validated against the live DB)
-7. Validate every seed example (user reviews via dashboard)
-8. Post-introspect trust summary
-9. Follow-up suggestions
+2. Organization context (MANDATORY): first onboard → company name + description (root record via `sm set-org`); every onboard → this-database narrative
+3. Discover & prune: list tables + columns, user prunes what they don't need
+4. Introspect the KEPT tables → semantic model (engine: grain, FK cardinality)
+5. Enrich: descriptions, entities, metrics (LLM, validated into the model)
+6. Curate before examples: exclude columns/tables + sign off metrics & entities
+7. Generate seed NL→SQL examples (validated against the live DB)
+8. Validate every seed example (user reviews via dashboard)
+9. Post-introspect trust summary
+10. Follow-up suggestions
 ```
 
 Use `content` for the imperative form and `activeForm` for the present-continuous form. **Mark each todo `in_progress` when its phase starts and `completed` immediately when it ends.** Exactly one `in_progress` at a time.
@@ -427,7 +428,7 @@ Introspection can take a while against cloud DBs. Tell the user **before** the f
 If `<artifacts_dir>/<profile>/org.yaml` exists and `$ARGUMENTS != reintrospect`: the profile is already onboarded. Offer (AskUserQuestion, no `(Recommended)` — these are equal-weight choices), capped at 4:
 - **Re-introspect `<profile>`** — refresh the structure from the live DB (new/changed tables, columns, FKs) while preserving descriptions, entities, metrics, caveats, and sign-offs (the `reintrospect` path).
 - **Open model explorer** — browse + curate the existing model and review/sign off the trust layer (`/agami-model`).
-- **Onboard another database** — set up a **different** database (a different connection) under a **new** profile, leaving `<profile>` untouched. On this choice, **start a fresh onboarding for a new profile**: jump to the profile-naming step (Phase 0a's naming question) → have the user name the new profile (must differ from `<profile>` and any existing `[section]` in `<artifacts_dir>/local/credentials`) and pick its DB type → write that profile's `credentials.example` → run the full flow for it. Never reuse or overwrite the current profile's credentials or model.
+- **Onboard another database** — set up a **different** database (a different connection), leaving `<profile>` untouched. On this choice, **first ask whether it's the same company or a different one** (see 1.1a), then start a fresh onboarding: jump to the profile-naming step (Phase 0a's naming question) → have the user name the new profile (must differ from `<profile>` and any existing `[section]` in `<artifacts_dir>/local/credentials`) and pick its DB type → write that profile's `credentials.example` → run the full flow for it. Never reuse or overwrite the current profile's credentials or model.
 - **Try the sample database** — explore agami's bundled **`agami-example`** sample (retail + subscriptions, no connection needed), leaving `<profile>` untouched. Routes to [Phase 0s](#phase-0s-sample-database-bootstrap-no-connection). This MUST be a real selectable option here (not a prose aside) — a returning user with an onboarded profile has no other visible path to the sample, since plain `/agami-connect` resolves their active profile and lands on this menu.
 
 (Cancel isn't a listed option — the modal's Esc / "Other" covers "do nothing"; the four real choices are the actions above. Keep the list at exactly these four.)
@@ -435,6 +436,18 @@ If `<artifacts_dir>/<profile>/org.yaml` exists and `$ARGUMENTS != reintrospect`:
 **Same DB, another *schema*? That's the Re-introspect path, not "Onboard another database."** If the user wants to add a schema that lives in the **same database** they already onboarded (e.g. they did `public`, now they want `billing` too), choose **Re-introspect** and **expand the schema selection** in Phase 1.3 to include both the old and the new schemas. The engine scans them together in one pass, so any relationship between the original and the new schema is detected as a first-class **cross-schema** join (Case 1) and surfaced for review. Picking "Onboard another database" instead would split the two schemas into separate models and demote any link between them to manual cross-profile glue (Phase 2b federation) — wrong for one DB. If you're unsure which the user means, ask: *"Is `billing` in the same database connection as `<profile>`, or a different server/database?"* — same connection → Re-introspect + expand schemas; different → new profile.
 
 The engine **auto-backs-up any legacy (v1) model** (`index.yaml` + per-schema `_schema.yaml`) it finds at the profile root into `.legacy_backup/` before writing — so a first run over an old profile is safe and reversible; surface a one-liner when that happens.
+
+### 1.1a — Same company vs different company
+
+When the user chooses **Onboard another database**, ask (AskUserQuestion) whether the new database belongs to the **same company** or a **different** one. A deployment (one artifacts dir) holds exactly **one** company/organization with many datasources under it; a genuinely different company is a **different folder**.
+
+- **Same company (the common case)** → the new profile **attaches under the deployment org**: it lands in the **same** `<artifacts_dir>`, shares the same `org_id` from the root `organization.yaml`, and **shares the company context** authored earlier. Do **not** re-ask the company description (1.4 detects the already-authored company context and skips it); the per-database note is still asked. Narrate it: *"This attaches under your **`<company name>`** organization, sharing the company context you set earlier — its per-database notes stay its own."*
+- **Different company** → set up a **new deployment folder**. Pick/confirm a new artifacts dir path, create it, and **repoint** the pointer to it (the same idiom Phase 0a.1 uses for a non-default dir):
+  ```bash
+  mkdir -p "<new_artifacts_dir>" && mkdir -p ~/.config/agami && printf '%s\n' "<new_artifacts_dir>" > ~/.config/agami/path
+  grep -qxF 'local/' "<new_artifacts_dir>/.gitignore" 2>/dev/null || printf 'local/\n' >> "<new_artifacts_dir>/.gitignore"
+  ```
+  The current org's files are **untouched**; the first onboarding in the new folder mints a **fresh** `org_id` + its own company record (1.4 authors it there). This is the only way to run two companies from one machine — one folder each.
 
 ### 1.2 — Scope: schemas, and the no-catalog case
 
@@ -466,12 +479,26 @@ Example to say BEFORE introspecting: *"Found 70 tables across 18 schemas. I'll m
 
 ### 1.4 — Organization context (MANDATORY — ALWAYS ASK)
 
-This runs on **every** invocation. The user's yes/skip is theirs; the skill never decides for them. "don't ask clarifying questions" does NOT cancel this — it's required state-gathering, not a clarifying question. **Only conditional skip:** `ORGANIZATION.md` exists and has been edited beyond the template.
+Two levels: a **company** description written **once** at the deployment root and shared by every datasource, and a **per-database** narrative for the datasource being connected now. The skill never decides yes/skip for the user; "don't ask clarifying questions" does NOT cancel this — it's required state-gathering. Ask **A** then **B**.
 
-**AskUserQuestion:**
-> Want to give me a one-paragraph description of what this database is about? It improves NL→SQL accuracy a lot. Examples: what the company/product is, what "MRR" or "active user" means in your terms.
+**A. Company context — ask ONCE, on the first onboard into this deployment.** Decide "already authored" by content, not by file existence: treat it as done only if the root `<artifacts_dir>/ORGANIZATION.md` exists **or** the root `<artifacts_dir>/organization.yaml` already has a non-empty `name`/`description`. If neither, this is the first onboard → ask:
+> What's your **company/organization** called, and a sentence or two on what it does? It's shared across every database you connect here and improves NL→SQL. (e.g. what the company/product is, what "MRR" or "active user" means company-wide.)
 
-`Yes — I'll type it now (Other field)` → write their words to `<artifacts_dir>/<profile>/ORGANIZATION.md` under `# About this database`. **Their narrative ONLY** — do NOT append model facts (subject areas, metrics, glossary). Those are *derived from the model at read time* (the query path assembles them via `cli org-context`), so they never get baked into the editable prose file where a human could clobber them. `Skip — I'll auto-fill it from my data (Recommended)` → leave ORGANIZATION.md absent for now; Phase 2f writes a short human-narrative starter. `chmod 600` whatever you write. See [`shared/organization-context-format.md`](../../shared/organization-context-format.md).
+On an answer, do **BOTH** of these (not one — the record write is what populates `organization.yaml`):
+1. **Run this command** to write the company `name` + a short `description` into the record (this is the ONLY thing that fills those fields — a file write alone will not):
+   `bash "$AGAMI_PLUGIN_ROOT/scripts/sm" set-org "<artifacts_dir>" --name "<company name>" --description "<one-line summary>"`
+2. **Write** the fuller paragraph to the **root** `<artifacts_dir>/ORGANIZATION.md` under `# About this company` (**narrative prose ONLY** — no model facts).
+
+Then confirm both landed: `<artifacts_dir>/organization.yaml` now shows `name:`/`description:`, and `<artifacts_dir>/ORGANIZATION.md` exists.
+
+`Skip` → leave the company context empty (the composition simply omits the company block). Mention that richer company context (conventions, glossary) can be added later in `/agami-model`. On a **subsequent** onboard (company context already authored) **do NOT re-ask** — narrate *"Sharing the **`<company>`** context you set earlier."*
+
+**B. This-database narrative — ask on EVERY onboard.** For the datasource being connected now:
+> Want a one-paragraph description of what **this database** is about — what it holds, and any term that means something specific here? Optional.
+
+`Yes` → write to the **per-profile** `<artifacts_dir>/<profile>/ORGANIZATION.md` under `# About this database` (this datasource's narrative only). `Skip` → leave it absent; Phase 2f writes a short per-database starter from the enriched model.
+
+`chmod 644` whatever you write — these are **non-secret model files** and must stay readable (e.g. by the deploy container / a teammate reading a checked-in copy); never `chmod 600` them (that's for `local/` secrets only). See [`shared/organization-context-format.md`](../../shared/organization-context-format.md) for the content-routing rule (company-wide → root; per-database → the profile; per-column units → the structured model; personal → `USER_MEMORY.md`).
 
 ### 1.5 — Existing data model / semantic layer (MANDATORY — ALWAYS ASK)
 
@@ -734,12 +761,12 @@ On `reintrospect`, the engine rewrites the structural skeleton. **Preserve hand-
 
 ORGANIZATION.md is the human's narrative ONLY — it does **not** hold model facts. The factual summary (subject areas, conventions, the decoded glossary) is **derived from the structured model at read time** (`cli org-context` assembles it for the query path; the explorer shows it as a read-only field). The two homes stay separate by construction.
 
-**Only on the skip path** (ORGANIZATION.md missing/empty, the user gave no narrative), **seed it with a short factual narrative** so `# About this database` reads as something, not a blank. You've just enriched every table — so write a **1–2 sentence description of what this database is about**, synthesised from the table/area descriptions (e.g. *"Tracks an electric-vehicle battery-swap network — stations, vehicles, battery packs, the swap transactions between them, and the alerts they raise."*). Write it under `# About this database` with the editable comment, and `chmod 600`. Keep it factual (don't invent business specifics you can't see); it's a starting **draft** the user edits.
+**Only on the skip path** (ORGANIZATION.md missing/empty, the user gave no narrative), **seed it with a short factual narrative** so `# About this database` reads as something, not a blank. You've just enriched every table — so write a **1–2 sentence description of what this database is about**, synthesised from the table/area descriptions (e.g. *"Tracks an electric-vehicle battery-swap network — stations, vehicles, battery packs, the swap transactions between them, and the alerts they raise."*). Write it under `# About this database` with the editable comment, and `chmod 644` (a non-secret model file — keep it readable). Keep it factual (don't invent business specifics you can't see); it's a starting **draft** the user edits.
 
 If you can't summarise (no descriptions yet), fall back to the deterministic starter:
 ```bash
 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" org-draft "$ROOT" > "$ROOT/ORGANIZATION.md"   # one-line factual seed
-chmod 600 "$ROOT/ORGANIZATION.md"
+chmod 644 "$ROOT/ORGANIZATION.md"   # non-secret model file — must stay readable (deploy bundle / teammates)
 ```
 
 If the user **did** write a narrative in 1.4, leave it untouched. The glossary from `set-terminology` (2b) needs no re-render — it's surfaced automatically by `org-context`. Mention in the Phase 7 summary that the glossary + summary are auto-derived and the narrative is theirs to edit.

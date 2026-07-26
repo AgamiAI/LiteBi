@@ -21,7 +21,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .models import Organization
+    from .models import Organization, OrgRecord
 
 
 def _plural(n: int, word: str) -> str:
@@ -116,6 +116,87 @@ def compose_context(human_md: str, org: "Organization") -> str:
     if derived:
         parts.append("## Model summary (auto-generated from your schema)\n\n" + derived)
     return "\n\n".join(parts).strip()
+
+
+def _company_block(record: "OrgRecord", narrative: str) -> str:
+    """The shared COMPANY context (F15): name/description + the root ORGANIZATION.md narrative +
+    company-wide display conventions + the company glossary. Rendered ONCE above every datasource."""
+    lines: list[str] = [f"# {record.name or 'Company'} — company context", ""]
+    if record.description:
+        lines += [record.description, ""]
+    human = _strip_comments(narrative)
+    if human:
+        lines += [human, ""]
+
+    dc = record.display_conventions
+    conventions: list[str] = []
+    if record.fiscal_year_start_month:
+        conventions.append(f"Fiscal year starts in month {record.fiscal_year_start_month}.")
+    if dc.currency:
+        conventions.append(f"Currency: {dc.currency}.")
+    if dc.rounding is not None:
+        conventions.append(f"Rounding: {dc.rounding} decimal places.")
+    if dc.week_start:
+        conventions.append(f"Week starts on {dc.week_start}.")
+    conventions += [n for n in (dc.notes or []) if n]
+    if conventions:
+        lines.append("### Company conventions")
+        lines.append("")
+        lines += [f"- {c}" for c in conventions]
+        lines.append("")
+
+    if record.glossary:
+        lines.append("### Company glossary")
+        lines.append("")
+        lines += [f"- **{term}**: {defn}" for term, defn in record.glossary.items()]
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _source_block(org: "Organization", narrative: str) -> str:
+    """One datasource's context: its optional source-specific narrative + the model-derived summary,
+    under a heading naming the datasource (so a federated answer keeps the vocabularies apart)."""
+    seg = [f"## {org.organization} — datasource context"]
+    src = _strip_comments(narrative)
+    if src:
+        seg.append(src)
+    body = derived_context(org)
+    if body:
+        seg.append(body)
+    return "\n\n".join(seg).strip()
+
+
+def compose_org_context(
+    org_record: "OrgRecord | None",
+    ontologies: "list[Organization]",
+    *,
+    company_narrative: str = "",
+    source_narratives: "list[str] | None" = None,
+) -> str:
+    """Two-level org context (F15 / ACE-069). Renders the shared COMPANY block ONCE from the ``OrgRecord``
+    (name/description + the root ``ORGANIZATION.md`` narrative + display conventions + company glossary),
+    then each datasource's model-derived ontology under its own heading. Single-source passes one
+    ontology; a FEDERATED question passes several — the company block still renders exactly once, and each
+    source keeps its own vocabulary (so "Account" resolves per source).
+
+    ``source_narratives`` (optional, aligned by index to ``ontologies``) carries each datasource's
+    source-specific ``ORGANIZATION.md`` prose; company-wide prose now lives in ``company_narrative`` (the
+    root file), not the per-profile ones.
+
+    Graceful degradation: when ``org_record`` is ``None`` this returns exactly today's per-profile
+    assembly (``compose_context`` of each ontology with its narrative) — byte-identical to pre-F15, so
+    every deployment without a record keeps working untouched."""
+    ontologies = list(ontologies)
+    narrs = list(source_narratives or [])
+    narrs += [""] * (len(ontologies) - len(narrs))  # pad so index access is safe
+
+    if org_record is None:
+        # No record: fall back to the pre-F15 single-level assembly, one block per ontology.
+        return "\n\n".join(compose_context(narrs[i], org) for i, org in enumerate(ontologies)).strip()
+
+    parts = [_company_block(org_record, company_narrative)]
+    parts += [_source_block(org, narrs[i]) for i, org in enumerate(ontologies)]
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 def starter_organization_md(org: "Organization") -> str:

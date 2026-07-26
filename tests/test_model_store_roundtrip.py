@@ -220,7 +220,7 @@ def test_tools_serve_memory_and_version_from_db_no_files(tmp_path, monkeypatch):
     monkeypatch.setenv("AGAMI_DB_URL", db_url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "does-not-exist"))
     assert tools._model_version("main") == "v-deadbeef"
-    org_md, user_md = tools._domain_memory("main")
+    org_md, user_md, _, _ = tools._context_sources("main", tools._current_org_id())
     assert "Widgets co." in org_md and user_md == "exclude test users"
 
 

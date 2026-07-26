@@ -18,7 +18,7 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from semantic_model.models import Organization
+from semantic_model.models import Organization, OrgRecord
 from store import Store
 
 # The per-datasource model tables write_organization clears before a re-seed (so a redeploy
@@ -247,6 +247,57 @@ def write_model_version(
         (org_id, datasource, version, created_at),
     )
     store.commit()
+
+
+def write_organization_record(store: Store, record: OrgRecord, org_id: str = DEFAULT_ORG) -> None:
+    """Derive the deployment's `OrgRecord` (ACE-067) into the `organization` table — the one company-level
+    row (org_id, name, description, doc), keyed on org alone.
+
+    FK-SAFE UPSERT, deliberately NOT the clear-then-insert (`DELETE`+`INSERT`) every other writer here
+    uses: in the hosted stack `org_membership.org_id` and `license.org_id` hold foreign keys to this row,
+    so a `DELETE` on redeploy would violate them (and FK enforcement is ON — store.py). `ON CONFLICT DO
+    UPDATE` rewrites only the content columns and preserves any hosted-owned `org_name`/`created_at`, so
+    hosted onboarding (which INSERTs the row first) and core deploy (which upserts content) coexist on one
+    row. Portable across SQLite (>=3.24) and Postgres. Idempotent — a redeploy replaces, never duplicates."""
+    doc = json.dumps(
+        {
+            "fiscal_year_start_month": record.fiscal_year_start_month,
+            "display_conventions": record.display_conventions.model_dump(mode="json"),
+            "glossary": record.glossary,
+            "datasources": record.datasources,
+        }
+    )
+    store.execute(
+        "INSERT INTO organization (org_id, org_name, description, doc) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (org_id) DO UPDATE SET "
+        "org_name = COALESCE(organization.org_name, excluded.org_name), "
+        "description = excluded.description, "
+        "doc = excluded.doc",
+        (org_id, record.name, record.description, doc),
+    )
+    store.commit()
+
+
+def load_organization_record(store: Store, org_id: str = DEFAULT_ORG) -> OrgRecord | None:
+    """Rebuild the `OrgRecord` for `org_id` from the `organization` row, or `None` when no row exists —
+    the graceful-degradation contract ACE-069's composition relies on. A hosted-only row (tenant onboarded
+    but no model deployed yet) has `doc='{}'` and rebuilds to a bare record carrying just the name."""
+    rows = store.query(
+        "SELECT org_name, description, doc FROM organization WHERE org_id = ?", (org_id,)
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    doc = json.loads(row["doc"]) if row["doc"] else {}
+    return OrgRecord(
+        org_id=org_id,
+        name=row["org_name"],
+        description=row["description"],
+        fiscal_year_start_month=doc.get("fiscal_year_start_month"),
+        display_conventions=doc.get("display_conventions") or {},
+        glossary=doc.get("glossary") or {},
+        datasources=doc.get("datasources") or [],
+    )
 
 
 def newest_model_version(store: Store, datasource: str, org_id: str = DEFAULT_ORG) -> str | None:

@@ -676,6 +676,53 @@ class Organization(_Base):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Organization record (F15 / ACE-067) — the deployment-level company record that
+# sits ABOVE the per-datasource Organization models. One per artifacts dir.
+# ---------------------------------------------------------------------------
+
+
+class DisplayConventions(_Base):
+    """Company-wide, machine-actionable rendering conventions the SQL/answer path can act on
+    directly rather than parse out of prose. All optional; `notes` carries free-form conventions
+    that don't fit a structured slot."""
+
+    currency: Optional[str] = None
+    rounding: Optional[int] = None
+    week_start: Optional[str] = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class OrgRecord(_Base):
+    """The deployment-level company record (F15). Written ONCE at ``<artifacts_dir>/organization.yaml``
+    and shared across every datasource under the deployment, so company-wide facts (name, description,
+    fiscal year, display conventions, glossary) live in one place instead of drifting across each
+    profile's ``org.yaml``. ``org_id`` is F14's deployment identity, relocated here from the per-profile
+    ``org.yaml`` (minted once, immutable, deployment-scoped — the value is preserved, never re-minted).
+    Every non-id field is optional so a bare record (id only) validates; company content is authored
+    later by onboarding/curation."""
+
+    org_id: str
+    name: Optional[str] = None
+    description: Optional[str] = None
+    fiscal_year_start_month: Optional[int] = None
+    display_conventions: DisplayConventions = Field(default_factory=DisplayConventions)
+    # Company-wide glossary: term -> one-line definition. Same shape as Organization.key_terminology
+    # (the established glossary type), but scoped to the COMPANY rather than a single datasource.
+    glossary: dict[str, str] = Field(default_factory=dict)
+    # The datasources (profile names) attached under this org. Auto-maintained: rebuilt from the profile
+    # directories present on disk on every onboard/deploy, never hand-edited, so it cannot drift.
+    datasources: list[str] = Field(default_factory=list)
+
+    @field_validator("fiscal_year_start_month")
+    @classmethod
+    def _fy_month(cls, v: Optional[int]) -> Optional[int]:
+        # Same 1..12 bound as Organization, but None is allowed (an unauthored record has no fiscal year).
+        if v is not None and not 1 <= v <= 12:
+            raise ValueError("fiscal_year_start_month must be 1..12")
+        return v
+
+
 # Resolve forward references (TrustBlock.migrated_from -> MigratedFrom).
 TrustBlock.model_rebuild()
 
@@ -708,6 +755,8 @@ __all__ = [
     "CrossSubjectAreaRelationship",
     "SubjectArea",
     "Organization",
+    "DisplayConventions",
+    "OrgRecord",
     # constants
     "DEEP_TABLE_COLUMN_THRESHOLD",
 ]

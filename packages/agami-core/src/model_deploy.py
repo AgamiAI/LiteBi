@@ -103,12 +103,34 @@ def deploy_one(store: Store, datasource: str, profile_dir: Path, org_id: str | N
 def _deploy_user_memory(store: Store, artifacts_dir: Path, org_id: str | None = None) -> None:
     """USER_MEMORY.md is **cross-datasource** (one row per org, keyed by the global sentinel inside
     write_memory) and lives at the artifacts ROOT — not per profile — matching how the server reads it
-    (`tools._domain_memory` → `artifacts/USER_MEMORY.md`). Written once per run; absent ⇒ nothing to do."""
+    (`tools._context_sources` → `artifacts/USER_MEMORY.md`). Written once per run; absent ⇒ nothing to do."""
     f = artifacts_dir / "USER_MEMORY.md"
     if f.exists():
         org_id = org_id if org_id is not None else _default_org()
         model_store.write_memory(store, "", user=f.read_text(), org_id=org_id)  # global user row
         store.commit()
+
+
+def _deploy_org_record(store: Store, artifacts_dir: Path, org_id: str | None = None) -> None:
+    """Derive the deployment-level org record (F15 / ACE-067's `<artifacts_dir>/organization.yaml`) into
+    the one `organization` row — company-wide context shared across every datasource, written ONCE per
+    run at the artifacts ROOT (like USER_MEMORY.md), never per datasource. Absent record ⇒ nothing to do
+    (a pre-F15 deployment; composition degrades to per-profile). No tenant-row backfill — F14/ACE-057
+    already stamped `org_id`; this only upserts the single org row (FK-safe, see write_organization_record)."""
+    from semantic_model import org_record as OR  # lazy: keeps the deploy CLI's import surface small
+
+    record = OR.load_org_record(artifacts_dir)
+    if record is not None:
+        # Refresh the datasource list from disk so the derived row reflects what's actually deployed.
+        # Only when a record already exists — an absent record still degrades (no mint at deploy time).
+        record = OR.refresh_datasources(artifacts_dir) or record
+        org_id = org_id if org_id is not None else _default_org()
+        model_store.write_organization_record(store, record, org_id=org_id)
+        # The company NARRATIVE is prose, not structured — it lives in a company-level `memory` row
+        # (datasource='' sentinel, like USER_MEMORY.md) so the served two-level context can read it.
+        narrative = OR.narrative_path(artifacts_dir)
+        if narrative.exists():
+            model_store.write_memory(store, "", organization=narrative.read_text(), org_id=org_id)
 
 
 def deploy_models(store: Store, artifacts_dir: Path, org_id: str | None = None) -> list[str]:
@@ -170,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
         _deploy_user_memory(store, artifacts_dir)  # install-global USER_MEMORY.md, once
+        _deploy_org_record(store, artifacts_dir)  # deployment-level company record, once (F15)
     except Exception as e:  # noqa: BLE001 — any load/write failure is a clean fail-closed exit, not a traceback
         print(f"model_deploy: failed: {e}", file=sys.stderr)
         return 1
