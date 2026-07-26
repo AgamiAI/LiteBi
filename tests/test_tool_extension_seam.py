@@ -202,7 +202,7 @@ def test_a_refusing_resolver_gives_403_not_500(base_url):
         activity_sink=FileActivitySink(),
         org_resolver=_RefusingResolver(),
         auth_provider=PresenceAuthProvider(),
-        governance=WarnOnlyGovernancePolicy(),
+        governance=NoopGovernancePolicy(),
     )
     c = TestClient(mcp_http.create_app(adapters=adapters))
     r = c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=AUTH)

@@ -1095,6 +1095,8 @@ def _resolve_guard_model(profile: str):
     root = Path(os.environ.get("AGAMI_ARTIFACTS_DIR") or (Path.home() / "agami-artifacts")) / profile
     if (root / "datasource.yaml").exists():
         try:
+            from semantic_model import loader as L
+
             return L.load_datasource(root)
         except Exception:
             pass  # unparseable/absent on disk, or loader import failure -> None (hosted fails closed)
