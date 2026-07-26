@@ -5,7 +5,6 @@ can be found: a served query never runs with the fan/chasm/scope/PII guards sile
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -77,9 +76,9 @@ def test_hosted_fail_closed_refuses_when_no_model(tmp_path, monkeypatch, capsys)
     monkeypatch.setenv("AGAMI_DB_URL", url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_artifacts"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code == 1  # refused, not run
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "model_unavailable"
+    _, refusal = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert refusal is not None and refusal.kind == "model_unavailable"  # refused (returned, not run)
+    assert capsys.readouterr().err == ""  # _model_safety returns the refusal, no stderr side-effect
 
 
 def test_local_missing_model_is_noop(tmp_path, monkeypatch):
@@ -99,16 +98,17 @@ def test_db_sourced_model_enforces_guards(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AGAMI_DB_URL", url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
-    assert code == 1  # undeclared table refused by the table-scope guard, sourced from the DB model
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "table_out_of_scope"
+    _, refusal = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
+    assert refusal is not None and refusal.kind == "table_out_of_scope"  # undeclared table, DB model
+    assert capsys.readouterr().err == ""
 
-    sql, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code is None  # a declared table with a named projection passes
+    sql, refusal = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert refusal is None  # a declared table with a named projection passes
 
 
 def test_disk_db_verdict_parity(tmp_path, monkeypatch, capsys):
     # The same model sourced from disk vs the DB must yield identical guard verdicts.
+    monkeypatch.delenv("AGAMI_SQL_UNSCOPABLE_POSTURE", raising=False)  # default enforce for the rows below
     _write_disk(tmp_path / "art" / "acme")
     url = "sqlite://" + str(tmp_path / "model.db")
     _seed_db(url, "acme")
@@ -125,14 +125,27 @@ def test_disk_db_verdict_parity(tmp_path, monkeypatch, capsys):
         return code
 
     # Query BOTH declared tables + an undeclared table + a bad column, so a lossy DB round-trip that
-    # drops a table (customers) or mangles a column can't hide behind identical verdicts.
+    # drops a table (customers) or mangles a column can't hide behind identical verdicts. The last two
+    # rows are ACE-037's SC5: an unscopable query must produce the SAME fail-closed verdict on either
+    # source — the scopability gate is path-agnostic (it reads the parsed tree + the resolved model,
+    # never the datasource), so file-served and DB-served models refuse identically.
     for sql in (
-        "SELECT id FROM sqlite_master",   # undeclared table → refuse (both)
-        "SELECT id FROM orders",          # declared → allow (both)
-        "SELECT id FROM customers",       # the OTHER declared table → allow only if it survived
-        "SELECT nope FROM orders",        # undeclared column → refuse only if the column set survived
+        "SELECT id FROM sqlite_master",  # undeclared table → refuse (both)
+        "SELECT id FROM orders",  # declared → allow (both)
+        "SELECT id FROM customers",  # the OTHER declared table → allow only if it survived
+        "SELECT nope FROM orders",  # undeclared column → refuse only if the column set survived
     ):
         assert verdict(hosted=True, sql=sql) == verdict(hosted=False, sql=sql), sql
+
+    # The unscopable rows must both REFUSE (a Refusal, not None), not merely agree — pins the
+    # fail-closed half of SC5 (a silent no-op on BOTH sources would satisfy equality alone).
+    for sql in (
+        "SELECT g FROM generate_series(1, 10) AS t(g)",  # table-function
+        "SELECT x FROM (VALUES (1)) AS v(x)",  # VALUES source
+    ):
+        h, d = verdict(hosted=True, sql=sql), verdict(hosted=False, sql=sql)
+        assert h is not None and h.kind == "unscopable_sql", sql
+        assert d is not None and d.kind == "unscopable_sql", sql
 
 
 def test_hosted_falls_back_to_disk_when_db_has_no_model(tmp_path, monkeypatch, capsys):
@@ -147,9 +160,9 @@ def test_hosted_falls_back_to_disk_when_db_has_no_model(tmp_path, monkeypatch, c
     monkeypatch.setenv("AGAMI_DB_URL", url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "art"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
-    assert code == 1  # refused by the disk-sourced model, NOT model_unavailable
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "table_out_of_scope"
+    _, refusal = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
+    assert refusal is not None and refusal.kind == "table_out_of_scope"  # disk model, NOT model_unavailable
+    assert capsys.readouterr().err == ""
 
 
 def test_hosted_db_load_error_falls_back_to_disk(tmp_path, monkeypatch):
@@ -169,11 +182,12 @@ def test_refusal_stderr_is_a_single_clean_json_object(tmp_path, monkeypatch, cap
     monkeypatch.setenv("AGAMI_DB_URL", "postgres://user:pw@127.0.0.1:1/nope")  # unreachable → raises
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))  # no disk model either
 
-    _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code == 1
-    err = capsys.readouterr().err.strip()
-    assert json.loads(err)["error"]["kind"] == "model_unavailable"  # parses whole → single object
-    assert "127.0.0.1" not in err and "pw" not in err  # no connection details leaked
+    _, refusal = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert refusal is not None and refusal.kind == "model_unavailable"
+    # The DB load error must not leak connection details into the refusal reason, and _model_safety
+    # writes NOTHING to stderr — the JSON is emitted exactly once, by main()/execute_guarded.
+    assert "127.0.0.1" not in refusal.reason and "pw" not in refusal.reason
+    assert capsys.readouterr().err == ""
 
 
 def test_hosted_fail_closed_when_model_package_unimportable(tmp_path, monkeypatch, capsys):
@@ -192,6 +206,80 @@ def test_hosted_fail_closed_when_model_package_unimportable(tmp_path, monkeypatc
     monkeypatch.setattr(builtins, "__import__", boom)
     monkeypatch.setenv("AGAMI_DB_URL", "sqlite://" + str(tmp_path / "x.db"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code == 1  # fail closed — no DB load is even attempted (we never resolve a model)
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "model_unavailable"
+    _, refusal = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert refusal is not None and refusal.kind == "model_unavailable"  # fail closed, no DB load
+    assert capsys.readouterr().err == ""
+
+
+# ── ACE-037: the scopability gate wired into _model_safety + the posture flag ─────────────────
+
+# The differential corpus — queries that parse but don't scope (a source the scope walk can't
+# resolve). Fixtures live here; the broad regression suite is ACE-040's.
+_UNSCOPABLE_CORPUS = [
+    "SELECT g FROM generate_series(1, 10) AS t(g)",  # table-function
+    "SELECT a FROM ROWS FROM (generate_series(1, 3)) AS t(a)",  # ROWS FROM
+    "SELECT x FROM (VALUES (1), (2)) AS v(x)",  # VALUES source
+    "SELECT x FROM UNNEST(ARRAY[1, 2]) AS t(x)",  # UNNEST source
+    "SELECT a FROM orders o, LATERAL (SELECT 1 AS a) l",  # LATERAL source
+    "SELECT id FROM orders UNION SELECT g FROM generate_series(1, 3) AS t(g)",  # unscopable set-op arm
+]
+
+
+@pytest.mark.parametrize("sql", _UNSCOPABLE_CORPUS)
+def test_unscopable_corpus_refused_under_enforce(tmp_path, monkeypatch, capsys, sql):
+    # Every parse-but-don't-scope construct is refused (unscopable_sql) by _model_safety under the
+    # default `enforce` posture — proving the gate is REACHED in the wired pass (no silent pass).
+    url = "sqlite://" + str(tmp_path / "model.db")
+    _seed_db(url, "acme")
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+    monkeypatch.delenv("AGAMI_SQL_UNSCOPABLE_POSTURE", raising=False)  # default = enforce
+
+    _, refusal = execute_sql._model_safety(sql, "acme", None)
+    assert refusal is not None and refusal.kind == "unscopable_sql"  # refused, never executed
+    assert capsys.readouterr().err == ""
+
+
+def test_unscopable_allowed_and_logged_under_warn(tmp_path, monkeypatch, capsys):
+    # `warn` is the staged-rollout escape hatch: log + allow, do NOT refuse.
+    url = "sqlite://" + str(tmp_path / "model.db")
+    _seed_db(url, "acme")
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+    monkeypatch.setenv("AGAMI_SQL_UNSCOPABLE_POSTURE", "warn")
+
+    _, refusal = execute_sql._model_safety("SELECT g FROM generate_series(1, 10) AS t(g)", "acme", None)
+    assert refusal is None  # allowed (not refused)
+    err = capsys.readouterr().err
+    assert "unscopable SQL allowed" in err and "warn" in err
+    assert '"unscopable_sql"' not in err  # no refusal emitted
+
+
+@pytest.mark.parametrize("posture", ["off", "disable", "warm", "", "ENFORCE ", "0"])
+def test_unknown_posture_value_fails_closed(tmp_path, monkeypatch, capsys, posture):
+    # The posture flag's core safety invariant: ONLY exact `warn` allows; every other value
+    # (typo, empty, garbage) must fail closed (refuse). Guards against a future refactor that flips
+    # the default open.
+    url = "sqlite://" + str(tmp_path / "model.db")
+    _seed_db(url, "acme")
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+    monkeypatch.setenv("AGAMI_SQL_UNSCOPABLE_POSTURE", posture)
+
+    _, refusal = execute_sql._model_safety("SELECT g FROM generate_series(1, 3) AS t(g)", "acme", None)
+    assert refusal is not None and refusal.kind == "unscopable_sql"
+    assert capsys.readouterr().err == ""
+
+
+def test_scopability_gate_runs_before_table_scope(tmp_path, monkeypatch, capsys):
+    # A table-function is unscopable AND references no declared table; it must refuse as
+    # `unscopable_sql` (the gate runs first), not fall through to a different verdict.
+    url = "sqlite://" + str(tmp_path / "model.db")
+    _seed_db(url, "acme")
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+    monkeypatch.delenv("AGAMI_SQL_UNSCOPABLE_POSTURE", raising=False)
+
+    _, refusal = execute_sql._model_safety("SELECT g FROM generate_series(1, 3) AS t(g)", "acme", None)
+    assert refusal is not None and refusal.kind == "unscopable_sql"
+    assert capsys.readouterr().err == ""

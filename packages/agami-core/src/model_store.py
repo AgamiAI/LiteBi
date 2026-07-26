@@ -445,6 +445,51 @@ class DbActivitySink:
         )
         self._store.commit()
 
+    _AUDIT_COLS = (
+        "audit_id, ts, datasource, status, refusal_kind, sql, row_count, execution_ms, "
+        "correlation_id, source"
+    )
+
+    def record_guardrail_audit(self, record: Any) -> None:
+        base = (
+            record.audit_id,
+            record.ts,
+            record.datasource,
+            record.status,
+            record.refusal_kind,
+            record.sql,
+            record.row_count,
+            record.execution_ms,
+            record.correlation_id,
+            record.source,
+        )
+        try:
+            self._store.execute(
+                f"INSERT INTO guardrail_audit ({self._AUDIT_COLS}, error_detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*base, record.error_detail),
+            )
+        except Exception as exc:
+            # ONLY the pre-013 schema (the error_detail column isn't there yet — new code against an
+            # un-migrated DB) is retried WITHOUT the raw detail. Any OTHER failure must propagate: a
+            # blanket retry would both mask a real DB error and silently drop error_detail (Copilot
+            # review). Match the missing-column signature across drivers (sqlite "has no column named",
+            # Postgres "does not exist" / UndefinedColumn).
+            msg = str(exc).lower()
+            missing_error_detail = "error_detail" in msg and (
+                "no column" in msg or "does not exist" in msg or "undefined" in msg
+            )
+            if not missing_error_detail:
+                raise  # a genuine DB failure — surface it to the best-effort caller, don't mask it
+            # Roll back first so a Postgres aborted-transaction doesn't fail the retry.
+            self._store.rollback()
+            self._store.execute(
+                f"INSERT INTO guardrail_audit ({self._AUDIT_COLS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                base,
+            )
+        self._store.commit()
+
 
 # ---------------------------------------------------------------------------
 # Read path — the admin activity views (read-only).

@@ -100,9 +100,9 @@ def test_verdict_parity_with_and_without_ctx(sql):
     handed a shared ctx — the behaviour-preserving guarantee."""
     org = _org()
     ctx = rt.build_guard_context(sql, org)
-    assert rt.check_table_scope(sql, org).as_dict() == rt.check_table_scope(sql, org, ctx=ctx).as_dict()
-    assert rt.check_no_select_star(sql).as_dict() == rt.check_no_select_star(sql, ctx=ctx).as_dict()
-    assert rt.check_column_scope(sql, org).as_dict() == rt.check_column_scope(sql, org, ctx=ctx).as_dict()
+    assert rt.check_table_scope(sql, org) == rt.check_table_scope(sql, org, ctx=ctx)
+    assert rt.check_no_select_star(sql) == rt.check_no_select_star(sql, ctx=ctx)
+    assert rt.check_column_scope(sql, org) == rt.check_column_scope(sql, org, ctx=ctx)
     assert rt.pre_flight_check(sql, org).as_dict() == rt.pre_flight_check(sql, org, ctx=ctx).as_dict()
     assert (rt.check_sensitive_projection(sql, org).as_dict()
             == rt.check_sensitive_projection(sql, org, ctx=ctx).as_dict())
@@ -115,5 +115,5 @@ def test_unparseable_sql_ctx_tree_is_none_and_guards_allow():
     org = _org()
     bad = "NOT SQL AT ALL ;;;"
     ctx = rt.build_guard_context(bad, org)
-    assert rt.check_table_scope(bad, org, ctx=ctx).action == "allow"
-    assert rt.check_no_select_star(bad, ctx=ctx).action == "allow"
+    assert rt.check_table_scope(bad, org, ctx=ctx) is None
+    assert rt.check_no_select_star(bad, ctx=ctx) is None

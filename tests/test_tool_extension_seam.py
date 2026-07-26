@@ -20,9 +20,9 @@ import mcp_http  # noqa: E402
 import tools  # noqa: E402
 from oss_adapters import (  # noqa: E402
     FileActivitySink,
+    NoopGovernancePolicy,
     PresenceAuthProvider,
     SingleTenantOrgResolver,
-    WarnOnlyGovernancePolicy,
 )
 from ports import Adapters, Org  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
@@ -167,7 +167,7 @@ def test_adapters_none_uses_the_oss_defaults(base_url):
     assert isinstance(a.org_resolver, SingleTenantOrgResolver)
     assert isinstance(a.auth_provider, PresenceAuthProvider)  # presence when no signing secret
     assert isinstance(a.activity_sink, FileActivitySink)
-    assert isinstance(a.governance, WarnOnlyGovernancePolicy)
+    assert isinstance(a.governance, NoopGovernancePolicy)
 
 
 def test_create_app_uses_the_passed_adapters(base_url):
@@ -177,7 +177,7 @@ def test_create_app_uses_the_passed_adapters(base_url):
         activity_sink=FileActivitySink(),
         org_resolver=resolver,
         auth_provider=auth,
-        governance=WarnOnlyGovernancePolicy(),
+        governance=NoopGovernancePolicy(),
     )
     kwargs = _auth_middleware_kwargs(mcp_http.create_app(adapters=adapters))
     assert kwargs["resolver"] is resolver  # the passed adapters are used at the composition root

@@ -115,7 +115,7 @@ def test_http_server_runs_in_process_by_default_no_fork(monkeypatch):
     )
 
     out = json.loads(tools.tool_execute_sql({"sql": "SELECT 1 AS n", "datasource": "acme"}))
-    assert out["columns"] == ["n"]  # ran in-process, no subprocess
+    assert out["data"]["columns"] == ["n"]  # ran in-process, no subprocess
 
 
 def test_stdio_cli_path_still_forks_when_no_executor_injected(monkeypatch):
@@ -139,7 +139,7 @@ def test_stdio_cli_path_still_forks_when_no_executor_injected(monkeypatch):
 
     out = json.loads(tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme"}))
     assert "-m" in captured["cmd"] and "execute_sql" in captured["cmd"]  # forked
-    assert out["rows"] == [["1"]]
+    assert out["data"]["rows"] == [["1"]]
 
 
 def test_in_process_default_matches_subprocess_result_envelope(monkeypatch, tmp_path):
@@ -180,6 +180,6 @@ def test_in_process_default_matches_subprocess_result_envelope(monkeypatch, tmp_
     )  # in-process, as the HTTP default does
     inproc = json.loads(tools.tool_execute_sql(args))
 
-    assert "columns" in sub, sub  # subprocess actually produced a result (not a creds error)
+    assert "columns" in sub["data"], sub  # subprocess actually produced a result (not a creds error)
     for key in ("columns", "rows", "row_count", "truncated"):
-        assert sub[key] == inproc[key]  # identical successful envelope whichever ran it
+        assert sub["data"][key] == inproc["data"][key]  # identical envelope whichever ran it

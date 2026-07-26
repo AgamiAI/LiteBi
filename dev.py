@@ -42,7 +42,7 @@ _LIB_DST = _ROOT / "plugins" / "agami" / "lib"
 # The module-load import closure of the 4 scripts (all stdlib-only). tests/test_plugin_lib_resolution.py
 # fails if a script gains a module-level import that's missing here; a new *lazy* import from the package
 # would also need adding to this list.
-_VENDORED = ["agami_paths.py", "execute_sql.py", "sql_guard.py", "semantic_model/__init__.py", "semantic_model/units.py"]
+_VENDORED = ["agami_paths.py", "execute_sql.py", "sql_guard.py", "guardrail.py", "semantic_model/__init__.py", "semantic_model/units.py"]
 
 
 def run(cmd: list[str], *, allow_fail: bool = False) -> int:

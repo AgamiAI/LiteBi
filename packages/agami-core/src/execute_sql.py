@@ -45,14 +45,18 @@ import json
 import os
 import stat
 import sys
+import threading
+import time
 import urllib.parse
 from collections.abc import Callable
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import agami_paths
+from guardrail import Refusal, Verdict
 
 if TYPE_CHECKING:
     # ``Executor`` is the 5th port; imported only for type-checkers. At runtime ``execute_sql`` never
@@ -82,6 +86,7 @@ def _resolve_default_profile() -> str:
     if CONFIG_PATH.exists():
         try:
             import json as _json
+
             cfg = _json.loads(CONFIG_PATH.read_text())
             active = cfg.get("active_profile")
             if isinstance(active, str) and active:
@@ -126,13 +131,14 @@ class ExecutorError(Exception):
 
 
 class GuardRefused(Exception):
-    """A guard refusal short-circuiting the envelope. ``envelope`` is the JSON error object the
-    caller must emit (the read-only guard's ``permission`` refusal), or ``None`` when the refusal
-    JSON was already written to stderr by ``_model_safety`` (carry only the exit ``code``)."""
+    """A guard refusal short-circuiting the executor. Carries the typed ``Refusal`` (the shared
+    guardrail shape) so BOTH callers build the SAME envelope from it: the subprocess ``main`` emits
+    ``Envelope.refused(refusal)`` JSON to stderr, and the in-process MCP handler returns it directly.
+    No stderr round-trip — so a model-safety refusal keeps its structured detail on both paths."""
 
-    def __init__(self, envelope: dict | None, *, code: int) -> None:
+    def __init__(self, refusal: Refusal, *, code: int) -> None:
         super().__init__()
-        self.envelope = envelope
+        self.refusal = refusal
         self.code = code
 
 
@@ -271,9 +277,12 @@ def _load_credentials(profile: str, org_id: str = "local") -> dict[str, str]:
 # Schemes we accept. Strip "+driver" suffixes (e.g. postgresql+asyncpg, postgres+psycopg2).
 _POSTGRES_SCHEMES = {"postgres", "postgresql"}
 _MYSQL_SCHEMES = {"mysql", "mariadb"}
-_REDSHIFT_SCHEMES = {"redshift"}        # speaks Postgres wire protocol; port 5439, SSL required
-_SNOWFLAKE_SCHEMES = {"snowflake"}      # native CLI (snowsql) + snowflake-connector-python
-_BIGQUERY_SCHEMES = {"bigquery", "bq"}  # google-cloud-bigquery — auth via service-account JSON or ADC
+_REDSHIFT_SCHEMES = {"redshift"}  # speaks Postgres wire protocol; port 5439, SSL required
+_SNOWFLAKE_SCHEMES = {"snowflake"}  # native CLI (snowsql) + snowflake-connector-python
+_BIGQUERY_SCHEMES = {
+    "bigquery",
+    "bq",
+}  # google-cloud-bigquery — auth via service-account JSON or ADC
 
 
 def _parse_dsn(dsn: str) -> dict[str, str]:
@@ -342,7 +351,7 @@ def _parse_dsn(dsn: str) -> dict[str, str]:
         return out
     elif base_scheme == "sqlite":
         # sqlite:///absolute/path or sqlite:relative/path
-        path = dsn[len("sqlite://"):]
+        path = dsn[len("sqlite://") :]
         if path.startswith("/"):
             path = path[1:] if path[1:2] == "/" else path  # handle `sqlite:////abs`
         # Trailing path normalization
@@ -430,15 +439,30 @@ def _run_postgres(creds: dict[str, str], sql: str) -> ExecResult:
         raise ExecutorError(f"Postgres connect failed: {e}", code=4)
     try:
         with conn:
+            # Genuine server-side cancel: the backend aborts the statement itself after the deadline.
+            # Set per-transaction via SET LOCAL — NOT the libpq `options` startup parameter, which a
+            # transaction-mode pooler (Supabase Supavisor, PgBouncer) can reject at connect. SET LOCAL
+            # is transaction-scoped, which those poolers pass through cleanly. The watchdog's
+            # conn.cancel() (a pg_cancel request) is the client-initiated backstop.
+            with conn.cursor() as setup:
+                setup.execute(f"SET LOCAL statement_timeout = {_timeout_ms()}")
             # A server-side (named) cursor so the row cap bounds TRANSFER, not just what we write:
             # psycopg2's default client-side cursor buffers the ENTIRE result before we can fetchmany,
             # so a runaway result would still be pulled whole. The named cursor streams from the
             # server in bounded batches (ACE-038). Read-only SELECTs (the only thing the guard admits)
             # are exactly what a server-side cursor supports.
-            with conn.cursor(name="agami_bounded") as cur:
-                cur.itersize = _resolve_row_cap() + 1  # server fetch batch = the bounded window
-                cur.execute(sql)
-                result = _collect_cursor(cur)
+            cur = conn.cursor(name="agami_bounded")  # not `with`: a cancelled txn makes CLOSE raise
+            cur.itersize = _resolve_row_cap() + 1  # server fetch batch = the bounded window
+            try:
+                result = _run_bounded(lambda: _exec(cur, sql), conn.cancel)
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass  # a cancelled query leaves the txn aborted; closing the server-side cursor
+                    # would raise and mask _ResourceLimit — swallow so the timeout refusal survives
+    except _ResourceLimit:
+        raise  # timed out; `with conn` rolled back — execute_guarded maps it to a resource_limit refusal
     except Exception as e:
         raise ExecutorError(f"Postgres execution error: {e}", code=5)
     finally:
@@ -452,6 +476,7 @@ def _run_mysql(creds: dict[str, str], sql: str) -> ExecResult:
     except ImportError:
         raise ExecutorError("pymysql not installed. Run: pip install pymysql", code=3)
     _require(creds, "host", "port", "user", "password", "database")
+    secs = _resolve_timeout_s()
     try:
         conn = pymysql.connect(
             host=creds["host"],
@@ -461,18 +486,37 @@ def _run_mysql(creds: dict[str, str], sql: str) -> ExecResult:
             database=creds["database"],
             charset="utf8mb4",
             connect_timeout=10,
+            # The reliable client-side bound: a socket read/write blocked past the deadline raises on
+            # its own. Closing the connection from the watchdog thread does NOT unblock a recv() on
+            # Linux (that needs shutdown(), which pymysql's close() skips), so this — not the close —
+            # is what guarantees MySQL/MariaDB can't hang past the deadline.
+            read_timeout=secs,
+            write_timeout=secs,
             autocommit=True,
         )
     except Exception as e:
         raise ExecutorError(f"MySQL connect failed: {e}", code=4)
+    # Native server-side timeout. MySQL 5.7.8+ spells it max_execution_time (ms); MariaDB spells it
+    # max_statement_time (seconds). Try both — each is a no-op on the other dialect (a swallowed
+    # unknown-variable error) — so whichever the server is gets a genuine server-side abort.
+    for stmt in (
+        f"SET SESSION max_execution_time={secs * 1000}",
+        f"SET SESSION max_statement_time={secs}",
+    ):
+        try:
+            with conn.cursor() as _c:
+                _c.execute(stmt)
+        except Exception:
+            pass  # not this dialect; read_timeout still bounds the client
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            result = _collect_cursor(cur)
+        cur = conn.cursor()  # not `with` — the watchdog may close conn, so avoid a close-on-close
+        result = _run_bounded(lambda: _exec(cur, sql), lambda: _safe_close(conn))
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"MySQL execution error: {e}", code=5)
     finally:
-        conn.close()
+        _safe_close(conn)
     return result
 
 
@@ -498,6 +542,8 @@ def _run_snowflake(creds: dict[str, str], sql: str) -> ExecResult:
         "user": creds["user"],
         "client_session_keep_alive": False,
         "login_timeout": 15,
+        # Native server-side statement timeout (seconds) — Snowflake aborts the query itself.
+        "session_parameters": {"STATEMENT_TIMEOUT_IN_SECONDS": _resolve_timeout_s()},
     }
     for k in ("password", "warehouse", "database", "schema", "role", "authenticator"):
         if creds.get(k):
@@ -508,15 +554,13 @@ def _run_snowflake(creds: dict[str, str], sql: str) -> ExecResult:
         raise ExecutorError(f"Snowflake connect failed: {e}", code=4)
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        result = _run_bounded(lambda: _exec(cur, sql), lambda: _safe_close(conn))
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Snowflake execution error: {e}", code=5)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _safe_close(conn)
     return result
 
 
@@ -567,9 +611,7 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
         except Exception:
             pass
         try:
-            creds_obj = service_account.Credentials.from_service_account_file(
-                sa_path_expanded
-            )
+            creds_obj = service_account.Credentials.from_service_account_file(sa_path_expanded)
             client_kwargs["credentials"] = creds_obj
         except Exception as e:
             raise ExecutorError(f"BigQuery credentials load failed: {e}", code=2)
@@ -581,7 +623,8 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
 
     # If `dataset` was set, prefix unqualified table references via the
     # default_dataset job config so the SQL can omit `<project>.<dataset>.`
-    job_config_kwargs: dict[str, Any] = {}
+    # `job_timeout_ms` is the native server-side job timeout — BigQuery ends the job itself.
+    job_config_kwargs: dict[str, Any] = {"job_timeout_ms": _timeout_ms()}
     if creds.get("dataset"):
         try:
             job_config_kwargs["default_dataset"] = f"{project}.{creds['dataset']}"
@@ -589,16 +632,30 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
             pass
 
     cap = _resolve_row_cap()
+    job_box: dict[str, Any] = {}
+    started = time.monotonic()
+    timeout_s = _resolve_timeout_s()
+
+    def _bq_cancel() -> None:
+        job = job_box.get("job")
+        if job is not None:
+            job.cancel()  # genuine server-side job cancel (the client-initiated backstop to job_timeout_ms)
+
     try:
-        if job_config_kwargs:
-            job_config = bigquery.QueryJobConfig(**job_config_kwargs)
-            job = client.query(sql, job_config=job_config)
-        else:
-            job = client.query(sql)
-        # BigQuery has no DB-API cursor, so it can't funnel through `_collect_cursor`; apply the
-        # same bounded-fetch cap here. `max_results=cap+1` bounds what the API returns (transfer),
-        # and the (cap+1)th row flags truncation — the never-silent guarantee holds for BigQuery too.
-        results = job.result(max_results=cap + 1)  # waits for completion; raises on error
+        with _deadline(_bq_cancel, timeout_s) as fired:
+            try:
+                job = client.query(sql, job_config=bigquery.QueryJobConfig(**job_config_kwargs))
+                job_box["job"] = job
+                # BigQuery has no DB-API cursor, so it can't funnel through `_collect_cursor`; apply the
+                # same bounded-fetch cap here. `max_results=cap+1` bounds what the API returns (transfer),
+                # and the (cap+1)th row flags truncation — the never-silent guarantee holds for BigQuery too.
+                results = job.result(max_results=cap + 1)  # waits for completion; raises on error
+            except Exception:
+                if _deadline_hit(fired, started, timeout_s):
+                    raise _ResourceLimit from None
+                raise
+    except _ResourceLimit:
+        raise  # execute_guarded maps a fired BigQuery deadline to a resource_limit refusal
     except Exception as e:
         raise ExecutorError(f"BigQuery execution error: {e}", code=5)
 
@@ -618,6 +675,7 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
 
 def _run_sqlite(creds: dict[str, str], sql: str) -> ExecResult:
     import sqlite3  # always available in stdlib
+
     _require(creds, "path")
     path = os.path.expanduser(creds["path"])
     try:
@@ -626,8 +684,9 @@ def _run_sqlite(creds: dict[str, str], sql: str) -> ExecResult:
         raise ExecutorError(f"SQLite connect failed: {e}", code=4)
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        result = _run_bounded(lambda: _exec(cur, sql), conn.interrupt)
+    except _ResourceLimit:
+        raise  # timed out — execute_guarded maps it to a resource_limit refusal
     except Exception as e:
         raise ExecutorError(f"SQLite execution error: {e}", code=5)
     finally:
@@ -644,23 +703,25 @@ def _run_sqlserver(creds: dict[str, str], sql: str) -> ExecResult:
     _require(creds, "host", "user", "password")
     try:
         conn = pymssql.connect(
-            server=creds["host"], port=int(creds.get("port", 1433)),
-            user=creds["user"], password=creds["password"],
-            database=creds.get("database", ""), login_timeout=15,
+            server=creds["host"],
+            port=int(creds.get("port", 1433)),
+            user=creds["user"],
+            password=creds["password"],
+            database=creds.get("database", ""),
+            login_timeout=15,
+            timeout=_resolve_timeout_s(),  # native per-query timeout (seconds)
         )
     except Exception as e:
         raise ExecutorError(f"SQL Server connect failed: {e}", code=4)
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        result = _run_bounded(lambda: _exec(cur, sql), lambda: _safe_close(conn))
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"SQL Server execution error: {e}", code=5)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _safe_close(conn)
     return result
 
 
@@ -674,23 +735,26 @@ def _run_oracle(creds: dict[str, str], sql: str) -> ExecResult:
     dsn = creds.get("dsn") or creds.get("url")
     if not dsn:
         _require(creds, "host", "service_name")
-        dsn = oracledb.makedsn(creds["host"], int(creds.get("port", 1521)),
-                               service_name=creds["service_name"])
+        dsn = oracledb.makedsn(
+            creds["host"], int(creds.get("port", 1521)), service_name=creds["service_name"]
+        )
     try:
         conn = oracledb.connect(user=creds["user"], password=creds["password"], dsn=dsn)
     except Exception as e:
         raise ExecutorError(f"Oracle connect failed: {e}", code=4)
     try:
+        conn.call_timeout = _timeout_ms()  # native round-trip timeout (ms)
+    except Exception:
+        pass  # older driver / mode; the wall-clock watchdog still bounds the query
+    try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        result = _run_bounded(lambda: _exec(cur, sql), lambda: _safe_close(conn))
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Oracle execution error: {e}", code=5)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _safe_close(conn)
     return result
 
 
@@ -706,22 +770,27 @@ def _run_databricks(creds: dict[str, str], sql: str) -> ExecResult:
     _require(creds, "host", "http_path", "token")
     try:
         conn = dbsql.connect(
-            server_hostname=creds["host"], http_path=creds["http_path"],
+            server_hostname=creds["host"],
+            http_path=creds["http_path"],
             access_token=creds["token"],
         )
     except Exception as e:
         raise ExecutorError(f"Databricks connect failed: {e}", code=4)
     try:
+        with conn.cursor() as _c:  # best-effort native server-side bound (seconds; 0 = no timeout)
+            _c.execute(f"SET STATEMENT_TIMEOUT = {_resolve_timeout_s()}")
+    except Exception:
+        pass  # older runtime without the config; cur.cancel() below is the cross-thread cancel
+    try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # cur.cancel() is a genuine server-side cancel of the running statement.
+        result = _run_bounded(lambda: _exec(cur, sql), cur.cancel)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Databricks execution error: {e}", code=5)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _safe_close(conn)
     return result
 
 
@@ -737,23 +806,28 @@ def _run_trino(creds: dict[str, str], sql: str) -> ExecResult:
         if creds.get("password"):
             auth = trino.auth.BasicAuthentication(creds["user"], creds["password"])
         conn = trino.dbapi.connect(
-            host=creds["host"], port=int(creds.get("port", 8080)), user=creds["user"],
-            catalog=creds.get("catalog"), schema=creds.get("schema"),
-            http_scheme="https" if creds.get("password") else "http", auth=auth,
+            host=creds["host"],
+            port=int(creds.get("port", 8080)),
+            user=creds["user"],
+            catalog=creds.get("catalog"),
+            schema=creds.get("schema"),
+            http_scheme="https" if creds.get("password") else "http",
+            auth=auth,
+            # Native server-side cap on total query runtime.
+            session_properties={"query_max_run_time": f"{_resolve_timeout_s()}s"},
         )
     except Exception as e:
         raise ExecutorError(f"Trino connect failed: {e}", code=4)
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # cur.cancel() cancels the running Trino query server-side.
+        result = _run_bounded(lambda: _exec(cur, sql), cur.cancel)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Trino execution error: {e}", code=5)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _safe_close(conn)
     return result
 
 
@@ -769,15 +843,15 @@ def _run_duckdb(creds: dict[str, str], sql: str) -> ExecResult:
     except Exception as e:
         raise ExecutorError(f"DuckDB open failed: {e}", code=4)
     try:
-        cur = conn.execute(sql)
-        result = _collect_cursor(cur)
+        # DuckDB runs the query in conn.execute() and returns the streaming source; conn.interrupt()
+        # aborts an in-flight query (in-process, thread-safe) — same shape as SQLite.
+        result = _run_bounded(lambda: conn.execute(sql), conn.interrupt)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"DuckDB execution error: {e}", code=5)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _safe_close(conn)
     return result
 
 
@@ -857,6 +931,127 @@ def _write_cursor_csv(cur: Any) -> None:
     _emit_result_csv(_collect_cursor(cur))
 
 
+# ---------------------------------------------------------------------------
+# Per-statement timeout — the availability guarantee
+#
+# A generated query can hang or exhaust the DB (recursive CTE, cartesian bomb, unbounded scan). The
+# read-only role is not mandated to carry a role-level statement_timeout, so this app-layer bound is
+# the SOLE availability guarantee: a wall-clock watchdog cancels the in-flight query after
+# AGAMI_SQL_TIMEOUT_S (default 30) — the universal backstop for every engine — layered under each
+# engine's native statement timeout where it has one (the primary, genuine DB-side cancel). A fired
+# deadline emits a `resource_limit` refusal; the query is killed, no result is returned.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TIMEOUT_S = 30  # per-statement wall-clock timeout, overridable by AGAMI_SQL_TIMEOUT_S
+
+
+def _resolve_timeout_s() -> int:
+    """Per-statement timeout in seconds — `AGAMI_SQL_TIMEOUT_S` (default 30). A missing / invalid /
+    non-positive value falls back to the default; there is no "0 = unlimited" (availability is a
+    safety obligation — a query is always bounded). Read once at the point of use, like
+    `_resolve_row_cap`."""
+    raw = os.environ.get("AGAMI_SQL_TIMEOUT_S", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else _DEFAULT_TIMEOUT_S
+
+
+@contextmanager
+def _deadline(cancel: Callable[[], None], timeout_s: int):
+    """Bound the enclosed statement by a wall-clock watchdog: after `timeout_s` seconds, `cancel()`
+    interrupts the in-flight query (per driver — `conn.cancel()` / `conn.interrupt()` / `cur.cancel()`),
+    which makes the blocked execute/fetch raise. The universal availability backstop so no engine hangs
+    past the deadline, even one with no native statement timeout. Yields an Event that is set iff the
+    deadline fired (so the caller can tell a timeout from a real error).
+
+    `timeout_s` is passed in (not re-read from the env here) so the watchdog duration and the caller's
+    `_deadline_hit` elapsed-vs-timeout classification key off the SAME resolved value — a mid-flight
+    change to `AGAMI_SQL_TIMEOUT_S` can't make the two diverge (Copilot review)."""
+    fired = threading.Event()
+
+    def _fire() -> None:
+        fired.set()
+        try:
+            cancel()
+        except Exception:
+            pass  # best-effort cancel; the deadline having fired is what the caller keys on
+
+    timer = threading.Timer(timeout_s, _fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield fired
+    finally:
+        timer.cancel()
+
+
+class _ResourceLimit(Exception):
+    """The per-statement deadline fired and the query was cancelled. Raised out through the engine's
+    `with conn` / transaction handling so it ROLLS BACK (a cancelled query leaves the txn aborted)
+    rather than committing; the engine re-raises it and `execute_guarded` maps it to the typed
+    `resource_limit` refusal (one refusal, both surfaces)."""
+
+
+def _timeout_ms() -> int:
+    """The statement timeout in milliseconds — for the engines whose native param takes ms."""
+    return _resolve_timeout_s() * 1000
+
+
+def _safe_close(conn: Any) -> None:
+    """Close a connection, swallowing errors — safe to call twice (the watchdog may close it to
+    interrupt an in-flight query, then the engine's `finally` closes it again)."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _exec(cur: Any, sql: str) -> Any:
+    """Run `sql` on a DB-API cursor and return it as the streaming source (for `_run_bounded`)."""
+    cur.execute(sql)
+    return cur
+
+
+def _resource_limit_refusal() -> Refusal:
+    """Build the typed `resource_limit` refusal for a query cancelled at the statement deadline. The
+    single source of the timeout refusal — `execute_guarded` raises it as a `GuardRefused` so both the
+    subprocess wire and the in-process path surface the identical refused Envelope."""
+    secs = _resolve_timeout_s()
+    return Refusal(
+        kind="resource_limit",
+        reason=f"the query exceeded the {secs}s statement timeout and was cancelled",
+        remediation=f"Narrow the query, or raise AGAMI_SQL_TIMEOUT_S (currently {secs}s).",
+    )
+
+
+def _deadline_hit(fired: threading.Event, started: float, timeout_s: int) -> bool:
+    """True if the query was ended by the statement deadline. Primary signal: the watchdog `fired`
+    (it sets the flag before it cancels, so a watchdog-driven kill is always flagged). Secondary
+    signal: wall-clock elapsed reached the timeout — an engine's NATIVE server timeout (set to the
+    same duration) can win the race and raise before the watchdog's callback runs, and without the
+    elapsed check that genuine timeout would be mislabeled a generic error. Either signal → the query
+    ran to the deadline, so the raise is a `resource_limit`, not a real error."""
+    return fired.is_set() or (time.monotonic() - started) >= timeout_s
+
+
+def _run_bounded(execute: Callable[[], Any], cancel: Callable[[], None]) -> ExecResult:
+    """Run a statement under the deadline and return its bounded ``ExecResult``. `execute()` runs the
+    SQL and returns the cursor/result to fetch from (a thunk so both the `cur.execute(sql)` engines and
+    DuckDB's `conn.execute(sql)` fit). On a deadline hit — the client watchdog fired OR wall-clock
+    reached the timeout (whichever mechanism, client cancel or native server timeout, killed the
+    query) — it raises `_ResourceLimit`; the engine re-raises it and `execute_guarded` maps it to a
+    single `resource_limit` refusal, so no partial result is ever returned. A non-timeout error
+    (raised before the deadline) propagates unchanged to the engine's handler."""
+    started = time.monotonic()
+    timeout_s = _resolve_timeout_s()
+    with _deadline(cancel, timeout_s) as fired:
+        try:
+            cur = execute()
+            return _collect_cursor(cur)
+        except Exception:
+            if _deadline_hit(fired, started, timeout_s):
+                raise _ResourceLimit from None
+            raise
+
+
 def _hosted() -> bool:
     """The served (hosted) path is signalled by a configured database — the same signal
     `tools._load_org` / `Store.from_env` use. On it, a missing model is a safety failure (fail
@@ -869,11 +1064,10 @@ def _resolve_guard_model(profile: str):
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
     on-disk YAML (local). Returns a `Datasource` or None if neither is available.
 
-    The DB import is lazy AND env-guarded on purpose: the local executor runs from a stdlib-lean
-    mirror that does not ship `store`/`model_store`, so we only reach for them when a DB is set.
-    Any DB-load failure degrades to disk rather than crashing the executor."""
-    from semantic_model import loader as L
-
+    The DB/loader imports are lazy AND (for the DB) env-guarded on purpose: the local executor runs
+    from a stdlib-lean mirror that does not ship `store`/`model_store`, so we only reach for them when
+    a DB is set; and the loader import sits inside the disk-path try so an import failure degrades to
+    None (hosted then fails closed) rather than crashing the executor."""
     # Any load failure below degrades to the next source (DB → disk → None), silently: a freeform
     # error line here would (a) leak DB connection details from the exception and (b) precede the
     # JSON refusal `_model_safety` emits when both sources are absent on hosted, breaking the
@@ -889,7 +1083,10 @@ def _resolve_guard_model(profile: str):
                 try:
                     org = _load_db(store, profile)
                 finally:
-                    store.close()
+                    try:
+                        store.close()
+                    except Exception:
+                        pass  # a close error must not discard a model that loaded fine (→ false refusal)
                 if org is not None:
                     return org
         except Exception:
@@ -900,19 +1097,35 @@ def _resolve_guard_model(profile: str):
         try:
             return L.load_datasource(root)
         except Exception:
-            pass  # unparseable/absent on disk -> None (hosted then fails closed)
+            pass  # unparseable/absent on disk, or loader import failure -> None (hosted fails closed)
     return None
 
 
-def _model_safety(sql: str, profile: str, area: str | None):
+def _refusal_from_verdict(kind: str, verdict: Verdict) -> Refusal:
+    """Build the shared ``Refusal`` from a safety ``Verdict``. A safety verdict always refuses
+    (``policy(safety)`` is ``reject`` in every tier), so the guard chain refuses unconditionally on a
+    non-None verdict. ``kind`` is the caller-supplied refusal kind (the verdict's ``rule`` names the
+    gate, e.g. ``read_only``; the refusal ``kind`` is the outward vocabulary, e.g. ``permission``)."""
+    return Refusal(kind=kind, reason=verdict.detail, remediation=verdict.remediation)
+
+
+def _unscopable_posture() -> str:
+    """The unscopable-SQL rollout posture: ``enforce`` (default — fail-closed) or ``warn`` (a
+    staged-rollout escape hatch that logs and allows). ``warn`` is never the shipped default; safety
+    fails closed. This is an operational rollout knob, NOT the deployment tier — safety has no tier
+    variance and enforces in every tier."""
+    return os.environ.get("AGAMI_SQL_UNSCOPABLE_POSTURE", "enforce").strip().lower()
+
+
+def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusal | None]:
     """Semantic-model safety pass before execution: fan-trap / chasm-trap pre-flight
     + default_filters auto-application, over a model resolved from the DB (hosted) or disk (local).
 
-    Returns (sql_to_run, exit_code). exit_code is None to continue, or an int to
-    short-circuit (a refusal the caller must consume). Inert (returns the SQL unchanged) when the
-    model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
-    HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
-    """
+    Returns (sql_to_run, refusal). ``refusal`` is None to continue, or a typed ``Refusal`` the caller
+    (``execute_guarded``) raises as a ``GuardRefused`` — so both the subprocess and in-process paths
+    build the same envelope from it. Inert (returns the SQL unchanged) when the model package isn't
+    importable, or — on the LOCAL path only — when there is no model yet. On the HOSTED path a model
+    that can't be resolved fails closed (refuses), never runs unguarded (ACE-051)."""
     try:
         from semantic_model import runtime as RT
     except Exception:
@@ -922,11 +1135,11 @@ def _model_safety(sql: str, profile: str, area: str | None):
         # sqlglot-unavailable / unparseable-SQL degrade-to-allow is a distinct fail-open owned by
         # ACE-037, not closed here.)
         if _hosted():
-            json.dump({"error": {"kind": "model_unavailable", "reason":
-                       "semantic-model package not importable; refusing to run unguarded on the "
-                       "hosted server"}}, sys.stderr)
-            sys.stderr.write("\n")
-            return sql, 1
+            return sql, Refusal(
+                "model_unavailable",
+                "semantic-model package not importable; refusing to run unguarded on the "
+                "hosted server",
+            )
         return sql, None  # local: model package not available -> no-op
 
     org = _resolve_guard_model(profile)
@@ -934,11 +1147,11 @@ def _model_safety(sql: str, profile: str, area: str | None):
         if _hosted():
             # Fail closed: a served query with no resolvable model must be refused, never run with
             # the fan/chasm/scope/PII guards silently off.
-            json.dump({"error": {"kind": "model_unavailable", "reason":
-                       "no semantic model could be resolved (checked DB and disk); refusing to run "
-                       "unguarded on the hosted server"}}, sys.stderr)
-            sys.stderr.write("\n")
-            return sql, 1
+            return sql, Refusal(
+                "model_unavailable",
+                "no semantic model could be resolved (checked DB and disk); refusing to run "
+                "unguarded on the hosted server",
+            )
         return sql, None  # local: no model yet -> no-op (unchanged)
 
     # Build the shared guard context ONCE — parse the SQL + build each model index a single
@@ -947,41 +1160,43 @@ def _model_safety(sql: str, profile: str, area: str | None):
     # returns the same verdict as one that builds its own.
     ctx = RT.build_guard_context(sql, org)
 
+    # Scopability gate — refuse a query that can't be fully scoped (unparseable, or a non-`Table`
+    # FROM/JOIN source the scope walk can't reject) rather than run it blind. Runs
+    # BEFORE the object-scope gates so an unscopable query fails closed instead of reaching their
+    # degrade-to-allow branches. Posture `warn` is a staged-rollout escape hatch (logs + allows);
+    # the default `enforce` refuses. Safety fails closed regardless of tier.
+    scop = RT.check_scopable(sql, org, ctx=ctx)
+    if scop is not None:
+        if _unscopable_posture() == "warn":
+            sys.stderr.write(
+                "[agami] unscopable SQL allowed (AGAMI_SQL_UNSCOPABLE_POSTURE=warn): "
+                f"{scop.detail}\n"
+            )
+        else:
+            return sql, _refusal_from_verdict("unscopable_sql", scop)
+
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
     # so the fan/chasm and sensitive checks below only evaluate in-scope tables.
     ts = RT.check_table_scope(sql, org, ctx=ctx)
-    if ts.action == "refuse":
-        json.dump({"error": {"kind": "table_out_of_scope", "tables": ts.offending_tables,
-                             "reason": ts.reason, "suggestion": ts.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
+    if ts is not None:
+        return sql, _refusal_from_verdict("table_out_of_scope", ts)
 
     # SELECT * ban — force every projected column to be named, so the column-scope
     # guard below can check what is actually returned (and nothing hides behind *).
     star = RT.check_no_select_star(sql, ctx=ctx)
-    if star.action == "refuse":
-        json.dump({"error": {"kind": "select_star",
-                             "reason": star.reason, "suggestion": star.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
+    if star is not None:
+        return sql, _refusal_from_verdict("select_star", star)
 
     # Column-scope guard — a column that binds to a declared table must be one that
     # table declares (a hallucinated column, or a physical column the model excluded).
     cs = RT.check_column_scope(sql, org, ctx=ctx)
-    if cs.action == "refuse":
-        json.dump({"error": {"kind": "column_out_of_scope", "columns": cs.columns,
-                             "reason": cs.reason, "suggestion": cs.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
+    if cs is not None:
+        return sql, _refusal_from_verdict("column_out_of_scope", cs)
 
     pf = RT.pre_flight_check(sql, org, ctx=ctx)
     if pf.risk and pf.action == "refuse":
-        json.dump({"error": {"kind": "preflight_refused", "risk": pf.risk,
-                             "reason": pf.reason, "suggestion": pf.suggestion,
-                             "triggering_joins": pf.triggering_joins}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
+        return sql, Refusal("preflight_refused", pf.reason, pf.suggestion or "")
     if pf.risk and pf.action == "auto_rewrite" and pf.rewritten_sql:
         sys.stderr.write(f"[agami] auto-corrected {pf.risk}: ran rewritten SQL. {pf.reason}\n")
         sql = pf.rewritten_sql
@@ -993,10 +1208,7 @@ def _model_safety(sql: str, profile: str, area: str | None):
     # path happened to read a prose rule). Aggregates / filters / joins are allowed.
     sens = RT.check_sensitive_projection(sql, org, ctx=ctx)
     if sens.action == "refuse":
-        json.dump({"error": {"kind": "sensitive_columns", "columns": sens.columns,
-                             "reason": sens.reason, "suggestion": sens.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
+        return sql, Refusal("sensitive_columns", sens.reason, sens.suggestion or "")
 
     new_sql, applied = RT.apply_default_filters(sql, org, area=area, ctx=ctx)
     if applied:
@@ -1022,9 +1234,16 @@ def _model_safety(sql: str, profile: str, area: str | None):
 def _emit_or_err(run: Callable[[], ExecResult]) -> int:
     """Subprocess/CLI adapter over a ``_run_<db>`` function: write its result to stdout as CSV and
     return exit code 0, or translate an ``ExecutorError`` into the stderr message + exit code the CLI
-    contract documents (byte-identical to what the old ``_execute_<db>`` emitted)."""
+    contract documents (byte-identical to what the old ``_execute_<db>`` emitted). A per-statement
+    deadline (``_ResourceLimit``) surfaces as the shared ``resource_limit`` refusal on stderr + exit
+    code 1 — the same JSON ``execute_guarded``/``main`` emit — and ``run()`` raises it BEFORE returning
+    a result, so no partial CSV is written."""
     try:
         _emit_result_csv(run())
+    except _ResourceLimit:
+        json.dump({"refusal": _resource_limit_refusal().as_dict()}, sys.stderr)
+        sys.stderr.write("\n")
+        return 1
     except ExecutorError as e:
         return _err(e.msg, code=e.code)
     return 0
@@ -1137,26 +1356,38 @@ def execute_guarded(
 ) -> ExecResult:
     """The un-bypassable guarded envelope — the single execution chokepoint (REQ-002/REQ-014).
 
-    In fixed order: read-only / dangerous-SQL guard (the hard security gate — NOT bypassable via
-    ``no_safety``, which skips only the semantic-model pass, never write/RCE/DoS protection) ->
-    semantic-model safety pass (fan/chasm pre-flight + scope + PII + ``default_filters`` rewrite) ->
-    resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
-    SQL both guards have passed. Raises ``GuardRefused`` on a refusal (the read-only refusal carries
-    its JSON envelope for the caller to emit; a model-safety refusal already wrote its JSON to stderr
-    and carries only the exit code) and ``ExecutorError`` on a connect/run failure — so the
-    subprocess ``main`` and the in-process MCP handler apply the same guard and surface errors
-    identically. The row cap rides the request-scoped ``_max_rows_override`` ContextVar the caller sets."""
+    In fixed order: read-only / dangerous-SQL guard -> recon / metadata deny-list (both hard security
+    gates — NOT bypassable via ``no_safety``, which skips only the semantic-model pass, never
+    write/RCE/DoS protection) -> semantic-model safety pass (fan/chasm pre-flight + scope + PII +
+    ``default_filters`` rewrite) -> resolve the datasource -> ``executor.execute(vetted_sql, …)``. The
+    executor only ever receives SQL every guard has passed. Raises ``GuardRefused`` carrying the typed
+    ``Refusal`` on a refusal, and ``ExecutorError`` on a connect/run failure — so the subprocess
+    ``main`` and the in-process MCP handler apply the same guards and build the same envelope. The row
+    cap rides the request-scoped ``_max_rows_override`` ContextVar the caller sets."""
     import sql_guard
 
-    reason = sql_guard.check_read_only(sql)
-    if reason is not None:
-        raise GuardRefused({"error": {"kind": "permission", "remediation": reason}}, code=1)
+    verdict = sql_guard.check_read_only(sql)
+    if verdict is not None:
+        raise GuardRefused(_refusal_from_verdict("permission", verdict), code=1)
+    # Recon / metadata deny-list — refuse server-fingerprinting + system-catalog introspection
+    # (version(), current_user, information_schema, pg_* relations) as a distinct `recon` refusal.
+    # A hard gate, at the chokepoint so BOTH surfaces get it, and NOT bypassable via no_safety.
+    recon = sql_guard.check_no_recon(sql)
+    if recon is not None:
+        raise GuardRefused(_refusal_from_verdict("recon", recon), code=1)
     if not no_safety:
-        sql, rc = _model_safety(sql, profile, area)
-        if rc is not None:
-            raise GuardRefused(None, code=rc)
+        sql, refusal = _model_safety(sql, profile, area)
+        if refusal is not None:
+            raise GuardRefused(refusal, code=1)
     creds = _load_credentials(profile, org_id or "local")
-    return executor.execute(sql, creds, profile=profile)
+    try:
+        return executor.execute(sql, creds, profile=profile)
+    except _ResourceLimit:
+        # The per-statement deadline fired inside the engine (client watchdog or native server
+        # timeout). Map it to the shared refusal HERE — the one place both surfaces funnel through —
+        # so the timeout is a `resource_limit` refused Envelope with no partial data, identically for
+        # the subprocess wire and the in-process handler.
+        raise GuardRefused(_resource_limit_refusal(), code=1) from None
 
 
 def main() -> int:
@@ -1177,13 +1408,23 @@ def main() -> int:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--sql", help="SQL statement (use --sql-file for SQL with special characters)")
     src.add_argument("--sql-file", help="Path to a file containing one SQL statement")
-    p.add_argument("--area", default=None,
-                   help="Subject area for the semantic-model safety pass (pre-flight + default_filters).")
-    p.add_argument("--no-safety", action="store_true",
-                   help="Skip the semantic-model pre-flight / default_filters pass.")
-    p.add_argument("--max-rows", type=int, default=None,
-                   help="Lower the row cap for this call (never raises it). Effective cap = "
-                        "min(this, AGAMI_SQL_MAX_ROWS) — the env is the deployment cap, default 1000.")
+    p.add_argument(
+        "--area",
+        default=None,
+        help="Subject area for the semantic-model safety pass (pre-flight + default_filters).",
+    )
+    p.add_argument(
+        "--no-safety",
+        action="store_true",
+        help="Skip the semantic-model pre-flight / default_filters pass.",
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Lower the row cap for this call (never raises it). Effective cap = "
+        "min(this, AGAMI_SQL_MAX_ROWS) — the env is the deployment cap, default 1000.",
+    )
     args = p.parse_args()
 
     # Per-call cap (ACE-044); the sink reads it via _resolve_row_cap. No token/reset kept: main() is
@@ -1198,20 +1439,20 @@ def main() -> int:
 
     profile = args.profile or _resolve_default_profile()
 
-    # Route through the single guarded envelope with the built-in executor: guard -> model-safety ->
-    # resolve -> connect-and-run, returning native rows we then serialize to stdout as CSV (the
-    # subprocess wire). Same guard, same verdicts, same connect-per-query behaviour as before — the
-    # split just makes the connect-and-run step swappable in-process (AH-012). The guard is the hard
-    # security gate for EVERY caller (both MCP servers, the agami-query skill, cron), NOT bypassable
-    # via --no-safety (which skips only the semantic-model pass, never write/RCE/DoS protection).
+    # Route through the single guarded envelope with the built-in executor: guard -> recon deny-list
+    # -> model-safety -> resolve -> connect-and-run, returning native rows we then serialize to stdout
+    # as CSV (the subprocess wire). The guard is the hard security gate for EVERY caller (both MCP
+    # servers, the agami-query skill, cron), NOT bypassable via --no-safety (which skips only the
+    # semantic-model pass, never write/RCE/DoS protection).
     try:
         result = execute_guarded(
             sql, profile, args.area, executor=BUILTIN_EXECUTOR, no_safety=args.no_safety
         )
     except GuardRefused as refusal:
-        if refusal.envelope is not None:  # read-only refusal: emit its JSON (model-safety already did)
-            json.dump(refusal.envelope, sys.stderr)
-            sys.stderr.write("\n")
+        # Emit the shared refusal as one JSON line to stderr — the subprocess wire the MCP tool relays
+        # into a refused Envelope, and a direct CLI caller reads alongside the exit code.
+        json.dump({"refusal": refusal.refusal.as_dict()}, sys.stderr)
+        sys.stderr.write("\n")
         return refusal.code
     except ExecutorError as exc:
         sys.stderr.write(f"{exc.msg}\n")

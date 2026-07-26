@@ -13,11 +13,13 @@ Two things are pinned here:
      every day MUST pass. Over-tightening the deny-list silently degrades every
      query, so this corpus is the primary safety net.
 
-Bare `pg_catalog` / `information_schema` / environment-introspection blocking is a
-deferred follow-up (see `test_known_deferred_gaps_currently_pass` for the pinned
-current behavior).
+The recon / metadata deny-list (`sql_guard.check_no_recon`) is the companion gate —
+`version()`, `current_user`, `information_schema`, `pg_*` catalog relations are refused
+(`recon`). Its corpus below pins both the must-refuse vectors (no false negatives /
+info-leaks) and the must-pass analytics look-alikes (no false positives).
 
-`sql_guard.check_read_only` returns None (safe) or a short reason string (rejected).
+`sql_guard.check_read_only` returns None (safe) or a safety Verdict (rejected);
+`sql_guard.check_no_recon` returns None or a `recon` safety Verdict.
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ import sys
 from typing import Any
 
 import pytest
-from sql_guard import _MAX_SQL_CHARS, check_read_only
+import sql_guard
+from sql_guard import _MAX_SQL_CHARS, check_no_recon, check_read_only
 
 # ---------------------------------------------------------------------------
 # Accept — valid single read-only statements
@@ -257,8 +260,8 @@ def test_rejects_row_level_locks(sql: str) -> None:
 )
 def test_row_lock_rule_names_the_lock(sql: str) -> None:
     # These use SHARE (not a deny keyword) so the row-lock rule is what fires.
-    reason = check_read_only(sql)
-    assert reason is not None and "lock" in reason.lower(), reason
+    v = check_read_only(sql)
+    assert v is not None and "lock" in v.detail.lower(), v
 
 
 @pytest.mark.parametrize(
@@ -270,9 +273,9 @@ def test_row_lock_rule_names_the_lock(sql: str) -> None:
     ],
 )
 def test_rejects_select_into_write_path(sql: str) -> None:
-    reason = check_read_only(sql)
-    assert reason is not None, f"SELECT INTO not blocked: {sql!r}"
-    assert "INTO" in reason
+    v = check_read_only(sql)
+    assert v is not None, f"SELECT INTO not blocked: {sql!r}"
+    assert "INTO" in v.detail
 
 
 @pytest.mark.parametrize(
@@ -328,9 +331,9 @@ def test_rejects_dangerous_functions(sql: str) -> None:
 def test_rejects_over_length_cap() -> None:
     payload = "SELECT 1, " + ("a, " * 30_000) + "1"
     assert len(payload) > _MAX_SQL_CHARS
-    reason = check_read_only(payload)
-    assert reason is not None
-    assert "50000" in reason or "caps" in reason
+    v = check_read_only(payload)
+    assert v is not None
+    assert "50000" in v.detail or "caps" in v.detail
 
 
 def test_length_cap_exact_boundary() -> None:
@@ -577,28 +580,181 @@ def test_false_positive_guard_legitimate_analytics_sql(sql: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Deferred-scope pins — behaviors intentionally NOT hardened in this pass, so a
-# future change that adds them is a conscious decision (and updates this test).
+# Recon / metadata deny-list — check_no_recon. A false NEGATIVE here is a
+# shipped info-leak (server fingerprint / schema enumeration across the LLM boundary);
+# a false POSITIVE breaks a legitimate analytics query. Both are pinned exhaustively.
+# (These queries pass check_read_only — recon is a separate, distinct `recon` gate.)
 # ---------------------------------------------------------------------------
+
+_RECON_REFUSE = [
+    # paren fns / pg
+    "SELECT version()",
+    "SELECT current_database()",
+    "SELECT current_schemas(true)",
+    # paren fns / mysql
+    "SELECT database()",
+    "SELECT connection_id()",
+    "SELECT system_user()",
+    # paren fns / snowflake
+    "SELECT current_account()",
+    "SELECT current_warehouse()",
+    "SELECT current_version()",
+    # niladic (no-paren special values)
+    "SELECT current_user",
+    "SELECT session_user",
+    "SELECT current_catalog",
+    "SELECT current_schema",
+    "SELECT current_role",
+    "SELECT id FROM t WHERE owner = current_user",
+    # schema-qualified catalog access
+    "SELECT * FROM information_schema.tables",
+    "SELECT column_name FROM information_schema.columns",
+    "SELECT * FROM pg_catalog.pg_class",
+    "SELECT * FROM account_usage.query_history",
+    "SELECT * FROM mysql.user",
+    # bare catalog relations
+    "SELECT * FROM pg_tables",
+    "SELECT relname FROM pg_class",
+    "SELECT * FROM pg_stat_activity",
+    "SELECT usename FROM pg_user",
+    "SELECT * FROM pg_settings",
+    "SELECT * FROM pg_roles",
+    # catalog DATA / password / stats relations — caught by the pg_ prefix, NOT the explicit list
+    "SELECT rolname, rolpassword FROM pg_authid",
+    "SELECT most_common_vals, histogram_bounds FROM pg_stats WHERE tablename = 'salaries'",
+    "SELECT query FROM pg_stat_statements",
+    "SELECT * FROM pg_statistic",
+    "SELECT typname FROM pg_type",
+    "SELECT * FROM pg_constraint",
+    "SELECT * FROM pg_stat_user_tables",
+    "SELECT srvname FROM pg_foreign_server",
+    # catalog-DDL-dump / object-existence-probe / topology FUNCTIONS
+    "SELECT pg_get_viewdef('v')",
+    "SELECT pg_get_functiondef('f'::regprocedure)",
+    "SELECT has_table_privilege('secret_table', 'SELECT')",
+    "SELECT to_regclass('secret_table')",
+    "SELECT inet_server_addr()",
+    "SELECT inet_client_addr()",
+    "SELECT pg_relation_size('t')",
+    "SELECT pg_backend_pid()",
+    # redshift system tables (all four reserved prefixes) + pg_-prefixed redshift catalog helpers
+    "SELECT * FROM stl_query",
+    "SELECT * FROM svv_table_info",
+    "SELECT * FROM stv_sessions",
+    "SELECT * FROM svl_statementtext",
+    "SELECT * FROM pg_table_def",
+    "SELECT * FROM pg_user_info",
+    # mysql secondary recon schemas
+    "SELECT * FROM performance_schema.threads",
+    "SELECT * FROM sys.session",
+    # mysql system variables
+    "SELECT @@version",
+    "SELECT @@hostname",
+    "SELECT @@datadir",
+    "SELECT @@basedir",
+    # quoted-identifier bypass — _neutralize unwraps the quotes, so the recon token re-forms
+    'SELECT "version"()',
+    'SELECT "pg_class" FROM t',
+    # bypass attempts — neutralization must still catch them
+    "SELECT /*c*/ version()",
+    "SELECT VERSION()",
+    "SELECT  version  ()",
+    "select * from Information_Schema.Tables",
+    "SELECT id FROM t UNION SELECT version()",
+    "SELECT * FROM (SELECT * FROM pg_tables) s",
+]
+
+
+@pytest.mark.parametrize("sql", _RECON_REFUSE)
+def test_recon_refused(sql: str) -> None:
+    v = check_no_recon(sql)
+    assert v is not None, f"RECON NOT BLOCKED (false negative / info-leak): {sql!r}"
+    assert v.rule == "recon", v
+
+
+_RECON_PASS = [
+    # bare recon token as a column / alias — only the ()-call form is recon
+    "SELECT version FROM releases",
+    "SELECT version AS v FROM app_releases",
+    "SELECT current_database FROM config",
+    # suffix on a niladic/paren token — the word boundary protects these (NOT pg_-prefixed)
+    "SELECT current_user_id FROM audit",
+    "SELECT session_user_count FROM stats",
+    "SELECT versions.id FROM versions",
+    # deliberately-allowed bare niladic synonyms (too common as column names) — only their ()-form is recon
+    "SELECT user FROM accounts",
+    "SELECT schema, name FROM migrations",
+    "SELECT database FROM connections",
+    # qualified column — the (?<!\\.) lookbehind (niladic AND relation) lets these pass
+    "SELECT t.current_user FROM team t",
+    "SELECT o.pg_class FROM orders o",
+    "SELECT s.pg_tables FROM settings s",
+    # bare schema name without a dot
+    "SELECT information_schema FROM catalog_meta",
+    # recon token inside a string literal (neutralized away)
+    "SELECT id FROM t WHERE note = 'see pg_tables for detail'",
+    "SELECT 'version()' AS label FROM t",
+    "SELECT id FROM t WHERE u = 'current_user'",
+    # recon token inside a comment (neutralized away)
+    "SELECT id FROM t -- current_user audit",
+    "SELECT id /* pg_stat_activity */ FROM t",
+    # control analytics that must never trip the gate
+    "SELECT date_trunc('month', created_at), count(*) FROM orders GROUP BY 1",
+    "SELECT u.id, o.amount FROM users u JOIN orders o ON o.user_id = u.id",
+    "WITH v AS (SELECT max(created_at) mx FROM events) SELECT * FROM v",
+    "SELECT count(*) OVER (PARTITION BY region) FROM sales",
+    "SELECT d::date FROM generate_series('2026-01-01'::date, '2026-12-31'::date, INTERVAL '1 day') AS d",
+]
+
+
+@pytest.mark.parametrize("sql", _RECON_PASS)
+def test_recon_gate_no_false_positive(sql: str) -> None:
+    assert check_no_recon(sql) is None, (
+        f"FALSE POSITIVE — legit query blocked by recon gate: {sql!r}"
+    )
 
 
 @pytest.mark.parametrize(
     "sql",
     [
-        # Bare `pg_catalog` / `information_schema` probing and environment-introspection
-        # keywords/functions are NOT blocked by this gate (schema-scoping is a deferred
-        # follow-up — see the plan). They currently PASS. When the follow-up lands, move
-        # these into a reject test.
-        "SELECT * FROM pg_tables",
-        "SELECT * FROM information_schema.tables",
-        "SELECT current_user",
-        "SELECT current_database()",
+        'SELECT "current_user"',  # bare quoted niladic — _neutralize unwraps the quotes
+        "SELECT x AS pg_tables FROM t",  # alias deliberately named a reserved catalog relation
+        # A bare, unqualified user identifier literally prefixed `pg_` — the reserved-prefix rule
+        # refuses it (Postgres reserves the `pg_` object-name prefix). Qualified `t.pg_foo` passes.
+        "SELECT pg_tables_archived FROM meta",
+        "SELECT pg_class_history FROM audit_log",
     ],
 )
-def test_known_deferred_gaps_currently_pass(sql: str) -> None:
-    assert check_read_only(sql) is None, (
-        f"Expected this deferred-scope query to pass the read-only gate for now: {sql!r}"
-    )
+def test_recon_accepted_residual_false_positives(sql: str) -> None:
+    # Regex without AST binding can't distinguish these from a real recon reference; all are rare +
+    # convention-violating and documented in sql_guard. Pinned so a future change that flips one is a
+    # conscious decision.
+    assert check_no_recon(sql) is not None, sql
+
+
+def test_recon_sets_drive_the_regexes() -> None:
+    # A new engine builtin is a one-line SET edit — the compiled regexes derive from these sets (SC4).
+    # Loop over EVERY member so the corpus is self-updating: adding/removing a set entry is auto-tested,
+    # and no member can silently stop matching.
+    for name in sql_guard._RECON_PAREN_FNS:
+        assert check_no_recon(f"SELECT {name}()").rule == "recon", name
+    for name in sql_guard._RECON_NILADIC:
+        assert check_no_recon(f"SELECT {name}").rule == "recon", name
+    for name in sql_guard._RECON_BARE_RELATIONS:
+        assert check_no_recon(f"SELECT * FROM {name}").rule == "recon", name
+    for name in sql_guard._RECON_SCHEMAS:
+        assert check_no_recon(f"SELECT * FROM {name}.x").rule == "recon", name
+    # the pg_ reserved-prefix catch-all covers catalog relations NOT in the explicit list
+    for name in ("pg_statistic", "pg_authid", "pg_stats", "pg_stat_statements", "pg_type"):
+        assert check_no_recon(f"SELECT * FROM {name}").rule == "recon", name
+
+
+def test_recon_fails_closed_on_unparseable_input() -> None:
+    # A form _neutralize can't disambiguate (a bare `--x` comment) → check_no_recon fails CLOSED (a
+    # recon verdict), not open. In the normal flow check_read_only refuses it first; this pins the
+    # defense-in-depth for a standalone / reordered caller.
+    v = check_no_recon("SELECT 1--x")
+    assert v is not None and v.rule == "recon", v
 
 
 # ---------------------------------------------------------------------------
@@ -634,14 +790,31 @@ def test_executor_blocks_dangerous_sql_even_with_no_safety(tmp_path, extra) -> N
                 envelope = json.loads(line)
             except ValueError:
                 continue
-    assert envelope is not None, f"no JSON error envelope on stderr; got: {proc.stderr!r}"
-    assert envelope["error"]["kind"] == "permission", envelope
+    assert envelope is not None, f"no JSON refusal envelope on stderr; got: {proc.stderr!r}"
+    assert envelope["refusal"]["kind"] == "permission", envelope
 
 
 def test_executor_dangerous_function_blocked(tmp_path) -> None:
     proc = _run_executor("SELECT pg_read_file('/etc/passwd')", tmp_path)
     assert proc.returncode != 0
     assert "permission" in proc.stderr
+
+
+def test_executor_recon_query_blocked(tmp_path) -> None:
+    # The recon gate fires at the shared chokepoint (execute_sql.py::main, which both transports
+    # call), refusing BEFORE credentials are loaded — proving both surfaces inherit it (SC3).
+    proc = _run_executor("SELECT current_user", tmp_path)
+    assert proc.returncode != 0, proc.stdout
+    envelope = None
+    for line in proc.stderr.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                envelope = json.loads(line)
+            except ValueError:
+                continue
+    assert envelope is not None, f"no JSON refusal envelope on stderr; got: {proc.stderr!r}"
+    assert envelope["refusal"]["kind"] == "recon", envelope
 
 
 def test_executor_lets_valid_select_past_the_gate(tmp_path) -> None:

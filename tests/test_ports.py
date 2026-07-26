@@ -14,7 +14,6 @@ from ports import (
     ActivitySink,
     AuthProvider,
     GovernancePolicy,
-    GovernanceVerdict,
     Org,
     OrgResolver,
     Principal,
@@ -45,15 +44,15 @@ def test_ports_module_imports_without_model_deps():
 def test_default_adapters_satisfy_protocols():
     from oss_adapters import (
         FileActivitySink,
+        NoopGovernancePolicy,
         PresenceAuthProvider,
         SingleTenantOrgResolver,
-        WarnOnlyGovernancePolicy,
     )
 
     assert isinstance(FileActivitySink(), ActivitySink)
     assert isinstance(SingleTenantOrgResolver(), OrgResolver)
     assert isinstance(PresenceAuthProvider(), AuthProvider)
-    assert isinstance(WarnOnlyGovernancePolicy(), GovernancePolicy)
+    assert isinstance(NoopGovernancePolicy(), GovernancePolicy)
 
 
 # --- adapter behavior -------------------------------------------------------
@@ -81,11 +80,12 @@ def test_presence_auth_accepts_nonempty_rejects_empty():
 
 
 def test_warn_only_governance_never_blocks():
-    from oss_adapters import WarnOnlyGovernancePolicy
+    from oss_adapters import NoopGovernancePolicy
 
-    v = WarnOnlyGovernancePolicy().evaluate()
-    assert isinstance(v, GovernanceVerdict)
-    assert v.allowed is True
+    # The OSS default emits no governance findings (an empty Verdict list), so nothing is
+    # warned/rewritten/blocked. Enforcement is a paid adapter that returns governance Verdicts.
+    verdicts = NoopGovernancePolicy().evaluate()
+    assert verdicts == []
 
 
 def test_file_activity_sink_writes_jsonl(tmp_path):

@@ -1,0 +1,11 @@
+-- Store the RAW driver/DB error text server-side, keyed by audit_id. The caller only ever receives a
+-- generic, value-free classified message (raw schema / column / value names must never cross the
+-- assistant boundary), so the operator needs somewhere to see the real error when debugging a failed
+-- query — that is this column. Populated ONLY on an operational failure (the executor's stderr);
+-- NULL for guardrail refusals (their reasons are already clean). Portable (SQLite + Postgres).
+--
+-- SENSITIVITY: a driver error can embed data VALUES (e.g. a Postgres unique-violation
+-- `DETAIL: Key (email)=(...)`), so this column inherits the datasource's sensitivity classification.
+-- It is strictly better than the prior behavior (which returned that text to the caller), but for a
+-- PHI/PII deployment it must fall under the audit table's access-control + retention/redaction policy.
+ALTER TABLE guardrail_audit ADD COLUMN error_detail TEXT;

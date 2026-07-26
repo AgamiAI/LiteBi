@@ -13,13 +13,20 @@ expected to run under a read-only role. Postgres / Redshift are the primary conc
 are neutral enough to be safe across the other supported engines.
 
 `check_read_only(sql)` returns `None` when the SQL is a single safe read-only
-statement, else a short human-readable reason string. Callers decide how to wrap it
-(the MCP tools attach `kind="permission"`).
+statement, else a safety `Verdict` the shared executor maps to a refusal
+(`kind="permission"`). The rejection ladder itself lives in `_read_only_reason`.
+
+`check_no_recon(sql)` is the companion metadata/recon gate — it returns a `Verdict`
+(`kind="recon"`) for a query that fingerprints the server or reads the system catalog
+(`version()`, `current_user`, `information_schema`, `pg_*` relations). Both run at the
+same chokepoint over the same neutralized SQL.
 """
 
 from __future__ import annotations
 
 import re
+
+from guardrail import Verdict, safety_verdict
 
 # Hard cap on SQL length. Prevents a compromised client from POSTing a multi-MB
 # SQL blob that takes the parser / planner / this gate down a slow path. Real
@@ -231,7 +238,102 @@ _DANGEROUS_FN_RE = re.compile(
 )
 
 
-def check_read_only(sql: str | None) -> str | None:
+# ---------------------------------------------------------------------------
+# Recon / metadata deny-list. A query can pass read-only + object-scope and STILL fingerprint the
+# server (`version()`, `current_user`, `inet_server_addr()`), enumerate or dump the system catalog
+# (`information_schema`, `pg_catalog`, any `pg_*` relation — including `pg_stats` sampled VALUES and
+# `pg_authid` password hashes), read catalog DDL (`pg_get_viewdef`/`pg_get_functiondef`), or probe
+# object existence (`has_table_privilege`, `to_regclass`) — all leaking DB internals across the LLM
+# boundary. The read-only role can't revoke catalog access on most engines (Q1), so this is the
+# INTENDED backstop and denies it app-side, as a DISTINCT `recon` refusal. Matched over the SAME
+# neutralized SQL as `check_read_only` (no second parser); the sets/prefixes below are the source of
+# truth — adding an engine's recon builtin is a one-line edit.
+#
+# FP discipline (regex, not AST — so exact-name matching is the residual): the paren set requires a
+# trailing `(`, so bare `version`/`database`/`user` COLUMNS pass; the niladic + relation sets use a
+# `.`-lookbehind so a qualified column (`t.current_user`, `t.pg_class`) passes; schema names require a
+# trailing `.`. The `pg_`/`stl_`/… prefixes match RESERVED namespaces (Postgres reserves the `pg_`
+# object-name prefix; Redshift reserves `stl_/stv_/svl_/svv_`), so the FP surface is a bare, unqualified
+# column literally prefixed `pg_`/`stl_` — rare, documented, pinned in the FP corpus. Bare
+# `user`/`schema`/`database` (Postgres niladic synonyms) are DELIBERATELY omitted from the niladic set —
+# far too common as intended column names; only their `()`-call form is denied (a known, minor
+# username-fingerprint residual).
+_RECON_PAREN_FNS = frozenset(
+    {
+        "version",  # server version string (pg / snowflake)
+        "current_database",
+        "current_schemas",  # pg (plural, takes a bool) — the niladic current_schema is below
+        "database",
+        "schema",
+        "user",  # MySQL user() / system_user() — the CALL form only
+        "connection_id",
+        "system_user",
+        "current_account",  # snowflake
+        "current_region",
+        "current_version",
+        "current_warehouse",
+        "inet_server_addr",  # server/client network fingerprint (pg)
+        "inet_server_port",
+        "inet_client_addr",
+        "inet_client_port",
+    }
+)
+# Function FAMILIES matched by prefix/pattern (each still requires the trailing `(`): every `pg_*`
+# call (introspection + DDL-dump like pg_get_viewdef / size/topology like pg_relation_size — the
+# dangerous subset is already denied earlier by check_read_only as `permission`), the
+# has_*_privilege family (object-existence probing), and to_reg* (name→OID resolution / enumeration).
+_RECON_CALL_FAMILIES = (r"pg_\w+", r"has_\w+_privilege", r"to_reg\w+")
+_RECON_NILADIC = frozenset(
+    {"current_user", "session_user", "current_catalog", "current_schema", "current_role"}
+)
+_RECON_SCHEMAS = frozenset(
+    {"information_schema", "pg_catalog", "account_usage", "mysql", "performance_schema", "sys"}
+)
+# High-value catalog relations named explicitly for readability; the `pg_` prefix below is the actual
+# catch-all (it also covers pg_stats / pg_authid / pg_statistic / pg_stat_statements / pg_type / … ).
+_RECON_BARE_RELATIONS = frozenset(
+    {
+        "pg_tables",
+        "pg_class",
+        "pg_stat_activity",
+        "pg_roles",
+        "pg_user",
+        "pg_shadow",
+        "pg_authid",
+        "pg_stats",
+    }
+)
+# Reserved relation-name namespaces (unshadowable-by-convention): Postgres `pg_`, Redshift system tables.
+_RECON_RELATION_PREFIXES = ("pg_", "stl_", "stv_", "svl_", "svv_")
+
+
+def _recon_group(names: frozenset[str]) -> str:
+    # Longest-first so an alternation prefers the more specific name (regex alternation is greedy per
+    # position but this also keeps `current_schemas` from being shadowed by `current_schema`).
+    return "|".join(sorted(names, key=len, reverse=True))
+
+
+_RECON_PAREN_RE = re.compile(
+    rf"\b({_recon_group(_RECON_PAREN_FNS)}|{'|'.join(_RECON_CALL_FAMILIES)})\s*\(", re.IGNORECASE
+)
+# `(?<!\.)` — an unqualified, unquoted niladic keyword IS the special function; a real column of that
+# name must be qualified (`t.current_user`) or quoted, so the lookbehind lets those through.
+_RECON_NILADIC_RE = re.compile(rf"(?<!\.)\b({_recon_group(_RECON_NILADIC)})\b", re.IGNORECASE)
+_RECON_SCHEMA_RE = re.compile(rf"\b({_recon_group(_RECON_SCHEMAS)})\s*\.", re.IGNORECASE)
+# `(?<!\.)` so a qualified column matching a reserved relation name (`t.pg_class`) passes — a catalog
+# relation is referenced bare (search-path-resolved) or schema-qualified (caught by _RECON_SCHEMA_RE).
+_RECON_RELATION_RE = re.compile(
+    r"(?<!\.)\b("
+    + _recon_group(_RECON_BARE_RELATIONS)
+    + "|"
+    + "|".join(p + r"\w+" for p in _RECON_RELATION_PREFIXES)
+    + r")\b",
+    re.IGNORECASE,
+)
+_RECON_SYSVAR_RE = re.compile(r"@@\w+")  # MySQL system variables — all config/recon
+
+
+def _read_only_reason(sql: str | None) -> str | None:
     """Return None if `sql` is a single safe read-only statement, else a reason string.
 
     Rejection ladder (each step has its own message so the caller can correct):
@@ -295,3 +397,63 @@ def check_read_only(sql: str | None) -> str | None:
             "process-control / sleep / remote-SQL functions are blocked"
         )
     return None
+
+
+def check_read_only(sql: str | None) -> Verdict | None:
+    """Return ``None`` if ``sql`` is a single safe read-only statement, else a safety ``Verdict``.
+
+    Thin wrapper over :func:`_read_only_reason` (which owns the rejection ladder). A fired gate
+    becomes a safety-class verdict; the shared executor maps it to a refusal (``kind=permission``).
+    """
+    reason = _read_only_reason(sql)
+    if reason is None:
+        return None
+    return safety_verdict(
+        "read_only",
+        reason,
+        "Send a single read-only SELECT / WITH...SELECT — no DML, DDL, transaction/session "
+        "control, or multiple statements.",
+    )
+
+
+def check_no_recon(sql: str | None) -> Verdict | None:
+    """Return ``None`` if ``sql`` calls no metadata/recon function and reads no system catalog, else a
+    safety ``Verdict`` the shared executor maps to a refusal (``kind=recon``).
+
+    Runs AFTER :func:`check_read_only` at the shared executor chokepoint (and as a fail-fast pre-check
+    in the tool layer). Detection is regex over the SAME neutralized SQL — comments + literals blanked,
+    quoted identifiers unwrapped — so a recon token hidden in a string/comment can't smuggle past, and
+    (symmetrically) a legitimate mention inside a literal/comment doesn't false-trip. See the
+    ``_RECON_*`` sets for the deny-list and its false-positive discipline.
+    """
+    if not sql or not sql.strip():
+        return None  # empty — check_read_only owns that rejection
+    try:
+        stripped = _neutralize(sql)
+    except _GuardReject:
+        # Dialect-ambiguous form we can't neutralize → fail CLOSED. In the normal flow check_read_only
+        # (same neutralizer) already refused this input; failing closed here keeps the recon gate safe
+        # even for a hypothetical caller that invoked it standalone or reordered the two checks.
+        return safety_verdict(
+            "recon",
+            "the query uses a form that can't be safely analyzed for metadata/recon access",
+            "Send a single, unambiguous read-only SELECT over your declared tables and columns.",
+        )
+
+    m = (
+        _RECON_PAREN_RE.search(stripped)
+        or _RECON_NILADIC_RE.search(stripped)
+        or _RECON_SCHEMA_RE.search(stripped)
+        or _RECON_RELATION_RE.search(stripped)
+        or _RECON_SYSVAR_RE.search(stripped)
+    )
+    if m is None:
+        return None
+    hit = m.group(0).strip(" .(")  # the matched token, without the trailing `(` / `.` anchor
+    return safety_verdict(
+        "recon",
+        f"metadata/recon access is not allowed (`{hit}`) — server/version fingerprinting and "
+        "system-catalog / information_schema introspection are blocked",
+        "Query only your declared tables and columns; drop any server-metadata function or "
+        "system-catalog / information_schema reference.",
+    )

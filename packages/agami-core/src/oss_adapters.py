@@ -1,7 +1,8 @@
 """OSS default adapters for the four ports.
 
 These defaults make the local product run out of the box — the single-tenant resolver, the
-file/jsonl activity sink, presence-only auth, and warn-only governance. They live in agami-core
+file/jsonl activity sink, presence-only auth, and no-op governance (warn-only posture, no rules
+wired). They live in agami-core
 (not the ``agami-oss-adapters`` placeholder) so ``pip install agami-core`` is enough to run
 locally; richer adapters (a Postgres sink, real auth providers, enforcement) are supplied by
 their own consumers.
@@ -13,10 +14,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import agami_paths
 from contracts import QueryExecutionRecord
-from ports import GovernanceVerdict, Org, Principal
+from ports import Org, Principal
+
+if TYPE_CHECKING:
+    from guardrail import Verdict
 
 
 def _append_jsonl(path: Path, record: dict) -> bool:
@@ -69,9 +74,13 @@ class PresenceAuthProvider:
         return Principal(subject=self._subject) if (token or "").strip() else None
 
 
-class WarnOnlyGovernancePolicy:
-    """Default ``GovernancePolicy`` — never blocks (``allowed=True``); any warnings are advisory
-    ("basic governance warning"). Enforcement is a paid tier."""
+class NoopGovernancePolicy:
+    """Default ``GovernancePolicy`` for OSS: a **no-op** — ``evaluate`` emits **no** findings (an empty
+    ``Verdict`` list), so nothing is annotated, rewritten, or blocked. The OSS posture is warn-only
+    (governance never enforces), but the default adapter has no governance rules wired, so there is
+    nothing to warn about — hence the no-op name. A paid tier supplies its own adapter that returns
+    governance-class ``Verdict``s; whether any blocks is ``guardrail.policy(verdict, tier)``'s call,
+    not this adapter's."""
 
-    def evaluate(self, ctx: object | None = None) -> GovernanceVerdict:
-        return GovernanceVerdict(allowed=True, warnings=[])
+    def evaluate(self, ctx: object | None = None) -> list[Verdict]:
+        return []

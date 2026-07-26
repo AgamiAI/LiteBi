@@ -245,7 +245,8 @@ def test_execute_sql_rejects_mutation_over_protocol():
     ])
     by_id = {m.get("id"): m for m in out}
     payload = json.loads(by_id[2]["result"]["content"][0]["text"])
-    assert payload["error"]["kind"] == "permission"
+    assert payload["status"] == "refused"
+    assert payload["refusal"]["kind"] == "permission"
 
 
 def test_unknown_method_returns_error():

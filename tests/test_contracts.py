@@ -15,8 +15,8 @@ pytest.importorskip("pydantic")
 from contracts import (  # noqa: E402
     CrossAreaRelationship,
     DatasourceSchemaResult,
-    ErrorResult,
     ExecuteSqlResult,
+    GuardrailAuditRecord,
     ListDatasourcesResult,
     PromptExamplesResult,
     QueryExecutionRecord,
@@ -110,13 +110,25 @@ def test_execute_sql_result_with_receipt_roundtrip():
     assert _roundtrip(ExecuteSqlResult, sample) == sample
 
 
-def test_execute_sql_error_roundtrip():
+# The error/refusal wire moved to the shared guardrail Envelope + Refusal (see test_guardrail.py);
+# the ad-hoc ErrorResult contract was retired.
+
+
+def test_guardrail_audit_record_roundtrip():
     sample = {
-        "error": {"kind": "permission", "remediation": "DML/DDL rejected."},
+        "audit_id": "a1b2",
+        "ts": "2026-07-11T00:00:00Z",
+        "status": "refused",
+        "datasource": "sales",
+        "refusal_kind": "permission",
         "sql": "DELETE FROM orders",
-        "execution_ms": 0,
+        "row_count": None,
+        "execution_ms": None,
+        "correlation_id": "turn-1",
+        "source": "mcp_server",
+        "error_detail": None,
     }
-    assert _roundtrip(ErrorResult, sample) == sample
+    assert _roundtrip(GuardrailAuditRecord, sample) == sample
 
 
 def test_activity_sink_records_roundtrip():

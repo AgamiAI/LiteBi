@@ -30,6 +30,35 @@ def _reset_org_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_injected_executor():
+    """The composition-root executor (AH-012 / ACE-028) is process-global; reset it around each test so
+    a test that injects one — or an HTTP app that defaults to in-process — can't make a later
+    subprocess-path test run in-process instead."""
+    try:
+        import tools
+    except Exception:
+        yield
+        return
+    tools.set_injected_executor(None)
+    yield
+    tools.set_injected_executor(None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_warned():
+    """The audit-sink first-failure warn dedup set is process-global; clear it around each test so a
+    test that asserts the one-time warning fires isn't suppressed by an earlier test's warning."""
+    try:
+        import tools
+    except Exception:
+        yield
+        return
+    tools._AUDIT_WARNED.clear()
+    yield
+    tools._AUDIT_WARNED.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_validation_cache():
     """The incremental-curation-validation cache (ACE-046) is module-global too; clear it around
     each test so one test's cached per-area findings can't bleed into the next."""

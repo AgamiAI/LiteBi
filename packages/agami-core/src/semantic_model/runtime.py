@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional
 
+from guardrail import Verdict, safety_verdict
+
 try:
     import sqlglot
     from sqlglot import expressions as exp
@@ -108,6 +110,7 @@ def build_guard_context(sql: str, org: Datasource) -> "GuardContext | None":
         sensitive_by_table=_sensitive_by_table(org),
         model_table_index=_model_table_index(org),
     )
+
 
 # Ambiguity threshold — "ask, don't guess" when top-two are within this delta.
 AMBIGUITY_DELTA = 0.15
@@ -213,9 +216,7 @@ def resolve_entities(
                         "subject_area": area_name,
                         "score": round(score, 3),
                         "primary_mapping": (
-                            {"table": primary.table, "column": primary.column}
-                            if primary
-                            else None
+                            {"table": primary.table, "column": primary.column} if primary else None
                         ),
                         "value_pattern": ent.value_pattern,
                     },
@@ -343,9 +344,7 @@ def identify_entity(
         return IdentifyResult(
             "clarify",
             effective,
-            question_template=(
-                f"'{literal}' could be a {names}. Which did you mean?"
-            ),
+            question_template=(f"'{literal}' could be a {names}. Which did you mean?"),
         )
 
     # no pattern/probe match: fallback probe of small-cardinality candidates
@@ -433,8 +432,12 @@ class SensitiveCheckResult:
     suggestion: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "columns": self.columns,
-                "reason": self.reason, "suggestion": self.suggestion}
+        return {
+            "action": self.action,
+            "columns": self.columns,
+            "reason": self.reason,
+            "suggestion": self.suggestion,
+        }
 
 
 def _sensitive_by_table(org: Datasource) -> tuple[dict[str, set[str]], set[str]]:
@@ -540,7 +543,9 @@ def check_sensitive_projection(sql: str, org: Datasource,
                     offending.add(f"{tbl}.{col.name}")
                 # same-named column on a non-sensitive table → not offending
             # (b) `*` / `t.*` that would expand a directly-FROM'd table holding sensitive cols
-            is_star = isinstance(proj, exp.Star) or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star))
+            is_star = isinstance(proj, exp.Star) or (
+                isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+            )
             if is_star:
                 qualifier = proj.table if isinstance(proj, exp.Column) else None
                 tables = {scope.get(qualifier, qualifier)} if qualifier else direct
@@ -554,10 +559,11 @@ def check_sensitive_projection(sql: str, org: Datasource,
     return SensitiveCheckResult(
         "refuse",
         columns=cols,
-        reason="query projects raw values of sensitive column(s): " + ", ".join(cols)
-               + " — sensitive columns may be counted or filtered, not output raw.",
+        reason="query projects raw values of sensitive column(s): "
+        + ", ".join(cols)
+        + " — sensitive columns may be counted or filtered, not output raw.",
         suggestion="Aggregate it (e.g. COUNT(DISTINCT <col>)) for a count, or omit it and "
-                   "select the entity's non-sensitive key (e.g. id) instead.",
+        "select the entity's non-sensitive key (e.g. id) instead.",
     )
 
 
@@ -574,20 +580,9 @@ def check_sensitive_projection(sql: str, org: Datasource,
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class TableScopeResult:
-    action: str  # "allow" | "refuse"
-    offending_tables: list[str] = field(default_factory=list)  # bare names not in the model
-    reason: str = ""
-    suggestion: Optional[str] = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "offending_tables": self.offending_tables,
-                "reason": self.reason, "suggestion": self.suggestion}
-
-
-def check_table_scope(sql: str, org: Datasource,
-                      ctx: "GuardContext | None" = None) -> TableScopeResult:
+def check_table_scope(
+    sql: str, org: Datasource, ctx: "GuardContext | None" = None
+) -> Verdict | None:
     """Refuse a query that references a table not declared in the semantic model.
 
     Only *physical* table references count: CTE names (defined by WITH) and
@@ -603,23 +598,35 @@ def check_table_scope(sql: str, org: Datasource,
     declared tables also allows — there is nothing to scope against.
     """
     if not _HAVE_SQLGLOT:
-        return TableScopeResult("allow")
-    allow = {name.lower() for name in (ctx.model_table_index if ctx is not None else _model_table_index(org))}
+        return None
+    index = ctx.model_table_index if ctx is not None else _model_table_index(org)
+    allow = {name.lower() for name in index}
     if not allow:
-        return TableScopeResult("allow")
+        return None
+    # name -> the set of declared (non-empty) SCHEMAS for that name. Used to catch a SCHEMA-qualified
+    # reference to a same-named table in an UNDECLARED schema — `secret_schema.orders` when the model
+    # declares only `public.orders` — which bare-name matching alone would wrongly admit, letting a
+    # query read a table the model never declared if the datasource role can see other schemas.
+    # `_model_table_index` values are `(Table, area_name)`; `Table.schema_name` is the declared schema
+    # (the field is aliased from `schema` — plain `.schema` collides with Pydantic's BaseModel.schema).
+    declared_schemas: dict[str, set[str]] = {}
+    for name, val in index.items():
+        sch = (val[0].schema_name or "").lower()
+        if sch:
+            declared_schemas.setdefault(name.lower(), set()).add(sch)
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return TableScopeResult("allow")
+            return None
     # A set operation (UNION/INTERSECT/EXCEPT) parses to exp.Union, not exp.Select,
     # so gate on "contains a SELECT" rather than "is a SELECT" — otherwise every
     # set-operation arm would bypass the guard. A non-SELECT statement has no SELECT
     # node and still degrades to allow (the upstream read-only guard owns those).
     if tree is None or tree.find(exp.Select) is None:
-        return TableScopeResult("allow")
+        return None
 
     cte_names = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
     offending: set[str] = set()
@@ -627,20 +634,30 @@ def check_table_scope(sql: str, org: Datasource,
         name = tbl.name
         if not name or name.lower() in cte_names:
             continue  # a CTE reference, not a physical table
-        if name.lower() not in allow:
+        name_l = name.lower()
+        if name_l not in allow:
             offending.add(name)
+            continue
+        # The bare name is declared. If the reference QUALIFIES a schema, and the declared table(s) of
+        # that name carry a schema, the reference's schema must be one of them — else it targets a
+        # same-named table in an undeclared schema and is refused (confinement). An UNqualified
+        # reference matches by name as before: the datasource search_path resolves it, and we don't
+        # second-guess which schema that is.
+        q_schema = (tbl.db or "").lower()
+        if q_schema:
+            schemas = declared_schemas.get(name_l)
+            if schemas and q_schema not in schemas:
+                offending.add(f"{tbl.db}.{name}")
     if not offending:
-        return TableScopeResult("allow")
+        return None
 
     tables = sorted(offending)
-    return TableScopeResult(
-        "refuse",
-        offending_tables=tables,
-        reason="query references table(s) not in the semantic model: "
-               + ", ".join(tables)
-               + " — only tables declared in the model may be queried.",
-        suggestion="Add the table to the model (agami-connect / '/agami-model'), "
-                   "or remove it from the query.",
+    return safety_verdict(
+        "table_scope",
+        "query references table(s) not in the semantic model: "
+        + ", ".join(tables)
+        + " — only tables declared in the model may be queried.",
+        "Add the table to the model (agami-connect / '/agami-model'), or remove it from the query.",
     )
 
 
@@ -655,17 +672,7 @@ def check_table_scope(sql: str, org: Datasource,
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class StarCheckResult:
-    action: str  # "allow" | "refuse"
-    reason: str = ""
-    suggestion: Optional[str] = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "reason": self.reason, "suggestion": self.suggestion}
-
-
-def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> StarCheckResult:
+def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> Verdict | None:
     """Refuse a query whose projection list contains `*` or `t.*`.
 
     A star defeats column-level scoping (an undeclared column hides behind it) and
@@ -679,42 +686,33 @@ def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> StarChe
     not a SELECT-bearing statement (the upstream read-only guard owns non-SELECTs).
     """
     if not _HAVE_SQLGLOT:
-        return StarCheckResult("allow")
+        return None
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return StarCheckResult("allow")
+            return None
     if tree is None or tree.find(exp.Select) is None:
-        return StarCheckResult("allow")
+        return None
     for select in tree.find_all(exp.Select):
         for proj in select.expressions:
-            if isinstance(proj, exp.Star) or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)):
-                return StarCheckResult(
-                    "refuse",
-                    reason="query uses SELECT * — every column must be named so it can be "
-                           "checked against the semantic model.",
-                    suggestion="List the columns explicitly instead of '*'.",
+            if isinstance(proj, exp.Star) or (
+                isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+            ):
+                return safety_verdict(
+                    "no_select_star",
+                    "query uses SELECT * — every column must be named so it can be "
+                    "checked against the semantic model.",
+                    "List the columns explicitly instead of '*'.",
                 )
-    return StarCheckResult("allow")
+    return None
 
 
-@dataclass
-class ColumnScopeResult:
-    action: str  # "allow" | "refuse"
-    columns: list[str] = field(default_factory=list)  # offending "table.column" / "column"
-    reason: str = ""
-    suggestion: Optional[str] = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "columns": self.columns,
-                "reason": self.reason, "suggestion": self.suggestion}
-
-
-def check_column_scope(sql: str, org: Datasource,
-                       ctx: "GuardContext | None" = None) -> ColumnScopeResult:
+def check_column_scope(
+    sql: str, org: Datasource, ctx: "GuardContext | None" = None
+) -> Verdict | None:
     """Refuse a query that references a column not declared on the table it binds to.
 
     Strict where a column visibly binds to a declared physical table — qualified by
@@ -732,19 +730,19 @@ def check_column_scope(sql: str, org: Datasource,
     a SELECT, or the model declares no columns.
     """
     if not _HAVE_SQLGLOT:
-        return ColumnScopeResult("allow")
+        return None
     colidx = ctx.column_index if ctx is not None else _column_index(org)
     if not colidx:
-        return ColumnScopeResult("allow")
+        return None
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return ColumnScopeResult("allow")
+            return None
     if tree is None or tree.find(exp.Select) is None:
-        return ColumnScopeResult("allow")
+        return None
 
     # case-insensitive declared-column index: lower(table) -> {lower(column)}
     declared = {t.lower(): {c.lower() for c in cols} for t, cols in colidx.items()}
@@ -775,9 +773,9 @@ def check_column_scope(sql: str, org: Datasource,
     # whether it reads from a CTE ref / derived subquery (→ a bare column we can't
     # match may be that source's output, so fail-open).
     alias_by_select: dict[int, dict[str, str]] = {}  # id(select) -> {alias -> bare physical table}
-    direct_phys: dict[int, set[str]] = {}            # id(select) -> {bare physical table read directly}
-    has_derived: dict[int, bool] = {}                # id(select) -> reads a CTE ref / derived subquery directly
-    output_by_select: dict[int, set[str]] = {}       # id(select) -> {select-list output alias}
+    direct_phys: dict[int, set[str]] = {}  # id(select) -> {bare physical table read directly}
+    has_derived: dict[int, bool] = {}  # id(select) -> reads a CTE ref / derived subquery directly
+    output_by_select: dict[int, set[str]] = {}  # id(select) -> {select-list output alias}
     for tbl in tree.find_all(exp.Table):
         name = (tbl.name or "").lower()
         if not name:
@@ -828,7 +826,11 @@ def check_column_scope(sql: str, org: Datasource,
         # unqualified: judge against the tables its own SELECT reads directly
         if sel is not None and lname in output_by_select.get(id(sel), set()):
             continue  # a select-list output alias of THIS select, not a base column
-        local = {t for t in direct_phys.get(id(sel), set()) if t in declared} if sel is not None else set()
+        local = (
+            {t for t in direct_phys.get(id(sel), set()) if t in declared}
+            if sel is not None
+            else set()
+        )
         if any(lname in declared[t] for t in local):
             continue  # declared on a table this select reads (possibly ambiguous — don't false-reject)
         if sel is not None and has_derived.get(id(sel), False):
@@ -838,16 +840,95 @@ def check_column_scope(sql: str, org: Datasource,
         offending.add(name)
 
     if not offending:
-        return ColumnScopeResult("allow")
+        return None
     cols = sorted(offending)
-    return ColumnScopeResult(
-        "refuse",
-        columns=cols,
-        reason="query references column(s) not in the semantic model: " + ", ".join(cols)
-               + " — only columns declared on the model's tables may be queried.",
-        suggestion="Add the column to the model (agami-connect / '/agami-model'), "
-                   "or remove it from the query.",
+    return safety_verdict(
+        "column_scope",
+        "query references column(s) not in the semantic model: "
+        + ", ".join(cols)
+        + " — only columns declared on the model's tables may be queried.",
+        "Add the column to the model (agami-connect / '/agami-model'), "
+        "or remove it from the query.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Scopability gate (fail-closed)
+#
+# The object-scope gates above only reject the `exp.Table` sources they FIND. A
+# query that passes the read-only guard but yields no scopable tree, or a
+# FROM/JOIN source that is not a plain named `exp.Table` — a table-function or
+# `ROWS FROM` (an `exp.Table` with an EMPTY name, the function in `.this`), or a
+# `VALUES` / `UNNEST` / `LATERAL` node — leaves the scope walk with nothing to
+# reject: a silent fail-OPEN the contract forbids. This gate closes it: a query
+# that can't be fully scoped is refused (`unscopable_sql`) rather than run blind.
+# Reuses the single parse in `ctx` (no second parser) and enforces only when the
+# model declares a table surface, consistent with the object-scope gates.
+# ---------------------------------------------------------------------------
+
+
+def _unscopable(detail: str) -> Verdict:
+    return safety_verdict(
+        "unscopable_sql",
+        "the query can't be scoped to the declared object surface: "
+        + detail
+        + " — only queries whose FROM/JOIN sources resolve to declared tables may run.",
+        "Query only declared tables (no table-functions, VALUES, UNNEST, or LATERAL "
+        "sources); add a source to the model if it should be queryable.",
+    )
+
+
+def check_scopable(
+    sql: str, org: Datasource, ctx: "GuardContext | None" = None
+) -> Verdict | None:
+    """Refuse a query that passes read-only but cannot be fully parsed/scoped.
+
+    Returns ``None`` when every FROM/JOIN source is something the scope checks can
+    resolve — a named `exp.Table` (real table or CTE reference) or a derived
+    `exp.Subquery` (whose own sources are covered by the same whole-tree walk) —
+    else a safety ``Verdict`` (`rule=unscopable_sql`). Fail-closed when: sqlglot is
+    unavailable, the SQL doesn't parse (`tree is None`), the tree has no SELECT, a
+    source is a table-function / `ROWS FROM` (an `exp.Table` with an empty name),
+    or a source is a `VALUES` / `UNNEST` / `LATERAL` / any other non-`Table`,
+    non-`Subquery` node — anywhere in the tree, so every set-operation arm is
+    covered. Reuses ``ctx.tree`` (no second parser). Inert (allow) when the model
+    declares no tables — a deployment with no declared surface isn't scoping,
+    consistent with `check_table_scope`.
+    """
+    # No declared surface -> not scoping (matches the object-scope gates' empty-model no-op). Only
+    # the emptiness matters here, so don't build a membership set.
+    if not (ctx.model_table_index if ctx is not None else _model_table_index(org)):
+        return None
+    if not _HAVE_SQLGLOT:
+        return _unscopable("the SQL parser is unavailable")
+    tree = ctx.tree if ctx is not None else _parse_sql(sql)
+    if tree is None:
+        return _unscopable("the query did not parse")
+    if tree.find(exp.Select) is None:
+        return _unscopable("the query has no SELECT to scope")
+    # Table-functions and `ROWS FROM` parse to an `exp.Table` with an EMPTY name (the
+    # function lives in `.this`); the object-scope gates skip empty-name tables, so a
+    # whole-tree sweep catches them here — including inside a set-operation arm.
+    for tbl in tree.find_all(exp.Table):
+        if not (tbl.name or ""):
+            return _unscopable("a FROM/JOIN source is a table-function, not a named table")
+    # LATERAL is a table-generating source that can't be scoped; sqlglot attaches it under a
+    # From/Join (Postgres `LATERAL (...)`) OR as a Select `laterals` property (Hive `LATERAL
+    # VIEW`), so sweep the whole tree, not only From/Join `.this`.
+    if tree.find(exp.Lateral) is not None:
+        return _unscopable("a FROM/JOIN source is a LATERAL, not a table")
+    # VALUES / UNNEST and any other non-`Table`, non-derived-subquery FROM/JOIN source. A comma-join
+    # `FROM t1, <VALUES/UNNEST/...>` normalizes to a `Join` node whose `.this` is that source (so it is
+    # covered by walking From AND Join). Some sqlglot versions instead hang the additional comma-join
+    # sources off `From.expressions`, so check those too — belt-and-suspenders, so an unscopable
+    # comma-join source can't slip through on either shape (Copilot review).
+    for node in tree.find_all(exp.From, exp.Join):
+        for src in [node.this, *(node.args.get("expressions") or [])]:
+            if src is not None and not isinstance(src, (exp.Table, exp.Subquery)):
+                return _unscopable(
+                    f"a FROM/JOIN source is a {type(src).__name__.upper()}, not a table"
+                )
+    return None
 
 
 def _cardinality_index(org: Datasource) -> list[Relationship]:
@@ -858,7 +939,9 @@ def _cardinality_index(org: Datasource) -> list[Relationship]:
     return rels
 
 
-def _one_side_facing_many(rels: list[Relationship], table: str, others: set[str]) -> list[Relationship]:
+def _one_side_facing_many(
+    rels: list[Relationship], table: str, others: set[str]
+) -> list[Relationship]:
     """Relationships where `table` is the ONE side and a joined `other` is the MANY side."""
     hits = []
     for r in rels:
@@ -905,9 +988,17 @@ def pre_flight_check(sql: str, org: Datasource,
         res = _preflight_select(arm, org, arm.sql(), allow_rewrite=False, ctx=ctx)
         if res.risk and res.action == "refuse":
             # tie the arm's diagnosis back to the full set-operation query
-            return PreFlightResult(res.risk, "refuse", sql, reason=res.reason,
-                                   suggestion=res.suggestion, triggering_joins=res.triggering_joins)
-    return PreFlightResult(None, "allow", sql, reason="no fan/chasm or aggregation issue in any arm")
+            return PreFlightResult(
+                res.risk,
+                "refuse",
+                sql,
+                reason=res.reason,
+                suggestion=res.suggestion,
+                triggering_joins=res.triggering_joins,
+            )
+    return PreFlightResult(
+        None, "allow", sql, reason="no fan/chasm or aggregation issue in any arm"
+    )
 
 
 def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewrite: bool,
@@ -1029,15 +1120,17 @@ def _column_index(org: Datasource) -> dict[str, dict[str, Column]]:
     return idx
 
 
-def _lookup_column(col: "exp.Column", scope: dict[str, str],
-                   colidx: dict[str, dict[str, Column]]) -> Optional[Column]:
+def _lookup_column(
+    col: "exp.Column", scope: dict[str, str], colidx: dict[str, dict[str, Column]]
+) -> Optional[Column]:
     t = _resolve_col_table(col, scope)
     if t and col.name in colidx.get(t, {}):
         return colidx[t][col.name]
     # bare column, ambiguous table: only safe if exactly one in-scope table defines it
     if not t:
-        owners = [tt for tt, cols in colidx.items()
-                  if tt in set(scope.values()) and col.name in cols]
+        owners = [
+            tt for tt, cols in colidx.items() if tt in set(scope.values()) and col.name in cols
+        ]
         if len(owners) == 1:
             return colidx[owners[0]][col.name]
     return None
@@ -1087,8 +1180,9 @@ def _semi_additive_columns(org: Datasource) -> dict[tuple[str, str], "Metric"]:
     return out
 
 
-def _groups_by_time(tree: "exp.Select", scope: dict[str, str],
-                    colidx: dict[str, dict[str, Column]]) -> bool:
+def _groups_by_time(
+    tree: "exp.Select", scope: dict[str, str], colidx: dict[str, dict[str, Column]]
+) -> bool:
     """Does the query GROUP BY a time grain — a date/timestamp column, or a
     DATE_TRUNC/EXTRACT/TO_CHAR/DATE_PART over one?"""
     grp = tree.args.get("group")
@@ -1120,17 +1214,23 @@ def _check_aggregation_semantics(
             if c is None:
                 continue
             cls = getattr(c, "aggregation", "unknown")
-            bad = (is_sum and cls in ("averageable", "dimension")) or (is_avg and cls == "dimension")
+            bad = (is_sum and cls in ("averageable", "dimension")) or (
+                is_avg and cls == "dimension"
+            )
             if bad:
                 verb = "SUM" if is_sum else "AVG"
                 return PreFlightResult(
-                    "bad_aggregation", "refuse", sql,
+                    "bad_aggregation",
+                    "refuse",
+                    sql,
                     reason=(
                         f"{verb}({col.name}) is meaningless: {col.name!r} is classified "
                         f"`{cls}` ("
-                        + ("a rate/ratio/price — summing it has no meaning"
-                           if cls == "averageable"
-                           else "an identifier/code, not a measure")
+                        + (
+                            "a rate/ratio/price — summing it has no meaning"
+                            if cls == "averageable"
+                            else "an identifier/code, not a measure"
+                        )
                         + ")."
                     ),
                     suggestion=(
@@ -1156,7 +1256,9 @@ def _check_aggregation_semantics(
                 if mm is not None:
                     how = mm.semi_additive_agg or "last"
                     return PreFlightResult(
-                        "semi_additive", "refuse", sql,
+                        "semi_additive",
+                        "refuse",
+                        sql,
                         reason=(
                             f"SUM({col.name}) across time is wrong: {col.name!r} backs the "
                             f"semi-additive metric {mm.name!r} ({mm.non_additive_dimensions}) — "
@@ -1259,9 +1361,14 @@ def assemble_receipt(
     (LLM-discovered) metrics to `metrics` after the fact.
     """
     receipt: dict[str, Any] = {
-        "sql": sql, "model_version": model_version,
-        "tables_used": [], "relationships": [], "metrics": [],
-        "named_filters": [], "assumptions": [], "warnings": [],
+        "sql": sql,
+        "model_version": model_version,
+        "tables_used": [],
+        "relationships": [],
+        "metrics": [],
+        "named_filters": [],
+        "assumptions": [],
+        "warnings": [],
     }
     if not _HAVE_SQLGLOT:
         return receipt
@@ -1272,7 +1379,7 @@ def assemble_receipt(
     if tree is None:
         return receipt
 
-    scope = _tables_in_scope(tree)            # alias/name -> bare table name
+    scope = _tables_in_scope(tree)  # alias/name -> bare table name
     used = set(scope.values())
     tidx = _model_table_index(org)
 
@@ -1282,12 +1389,14 @@ def assemble_receipt(
             continue
         t, _area = info
         ph = t.performance_hints
-        receipt["tables_used"].append({
-            "qname": f"{t.schema_name}.{t.name}" if t.schema_name else t.name,
-            "rows": (ph.estimated_row_count if ph else None),
-            "rows_as_of": (ph.estimated_row_count_at if ph else None),
-            "freshness": freshness,
-        })
+        receipt["tables_used"].append(
+            {
+                "qname": f"{t.schema_name}.{t.name}" if t.schema_name else t.name,
+                "rows": (ph.estimated_row_count if ph else None),
+                "rows_as_of": (ph.estimated_row_count_at if ph else None),
+                "freshness": freshness,
+            }
+        )
 
     warnings: list[str] = []
     for sa in org.subject_areas:
@@ -1296,38 +1405,46 @@ def assemble_receipt(
                 fq = (r.from_schema + ".") if (r.cross_schema and r.from_schema) else ""
                 tq = (r.to_schema + ".") if (r.cross_schema and r.to_schema) else ""
                 label = f"{fq}{r.from_table} → {tq}{r.to_table}"
-                receipt["relationships"].append({
-                    "name": f"{r.from_table}_to_{r.to_table}",
-                    "from_to": label,
-                    "cardinality": r.relationship,
-                    "confidence": r.confidence,
-                    "review_state": r.review_state,
-                    "origin": "fk" if r.confidence == "confirmed" else "introspect_heuristic",
-                    "signed_off_by": r.signed_off_by,
-                    "signed_off_role": r.signed_off_role,
-                    "signed_off_at": r.signed_off_at,
-                    "cross_schema": r.cross_schema,
-                    "on": r.on,
-                })
+                receipt["relationships"].append(
+                    {
+                        "name": f"{r.from_table}_to_{r.to_table}",
+                        "from_to": label,
+                        "cardinality": r.relationship,
+                        "confidence": r.confidence,
+                        "review_state": r.review_state,
+                        "origin": "fk" if r.confidence == "confirmed" else "introspect_heuristic",
+                        "signed_off_by": r.signed_off_by,
+                        "signed_off_role": r.signed_off_role,
+                        "signed_off_at": r.signed_off_at,
+                        "cross_schema": r.cross_schema,
+                        "on": r.on,
+                    }
+                )
                 if r.review_state != "approved":
                     warnings.append(f"Used an unreviewed join ({label}).")
 
     nsql = _norm_sql(sql)
     for sa in org.subject_areas:
         for met in sa.metrics:
-            binding = next((b for b in (met.bindings or {}).values()
-                            if b and _norm_sql(b) in nsql), "")
+            binding = next(
+                (b for b in (met.bindings or {}).values() if b and _norm_sql(b) in nsql), ""
+            )
             if not binding:
                 continue
-            receipt["metrics"].append({
-                "name": met.name, "area": sa.name,
-                "definition_prose": met.calculation, "expression": binding,
-                "confidence": met.confidence, "review_state": met.review_state,
-                "origin": getattr(met, "source", None),
-                "signed_off_by": met.signed_off_by,
-                "signed_off_role": met.signed_off_role,
-                "signed_off_at": met.signed_off_at,
-            })
+            receipt["metrics"].append(
+                {
+                    "name": met.name,
+                    "area": sa.name,
+                    "definition_prose": met.calculation,
+                    "expression": binding,
+                    "confidence": met.confidence,
+                    "review_state": met.review_state,
+                    "origin": getattr(met, "source", None),
+                    "signed_off_by": met.signed_off_by,
+                    "signed_off_role": met.signed_off_role,
+                    "signed_off_at": met.signed_off_at,
+                }
+            )
             # metrics get their own approve/change banner — no duplicate warning line.
 
     # assumptions: the load-bearing columns the answer leaned on whose description is
@@ -1344,9 +1461,9 @@ def assemble_receipt(
     for col in tree.find_all(exp.Column):
         if not col.name:
             continue
-        if col.table:                                   # qualified -> resolve via alias scope
+        if col.table:  # qualified -> resolve via alias scope
             ref_cols.add((scope.get(col.table, col.table), col.name))
-        else:                                           # unqualified -> attribute only if unambiguous
+        else:  # unqualified -> attribute only if unambiguous
             cands = _tables_defining(col.name)
             if len(cands) == 1:
                 ref_cols.add((cands[0], col.name))
@@ -1368,14 +1485,19 @@ def assemble_receipt(
     receipt["assumptions"] = (unknown + unval)[:3]
 
     if warnings:
-        warnings.append("Review these unreviewed joins in the agami model explorer "
-                        "(/agami-model, or say 'open the review queue').")
+        warnings.append(
+            "Review these unreviewed joins in the agami model explorer "
+            "(/agami-model, or say 'open the review queue')."
+        )
     receipt["warnings"] = warnings
     if applied_filters:
         receipt["default_filters_applied"] = applied_filters
     if pre_flight and pre_flight.risk:
-        receipt["pre_flight"] = {"risk": pre_flight.risk, "action": pre_flight.action,
-                                 "reason": pre_flight.reason}
+        receipt["pre_flight"] = {
+            "risk": pre_flight.risk,
+            "action": pre_flight.action,
+            "reason": pre_flight.reason,
+        }
     return receipt
 
 
@@ -1642,8 +1764,17 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
     has_star = any(isinstance(p, exp.Star) or p.find(exp.Star) is not None for p in projs)
 
     # Unit-preserving scalar ops: an aggregate/round of a currency is still that currency.
-    _preserving = (exp.Sum, exp.Avg, exp.Min, exp.Max, exp.Round, exp.Coalesce,
-                   exp.Abs, exp.Ceil, exp.Floor)
+    _preserving = (
+        exp.Sum,
+        exp.Avg,
+        exp.Min,
+        exp.Max,
+        exp.Round,
+        exp.Coalesce,
+        exp.Abs,
+        exp.Ceil,
+        exp.Floor,
+    )
 
     def _unit_of(e) -> Optional[str]:
         """Dimensional analysis: the unit a (sub)expression produces, or None when it's
@@ -1657,12 +1788,12 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
         if isinstance(e, exp.Column):
             return col_units.get((e.name or "").lower())
         if isinstance(e, exp.Count):
-            return None                                   # a count is dimensionless
+            return None  # a count is dimensionless
         if isinstance(e, _preserving):
             return _unit_of(e.this)
         if isinstance(e, exp.Div):
             num, den = _unit_of(e.this), _unit_of(e.expression)
-            return num if (num and not den) else None      # currency/count → currency; X/X → none
+            return num if (num and not den) else None  # currency/count → currency; X/X → none
         if isinstance(e, exp.Mul):
             return _unit_of(e.this) or _unit_of(e.expression)  # currency × scalar → currency
         if isinstance(e, (exp.Add, exp.Sub)):
@@ -1671,8 +1802,11 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
         # fallback: a single distinct column unit, only if no count/division muddies it
         if e.find(exp.Count) is not None or e.find(exp.Div) is not None:
             return None
-        units = {col_units[c.name.lower()] for c in e.find_all(exp.Column)
-                 if c.name and c.name.lower() in col_units}
+        units = {
+            col_units[c.name.lower()]
+            for c in e.find_all(exp.Column)
+            if c.name and c.name.lower() in col_units
+        }
         return next(iter(units)) if len(units) == 1 else None
 
     def _unit_for(proj) -> Optional[str]:
@@ -1687,9 +1821,9 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
             continue
         name = proj.alias_or_name
         if name:
-            out[name] = unit                 # by output name (aliased / named columns)
+            out[name] = unit  # by output name (aliased / named columns)
         if not has_star:
-            out[f"#{i}"] = unit              # by position — covers unaliased MAX(amount) etc.
+            out[f"#{i}"] = unit  # by position — covers unaliased MAX(amount) etc.
     return out
 
 

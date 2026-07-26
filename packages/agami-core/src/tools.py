@@ -34,11 +34,13 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 # ---------------------------------------------------------------------------
 # Paths & config resolution (mirrors execute_sql.py / file-layout.md exactly)
 # ---------------------------------------------------------------------------
 import agami_paths
+from guardrail import Envelope, Refusal, Verdict
 
 # Secrets + per-user state live under <artifacts_dir>/local/. Re-resolved after bootstrap() in main().
 AGAMI_LOCAL = agami_paths.local_dir()
@@ -46,6 +48,7 @@ CREDENTIALS_PATH = agami_paths.credentials_path()
 CONFIG_PATH = agami_paths.config_path()
 QUERY_LOG = agami_paths.query_log_path()
 TOOL_CALL_LOG = AGAMI_LOCAL / "tool_calls.jsonl"
+GUARDRAIL_AUDIT_LOG = AGAMI_LOCAL / "guardrail_audit.jsonl"
 
 SERVER_NAME = "agami"
 
@@ -95,13 +98,14 @@ def bootstrap_paths() -> None:
     installs never create ~/.agami, so the migration is a no-op once there's nothing to move (it's
     a backward-compat shim, safe to drop in a later cleanup). Every entrypoint calls this so the
     paths reflect the resolved (possibly migrated) artifacts dir."""
-    global AGAMI_LOCAL, CREDENTIALS_PATH, CONFIG_PATH, QUERY_LOG, TOOL_CALL_LOG
+    global AGAMI_LOCAL, CREDENTIALS_PATH, CONFIG_PATH, QUERY_LOG, TOOL_CALL_LOG, GUARDRAIL_AUDIT_LOG
     agami_paths.bootstrap()
     AGAMI_LOCAL = agami_paths.local_dir()
     CREDENTIALS_PATH = agami_paths.credentials_path()
     CONFIG_PATH = agami_paths.config_path()
     QUERY_LOG = agami_paths.query_log_path()
     TOOL_CALL_LOG = AGAMI_LOCAL / "tool_calls.jsonl"
+    GUARDRAIL_AUDIT_LOG = AGAMI_LOCAL / "guardrail_audit.jsonl"
 
 
 def _load_config() -> dict[str, Any]:
@@ -185,8 +189,8 @@ def _db_type_for(profile: str, creds: dict[str, dict[str, str]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def check_read_only(sql: str) -> str | None:
-    """Return None if the SQL is a safe single read-only statement, else a reason string.
+def check_read_only(sql: str) -> Verdict | None:
+    """Return None if the SQL is a safe single read-only statement, else a safety Verdict.
 
     Thin fail-fast wrapper over the shared `sql_guard` — the SAME gate the executor
     (`execute_sql.py`) enforces — so the stdio server, the HTTP/OAuth server, the
@@ -197,6 +201,15 @@ def check_read_only(sql: str) -> str | None:
     import sql_guard
 
     return sql_guard.check_read_only(sql)
+
+
+def check_no_recon(sql: str) -> Verdict | None:
+    """Return None if the SQL calls no recon/metadata function and reads no system catalog, else a
+    safety Verdict (`recon`). Thin fail-fast wrapper over the SAME `sql_guard` gate the executor
+    enforces — blocking here avoids spawning the executor subprocess for a recon query."""
+    import sql_guard
+
+    return sql_guard.check_no_recon(sql)
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +722,12 @@ def _table_contexts(org, table_names: list[str], L, index=None) -> dict[str, Any
 
 
 def _schema_payload(
-    org, profile: str, mode: str, matched: list[str], metrics: dict[str, tuple[Any, str | None]], L,
+    org,
+    profile: str,
+    mode: str,
+    matched: list[str],
+    metrics: dict[str, tuple[Any, str | None]],
+    L,
     index=None,
 ) -> dict[str, Any]:
     """Build the structured schema payload at the given verbosity. `metric_index` + `large_tables`
@@ -939,6 +957,125 @@ def _classify_exit(code: int) -> str:
     }.get(code, "other")
 
 
+# Value-free, user-facing messages per error kind. These NEVER echo the raw driver text (schema /
+# column / value names) — that goes only to the server-side audit trail. The kinds mirror the shared
+# taxonomy in plugins/agami/shared/db_error_classifier.md (whose remediations these paraphrase without
+# the object/host placeholders).
+_ERROR_KINDS: dict[str, tuple[str, str]] = {
+    "auth": (
+        "Authentication to the database failed.",
+        "Check the datasource credentials and retry.",
+    ),
+    "dsn": (
+        "The datasource host or path could not be resolved.",
+        "Check the datasource connection settings.",
+    ),
+    "network": (
+        "Network error reaching the database.",
+        "Confirm the database is reachable (VPN / firewall / port) and retry.",
+    ),
+    "driver_missing": (
+        "The database driver is not installed on the server.",
+        "Install the driver for this datasource on the server.",
+    ),
+    "permission": (
+        "The database user lacks SELECT permission on a referenced object.",
+        "Grant the read-only role SELECT on the referenced tables, then retry.",
+    ),
+    "column_not_found": (
+        "The query referenced a column that does not exist.",
+        "Re-check the query against the current schema; re-introspect if the model has drifted.",
+    ),
+    "table_not_found": (
+        "The query referenced a table that does not exist.",
+        "Re-check the query against the current schema; re-introspect if the model has drifted.",
+    ),
+    "syntax": (
+        "The generated SQL had a syntax error.",
+        "Re-run the query — generation usually self-corrects.",
+    ),
+    "timeout": (
+        "The query was canceled (it timed out).",
+        "Add a filter, a LIMIT, or a date range to reduce the scan, then retry.",
+    ),
+    "other": ("The query failed; the details were logged for the operator.", ""),
+}
+
+
+def _classify_db_error(stderr: str | None, returncode: int) -> tuple[str, str, str]:
+    """Classify an executor operational failure into a ``(kind, reason, remediation)``.
+
+    The RICH ``kind`` (mirroring ``db_error_classifier.md``) drives the assistant's handling; the
+    ``reason`` / ``remediation`` are FIXED, value-free strings from ``_ERROR_KINDS`` — they never echo
+    the raw driver text, which is captured separately for the server-side audit trail only. Detection
+    layers the exit-code prior with stderr-substring refinement."""
+    text = (stderr or "").lower()
+
+    def has(*needles: str) -> bool:
+        return any(n in text for n in needles)
+
+    if returncode == 3 or has("no module named", "modulenotfounderror", "command not found"):
+        kind = "driver_missing"
+    elif has(
+        "permission denied",
+        "insufficient_privileges",
+        "command denied",
+        "insufficient_access_or_readonly",
+    ):
+        kind = "permission"
+    elif has(
+        "canceling statement",
+        "statement_timeout",
+        "query was canceled",
+        "querycanceled",
+        "lost connection during query",
+    ):
+        kind = "timeout"
+    elif has(
+        "no such column", "unknown column", "undefinedcolumn", "invalid identifier", "invalid_field"
+    ) or ("column" in text and has("does not exist", "not found")):
+        kind = "column_not_found"
+    elif has("no such table", "undefinedtable") or (
+        has("relation", "table", "object") and has("does not exist", "doesn't exist", "not found")
+    ):
+        # `object` covers Snowflake `Object '<name>' does not exist` (the name is between the words,
+        # so it's not a contiguous substring) — checked before `syntax` so it wins over Snowflake's
+        # `SQL compilation error` prefix.
+        kind = "table_not_found"
+    elif has("syntax error", "syntaxerror", "compilation error", "error in your sql syntax"):
+        kind = "syntax"
+    elif has(
+        "could not translate host",
+        "name or service not known",
+        "getaddrinfo",
+        "unknown mysql server host",
+        "can't connect",
+        "no such file or directory",
+    ):
+        kind = "dsn"
+    elif has(
+        "connection refused",
+        "timed out",
+        "connection reset",
+        "could not connect",
+        "wrong_version_number",
+    ):
+        kind = "network"
+    elif has(
+        "password authentication failed",
+        "no pg_hba",
+        "incorrect username or password",
+        "access denied",
+    ):
+        kind = "auth"
+    else:
+        # No substring matched — fall back to the exit-code prior (2→dsn, 3→driver_missing,
+        # 4→auth, 5→syntax, else→other).
+        kind = _classify_exit(returncode)
+    reason, remediation = _ERROR_KINDS.get(kind, _ERROR_KINDS["other"])
+    return kind, reason, remediation
+
+
 def _executor_truncated(stderr: str | None) -> bool:
     """True if execute_sql flagged a bounded-fetch truncation (ACE-038/044). The executor emits a
     non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
@@ -979,16 +1116,12 @@ def set_injected_executor(executor: Any | None) -> None:
 
 def _finalize_execution(
     columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
-    execution_ms: int, args: dict[str, Any],
+    execution_ms: int, args: dict[str, Any], audit_id: str,
 ) -> str:
-    """Shape a successful result (units + exact-render markdown + trust receipt), log the execution
-    through the single sink, and return the tool JSON. Shared by both execution paths — the subprocess
-    fork and the in-process executor — so a **successful** query returns the identical result envelope
-    whichever ran it. (A guard *refusal* is not yet identical across paths: the subprocess surfaces
-    execute_sql's stderr JSON as the remediation, while the in-process path returns a clean generic
-    refusal with the structured detail in the server log. Full structured-refusal parity needs
-    `_model_safety` to *return* its envelope — it currently writes it to stderr, pinned by the
-    fail-closed guard tests — so it's tracked as a follow-up, not folded into this seam.)"""
+    """Shape a successful result (units + exact-render markdown + trust receipt) into the ok
+    ``Envelope``, record it through the guardrail-audit chokepoint, and return the Envelope JSON.
+    Shared by BOTH execution paths — the subprocess fork and the in-process executor — so a
+    successful query returns the identical envelope whichever ran it."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
@@ -1000,7 +1133,7 @@ def _finalize_execution(
     except Exception:
         markdown = None
 
-    result = {
+    data = {
         "columns": columns,
         "rows": data_rows,
         "row_count": len(data_rows),
@@ -1015,6 +1148,8 @@ def _finalize_execution(
         # (offer to approve/correct via the save_correction tool).
         "receipt": _resolve_receipt(profile, sql),
     }
+    # A bounded (transfer-capped) result is a valid answer that is flagged, not a refusal.
+    applied = [{"row_cap": len(data_rows)}] if truncated else []
 
     # Log the execution through the single chokepoint: the DB sink when AGAMI_DB_URL is set (one
     # query_executions row), else the local jsonl the skills use. Best-effort either way.
@@ -1028,15 +1163,26 @@ def _finalize_execution(
             "source": "mcp_server",
         }
     )
-    return json.dumps(result, indent=2, default=str)
+    return _finish(
+        Envelope.ok(data=data, applied=applied, audit_id=audit_id),
+        args,
+        sql=sql,
+        execution_ms=execution_ms,
+    )
 
 
 def _run_in_process(
     sql: str, profile: str, area: str | None, max_rows: int | None, executor: Any
-) -> tuple[list, list, bool] | dict:
+) -> tuple[list, list, bool] | tuple[Refusal, str | None]:
     """Run through the in-process executor behind the shared guarded envelope (no subprocess, no CSV
-    round-trip). Returns ``(columns, data_rows, truncated)`` on success, or an error dict on a guard
-    refusal / execution failure — the same error shape the subprocess branch produces.
+    round-trip). Returns ``(columns, data_rows, truncated)`` on success, or ``(Refusal, error_detail)``
+    on a guard refusal / execution failure — the SAME refusal the subprocess path produces.
+
+    A guard refusal (read-only / recon / model-safety) carries its own clean typed ``Refusal`` and no
+    ``error_detail``. An execution/config failure (``ExecutorError``) is classified into a VALUE-FREE
+    ``Refusal`` via ``_classify_db_error`` — mirroring the subprocess ``_refusal_from_stderr`` — with
+    the raw driver text returned SEPARATELY as ``error_detail`` for the server-side audit trail only,
+    never in the refusal reason (which would leak schema / column / value names, or a DSN).
 
     Rows are textualized to match the subprocess CSV wire (``None`` → ``""``, else ``str``) so the
     two paths return observably identical JSON. Native-typed rows are a deliberately deferred decision
@@ -1044,36 +1190,28 @@ def _run_in_process(
     import execute_sql
 
     # The per-call cap rides execute_sql's `_max_rows_override` ContextVar (ACE-028) — request-scoped,
-    # so concurrent in-process queries with different caps don't stomp each other. Set/reset via the
-    # token (the `_current_org_ctx` pattern); `run_blocking` copied this request's context into the
-    # worker thread, so the set is isolated to this call.
+    # so concurrent in-process queries with different caps don't stomp each other. `run_blocking`
+    # copied this request's context into the worker thread, so the set is isolated to this call.
     cap_token = execute_sql._max_rows_override.set(max_rows)
     try:
         result = execute_sql.execute_guarded(
             sql, profile, area, executor=executor, org_id=_credential_org_id()
         )
     except execute_sql.GuardRefused as refusal:
-        # A read-only refusal (envelope present) is already caught by tool_execute_sql's upstream
-        # check_read_only fast-fail, so in practice only the model-safety branch (envelope None) is
-        # reached here; both are handled for defence-in-depth.
-        if refusal.envelope is not None:
-            return {"error": refusal.envelope["error"]}
-        # A model-safety refusal wrote its structured detail to the server log (stderr); surface a
-        # clean refusal here. (The subprocess path instead surfaces that stderr JSON as remediation —
-        # the not-yet-identical refusal envelope tracked as a follow-up.)
-        return {"error": {"kind": "permission",
-                          "remediation": "Query refused by the semantic-model safety pass "
-                                         "(see server logs for the specific rule)."}}
+        return refusal.refusal, None  # typed Refusal (read-only / recon / model-safety) — already clean
     except execute_sql.ExecutorError as exc:
-        return {"error": {"kind": _classify_exit(exc.code), "remediation": exc.msg}}
+        # Sanitize like the subprocess wire: a value-free classified refusal out, the raw driver text
+        # to the audit trail only. Parity with `_refusal_from_stderr` closes the in-process leak.
+        kind, reason, remediation = _classify_db_error(exc.msg, exc.code)
+        return (
+            Refusal(kind=kind, reason=reason, remediation=remediation),
+            (exc.msg or "").strip()[:500] or None,
+        )
     except SystemExit as exc:
-        # Defence-in-depth. The known credential/DSN failures now raise ExecutorError (handled above,
-        # carrying their detailed message), so this net catches only a residual/future sys.exit deep
-        # in a driver — ensuring an in-process query can never take down the host; it becomes a
-        # fail-closed tool error instead.
+        # Defence-in-depth: a residual/future sys.exit deep in a driver becomes a fail-closed refusal
+        # rather than taking down the host process.
         code = exc.code if isinstance(exc.code, int) else 2
-        return {"error": {"kind": _classify_exit(code),
-                          "remediation": "Datasource configuration error."}}
+        return Refusal(_classify_exit(code), reason="Datasource configuration error."), None
     finally:
         execute_sql._max_rows_override.reset(cap_token)
 
@@ -1086,6 +1224,78 @@ def _run_in_process(
     return columns, data_rows, truncated
 
 
+def _refusal_from_stderr(stderr: str | None, returncode: int) -> tuple[Refusal, str | None]:
+    """Build a ``(Refusal, error_detail)`` from the executor's stderr.
+
+    A guardrail refusal is a ``{"refusal": {...}}`` line (safety / model gates) — its reason is
+    already clean → ``(Refusal(...), None)``. Anything else is an execution/config failure: it is
+    classified into a value-free message (``_classify_db_error``) and the RAW stderr is returned
+    SEPARATELY as ``error_detail`` for the server-side audit trail ONLY. Raw driver text (schema /
+    column / value names) never crosses the boundary in the ``Refusal`` — the previous behavior of
+    surfacing stderr as the reason leaked exactly that."""
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and '"refusal"' in line:
+            try:
+                r = json.loads(line).get("refusal")
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("kind"):
+                return (
+                    Refusal(
+                        kind=r["kind"],
+                        reason=r.get("reason", ""),
+                        remediation=r.get("remediation", ""),
+                    ),
+                    None,
+                )
+    kind, reason, remediation = _classify_db_error(stderr, returncode)
+    error_detail = (stderr or "").strip()[:500] or None
+    return Refusal(kind=kind, reason=reason, remediation=remediation), error_detail
+
+
+def _envelope_json(env: Envelope) -> str:
+    return json.dumps(env.as_dict(), indent=2, default=str)
+
+
+def _finish(
+    env: Envelope,
+    args: dict[str, Any],
+    *,
+    sql: str | None = None,
+    execution_ms: int | None = None,
+    error_detail: str | None = None,
+) -> str:
+    """Record the guardrail audit row keyed by ``env.audit_id``, then return the Envelope JSON.
+
+    This is the single chokepoint the audit trail relies on: every ok/refused execute_sql result
+    records its verdict trail here, on BOTH surfaces — unlike ``tool_calls``, which only the HTTP
+    transport writes. Best-effort: building OR writing the audit record never breaks the tool."""
+    try:
+        d = env.as_dict()
+        data = d.get("data") if isinstance(d.get("data"), dict) else {}
+        _record_guardrail_audit(
+            {
+                "audit_id": env.audit_id,
+                "ts": _now_iso(),
+                "datasource": args.get("datasource"),
+                "status": env.status,
+                "refusal_kind": (d.get("refusal") or {}).get("kind"),
+                "sql": sql,
+                "row_count": data.get("row_count"),
+                "execution_ms": execution_ms,
+                "correlation_id": args.get("correlation_id"),
+                "source": "mcp_server",
+                "error_detail": error_detail,  # raw driver text, server-side only
+            }
+        )
+    except Exception as exc:
+        # best-effort — a logging failure must never break an otherwise-good result — but surface a
+        # record-BUILD failure once (a Refusal/Envelope shape drift) so it isn't invisible forever.
+        _warn_once("guardrail_audit_build", f"guardrail audit record not built: {type(exc).__name__}")
+    return _envelope_json(env)
+
+
 def tool_execute_sql(args: dict[str, Any]) -> str:
     """Local analog of Ask Agami `execute_sql`: run a read-only SELECT locally.
 
@@ -1095,24 +1305,36 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
 
     Two execution paths behind the same guard: the default forks the execute_sql subprocess
     (isolation, byte-identical local/single-user); an injected executor (AH-012) runs in-process with
-    native rows. Both funnel through `_finalize_execution`, so a **successful** query's result
-    envelope is identical either way (a guard refusal's envelope is not yet identical across paths —
-    see `_finalize_execution` and the tracked structured-refusal-parity follow-up).
+    native rows. Both funnel through the same envelope assembly, so BOTH a **successful** result and a
+    **refusal** are identical either way: a refusal is reconstructed as the same typed `Refusal`
+    (kind + reason + remediation) on both paths — the subprocess path parses the executor's
+    `{"refusal": ...}` stderr line, the in-process path catches the typed `GuardRefused` — and both
+    return `Envelope.refused(...)` through `_finish`.
     """
+    audit_id = uuid4().hex
     sql = args.get("sql")
     if not isinstance(sql, str) or not sql.strip():
-        return json.dumps(
-            {"error": {"kind": "other", "remediation": "Pass a non-empty `sql` string."}}
+        return _finish(
+            Envelope.refused(Refusal("other", "Pass a non-empty `sql` string."), audit_id=audit_id),
+            args,
         )
 
-    reason = check_read_only(sql)
-    if reason is not None:
-        return json.dumps(
-            {
-                "error": {"kind": "permission", "remediation": reason},
-                "sql": sql,
-            },
-            indent=2,
+    verdict = check_read_only(sql)
+    if verdict is not None:
+        return _finish(
+            Envelope.refused(
+                Refusal("permission", verdict.detail, verdict.remediation), audit_id=audit_id
+            ),
+            args,
+            sql=sql,
+        )
+
+    recon = check_no_recon(sql)
+    if recon is not None:
+        return _finish(
+            Envelope.refused(Refusal("recon", recon.detail, recon.remediation), audit_id=audit_id),
+            args,
+            sql=sql,
         )
 
     profile = resolve_profile(args.get("datasource"))
@@ -1133,12 +1355,19 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         started = time.monotonic()
         outcome = _run_in_process(sql, profile, area, max_rows, _INJECTED_EXECUTOR)
         execution_ms = int((time.monotonic() - started) * 1000)
-        if isinstance(outcome, dict):  # guard refusal / execution error
-            return json.dumps({**outcome, "sql": sql, "execution_ms": execution_ms}, indent=2)
+        if isinstance(outcome[0], Refusal):  # guard refusal / execution error → (Refusal, error_detail)
+            refusal, error_detail = outcome
+            return _finish(
+                Envelope.refused(refusal, audit_id=audit_id),
+                args,
+                sql=sql,
+                execution_ms=execution_ms,
+                error_detail=error_detail,
+            )
         columns, data_rows, truncated = outcome
         return _finalize_execution(
             columns, data_rows, truncated,
-            profile=profile, sql=sql, execution_ms=execution_ms, args=args,
+            profile=profile, sql=sql, execution_ms=execution_ms, args=args, audit_id=audit_id,
         )
 
     # The model safety pass (fan/chasm pre-flight + default_filters) runs inside
@@ -1162,22 +1391,21 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             timeout=240,
         )
     except subprocess.TimeoutExpired:
-        return json.dumps(
-            {"error": {"kind": "timeout", "remediation": "Query exceeded 240s."}, "sql": sql}
+        return _finish(
+            Envelope.refused(Refusal("timeout", "Query exceeded 240s."), audit_id=audit_id),
+            args,
+            sql=sql,
         )
     execution_ms = int((time.monotonic() - started) * 1000)
 
     if proc.returncode != 0:
-        return json.dumps(
-            {
-                "error": {
-                    "kind": _classify_exit(proc.returncode),
-                    "remediation": (proc.stderr or "").strip() or "execute_sql.py failed",
-                },
-                "sql": sql,
-                "execution_ms": execution_ms,
-            },
-            indent=2,
+        refusal, error_detail = _refusal_from_stderr(proc.stderr, proc.returncode)
+        return _finish(
+            Envelope.refused(refusal, audit_id=audit_id),
+            args,
+            sql=sql,
+            execution_ms=execution_ms,
+            error_detail=error_detail,
         )
 
     # Parse the RFC-4180 CSV emitted on stdout.
@@ -1194,7 +1422,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
 
     return _finalize_execution(
         columns, data_rows, truncated,
-        profile=profile, sql=sql, execution_ms=execution_ms, args=args,
+        profile=profile, sql=sql, execution_ms=execution_ms, args=args, audit_id=audit_id,
     )
 
 
@@ -1204,6 +1432,24 @@ def _now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_AUDIT_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    """Emit a ONE-TIME (per-process, per-key) warning to stderr. The audit sinks are best-effort so an
+    audit-write failure never breaks a query — but "best-effort AND silent" means a PERSISTENTLY dead
+    sink (a DB role without INSERT, an unwritable log dir) loses the security record undetectably. This
+    surfaces the first such failure without spamming a line per query. Keep `msg` value-free (an
+    exception TYPE, never its text) so a driver message can't leak a DSN/schema/value through it."""
+    if key in _AUDIT_WARNED:
+        return
+    _AUDIT_WARNED.add(key)
+    try:
+        sys.stderr.write(f"[agami] {msg}\n")
+    except Exception:
+        pass
 
 
 def _append_jsonl(path: Path, record: dict[str, Any]) -> bool:
@@ -1249,9 +1495,10 @@ def record_tool_call(
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
     audit-grade fields are server-observed; `success`/`row_count`/`error_kind` are derived from the
-    result (execute_sql returns an `{"error": ...}` body on a bad query without raising). The self-report
-    fields (`user_question`/`agent_query`/`thread_id`) are whatever Claude supplied — may be None.
-    **Best-effort and never raises** — a logging failure must not break the tool."""
+    result: execute_sql returns a response Envelope (`status`/`refusal`/`data`); the other tools return
+    a `{"error": ...}` body on failure. The self-report fields (`user_question`/`agent_query`/
+    `thread_id`) are whatever Claude supplied — may be None. **Best-effort and never raises** — a
+    logging failure must not break the tool."""
     args = arguments or {}
     success, row_count, error_kind = True, None, None
     if raised:
@@ -1260,10 +1507,16 @@ def record_tool_call(
         try:
             parsed = json.loads(result_text) if result_text else None
             if isinstance(parsed, dict):
-                if isinstance(parsed.get("error"), dict):
+                if parsed.get("status") == "refused":  # execute_sql response Envelope
+                    success = False
+                    error_kind = (parsed.get("refusal") or {}).get("kind") or "error"
+                elif isinstance(parsed.get("error"), dict):  # other tools' {"error": ...} body
                     success = False
                     error_kind = parsed["error"].get("kind") or "error"
-                row_count = parsed.get("row_count")
+                data = parsed.get("data")
+                row_count = (
+                    data.get("row_count") if isinstance(data, dict) else parsed.get("row_count")
+                )
         except (ValueError, TypeError):
             pass
     _record_tool_call(
@@ -1308,6 +1561,30 @@ def _record_tool_call(rec: dict[str, Any]) -> None:
             store.close()
     except Exception:
         pass  # best-effort: never fail the tool because logging failed
+
+
+def _record_guardrail_audit(rec: dict[str, Any]) -> None:
+    """Write a guardrail audit record through the DB sink (AGAMI_DB_URL) or the local jsonl. Wrapped
+    so the whole thing is best-effort — even opening the store can't surface an error to the caller."""
+    try:
+        from store import Store
+
+        store = Store.from_env()
+        if store is None:
+            if not _append_jsonl(GUARDRAIL_AUDIT_LOG, rec):
+                _warn_once("guardrail_audit_jsonl", "guardrail audit not recorded: audit log unwritable")
+            return
+        try:
+            from contracts import GuardrailAuditRecord
+            from model_store import DbActivitySink
+
+            DbActivitySink(store).record_guardrail_audit(GuardrailAuditRecord(**rec))
+        finally:
+            store.close()
+    except Exception as exc:
+        # best-effort: never fail the tool because logging failed — but surface a PERSISTENT DB-sink
+        # failure once (type only, no message text) so a dead audit trail is observable, not silent.
+        _warn_once("guardrail_audit_db", f"guardrail audit not recorded (sink error): {type(exc).__name__}")
 
 
 # ---------------------------------------------------------------------------

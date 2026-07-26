@@ -62,7 +62,7 @@ STAR_EVASIONS = [
 
 @pytest.mark.parametrize("sql", STAR_EVASIONS)
 def test_star_evasion_refused(sql):
-    assert rt.check_no_select_star(sql).action == "refuse"
+    assert rt.check_no_select_star(sql) is not None
 
 
 # COUNT(*) / agg(*) must NOT be over-blocked by the star ban.
@@ -72,7 +72,7 @@ def test_star_evasion_refused(sql):
     "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
 ])
 def test_aggregate_star_allowed(sql):
-    assert rt.check_no_select_star(sql).action == "allow"
+    assert rt.check_no_select_star(sql) is None
 
 
 # ===========================================================================
@@ -91,7 +91,7 @@ CLAUSE_SMUGGLES = [
 
 @pytest.mark.parametrize("sql", CLAUSE_SMUGGLES)
 def test_undeclared_column_in_any_clause_refused(sql):
-    assert rt.check_column_scope(sql, _scope_org()).action == "refuse"
+    assert rt.check_column_scope(sql, _scope_org()) is not None
 
 
 # An undeclared column wrapped in an expression / function / window.
@@ -106,22 +106,25 @@ EXPR_WRAPS = [
 
 @pytest.mark.parametrize("sql", EXPR_WRAPS)
 def test_undeclared_column_in_expression_refused(sql):
-    assert rt.check_column_scope(sql, _scope_org()).action == "refuse"
+    assert rt.check_column_scope(sql, _scope_org()) is not None
 
 
 def test_alias_masquerade_refused():
     # The OUTPUT alias `id` is declared, but the underlying `bogus` is not — we
     # validate the underlying column, not the alias it is renamed to.
     res = rt.check_column_scope("SELECT bogus AS id FROM orders", _scope_org())
-    assert res.action == "refuse"
-    assert res.columns == ["bogus"]
+    assert res is not None
+    assert res.rule == "column_scope"  # gate identity (restores the precision the old .columns field pinned)
+    assert "bogus" in res.detail  # the underlying column is named…
+    assert "id" not in res.detail.split()  # …and the declared alias `id` is NOT flagged
 
 
 def test_undeclared_column_in_union_arm_refused():
     res = rt.check_column_scope(
         "SELECT id FROM orders UNION SELECT bogus FROM customers", _scope_org())
-    assert res.action == "refuse"
-    assert res.columns == ["bogus"]
+    assert res is not None
+    assert res.rule == "column_scope"  # gate identity, not merely "some refusal"
+    assert "bogus" in res.detail
 
 
 def test_correlated_subquery_qualified_smuggle_refused():
@@ -130,8 +133,8 @@ def test_correlated_subquery_qualified_smuggle_refused():
     res = rt.check_column_scope(
         "SELECT o.id FROM orders o "
         "WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.bogus)", _scope_org())
-    assert res.action == "refuse"
-    assert res.columns == ["orders.bogus"]
+    assert res is not None
+    assert "orders.bogus" in res.detail
 
 
 def test_undeclared_column_alongside_where_subquery_refused():
@@ -139,15 +142,15 @@ def test_undeclared_column_alongside_where_subquery_refused():
     # undeclared column in the outer query is still caught.
     res = rt.check_column_scope(
         "SELECT bogus FROM orders WHERE id IN (SELECT id FROM customers)", _scope_org())
-    assert res.action == "refuse"
-    assert res.columns == ["bogus"]
+    assert res is not None
+    assert "bogus" in res.detail
 
 
 def test_quoted_identifier_undeclared_refused():
     # Documents the case-insensitive-match behavior: a quoted undeclared name is
     # still refused.
     res = rt.check_column_scope('SELECT "BOGUS" FROM orders', _scope_org())
-    assert res.action == "refuse"
+    assert res is not None
 
 
 # ===========================================================================
@@ -161,7 +164,7 @@ def test_alias_reused_across_scopes_resolves_locally():
     res = rt.check_column_scope(
         "SELECT o.amount FROM orders o "
         "WHERE EXISTS (SELECT 1 FROM customers o WHERE o.id = 1)", _scope_org())
-    assert res.action == "allow"
+    assert res is None
 
 
 def test_nested_output_alias_does_not_mask_outer_column():
@@ -170,8 +173,9 @@ def test_nested_output_alias_does_not_mask_outer_column():
     res = rt.check_column_scope(
         "SELECT bogus FROM orders WHERE id IN (SELECT id AS bogus FROM customers)",
         _scope_org())
-    assert res.action == "refuse"
-    assert res.columns == ["bogus"]
+    assert res is not None
+    assert res.rule == "column_scope"  # gate identity, not merely "some refusal"
+    assert "bogus" in res.detail
 
 
 # ===========================================================================
@@ -183,7 +187,7 @@ def test_fail_open_derived_alias_qualified_column():
     # validated at the subquery's own body; the outer reference is not re-checked.
     res = rt.check_column_scope(
         "SELECT x.whatever FROM (SELECT id AS whatever FROM orders) x", _scope_org())
-    assert res.action == "allow"
+    assert res is None
 
 
 def test_fail_open_cte_shadowing_table_name():
@@ -191,7 +195,7 @@ def test_fail_open_cte_shadowing_table_name():
     # so the outer reference traces to no physical table (DB is the backstop).
     res = rt.check_column_scope(
         "WITH orders AS (SELECT 1 AS bogus) SELECT bogus FROM orders", _scope_org())
-    assert res.action == "allow"
+    assert res is None
 
 
 # ===========================================================================

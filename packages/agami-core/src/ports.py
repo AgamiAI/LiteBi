@@ -6,7 +6,7 @@ swapped at the composition root through these ports, never by forking a tool:
   - ``ActivitySink``     — where query-execution records go (file by default)
   - ``OrgResolver``      — single vs multi tenancy as a config flag, not a schema fork
   - ``AuthProvider``     — bearer token → principal (presence by default)
-  - ``GovernancePolicy`` — warn-only by default; enforcement is a paid concern
+  - ``GovernancePolicy`` — no-op by default (warn-only posture, no rules wired); enforcement is paid
   - ``Executor``         — the connect-and-run step, *behind* the shared guard (built-in by default;
                            a consumer injects a pooled/RBAC/tunnel executor without forking the guard)
 
@@ -14,16 +14,18 @@ These are **interfaces only** — `typing.Protocol`, so an adapter satisfies a p
 no import coupling back to core. The OSS default adapters live in ``oss_adapters`` (so the local
 product runs out of the box); a downstream consumer supplies its own.
 
-The seam value types (``Org`` / ``Principal`` / ``GovernanceVerdict``) are stdlib dataclasses, not
-pydantic models, so this module imports with **zero dependencies** — a consumer can depend on the
-seams without pulling the model deps. The wire shapes that need validation (the 4-tool I/O) live
-in ``contracts`` (pydantic). Each type is kept minimal — only what a default adapter or a
-consumer needs.
+The seam value types (``Org`` / ``Principal``) are stdlib dataclasses, not pydantic models, so
+this module imports with **zero dependencies** — a consumer can depend on the seams without
+pulling the model deps. The governance seam speaks the shared ``guardrail.Verdict`` (also
+stdlib-only), so a ``GovernancePolicy`` folds its findings into the one ``Envelope`` every
+surface returns instead of a bespoke result type. The wire shapes that need validation (the
+4-tool I/O) live in ``contracts`` (pydantic). Each type is kept minimal — only what a default
+adapter or a consumer needs.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
     # consumer that needs only the seams) import without the pydantic model deps. With
     # `from __future__ import annotations` the method annotations are lazy strings, and
     # @runtime_checkable only checks method *names*, so isinstance() works without these.
+    # (``guardrail`` is stdlib-only, but is kept here too so ``import ports`` stays minimal.)
     from contracts import QueryExecutionRecord
 
     # ``ExecResult`` is defined in ``execute_sql`` (not here): it is the executor's result type and
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
     # cannot import ``ports`` at runtime. Referencing it under TYPE_CHECKING keeps the ``Executor``
     # annotation resolvable for type-checkers without a runtime import cycle.
     from execute_sql import ExecResult
+    from guardrail import Verdict
 
 # ---------------------------------------------------------------------------
 # Seam value types (minimal — a consumer extends them when it needs more)
@@ -59,15 +63,6 @@ class Principal:
     providers populate identity/claims."""
 
     subject: str
-
-
-@dataclass(frozen=True)
-class GovernanceVerdict:
-    """The outcome of a governance check. The default is **warn-only** — ``allowed`` is always
-    True and ``warnings`` is advisory; only a paid enforcement tier may set allowed=False."""
-
-    allowed: bool = True
-    warnings: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +102,16 @@ class AuthProvider(Protocol):
 
 @runtime_checkable
 class GovernancePolicy(Protocol):
-    """Evaluate a request and return a ``GovernanceVerdict`` (warnings; never blocks by default).
+    """Evaluate a request and return governance-class ``guardrail.Verdict``s (annotations that
+    fold into ``Envelope.warnings``; empty ⇒ nothing to say). Whether any of them actually blocks
+    or rewrites is ``guardrail.policy(verdict, tier)``'s call, not this adapter's — this is the
+    swappable *source* of governance findings (the governance injection seam).
 
-    OSS default = warn-only ("basic governance warning"); enforcement is a paid tier."""
+    OSS default is a **no-op** — it returns an empty list (no findings, so nothing is annotated or
+    blocked). A paid tier supplies its own adapter that emits governance ``Verdict``s; the tier
+    posture (OSS warns · SaaS recommends · Enterprise enforces) is applied by ``policy``, not here."""
 
-    def evaluate(self, ctx: object | None = None) -> GovernanceVerdict: ...
+    def evaluate(self, ctx: object | None = None) -> list[Verdict]: ...
 
 
 @runtime_checkable

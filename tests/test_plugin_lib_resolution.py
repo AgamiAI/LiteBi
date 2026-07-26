@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "plugins" / "agami" / "scripts"
 LIB = REPO / "plugins" / "agami" / "lib"
 SRC = REPO / "packages" / "agami-core" / "src"
-VENDORED = ["agami_paths.py", "execute_sql.py", "sql_guard.py", "semantic_model/__init__.py", "semantic_model/units.py"]
+VENDORED = ["agami_paths.py", "execute_sql.py", "sql_guard.py", "guardrail.py", "semantic_model/__init__.py", "semantic_model/units.py"]
 
 # `-S` disables site.py, so an installed (incl. editable) agami-core is not on the path — the same
 # "the package isn't available" state a marketplace user's plain python3 is in.

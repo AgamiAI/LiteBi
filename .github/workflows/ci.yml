@@ -49,6 +49,57 @@ jobs:
           --with-editable "packages/agami-core[model,server]"
           pytest tests/ -q --cov=plugins --cov=packages/agami-core/src --cov-report=term-missing
 
+  integration-pg:
+    # The F9 safety regression gate that needs a real database: the Postgres-SERVED corpus path
+    # (file/db parity) + the read-only role floor. These skip cleanly in `lint-and-test` (no DB);
+    # here a Postgres service is present so they RUN. Make this a required check for the F9 done-bar.
+    name: integration (Postgres — F9 safety corpus + role floor)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: shop
+          POSTGRES_USER: agami_test
+          # Ephemeral localhost CI service: trust auth (no password) — nothing to leak, and the tests
+          # assert role PRIVILEGES, not authentication. Avoids a throwaway password literal in the diff.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # Wait for the server to accept connections before the steps run.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The env-gated PG tests read these (defaults target the local compose fixture); point them at
+      # the service. AGAMI_IT_PG_PASSWORD being set is what flips the tests from skip to run.
+      AGAMI_IT_PG_HOST: 127.0.0.1
+      AGAMI_IT_PG_PORT: "5432"
+      AGAMI_IT_PG_USER: agami_test
+      # A non-secret sentinel: it only has to be non-empty to flip the tests from skip→run (the service
+      # uses trust auth, so the value is never verified). Not a credential.
+      AGAMI_IT_PG_PASSWORD: trust
+      AGAMI_IT_PG_DB: shop
+      # In this job a DB is REQUIRED: an unavailable/unreachable Postgres FAILS the job instead of
+      # skipping, so an all-skip can't pass green and silently prove nothing (the F9 done-bar gate).
+      AGAMI_IT_PG_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+      # The [server] extra pulls psycopg2; run ONLY the DB-dependent safety tests (the file path is
+      # already covered by lint-and-test). A regression in either fails the F9 gate.
+      - name: pytest (Postgres safety corpus + read-only role floor)
+        run: >-
+          uvx --python 3.12
+          --with pytest
+          --with-editable "packages/agami-core[model,server]"
+          pytest tests/e2e/test_safety_corpus.py tests/e2e/test_role_floor_pg.py
+          -q -k "db_path or role"
+
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest

@@ -31,9 +31,9 @@ from async_offload import run_blocking
 from execute_sql import BUILTIN_EXECUTOR
 from oss_adapters import (
     FileActivitySink,
+    NoopGovernancePolicy,
     PresenceAuthProvider,
     SingleTenantOrgResolver,
-    WarnOnlyGovernancePolicy,
 )
 from ports import Adapters, AuthProvider, Org, OrgResolver
 from starlette.applications import Starlette
@@ -134,7 +134,7 @@ def default_adapters() -> Adapters:
         activity_sink=FileActivitySink(),
         org_resolver=_build_org_resolver(),
         auth_provider=_build_auth_provider(),
-        governance=WarnOnlyGovernancePolicy(),
+        governance=NoopGovernancePolicy(),
         executor=BUILTIN_EXECUTOR,
     )
 
