@@ -27,6 +27,20 @@ repos:
     hooks:
       - id: gitleaks
 
+  # Merge-conflict markers — a marker that survives a resolution is invisible to review
+  # and renders broken in a public repo. Deliberately NOT pre-commit-hooks'
+  # `check-merge-conflict`: that one only inspects files while a merge is in progress, so a
+  # marker already committed on a branch you later merge walks straight past it. This scans
+  # the tracked tree unconditionally. CI re-runs it as the unbypassable gate.
+  - repo: local
+    hooks:
+      - id: conflict-markers
+        name: no merge-conflict markers
+        entry: python3 dev/check_conflict_markers.py
+        language: system
+        always_run: true
+        pass_filenames: false
+
   # Test suite — runs at PRE-PUSH (not on every commit) so commits stay fast but nothing
   # red leaves your machine. Same deps + command CI uses.
   - repo: local

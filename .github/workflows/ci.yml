@@ -49,6 +49,17 @@ jobs:
           --with-editable "packages/agami-core[model,server]"
           pytest tests/ -q --cov=plugins --cov=packages/agami-core/src --cov-report=term-missing
 
+  hygiene:
+    name: hygiene (conflict markers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Its own job rather than a step on `gitleaks`, so a failure here reads as what it
+      # is instead of arriving under a secret-scan heading. Pre-commit runs the same
+      # script locally; this is the copy that cannot be skipped with `--no-verify`.
+      - name: no merge-conflict markers
+        run: python3 dev/check_conflict_markers.py
+
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
