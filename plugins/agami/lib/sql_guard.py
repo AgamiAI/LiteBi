@@ -136,6 +136,20 @@ def _neutralize(sql: str) -> str:
                 j += 1
             # A pathological identifier like "a;b" reduces to a;b and trips the
             # multi-statement check — a deliberate, safe-direction hardening choice.
+            #
+            # The quote is ALSO the token delimiter: a delimited identifier is
+            # self-delimiting in SQL, so `FROM"pg_class"` needs no whitespace and is a
+            # valid statement the engine runs. Dropping the quotes without re-supplying a
+            # separator therefore fuses two tokens into one (`FROM"pg_class"` ->
+            # `FROMpg_class`), destroying the `\b` anchor every deny-list pattern below
+            # relies on — the gate stops seeing the token at all rather than allowing it.
+            # Re-supply the boundary ONLY when the previous emitted char is a word char:
+            # a blanket space would split a qualified name (`t."col"` -> `t. col`) and
+            # break the `(?<!\.)` lookbehind that keeps a qualified column from reading as
+            # a bare dangerous identifier.
+            prev = out[-1][-1:] if out and out[-1] else ""
+            if prev.isalnum() or prev == "_":
+                out.append(" ")
             out.append("".join(buf))
             i = j
         elif sql[i] == "$":  # dollar-quoted string literal ($$...$$ or $tag$...$tag$)
