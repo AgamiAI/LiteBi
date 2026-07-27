@@ -29,7 +29,7 @@ import sys
 from typing import Any
 
 import pytest
-from sql_guard import _MAX_SQL_CHARS, check_read_only
+from sql_guard import _MAX_SQL_CHARS, _neutralize, check_read_only
 
 # ---------------------------------------------------------------------------
 # Accept — valid single read-only statements
@@ -392,6 +392,19 @@ def test_red_team_quoted_dangerous_fn_bypass(sql: str) -> None:
         'SELECT 1 FROM"pg_class"WHERE"pg_sleep"(10) IS NULL',
         # The weld can also appear mid-statement, after a non-keyword word char.
         'SELECT a FROM t WHERE b="pg_sleep"(1)',
+        # The CLOSING quote delimits too, so a keyword can hide on the trailing side.
+        # `SELECT ... INTO <table>` is a write that opens with SELECT, which is exactly
+        # why INTO is in the DML/DDL list; `\bINTO\b` does not match `xINTO`. Verified on
+        # PostgreSQL 16: each of these creates a table holding the source rows.
+        'SELECT "x"INTO evil FROM t',
+        'SELECT"x"INTO evil FROM t',
+        'SELECT t."x"INTO evil FROM t',
+        'SELECT 1 AS"a"INTO evil',
+        'WITH c AS (SELECT 1 AS "x")SELECT "x"INTO evil FROM c',
+        # Row-lock rule, same root cause. FOR UPDATE survives only because bare UPDATE is
+        # independently in the DML list; FOR SHARE has no such backstop.
+        'SELECT * FROM t AS"a"FOR SHARE',
+        'SELECT * FROM t AS"a"FOR KEY SHARE',
     ],
 )
 def test_red_team_welded_quoted_dangerous_fn_bypass(sql: str) -> None:
@@ -420,6 +433,34 @@ def test_red_team_welded_quoted_dangerous_fn_bypass(sql: str) -> None:
 def test_welded_fix_does_not_over_block_legitimate_quoted_identifiers(sql: str) -> None:
     """The weld fix must not turn a qualified quoted column into a false positive."""
     assert check_read_only(sql) is None, f"Legitimate quoted identifier wrongly blocked: {sql!r}"
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        # A separator is re-supplied ONLY where the quote actually separated two word
+        # chars — so a qualified name survives as ONE token.
+        ('SELECT t."current_user" FROM t', "SELECT t.current_user FROM t"),
+        ('SELECT "schema"."table" FROM "schema"."table"', "SELECT schema.table FROM schema.table"),
+        ('SELECT c."email" FROM customers c', "SELECT c.email FROM customers c"),
+        # ...and IS re-supplied on both sides where it was separating word chars.
+        ('SELECT * FROM"pg_class"', "SELECT * FROM pg_class"),
+        ('SELECT "x"INTO evil FROM t', "SELECT x INTO evil FROM t"),
+        ('SELECT 1 AS"a"INTO evil', "SELECT 1 AS a INTO evil"),
+    ],
+)
+def test_neutralize_preserves_token_structure(sql: str, expected: str) -> None:
+    """Pin the *shape* of the neutralized text, not just the gate's yes/no.
+
+    Every rule here is `\\b`-anchored, so a blanket separator on both sides would block the
+    same attacks and pass the same negatives — the gate-level tests alone cannot tell the
+    two designs apart, and a future refactor could silently swap one for the other. What a
+    blanket space would change is token *structure*: `t."col"` would become `t. col`, two
+    tokens where the statement meant one. Any rule that reasons about qualification (a
+    pattern anchored on a preceding `.`, say) would then read a qualified column as a bare
+    identifier. Asserting the neutralized string keeps that decision checkable.
+    """
+    assert _neutralize(sql) == expected
 
 
 @pytest.mark.parametrize(

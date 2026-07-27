@@ -74,6 +74,18 @@ def _neutralize(sql: str) -> str:
     deliberately NOT an escape here — engines disagree (MySQL yes, standard PG no),
     and not honoring it can only stop a literal *early* (fail safe), never late.
     """
+    def _last_emitted(chunks: list[str]) -> str:
+        """The last character actually emitted, skipping empty chunks.
+
+        Peeking at `chunks[-1]` alone is wrong: a zero-length identifier (`""`) appends an
+        empty string, which would hide the real preceding character and drop a separator
+        that is needed.
+        """
+        for chunk in reversed(chunks):
+            if chunk:
+                return chunk[-1]
+        return ""
+
     out: list[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -130,20 +142,28 @@ def _neutralize(sql: str) -> str:
             # A pathological identifier like "a;b" reduces to a;b and trips the
             # multi-statement check — a deliberate, safe-direction hardening choice.
             #
-            # The quote is ALSO the token delimiter: a delimited identifier is
-            # self-delimiting in SQL, so `FROM"pg_class"` needs no whitespace and is a
-            # valid statement the engine runs. Dropping the quotes without re-supplying a
-            # separator therefore fuses two tokens into one (`FROM"pg_class"` ->
-            # `FROMpg_class`), destroying the `\b` anchor every deny-list pattern below
-            # relies on — the gate stops seeing the token at all rather than allowing it.
-            # Re-supply the boundary ONLY when the previous emitted char is a word char:
-            # a blanket space would split a qualified name (`t."col"` -> `t. col`) and
-            # break the `(?<!\.)` lookbehind that keeps a qualified column from reading as
-            # a bare dangerous identifier.
-            prev = out[-1][-1:] if out and out[-1] else ""
-            if prev.isalnum() or prev == "_":
+            # The quotes are ALSO the token delimiters, on BOTH ends: a delimited
+            # identifier is self-delimiting, so `FROM"pg_class"` and `"x"INTO` are both
+            # valid SQL the engine runs. Dropping the quotes without re-supplying those
+            # boundaries fuses neighbouring tokens into one — `FROM"pg_class"` ->
+            # `FROMpg_class`, `"x"INTO` -> `xINTO` — which defeats the `\b` anchors every
+            # deny-list pattern below relies on. The gate then stops *seeing* the token
+            # rather than allowing it, so it returns no rejection at all. This is the same
+            # invariant the docstring states for comments and literals ("never empty");
+            # the identifier branch is simply the one place that was not honouring it.
+            #
+            # Re-supply a boundary only where the quote was actually separating two word
+            # chars, so a qualified name stays one token: `t."col"` must neutralize to
+            # `t.col`, not `t. col`. That structural fidelity is the neutralizer's job —
+            # it removes hiding places without re-tokenizing the statement — and it is
+            # pinned by an explicit output test, since no current rule distinguishes the
+            # two spellings on its own.
+            if _last_emitted(out).isalnum() or _last_emitted(out) == "_":
                 out.append(" ")
             out.append("".join(buf))
+            nxt = sql[j] if j < n else ""
+            if nxt.isalnum() or nxt == "_":
+                out.append(" ")
             i = j
         elif sql[i] == "$":  # dollar-quoted string literal ($$...$$ or $tag$...$tag$)
             # Only a `$tag$` with a MATCHING close delimiter is a literal we can blank.
