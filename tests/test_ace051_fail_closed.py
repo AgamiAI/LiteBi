@@ -106,6 +106,42 @@ def test_db_sourced_model_enforces_guards(tmp_path, monkeypatch, capsys):
     assert refusal is None  # a declared table with a named projection passes
 
 
+def test_db_model_under_minted_org_resolves_for_guard(tmp_path, monkeypatch, capsys):
+    # REGRESSION (ACE-051 org-scoping): a model seeded under a real MINTED org (not the 'local'
+    # default) must resolve for the safety guard when the runtime org matches — the guard read has to
+    # scope by org exactly like the serve path (tools._load_org). Before the fix, the guard's DB read
+    # defaulted to model_store.DEFAULT_ORG ('local'), so a non-'local' model was invisible to the
+    # guard even though it served fine → a false `model_unavailable` refusal on every query of a
+    # hosted, DB-only deploy (no baked /artifacts). The other DB tests here can't catch this: they
+    # seed AND read under the default 'local' org, so the scoping is a no-op.
+    import model_store
+    from store import Store
+
+    ORG = "09c499f4fe4e4203b178e04e76564faa"  # a minted org id, like a real deployment's
+    url = "sqlite://" + str(tmp_path / "model.db")
+    s = Store.connect(url)
+    s.run_migrations()
+    model_store.write_datasource(s, "acme", _org(), org_id=ORG)  # seeded under the MINTED org
+    s.close()
+
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ORG_ID", ORG)  # runtime org == the seeded org (what _guard_org_id reads)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))  # DB is the ONLY source
+    import tools
+
+    tools.resolved_org_id.cache_clear()  # memoized; force a re-resolve under this test's env
+    try:
+        # The model resolves under the minted org → a declared table passes (NOT model_unavailable).
+        _, refusal, _ = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+        assert refusal is None, "guard-model must resolve under the minted org, not fail closed"
+        # And the guards actually run off that DB-sourced model (undeclared table still refused).
+        _, refusal2, _ = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
+        assert refusal2 is not None and refusal2.kind == "table_out_of_scope"
+        assert capsys.readouterr().err == ""
+    finally:
+        tools.resolved_org_id.cache_clear()  # don't leak the minted org into later tests
+
+
 def test_disk_db_verdict_parity(tmp_path, monkeypatch, capsys):
     # The same model sourced from disk vs the DB must yield identical guard verdicts.
     monkeypatch.delenv("AGAMI_SQL_UNSCOPABLE_POSTURE", raising=False)  # default enforce for the rows below
