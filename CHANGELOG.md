@@ -10,6 +10,23 @@ is the source of truth a host installs against — bumping it is what invalidate
 user's plugin cache (see [CONTRIBUTING.md](CONTRIBUTING.md)). Each released section
 below corresponds to one such version.
 
+## [Unreleased]
+
+### Security
+
+- **Closed a read-only-guard bypass via a welded quoted identifier.** A double-quoted
+  identifier is self-delimiting in SQL, so `SELECT*FROM"pg_read_file"('/etc/passwd')` is a
+  valid statement with no whitespace before the quote. The guard's lexer dropped the quote
+  characters without re-supplying that boundary, fusing two tokens into one
+  (`FROM"pg_class"` → `FROMpg_class`) and destroying the word-boundary anchor every
+  dangerous-function pattern matches on — so the gate stopped seeing the token rather than
+  allowing it, and returned no rejection. Verified against PostgreSQL 16: the welded form
+  executes and reads a server-side file while the guard passed it. The lexer now re-supplies
+  a separator when, and only when, the previous emitted character is a word character, so a
+  qualified name (`t."current_user"`) is still not split. Prior corpus cases all happened to
+  carry a space before the quote, which is why this stayed invisible; the regression corpus
+  now pins the welded forms and the qualified-name negatives.
+
 ## [0.5.0] — 2026-07-25
 
 ### Changed

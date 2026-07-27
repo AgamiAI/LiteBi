@@ -376,6 +376,55 @@ def test_red_team_quoted_dangerous_fn_bypass(sql: str) -> None:
 @pytest.mark.parametrize(
     "sql",
     [
+        # WELDED quoted identifier — no whitespace between the preceding keyword and the
+        # opening `"`. A delimited identifier is self-delimiting in SQL (the quote IS the
+        # token boundary), so these are valid statements the engine happily runs; verified
+        # on PostgreSQL 16 (`SELECT"pg_read_file"('/tmp/x')` returns the file contents).
+        # Dropping the quotes without re-supplying a separator fuses two tokens into one
+        # (`FROM"pg_class"` -> `FROMpg_class`), which destroys the `\b` anchor every
+        # deny-list pattern relies on and silently blinds the gate.
+        "SELECT\"pg_read_file\"('/etc/passwd')",
+        "SELECT*FROM\"pg_read_file\"('/etc/passwd')",
+        'SELECT"pg_sleep"(10)',
+        'SELECT"dblink"(\'host=evil\', \'select 1\')',
+        'SELECT"pg_terminate_backend"(123)',
+        'SELECT"set_config"(\'statement_timeout\', \'0\', false)',
+        'SELECT 1 FROM"pg_class"WHERE"pg_sleep"(10) IS NULL',
+        # The weld can also appear mid-statement, after a non-keyword word char.
+        'SELECT a FROM t WHERE b="pg_sleep"(1)',
+    ],
+)
+def test_red_team_welded_quoted_dangerous_fn_bypass(sql: str) -> None:
+    """A quoted identifier welded to the preceding token must not escape the gate.
+
+    Regression for the `_neutralize` weld: every pre-existing case in the corpus above
+    happens to carry a space before the `"`, so the missing separator was invisible.
+    """
+    assert check_read_only(sql) is not None, f"Welded quoted-fn bypass NOT blocked: {sql!r}"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The separator must be re-supplied ONLY where the quote was actually delimiting
+        # two word chars. A blanket space would break qualified names — `t."col"` must stay
+        # `t.col`, not become `t. col` — so these legitimate reads must still pass.
+        'SELECT t."current_user" FROM t',
+        'SELECT "order id" FROM orders',
+        'SELECT "name", "email" FROM customers',
+        'SELECT c."email" FROM customers c',
+        'SELECT "schema"."table" FROM "schema"."table"',
+        'SELECT a."b" FROM x a',
+    ],
+)
+def test_welded_fix_does_not_over_block_legitimate_quoted_identifiers(sql: str) -> None:
+    """The weld fix must not turn a qualified quoted column into a false positive."""
+    assert check_read_only(sql) is None, f"Legitimate quoted identifier wrongly blocked: {sql!r}"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
         # Block comments between keywords must not defeat `\b` word boundaries —
         # comments are stripped to SPACE, not empty.
         "SELECT 1 FROM users WHERE id IN (SELECT/**/pg_sleep(10))",
