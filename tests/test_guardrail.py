@@ -173,13 +173,58 @@ def test_policy_unknown_class_raises():
         policy(bad)
 
 
-# ── policy stubs for the data-protection / governance branches (regression pins) ─
+# ── policy: the data-protection branch masks when maskable, else fails closed ─
+# Data-protection ENFORCES in every tier (tier never downgrades it, unlike governance): the gate
+# keys on `certainty` exactly the way safety does. `provable` means the gate traced every offending
+# sensitive projection to a clean 1:1 image of a single output column, so a masker can
+# deterministically replace it → `mask`. Anything less certain (`heuristic`/`uncertain`, or an
+# unexpected value) means the raw value is buried / untraceable and cannot be safely masked, so it
+# fails closed to `reject` — mirroring safety's "uncertainty ⇒ reject".
 
 
-def test_policy_data_protection_stub_fails_closed():
-    v = _safety(cls="data_protection", rule="sensitive_projection")
-    # Stub branch: fail-closed until the data-protection gates fill mask/row_filter selection.
-    assert policy(v) == "reject"
+def _data_protection(**over) -> Verdict:
+    base = dict(
+        cls="data_protection",
+        rule="sensitive_projection",
+        severity="high",
+        certainty="provable",
+        detail="query projects raw values of sensitive column(s)",
+        remediation="aggregate, filter, or drop the sensitive column",
+    )
+    base.update(over)
+    return Verdict(**base)
+
+
+def test_policy_data_protection_maskable_masks_every_tier():
+    # A `provable` data-protection verdict is deterministically maskable → `mask`, identically in
+    # every tier (the decision does not depend on tier — data-protection always enforces).
+    v = _data_protection(certainty="provable")
+    for tier in TIERS:
+        assert policy(v, tier) == "mask"
+
+
+def test_policy_data_protection_unmaskable_rejects_every_tier():
+    # `heuristic`/`uncertain` ⇒ the sensitive value cannot be traced to one output column, so it
+    # cannot be safely masked → fail closed to `reject`, identically in every tier.
+    for certainty in ("heuristic", "uncertain"):
+        v = _data_protection(certainty=certainty)
+        for tier in TIERS:
+            assert policy(v, tier) == "reject"
+
+
+def test_policy_data_protection_fails_closed_on_edge_certainty():
+    # Fail-closed default: ONLY `provable` masks; any other/unexpected certainty rejects.
+    v = _data_protection(certainty="bogus")
+    for tier in TIERS:
+        assert policy(v, tier) == "reject"
+
+
+def test_policy_data_protection_default_tier_masks_when_maskable():
+    # Default tier is oss; a maskable data-protection verdict still masks (tier is irrelevant here).
+    assert policy(_data_protection()) == "mask"
+
+
+# ── policy stubs for the governance branch (regression pin) ──────────────────
 
 
 def test_policy_governance_stub_warns_by_default_enforces_at_enterprise():

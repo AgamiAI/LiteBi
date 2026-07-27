@@ -280,10 +280,27 @@ def _run_execute_sql(art, sql):
         capture_output=True, text=True, env={**os.environ, "AGAMI_ARTIFACTS_DIR": str(art)})
 
 
-def test_execute_sql_refuses_raw_pii_both_paths(wired_artifacts):
-    """End-to-end through execute_sql.py — the path BOTH the skill and the MCP server
-    use — a raw PII projection is refused with a structured error, not leaked."""
+def test_execute_sql_masks_raw_pii_both_paths(wired_artifacts):
+    """End-to-end through execute_sql.py — the path BOTH the skill and the MCP server use.
+
+    BEHAVIOUR CHANGE (ACE-041 slice 3, was `refuse` before this slice): a *maskable* raw-PII
+    projection (a bare `email` column) is now REDACTED, not refused — the query runs, the sensitive
+    VALUE is replaced with the token on stdout (so no raw email ever leaves the process), and a
+    `{"masked": …}` marker names the column on stderr. `full_name` (non-sensitive) is untouched. This
+    is the spec's data-protection masking, not a weakened safety gate (an untraceable projection
+    still refuses — see test_execute_sql_still_refuses_untraceable_pii)."""
     proc = _run_execute_sql(wired_artifacts, "SELECT full_name, email FROM customers LIMIT 5")
+    assert proc.returncode == 0, proc.stderr  # the query RAN (masked, not blocked)
+    assert "@example.com" not in proc.stdout  # no raw email leaked — the value was redacted
+    assert "***" in proc.stdout  # the redaction token is present in the email column
+    assert '"masked"' in proc.stderr and "customers.email" in proc.stderr  # the applied-mask marker
+    assert "Traceback" not in proc.stderr
+
+
+def test_execute_sql_still_refuses_untraceable_pii(wired_artifacts):
+    """The safety counterpart: an UNTRACEABLE sensitive projection (the value buried in a function)
+    still fails closed — masking must not weaken the refuse path."""
+    proc = _run_execute_sql(wired_artifacts, "SELECT UPPER(email) FROM customers LIMIT 5")
     assert proc.returncode == 1, proc.stderr
     assert "sensitive_columns" in proc.stderr
     assert "@example.com" not in proc.stdout  # no raw email leaked

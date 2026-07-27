@@ -197,9 +197,15 @@ def policy(verdict: Verdict, tier: Tier = "oss") -> Action:
 
     - **safety** → always ``reject``, every tier; ``certainty == 'uncertain'`` also ⇒ ``reject``
       (fail-closed on doubt). Fully implemented here.
-    - **data_protection** → ``mask`` / ``row_filter`` where the gate names one, else ``reject``
-      (fail-closed). *Stub:* the data-protection gates fill this branch in later work; until then
-      it fails closed.
+    - **data_protection** → ``mask`` when the gate proves the sensitive projection is safely
+      maskable (``certainty == 'provable'``), else ``reject`` (fail-closed). It ENFORCES in every
+      tier — unlike governance, tier never downgrades a data-protection decision — and keys on
+      ``certainty`` exactly the way safety does: ``provable`` means the gate traced every offending
+      sensitive projection to a clean 1:1 image of a single output column, so a masker can
+      deterministically replace it; anything less certain (``heuristic`` / ``uncertain``, or an
+      unexpected value) means the raw value is buried / untraceable and cannot be safely masked, so
+      it fails closed. (Which output columns to mask travels separately on the guard result, not on
+      the ``Verdict`` — ``policy`` only decides mask-vs-reject.)
     - **governance** → graded by (severity, certainty, tier): ``reject``/``rewrite`` only for a
       ``provable`` verdict under an enforcing tier, else ``warn`` (OSS warns · SaaS recommends ·
       Enterprise enforces). *Stub:* the governance gates fill this branch in later work.
@@ -208,8 +214,11 @@ def policy(verdict: Verdict, tier: Tier = "oss") -> Action:
         # Safety is absolute: reject in every tier; uncertainty is already a reject (fail-closed).
         return "reject"
     if verdict.cls == "data_protection":
-        # Stub — fill mask/row_filter selection later. Fail closed until then (the safe default).
-        return "reject"
+        # Enforces in every tier (tier is deliberately not consulted here). A `provable` verdict is
+        # the gate's proof that every offending projection is a deterministically maskable 1:1 image
+        # of one output column → `mask`. Any weaker certainty means the sensitive value cannot be
+        # safely masked, so fail closed to `reject` — mirroring safety's "uncertainty ⇒ reject".
+        return "mask" if verdict.certainty == "provable" else "reject"
     if verdict.cls == "governance":
         # Stub — the graded (severity, certainty, tier) logic is filled in later.
         if tier == "enterprise" and verdict.certainty == "provable":

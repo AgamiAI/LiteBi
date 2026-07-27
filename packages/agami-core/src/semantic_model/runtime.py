@@ -80,7 +80,7 @@ class GuardContext:
     tree: "exp.Expression | None"
     column_index: "dict[str, dict[str, Column]]"
     cardinality_index: "list[Relationship]"
-    sensitive_by_table: "tuple[dict[str, set[str]], set[str]]"
+    sensitive_by_table: "tuple[dict[str, dict[str, str]], set[str]]"
     model_table_index: "dict[str, tuple]"
 
 
@@ -424,12 +424,44 @@ class PreFlightResult:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SensitiveProjection:
+    """One offending projection of a `sensitive` column, carrying the traceability a later masking
+    slice needs. `column` is the offending reference — "table.column" when the source table is
+    pinned, or a bare "column" when it cannot be (conservative fallback). `maskable` is True iff
+    this projection is a 1:1 image of a single OUTPUT column — a bare `col`, a table-qualified
+    `t.col`, or either through a simple `AS alias` — so a masker can deterministically replace that
+    one output column; False when the sensitive value is buried in an expression / function /
+    scalar subquery, or comes from a `*` expansion, where no single output column is a clean image
+    of the raw value (fail-closed → the query must be refused, never masked). `output_index` is the
+    0-based position of this projection in its SELECT arm's projection list when `maskable`, else
+    None. Set-operation (UNION/INTERSECT/EXCEPT) arms are each walked, so one query can carry
+    several entries that share an `output_index` (one per arm)."""
+
+    column: str
+    maskable: bool
+    output_index: Optional[int] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "column": self.column,
+            "maskable": self.maskable,
+            "output_index": self.output_index,
+        }
+
+
 @dataclass
 class SensitiveCheckResult:
     action: str  # "allow" | "refuse"
     columns: list[str] = field(default_factory=list)  # offending "table.column" / "column"
     reason: str = ""
     suggestion: Optional[str] = None
+    # Per-offending-projection traceability (ACE-041): the maskable-vs-must-refuse decision and, for
+    # maskable ones, the output-column index. Latent in THIS slice (the caller still refuses on any
+    # sensitive projection); a later masking slice reads it. Deterministic order: arm order, then
+    # projection index; duplicates and multi-arm collisions on `output_index` are preserved (unlike
+    # `columns`, which is the de-duplicated sorted set the refuse message is built from).
+    projections: list["SensitiveProjection"] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -437,19 +469,27 @@ class SensitiveCheckResult:
             "columns": self.columns,
             "reason": self.reason,
             "suggestion": self.suggestion,
+            "projections": [p.as_dict() for p in self.projections],
         }
 
 
-def _sensitive_by_table(org: Datasource) -> tuple[dict[str, set[str]], set[str]]:
-    """(table name -> {sensitive column names}, union of all sensitive column names)."""
-    by_table: dict[str, set[str]] = {}
+def _sensitive_by_table(org: Datasource) -> tuple[dict[str, dict[str, str]], set[str]]:
+    """(lower(table) -> {lower(col): "DeclaredTable.DeclaredCol"}, {lower(col) for every sensitive col}).
+
+    Keys are case-FOLDED so the sensitive-name match is case-insensitive — consistent with
+    `check_table_scope` / `check_column_scope`, which already fold (unquoted identifiers fold case in
+    Postgres and friends). Before ACE-041 slice 3 this index was case-sensitive, so `SELECT "SSN"` /
+    `SELECT SSN` slipped past a lower-case declared `ssn`; folding closes that PII bypass (it
+    masks/refuses MORE). The value preserves the DECLARED spelling so an offending ref names the
+    model's column regardless of how the query happened to spell it."""
+    by_table: dict[str, dict[str, str]] = {}
     allnames: set[str] = set()
     for sa in org.subject_areas:
         for t in sa.tables_defined:
             for c in t.columns:
                 if getattr(c, "sensitive", False):
-                    by_table.setdefault(t.name, set()).add(c.name)
-                    allnames.add(c.name)
+                    by_table.setdefault(t.name.lower(), {})[c.name.lower()] = f"{t.name}.{c.name}"
+                    allnames.add(c.name.lower())
     return by_table, allnames
 
 
@@ -491,7 +531,17 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     the table-scope fix). Nested subquery / CTE SELECTs are excluded on purpose: their
     projections feed an enclosing query, not the final result, so a sensitive column a
     WHERE-subquery projects but the outer query only filters on is not exposed and must
-    not be refused."""
+    not be refused.
+
+    # ACE-041 known limitation (pre-existing, NOT introduced by ACE-041): because only these
+    # OUTPUT-bearing SELECTs are walked and the sensitive match is name-based with no alias/lineage
+    # tracking, a sensitive column RENAMED inside a derived-table / CTE body escapes both mask and
+    # refuse — the outer query projects the renamed alias, which no longer name-matches the sensitive
+    # column, and this function never descends into the body that produced it. Two leaks are pinned as
+    # xfail regressions in tests/test_ace041_masking.py (`WITH t AS (SELECT ssn AS s FROM customers)
+    # SELECT s FROM t` and `SELECT z FROM (SELECT ssn AS z FROM customers) q`); they xfail today and
+    # flip to xpass when a future alias-lineage fix lands. Closing this needs real projection lineage
+    # through subquery/CTE bodies (follow-up spec ACE-062), which is deliberately out of ACE-041's scope."""
     if isinstance(node, exp.Select):
         return [node]
     if isinstance(node, exp.SetOperation):  # base of Union / Intersect / Except
@@ -501,8 +551,88 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     return []
 
 
-def check_sensitive_projection(sql: str, org: Datasource,
-                               ctx: "GuardContext | None" = None) -> SensitiveCheckResult:
+def _sensitive_col_ref(
+    col: "exp.Column",
+    scope: dict[str, str],
+    by_table: dict[str, dict[str, str]],
+    allnames: set[str],
+) -> Optional[str]:
+    """The offending "table.column" (or bare "column") IF `col` projects a raw sensitive value,
+    else None. Matching is CASE-INSENSITIVE (ACE-041 slice 3), consistent with the table/column-scope
+    gates: a column whose folded name is sensitive and is not COUNT-protected offends; it resolves to
+    the DECLARED "table.column" when the table is pinned and that table declares the column sensitive,
+    to the folded bare name when the table is ambiguous (conservative — sensitive somewhere in scope),
+    and to None when it binds to a table that does not declare it sensitive (a same-named column on a
+    non-sensitive table)."""
+    cname = col.name.lower()
+    if cname not in allnames or _count_protects(col):
+        return None
+    tbl = _resolve_col_table(col, scope)
+    if tbl is None:
+        return cname  # ambiguous but sensitive somewhere in scope → conservative folded bare name
+    tcols = by_table.get(tbl.lower())
+    if tcols is not None and cname in tcols:
+        return tcols[cname]  # the DECLARED "table.column" ref (query casing does not leak into it)
+    return None  # same-named column on a non-sensitive table → not offending
+
+
+def _classify_projection(
+    proj: "exp.Expression",
+    index: int,
+    scope: dict[str, str],
+    direct: set[str],
+    by_table: dict[str, dict[str, str]],
+    allnames: set[str],
+    offending: set[str],
+    projections: list["SensitiveProjection"],
+) -> None:
+    """Classify ONE output projection at position `index` in its SELECT arm, appending any offending
+    sensitive column(s) to `offending` (the historical refuse set, computed byte-identically to
+    before) and one typed `SensitiveProjection` per offending column to `projections`.
+
+    Three shapes, fail-closed by default (ACE-041):
+      (a) `*` / `t.*` — expand the starred table(s)' sensitive columns (exactly as the historical
+          star branch did) and mark each MUST-REFUSE: a star's output columns can't be pinned to a
+          single deterministic index.
+      (b) a bare `col`, a table-qualified `t.col`, or either through a simple `AS alias` — a 1:1
+          image of one output column, so it is MASKABLE at `index`.
+      (c) anything else (function / arithmetic / CASE / COALESCE / scalar subquery / …) that still
+          contains a sensitive column — the raw value is buried, so MUST-REFUSE."""
+    # (a) star projection — the historical `*` / `t.*` expansion, now fail-closed to must-refuse.
+    is_star = isinstance(proj, exp.Star) or (
+        isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+    )
+    if is_star:
+        qualifier = proj.table if isinstance(proj, exp.Column) else None
+        tables = {scope.get(qualifier, qualifier)} if qualifier else direct
+        for tbl in tables:
+            tcols = by_table.get((tbl or "").lower(), {})
+            for ckey in sorted(tcols):  # folded key order → the historical sorted-by-name order
+                ref = tcols[ckey]  # DECLARED "table.column"
+                offending.add(ref)
+                projections.append(SensitiveProjection(ref, maskable=False, output_index=None))
+        return
+
+    # (b) a single column projection (optionally behind a simple `AS` alias) → maskable at `index`.
+    inner = proj.this if isinstance(proj, exp.Alias) else proj
+    if isinstance(inner, exp.Column) and not isinstance(inner.this, exp.Star):
+        ref = _sensitive_col_ref(inner, scope, by_table, allnames)
+        if ref is not None:
+            offending.add(ref)
+            projections.append(SensitiveProjection(ref, maskable=True, output_index=index))
+        return
+
+    # (c) sensitive column buried in an expression / function / scalar subquery → must-refuse.
+    for col in inner.find_all(exp.Column):
+        ref = _sensitive_col_ref(col, scope, by_table, allnames)
+        if ref is not None:
+            offending.add(ref)
+            projections.append(SensitiveProjection(ref, maskable=False, output_index=None))
+
+
+def check_sensitive_projection(
+    sql: str, org: Datasource, ctx: "GuardContext | None" = None
+) -> SensitiveCheckResult:
     """Refuse a query that PROJECTS a `sensitive` column's raw values; allow the
     column in COUNT, filters, GROUP BY, and joins. Degrades to allow when sqlglot
     is unavailable or the SQL doesn't parse (same posture as the fan/chasm pass).
@@ -527,31 +657,19 @@ def check_sensitive_projection(sql: str, org: Datasource,
     if tree is None or tree.find(exp.Select) is None:
         return SensitiveCheckResult("allow")
 
+    # Walk every OUTPUT-bearing arm's projection list, classifying each projection into the shared
+    # `offending` set (the refuse decision, unchanged) and the per-projection `projections` list
+    # (the ACE-041 maskable/index traceability a later slice consumes). Index = position in THIS
+    # arm's projection list, which is the arm's output-column index.
     offending: set[str] = set()
+    projections: list[SensitiveProjection] = []
     for sel in _output_selects(tree):
         scope = _tables_in_scope(sel)
         direct = _direct_from_tables(sel)
-        for proj in sel.expressions:
-            # (a) a raw projection of a sensitive column, not protected by COUNT
-            for col in proj.find_all(exp.Column):
-                if col.name not in allnames or _count_protects(col):
-                    continue
-                tbl = _resolve_col_table(col, scope)
-                if tbl is None:
-                    offending.add(col.name)  # ambiguous + sensitive somewhere → conservative
-                elif tbl in by_table and col.name in by_table[tbl]:
-                    offending.add(f"{tbl}.{col.name}")
-                # same-named column on a non-sensitive table → not offending
-            # (b) `*` / `t.*` that would expand a directly-FROM'd table holding sensitive cols
-            is_star = isinstance(proj, exp.Star) or (
-                isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+        for index, proj in enumerate(sel.expressions):
+            _classify_projection(
+                proj, index, scope, direct, by_table, allnames, offending, projections
             )
-            if is_star:
-                qualifier = proj.table if isinstance(proj, exp.Column) else None
-                tables = {scope.get(qualifier, qualifier)} if qualifier else direct
-                for tbl in tables:
-                    for c in sorted(by_table.get(tbl, set())):
-                        offending.add(f"{tbl}.{c}")
 
     if not offending:
         return SensitiveCheckResult("allow")
@@ -564,6 +682,7 @@ def check_sensitive_projection(sql: str, org: Datasource,
         + " — sensitive columns may be counted or filtered, not output raw.",
         suggestion="Aggregate it (e.g. COUNT(DISTINCT <col>)) for a count, or omit it and "
         "select the entity's non-sensitive key (e.g. id) instead.",
+        projections=projections,
     )
 
 

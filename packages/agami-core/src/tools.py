@@ -1090,6 +1090,23 @@ def _executor_truncated(stderr: str | None) -> bool:
     return False
 
 
+def _executor_masked(stderr: str | None) -> list[str]:
+    """The DECLARED "table.column" refs of the columns execute_sql PII-redacted (ACE-041). The
+    executor emits a non-error ``{"masked": [...]}`` line on stderr — the same metadata channel as
+    ``{"truncated": …}`` — AFTER redacting the VALUES on stdout, so the subprocess surface records the
+    same ``applied[{mask}]`` note the in-process surface does. Returns [] when nothing was masked."""
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and '"masked"' in line:
+            try:
+                masked = json.loads(line).get("masked")
+            except ValueError:
+                continue
+            if isinstance(masked, list):
+                return [str(c) for c in masked]
+    return []
+
+
 # The composition-root executor (AH-012). ``None`` (the default) means "fork the execute_sql
 # subprocess" — the byte-identical local/single-user path. A consumer injects a ``ports.Executor``
 # via ``create_app(adapters=…)`` to run execution IN-PROCESS behind the same guard (no fork, native
@@ -1117,11 +1134,16 @@ def set_injected_executor(executor: Any | None) -> None:
 def _finalize_execution(
     columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
     execution_ms: int, args: dict[str, Any], audit_id: str,
+    masked_columns: list[str] | None = None,
 ) -> str:
     """Shape a successful result (units + exact-render markdown + trust receipt) into the ok
     ``Envelope``, record it through the guardrail-audit chokepoint, and return the Envelope JSON.
     Shared by BOTH execution paths — the subprocess fork and the in-process executor — so a
-    successful query returns the identical envelope whichever ran it."""
+    successful query returns the identical envelope whichever ran it.
+
+    ``masked_columns`` (ACE-041) are the DECLARED "table.column" refs the data-protection gate
+    redacted in ``data_rows``; each is recorded as an ``applied[{mask}]`` note so the trust surface
+    reports what was masked (the redacted VALUES already ride ``data_rows``)."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
@@ -1148,8 +1170,10 @@ def _finalize_execution(
         # (offer to approve/correct via the save_correction tool).
         "receipt": _resolve_receipt(profile, sql),
     }
-    # A bounded (transfer-capped) result is a valid answer that is flagged, not a refusal.
+    # A bounded (transfer-capped) result is a valid answer that is flagged, not a refusal. PII
+    # redaction is likewise a valid, flagged answer: one `{mask: "table.col"}` per redacted column.
     applied = [{"row_cap": len(data_rows)}] if truncated else []
+    applied += [{"mask": col} for col in (masked_columns or [])]
 
     # Log the execution through the single chokepoint: the DB sink when AGAMI_DB_URL is set (one
     # query_executions row), else the local jsonl the skills use. Best-effort either way.
@@ -1173,16 +1197,21 @@ def _finalize_execution(
 
 def _run_in_process(
     sql: str, profile: str, area: str | None, max_rows: int | None, executor: Any
-) -> tuple[list, list, bool] | tuple[Refusal, str | None]:
+) -> tuple[list, list, bool, list] | tuple[Refusal, str | None]:
     """Run through the in-process executor behind the shared guarded envelope (no subprocess, no CSV
-    round-trip). Returns ``(columns, data_rows, truncated)`` on success, or ``(Refusal, error_detail)``
-    on a guard refusal / execution failure — the SAME refusal the subprocess path produces.
+    round-trip). Returns ``(columns, data_rows, truncated, masked_columns)`` on success, or
+    ``(Refusal, error_detail)`` on a guard refusal / execution failure — the SAME refusal the
+    subprocess path produces.
 
     A guard refusal (read-only / recon / model-safety) carries its own clean typed ``Refusal`` and no
     ``error_detail``. An execution/config failure (``ExecutorError``) is classified into a VALUE-FREE
     ``Refusal`` via ``_classify_db_error`` — mirroring the subprocess ``_refusal_from_stderr`` — with
     the raw driver text returned SEPARATELY as ``error_detail`` for the server-side audit trail only,
     never in the refusal reason (which would leak schema / column / value names, or a DSN).
+
+    ``masked_columns`` (ACE-041) rides on the guarded ``ExecResult``: ``execute_guarded`` has already
+    redacted the sensitive values in ``result.rows``, so the rows textualized below are the redacted
+    ones; the refs travel through so the Envelope records ``applied[{mask}]``.
 
     Rows are textualized to match the subprocess CSV wire (``None`` → ``""``, else ``str``) so the
     two paths return observably identical JSON. Native-typed rows are a deliberately deferred decision
@@ -1218,10 +1247,11 @@ def _run_in_process(
     columns = list(result.columns)
     data_rows = [["" if v is None else str(v) for v in row] for row in result.rows]
     truncated = result.truncated
+    masked_columns = list(result.masked_columns)
     if max_rows is not None and len(data_rows) > max_rows:  # backstop, matches the subprocess branch
         data_rows = data_rows[:max_rows]
         truncated = True
-    return columns, data_rows, truncated
+    return columns, data_rows, truncated, masked_columns
 
 
 def _refusal_from_stderr(stderr: str | None, returncode: int) -> tuple[Refusal, str | None]:
@@ -1364,10 +1394,11 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
                 execution_ms=execution_ms,
                 error_detail=error_detail,
             )
-        columns, data_rows, truncated = outcome
+        columns, data_rows, truncated, masked_columns = outcome
         return _finalize_execution(
             columns, data_rows, truncated,
             profile=profile, sql=sql, execution_ms=execution_ms, args=args, audit_id=audit_id,
+            masked_columns=masked_columns,
         )
 
     # The model safety pass (fan/chasm pre-flight + default_filters) runs inside
@@ -1419,10 +1450,14 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     if max_rows is not None and len(data_rows) > max_rows:
         data_rows = data_rows[:max_rows]
         truncated = True
+    # The redacted VALUES are already in `data_rows` (the executor masked result.rows before emitting
+    # the CSV); this reads the `{"masked": …}` marker so the Envelope records the applied[{mask}] note.
+    masked_columns = _executor_masked(proc.stderr)
 
     return _finalize_execution(
         columns, data_rows, truncated,
         profile=profile, sql=sql, execution_ms=execution_ms, args=args, audit_id=audit_id,
+        masked_columns=masked_columns,
     )
 
 
