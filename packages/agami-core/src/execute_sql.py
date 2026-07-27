@@ -1096,6 +1096,20 @@ def _hosted() -> bool:
     return bool(os.environ.get("AGAMI_DB_URL") or os.environ.get("APP_DATABASE_URL"))
 
 
+def _guard_org_id() -> str:
+    """The org the guard-model DB load must scope to — mirrors ``tools._load_org`` (which passes
+    ``org_id=_current_org_id()``). Without it, ``model_store.load_datasource`` defaults to
+    ``DEFAULT_ORG`` ('local'), so a model seeded under a real minted org (a hosted, DB-only deploy with
+    no baked ``/artifacts``) is invisible to the guard → a false ``model_unavailable`` refusal on every
+    query. Lazy import + ``AGAMI_ORG_ID`` fallback so the stdlib-lean subprocess mirror still resolves."""
+    try:
+        from tools import _current_org_id  # mirror the serve path's org scoping
+
+        return _current_org_id()
+    except Exception:
+        return os.environ.get("AGAMI_ORG_ID", "").strip() or "local"
+
+
 def _resolve_guard_model(profile: str):
     """Resolve the semantic model for the safety pass, mirroring `tools._load_org` (ACE-051): from
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
@@ -1118,7 +1132,7 @@ def _resolve_guard_model(profile: str):
             store = Store.from_env()
             if store is not None:
                 try:
-                    org = _load_db(store, profile)
+                    org = _load_db(store, profile, org_id=_guard_org_id())
                 finally:
                     try:
                         store.close()
