@@ -36,8 +36,12 @@ repos:
     hooks:
       - id: conflict-markers
         name: no merge-conflict markers
-        entry: python3 dev/check_conflict_markers.py
-        language: system
+        entry: dev/check_conflict_markers.py
+        # `language: script` runs the file via its shebang and lets pre-commit resolve the
+        # interpreter per-platform. Neither bare name is portable: `python3` is absent on
+        # Windows (the official installer ships `python.exe` + the `py` launcher), and
+        # `python` is absent on Debian/Ubuntu without `python-is-python3`.
+        language: script
         always_run: true
         pass_filenames: false
 

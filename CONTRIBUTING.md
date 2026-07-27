@@ -40,7 +40,7 @@ tiny cross-platform task runner (`dev.py`) wraps it all:
 
 ```bash
 uv run dev.py setup     # once: wire the pre-commit hooks (ruff + gitleaks on commit, tests on push)
-uv run dev.py check     # the whole gate locally — ruff + tests + gitleaks (same as CI)
+uv run dev.py check     # the whole gate locally — ruff + tests + gitleaks + conflict markers (same as CI)
 uv run dev.py cover     # did the lines I changed get tested? (patch coverage)
 ```
 
