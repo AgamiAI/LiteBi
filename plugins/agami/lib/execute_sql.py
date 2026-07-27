@@ -42,6 +42,7 @@ import argparse
 import configparser
 import csv
 import json
+import logging
 import os
 import stat
 import sys
@@ -1104,11 +1105,11 @@ def _resolve_guard_model(profile: str):
     from a stdlib-lean mirror that does not ship `store`/`model_store`, so we only reach for them when
     a DB is set; and the loader import sits inside the disk-path try so an import failure degrades to
     None (hosted then fails closed) rather than crashing the executor."""
-    # Any load failure below degrades to the next source (DB → disk → None), silently: a freeform
-    # error line here would (a) leak DB connection details from the exception and (b) precede the
-    # JSON refusal `_model_safety` emits when both sources are absent on hosted, breaking the
-    # single-JSON-object contract callers parse. The observable signal is the fail-closed refusal
-    # itself, not a diagnostic line.
+    # Any load failure below degrades to the next source (DB → disk → None), and each is LOGGED (via
+    # `logging` → stderr, never stdout, so the single-JSON-object stdout contract callers parse stays
+    # intact) with the exception TYPE only — never str(exc), which could leak a DSN. This makes a real
+    # resolution bug observable: a lost import once made EVERY disk model fail to load and silently
+    # disabled the model-safety guards, indistinguishable from a legitimate "no model yet".
     if _hosted():
         try:
             from model_store import load_datasource as _load_db
@@ -1125,8 +1126,13 @@ def _resolve_guard_model(profile: str):
                         pass  # a close error must not discard a model that loaded fine (→ false refusal)
                 if org is not None:
                     return org
-        except Exception:
-            pass  # DB unreachable/misconfigured -> fall through to disk
+        except Exception as exc:
+            # DB unreachable/misconfigured -> fall through to disk (type only; str(exc) may carry a DSN).
+            logging.getLogger(__name__).warning(
+                "DB-backed model load failed for profile %r (%s); falling through to disk",
+                profile,
+                type(exc).__name__,
+            )
 
     root = Path(os.environ.get("AGAMI_ARTIFACTS_DIR") or (Path.home() / "agami-artifacts")) / profile
     if (root / "datasource.yaml").exists():
@@ -1134,8 +1140,11 @@ def _resolve_guard_model(profile: str):
             from semantic_model import loader as L
 
             return L.load_datasource(root)
-        except Exception:
-            pass  # unparseable/absent on disk, or loader import failure -> None (hosted fails closed)
+        except Exception as exc:
+            # unparseable/absent on disk, or a loader import/bug -> None (hosted then fails closed).
+            logging.getLogger(__name__).warning(
+                "disk model at %s failed to load (%s); treating as no model", root, type(exc).__name__
+            )
     return None
 
 
