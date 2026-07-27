@@ -462,6 +462,13 @@ class SensitiveCheckResult:
     # projection index; duplicates and multi-arm collisions on `output_index` are preserved (unlike
     # `columns`, which is the de-duplicated sorted set the refuse message is built from).
     projections: list["SensitiveProjection"] = field(default_factory=list)
+    # Whether the WHOLE output was resolvable, not just whether each FOUND projection was
+    # maskable (ACE-041 review). `projections` can only describe what the detector saw; this
+    # says whether it could have seen everything. False when an output-bearing arm draws
+    # through a derived table / CTE, or projects a column whose qualifier does not resolve —
+    # i.e. exactly where the name-based match is blind. Masking a partially-understood output
+    # is worse than refusing it: the caller gets a `***` that certifies the other columns.
+    output_provable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -470,6 +477,7 @@ class SensitiveCheckResult:
             "reason": self.reason,
             "suggestion": self.suggestion,
             "projections": [p.as_dict() for p in self.projections],
+            "output_provable": self.output_provable,
         }
 
 
@@ -519,6 +527,44 @@ def _direct_from_tables(tree: "exp.Select") -> set[str]:
         if anc is tree:
             names.add(tbl.name)
     return names
+
+
+def _output_lineage_provable(tree: "exp.Expression") -> bool:
+    """Could the sensitive-projection detector have seen EVERY value reaching the output?
+
+    The detector matches sensitive columns by name against the tables in scope. That is
+    sound only while every output value traces back to a declared table it can name. Two
+    things break the trace, and both are common:
+
+      * a derived table or CTE — `_output_selects` deliberately does not descend into their
+        bodies, so `(SELECT ssn FROM customers) t` presents an opaque `t` whose columns the
+        detector cannot attribute (and a rename inside makes even the name useless);
+      * a qualifier that does not resolve — `FROM customers C` puts `C` in scope while the
+        query says `c.ssn`, so the lookup misses and the column reads as un-sensitive.
+
+    Returning False here does NOT refuse the query. It only withholds the *proof* that the
+    output is fully understood, which downgrades a mask decision to a refusal. That
+    distinction matters: this runs only after an offending projection has already been
+    found, so an unrelated query using a CTE is untouched — see the caller.
+    """
+    if tree.find(exp.CTE) is not None:
+        return False  # a CTE body is not walked, so its output columns cannot be attributed
+    for sel in _output_selects(tree):
+        if sel.find(exp.Subquery) is not None:
+            return False  # derived table (or a scalar subquery in the projection): same blindness
+        scope = _tables_in_scope(sel)
+        # Case-fold the scope keys: SQL identifiers are case-insensitive unless quoted, so
+        # `FROM customers C` + `c.ssn` is one table, and a case-sensitive miss would silently
+        # read as "not a sensitive column" rather than "could not resolve".
+        lowered = {alias.lower() for alias in scope}
+        for proj in sel.expressions:
+            for col in proj.find_all(exp.Column):
+                if col.table:
+                    if col.table.lower() not in lowered:
+                        return False  # qualifier names nothing in scope
+                elif len(scope) != 1:
+                    return False  # bare column, ambiguous across several tables
+    return True
 
 
 def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
@@ -683,6 +729,7 @@ def check_sensitive_projection(
         suggestion="Aggregate it (e.g. COUNT(DISTINCT <col>)) for a count, or omit it and "
         "select the entity's non-sensitive key (e.g. id) instead.",
         projections=projections,
+        output_provable=_output_lineage_provable(tree),
     )
 
 
@@ -1691,7 +1738,19 @@ def _tables_referenced_outside_from(tree: "exp.Select", scope: dict[str, str]) -
 
 def _resolve_col_table(col: "exp.Column", scope: dict[str, str]) -> Optional[str]:
     if col.table:
-        return scope.get(col.table, col.table)
+        if col.table in scope:
+            return scope[col.table]
+        # SQL identifiers are case-insensitive unless quoted, so `FROM customers C` and `c.ssn`
+        # name the same table. A case-sensitive miss does not read as "unresolved" downstream —
+        # it falls through to the raw qualifier, which the sensitive gate then fails to match
+        # against its table index and treats as NOT sensitive. `4bd39bb` folded the COLUMN name
+        # for exactly this reason; the alias lookup is the other half of that fix. Exact match
+        # still wins, so a genuinely distinct quoted identifier is unaffected.
+        folded = col.table.lower()
+        for alias, name in scope.items():
+            if alias.lower() == folded:
+                return name
+        return col.table
     # unqualified column: ambiguous; only safe to attribute if single table
     if len(scope) == 1:
         return next(iter(scope.values()))

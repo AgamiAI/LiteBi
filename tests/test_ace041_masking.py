@@ -457,10 +457,102 @@ def test_mask_note_helper_is_accurate_and_deterministic():
 
 
 # ---------------------------------------------------------------------------
+# CO-PROJECTION FAIL-CLOSED — the mask verdict must be a WHOLE-OUTPUT proof.
+#
+# `all_maskable` quantifies over the projections the DETECTOR FOUND, which proves "every
+# offending projection we saw is maskable" — not "no sensitive value reaches the output".
+# Under the old refuse-only behaviour a detector miss leaked only when NOTHING was detected,
+# because anything detected blocked the whole query. Once a detected-and-maskable projection
+# started letting the query RUN, one seen column began unblocking the entire result set — so
+# every co-projected value the name-based detector missed came back raw, next to a `***` that
+# makes it look like masking worked.
+#
+# These are the co-projection forms of the alias-lineage gap below. The standalone forms are
+# genuinely pre-existing; these are NOT — each returned a raw SSN only after the refuse->mask
+# flip. Refusing is the correct outcome: when the output cannot be proven clean, fail closed.
+# ---------------------------------------------------------------------------
+
+_CO_PROJECTION_LEAK = [
+    # a detected `ssn` beside the same column laundered through a derived table
+    "SELECT ssn, t.ssn FROM customers, (SELECT ssn FROM customers) t",
+    # ...through a CTE with a rename
+    "WITH q AS (SELECT ssn AS z FROM customers) SELECT c.ssn, q.z FROM customers c, q",
+]
+
+
+@pytest.mark.parametrize("sql", _CO_PROJECTION_LEAK)
+def test_co_projected_unprovable_output_is_refused_not_partially_masked(guarded, sql):
+    """A raw sensitive value must never ride along beside a masked one.
+
+    Each of these ran and returned `('***', '111-22-3333')` before the whole-output proof:
+    one column redacted, its twin in the clear.
+    """
+    spy = _SpyExecutor(_R(["ssn", "ssn_2"], [("111-22-3333", "111-22-3333")]))
+    with pytest.raises(execute_sql.GuardRefused) as ei:
+        guarded(sql, spy)
+    assert ei.value.refusal.kind == "sensitive_columns"
+    assert not spy.calls, "an unprovable output must be refused BEFORE the executor runs"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT ssn FROM customers",
+        "SELECT c.ssn FROM customers c",
+        'SELECT "SSN" FROM customers',
+        "SELECT name, ssn FROM customers",
+        "SELECT ssn FROM customers UNION ALL SELECT ssn FROM customers",
+        # Case-mismatched alias: `FROM customers C` + `c.ssn`. `4bd39bb` folded the COLUMN
+        # name; the table ALIAS lookup was the other half. Once it resolves, this is an
+        # ordinary provable projection — so it MASKS rather than refusing, which is strictly
+        # better than the fail-closed outcome and better still than the raw value it returned.
+        "SELECT ssn, c.ssn FROM customers C",
+        "SELECT C.ssn FROM customers c",
+    ],
+)
+def test_provable_output_still_masks(guarded, sql):
+    """The whole-output proof must not collapse ACE-041 back into refuse-everything.
+
+    Every projection here resolves to a declared table, so the output IS provable and the
+    feature works as specified: the query runs and the sensitive column is redacted.
+    """
+    # Every cell carries the raw value, so whichever index the plan targets, a successful mask
+    # is observable without the fixture having to mirror each query's projection order.
+    spy = _SpyExecutor(_R(["a", "b"], [("111-22-3333", "111-22-3333")]))
+    result = guarded(sql, spy)
+    assert spy.calls, f"a provable maskable projection must still RUN: {sql!r}"
+    assert result.masked_columns, f"a provable projection must be MASKED, not passed through: {sql!r}"
+    assert execute_sql.REDACTION_TOKEN in [v for row in result.rows for v in row]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT COUNT(ssn) FROM customers",
+        "SELECT COUNT(*) FROM customers WHERE ssn IS NOT NULL",
+        "SELECT COUNT(*) FROM customers c, (SELECT id FROM orders) o WHERE c.ssn IS NOT NULL",
+    ],
+)
+def test_no_over_refusal_when_nothing_sensitive_is_projected(guarded, sql):
+    """Aggregate/filter use of a sensitive column stays allowed, derived table or not.
+
+    The proof runs ONLY once an offending projection has been detected, so a query that
+    merely counts or filters on a sensitive column never reaches it — including one with a
+    derived table in the FROM, which the proof would otherwise judge unprovable.
+    """
+    spy = _SpyExecutor(_R(["n"], [(3,)]))
+    result = guarded(sql, spy)
+    assert spy.calls, f"aggregate/filter use must not be refused: {sql!r}"
+    assert result.rows == [(3,)]
+
+
+# ---------------------------------------------------------------------------
 # KNOWN LIMITATION (ACE-041 review, finding 2): a sensitive column RENAMED inside a derived-table /
 # CTE body escapes both mask and refuse, because `_output_selects` excludes subquery/CTE bodies and
 # the sensitive match is name-based with no alias/lineage tracking. This is PRE-EXISTING (not
-# introduced by ACE-041). These xfail tests assert the DESIRED secure behaviour (the outer projection
+# introduced by ACE-041) in its STANDALONE form — nothing sensitive is detected at all, so the
+# whole-output proof above never engages. (Its CO-PROJECTION form was new, and is closed above.)
+# These xfail tests assert the DESIRED secure behaviour (the outer projection
 # is masked OR refused); they xfail today and will flip to xpass when a future alias-lineage fix
 # lands — that flip is the tracking signal. Do NOT "fix" them by weakening the assertion. See the
 # `# ACE-041 known limitation` comment in semantic_model/runtime.py::_output_selects.

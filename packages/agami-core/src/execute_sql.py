@@ -1296,14 +1296,23 @@ def _model_safety(
     mask_plan: MaskPlan | None = None
     sens = RT.check_sensitive_projection(sql, org, ctx=ctx)
     if sens.action == "refuse":
+        # Two conditions, and BOTH are required. `all_maskable` quantifies over the projections
+        # the detector FOUND, so on its own it proves only "every offending projection we saw is
+        # maskable" — never "no sensitive value reaches the output". Under the earlier refuse-only
+        # behaviour that gap leaked only when nothing was detected (anything detected blocked the
+        # whole query); once a maskable projection let the query RUN, one seen column unblocked the
+        # entire result set and every co-projected value the name-based detector missed came back
+        # raw — beside a `***` implying the row had been protected. `output_provable` is the
+        # missing half: the detector could see the whole output, not just part of it.
         all_maskable = bool(sens.projections) and all(
             p.maskable and p.output_index is not None for p in sens.projections
         )
+        provable = all_maskable and sens.output_provable
         verdict = Verdict(
             cls="data_protection",
             rule="sensitive_projection",
             severity="high",
-            certainty="provable" if all_maskable else "uncertain",
+            certainty="provable" if provable else "uncertain",
             detail=sens.reason,
             remediation=sens.suggestion or "",
         )
