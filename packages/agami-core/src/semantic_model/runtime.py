@@ -1149,15 +1149,25 @@ def check_column_scope(
 # ---------------------------------------------------------------------------
 
 
-def _unscopable(detail: str) -> Verdict:
+def _unscopable(detail: str, remediation: "str | None" = None) -> Verdict:
     return safety_verdict(
         "unscopable_sql",
         "the query can't be scoped to the declared object surface: "
         + detail
         + " — only queries whose FROM/JOIN sources resolve to declared tables may run.",
-        "Query only declared tables (no table-functions, VALUES, UNNEST, or LATERAL "
+        remediation
+        or "Query only declared tables (no table-functions, VALUES, UNNEST, or LATERAL "
         "sources); add a source to the model if it should be queryable.",
     )
+
+
+# A statement that did not parse is regenerable: the caller can re-emit it and try again, so
+# the remediation names that move rather than the declared-source advice above, which would
+# describe a problem this statement does not have.
+_REEMIT_REMEDIATION = (
+    "Re-emit the query using the declared table and column names, unquoted or quoted the way "
+    "this datasource's engine quotes identifiers."
+)
 
 
 def check_scopable(
@@ -1190,7 +1200,7 @@ def check_scopable(
     if tree is None:
         # Prefer the specific reason over the generic one, so the caller can tell the
         # operator-actionable case apart from the one the query itself can fix.
-        return _unscopable(why_not or "the query did not parse")
+        return _unscopable(why_not or "the query did not parse", _REEMIT_REMEDIATION)
     if tree.find(exp.Select) is None:
         return _unscopable("the query has no SELECT to scope")
     # Table-functions and `ROWS FROM` parse to an `exp.Table` with an EMPTY name (the
@@ -1215,6 +1225,16 @@ def check_scopable(
                 return _unscopable(
                     f"a FROM/JOIN source is a {type(src).__name__.upper()}, not a table"
                 )
+    # Dialect-independent backstop. A statement that reads from something, yet parses to no
+    # named table at all, cannot be attributed to the declared surface — and that is exactly
+    # the shape a mis-read produces. Catching it here means a quoting style nobody has mapped
+    # yet fails closed on its own, without the dialect map having to be complete first. A
+    # statement with no FROM (`SELECT 1`) reads nothing and is left alone.
+    if tree.find(exp.From) is not None and tree.find(exp.Table) is None:
+        return _unscopable(
+            "the query reads from a source that resolves to no named table",
+            _REEMIT_REMEDIATION,
+        )
     return None
 
 

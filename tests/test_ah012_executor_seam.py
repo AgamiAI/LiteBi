@@ -426,6 +426,7 @@ def test_injected_executor_real_pii_gate_masks_a_maskable_projection(monkeypatch
     org = m.Datasource(
         datasource="o",
         version=1,
+        storage_connections=[m.StorageConnection(name="c", storage_type="SQLite")],
         subject_areas=[
             m.SubjectArea(
                 name="area",
@@ -469,6 +470,7 @@ def test_injected_executor_real_pii_gate_refuses_an_untraceable_projection(monke
     org = m.Datasource(
         datasource="o",
         version=1,
+        storage_connections=[m.StorageConnection(name="c", storage_type="SQLite")],
         subject_areas=[
             m.SubjectArea(
                 name="area",

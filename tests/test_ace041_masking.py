@@ -62,7 +62,11 @@ def _org() -> "m.Datasource":
         columns=[m.Column(name="id", type="integer"), m.Column(name="ssn", type="string")],
     )
     sa = m.SubjectArea(name="area", description="d", tables_defined=[customers, orders, x])
-    return m.Datasource(datasource="AcmeCorp", version=1, subject_areas=[sa])
+    return m.Datasource(
+        datasource="AcmeCorp", version=1,
+        storage_connections=[m.StorageConnection(name="c", storage_type="SQLite")],
+        subject_areas=[sa],
+    )
 
 
 class _SpyExecutor:

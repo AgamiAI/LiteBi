@@ -50,6 +50,10 @@ def build_org():
     return m.Datasource(
         datasource="Shop",
         version=1,
+        # The corpus executes against SQLite (see `seed_sqlite`), and the declared engine is
+        # what the guards parse every statement in — so it must name the engine that actually
+        # runs the SQL, not a placeholder.
+        storage_connections=[m.StorageConnection(name="c", storage_type="SQLite")],
         subject_areas=[
             m.SubjectArea(name="sales", tables_defined=[_table(n, s) for n, s in SCHEMA.items()])
         ],
@@ -63,7 +67,12 @@ def write_disk_model(root: Path) -> None:
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True, exist_ok=True)
     (root / "datasource.yaml").write_text(
         yaml.safe_dump(
-            {"datasource": "Shop", "version": 1, "subject_areas": ["subject_areas/sales"]}
+            {
+                "datasource": "Shop",
+                "version": 1,
+                "storage_connections": [{"name": "c", "storage_type": "SQLite"}],
+                "subject_areas": ["subject_areas/sales"],
+            }
         )
     )
     (root / "subject_areas" / "sales" / "subject_area.yaml").write_text(

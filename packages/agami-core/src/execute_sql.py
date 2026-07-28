@@ -1229,6 +1229,23 @@ def _model_safety(
     # returns the same verdict as one that builds its own.
     ctx = RT.build_guard_context(sql, org)
 
+    # Ungovernable-engine gate — if the datasource does not determine which engine its SQL
+    # runs on, there is no grammar to read the statement in, so no gate below can reach a
+    # trustworthy verdict and the statement is refused rather than run blind. This is
+    # deliberately ahead of, and not subject to, the unscopable posture switch: the posture
+    # is a staged-rollout hatch for queries that cannot be scoped, whereas a datasource that
+    # cannot be parsed at all is a configuration fault the operator must fix. Refusing here
+    # also keeps the guarantee independent of which gate would otherwise have run.
+    if ctx is not None and ctx.dialect is None and ctx.parse_error:
+        return sql, Refusal(
+            "unscopable_sql",
+            ctx.parse_error,
+            # No rewrite of the query helps, so this must not invite a retry — it names the
+            # one change that makes the datasource governable.
+            "Declare the datasource's engine (storage_connections[].storage_type) so its SQL "
+            "can be parsed for the right engine, then retry.",
+        ), None
+
     # Scopability gate — refuse a query that can't be fully scoped (unparseable, or a non-`Table`
     # FROM/JOIN source the scope walk can't reject) rather than run it blind. Runs
     # BEFORE the object-scope gates so an unscopable query fails closed instead of reaching their
