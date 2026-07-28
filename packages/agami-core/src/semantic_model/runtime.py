@@ -31,6 +31,7 @@ Generic CTE synthesis is the planner follow-on (plan: "fan-trap detector v1.5+")
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional
@@ -668,7 +669,7 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
 
 def _sensitive_col_ref(
     col: "exp.Column",
-    scope: dict[str, str],
+    scope: Mapping[str, Optional[str]],
     by_table: dict[str, dict[str, str]],
     allnames: set[str],
 ) -> Optional[str]:
@@ -694,7 +695,7 @@ def _sensitive_col_ref(
 def _classify_projection(
     proj: "exp.Expression",
     index: int,
-    scope: dict[str, str],
+    scope: Mapping[str, Optional[str]],
     direct: set[str],
     by_table: dict[str, dict[str, str]],
     allnames: set[str],
@@ -1808,7 +1809,13 @@ def _tables_referenced_outside_from(tree: "exp.Select", scope: dict[str, str]) -
     return referenced
 
 
-def _resolve_col_table(col: "exp.Column", scope: dict[str, str]) -> Optional[str]:
+def _resolve_col_table(col: "exp.Column", scope: Mapping[str, Optional[str]]) -> Optional[str]:
+    """The table `col` binds to, or None when that cannot be decided.
+
+    `scope` values are Optional because the sensitive gate passes `_sensitive_scope`, which maps a
+    SHADOWED alias (one bound to two different tables) to None on purpose. `Mapping` rather than
+    `dict` so the fan/chasm and aggregation callers can keep passing a plain `dict[str, str]` — a
+    Mapping's value type is covariant, a dict's is not."""
     if col.table:
         # SQL identifiers are case-insensitive unless quoted, so `FROM customers C` and `c.ssn`
         # name the same table. A case-sensitive miss does not read as "unresolved" downstream —

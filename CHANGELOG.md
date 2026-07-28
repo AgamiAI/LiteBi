@@ -14,8 +14,8 @@ below corresponds to one such version.
 
 ### Security
 
-- **Required a whole-output proof before masking a sensitive projection, instead of
-  refusing.** The mask decision quantified over the projections the detector *found*
+- **Gated PII masking on a whole-output proof; an output that cannot be proven clean is
+  now refused.** The mask decision quantified over the projections the detector *found*
   (`all_maskable`), which proves "every offending projection we saw is maskable" but never
   "no sensitive value reaches the output". While any detected projection refused the whole
   query that gap was harmless; once a maskable projection let the query **run**, one seen
