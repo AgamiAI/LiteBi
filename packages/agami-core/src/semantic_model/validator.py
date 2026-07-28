@@ -400,7 +400,12 @@ def _datasource_columns(model: Datasource) -> set[str]:
 def _bridge_matches_key(bridge: CrossDatasourceRelationship, reconcile_on: list[str]) -> bool:
     """True if ``bridge`` reconciles on the metric's key — its ``from_columns`` OR ``to_columns`` set
     equals ``reconcile_on``. Set equality (not order) so a composite key declared in any order matches;
-    either half, because the two endpoints may name the shared key with different local columns."""
+    either half, because the two endpoints may name the shared key with different local columns.
+
+    Known limitation: ``reconcile_on`` must match one endpoint's column list VERBATIM. A bridge that
+    names the shared key differently on BOTH sides (from_columns != to_columns != reconcile_on) won't
+    match — fine for the same-named-key case this targets; a rename on both sides needs an explicit
+    reconcile_on matching one side."""
     key = set(reconcile_on)
     return key == set(bridge.from_columns) or key == set(bridge.to_columns)
 
@@ -464,41 +469,68 @@ def _check_metric_bridged(
     bridges: list[CrossDatasourceRelationship],
     res: ValidationResult,
 ) -> None:
-    """Fail-closed bridge rule: EVERY sub-measure datasource must appear in at least one declared
-    bridge, on the reconcile key, together with another of this metric's datasources — so no datasource
-    is left unbridged. (For the 2-datasource case this is exactly one matching bridge between them.)"""
-    sources = set(metric.source_datasources)
-    bridged: set[str] = set()
+    """Fail-closed bridge rule: the metric's datasources must form ONE connected component under the
+    matching bridges — so every piece can be reconciled onto the shared key with every other. A mere
+    degree>=1 test isn't enough: a PARTITIONED bridge set (A-B and C-D over {A,B,C,D}) leaves each
+    datasource bridged yet the whole splits into two islands that can't line up on one key. So build a
+    graph over ``source_datasources`` whose edges are the matching bridges between two of them, then
+    require a single component. (For the 2-datasource case this is exactly one matching bridge.)"""
+    sources = metric.source_datasources
+    if len(sources) < 2:
+        return  # single-source is a distinct finding (_check_metric); nothing to connect
+    # Edges: a matching bridge whose BOTH endpoints are datasources of this metric links that pair.
+    adj: dict[str, set[str]] = {ds: set() for ds in sources}
+    source_set = set(sources)
     for b in bridges:
         if not _bridge_matches_key(b, metric.reconcile_on):
             continue
         endpoints = {b.from_datasource, b.to_datasource}
-        # both endpoints must be distinct datasources of THIS metric for the bridge to link a pair.
-        if len(endpoints & sources) == 2:
-            bridged |= endpoints & sources
-    unbridged = sorted(sources - bridged)
-    if unbridged:
+        if len(endpoints & source_set) == 2 and b.from_datasource != b.to_datasource:
+            adj[b.from_datasource].add(b.to_datasource)
+            adj[b.to_datasource].add(b.from_datasource)
+    # BFS from the first datasource; anything unreached is in a disconnected island (or unbridged).
+    reached: set[str] = set()
+    queue = [sources[0]]
+    while queue:
+        node = queue.pop()
+        if node in reached:
+            continue
+        reached.add(node)
+        queue.extend(adj[node] - reached)
+    disconnected = sorted(source_set - reached)
+    if disconnected:
         res.error(
             "cross_datasource_metric_no_bridge",
-            f"cross-datasource metric {metric.name!r}: datasource(s) {unbridged} are not linked by a "
-            f"declared cross-datasource bridge on reconcile_on={metric.reconcile_on} to another of the "
-            "metric's datasources — declare the bridge(s) before the metric can be reconciled",
+            f"cross-datasource metric {metric.name!r}: datasource(s) {disconnected} are not connected to "
+            f"the rest by a declared cross-datasource bridge on reconcile_on={metric.reconcile_on} — the "
+            "metric's datasources must form ONE bridged component to reconcile onto the shared key",
         )
 
 
 def _check_metric_combine(metric: CrossDatasourceMetric, res: ValidationResult) -> None:
-    """The ``combine`` formula may only reference declared sub-measure aliases via ``{alias}``
-    placeholders — reuse ``derived.py``'s extractor (the same mechanism the derived-metric check uses),
-    so this is a pure static check with no SQL executed."""
+    """The ``combine`` formula must reference EXACTLY the declared sub-measure aliases via ``{alias}``
+    placeholders — the set of placeholders must EQUAL the set of aliases. Reuse ``derived.py``'s
+    extractor (the same mechanism the derived-metric check uses), so this is a pure static check with
+    no SQL executed. Two ways to fail: an UNKNOWN alias (a placeholder naming no piece — a typo), or an
+    UNUSED piece (a declared sub-measure the formula never references — a piece computed for nothing).
+    Constants and repeated references are fine; it's set equality, not a count."""
     from . import derived as D
 
     aliases = {sm.alias for sm in metric.sub_measures}
-    unknown = sorted(set(D.binding_refs(metric.combine)) - aliases)
+    refs = set(D.binding_refs(metric.combine))
+    unknown = sorted(refs - aliases)
     if unknown:
         res.error(
             "cross_datasource_metric_bad_combine",
             f"cross-datasource metric {metric.name!r}: combine references {unknown} which are not "
             f"sub_measure aliases {sorted(aliases)}",
+        )
+    unused = sorted(aliases - refs)
+    if unused:
+        res.error(
+            "cross_datasource_metric_bad_combine",
+            f"cross-datasource metric {metric.name!r}: sub_measure alias(es) {unused} are declared but "
+            f"never referenced by combine {metric.combine!r} — every piece must appear in the formula",
         )
 
 

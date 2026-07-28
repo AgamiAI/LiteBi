@@ -792,6 +792,28 @@ class CrossDatasourceMetric(_Base):
             raise ValueError(
                 f"cross-datasource metric {self.name!r}: reconcile_on (the shared key) must be non-empty"
             )
+        # `combine` is the formula that stitches the pieces together — a blank one is a metric that
+        # combines nothing. (str_strip_whitespace turns "  " into "".) Same non-empty rule as
+        # Metric.calculation, but on the composition rather than the prose.
+        if not self.combine:
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: combine (the formula over the pieces) "
+                "must be non-empty"
+            )
+        # Each piece groups by its LOCAL version of the composite key, so its grain must be non-empty
+        # and carry exactly one column per reconcile_on component — a 2-part key needs a 2-column grain.
+        for sm in self.sub_measures:
+            if not sm.grain:
+                raise ValueError(
+                    f"cross-datasource metric {self.name!r}: sub_measure {sm.alias!r} has an empty grain "
+                    "— each piece must group by its local key column(s)"
+                )
+            if len(sm.grain) != len(self.reconcile_on):
+                raise ValueError(
+                    f"cross-datasource metric {self.name!r}: sub_measure {sm.alias!r} grain {sm.grain} "
+                    f"has {len(sm.grain)} column(s) but reconcile_on {self.reconcile_on} has "
+                    f"{len(self.reconcile_on)} — each piece groups by its local version of the composite key"
+                )
         # Each piece needs a non-empty alias (str_strip_whitespace turns "  " into ""), and the
         # aliases must be unique — they are the names `combine` references, so a dupe is ambiguous.
         aliases = [sm.alias for sm in self.sub_measures]

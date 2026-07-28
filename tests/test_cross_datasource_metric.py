@@ -96,6 +96,32 @@ def _metric(**over) -> CrossDatasourceMetric:
     return CrossDatasourceMetric(**base)
 
 
+def _composite_datasource(name: str, schema: str, table: str) -> Datasource:
+    """A one-table datasource carrying a COMPOSITE key (`region` + `account_key`) plus `amount`, for
+    the composite-reconcile happy-path test."""
+    tbl = Table(
+        name=table,
+        schema=schema,
+        storage_connection="db",
+        grain=["region", "account_key"],
+        columns=[
+            Column(name="region", type="string"),
+            Column(name="account_key", type="string"),
+            Column(name="amount", type="decimal"),
+        ],
+    )
+    sa = SubjectArea(
+        name="core",
+        tables_defined=[tbl],
+        tables=[TableRef(table=table, schema=schema, storage_connection="db")],
+    )
+    return Datasource(
+        datasource=name,
+        storage_connections=[StorageConnection(name="db", storage_type="PostgreSQL")],
+        subject_areas=[sa],
+    )
+
+
 def _deployment(tmp_path: Path) -> Path:
     """A 2-datasource deployment on disk (acme_crm + acme_erp, both keyed on account_key), with an
     auto-maintained OrgRecord. Returns the artifacts dir."""
@@ -194,6 +220,38 @@ def test_model_rejects_empty_reconcile_on_and_bad_aliases():
 def test_model_rejects_empty_calculation():
     with pytest.raises(ValueError, match="calculation"):
         _metric(calculation="   ")
+
+
+def test_model_rejects_empty_combine():
+    # A blank `combine` is a metric that combines nothing — rejected at construction (str_strip
+    # turns "  " into "").
+    with pytest.raises(ValueError, match="combine"):
+        _metric(combine="   ")
+
+
+def test_model_rejects_empty_grain():
+    # Each piece must group by its local key column(s); an empty grain is rejected.
+    with pytest.raises(ValueError, match="empty grain"):
+        _metric(
+            sub_measures=[
+                SubMeasure(datasource="acme_crm", binding="SUM(amount)", grain=[], alias="crm_revenue"),
+                SubMeasure(datasource="acme_erp", binding="SUM(amount)", grain=["account_key"], alias="erp_ar"),
+            ],
+        )
+
+
+def test_model_rejects_grain_arity_mismatch():
+    # A 2-part reconcile key needs a 2-column grain on every piece; a 1-column grain is rejected.
+    with pytest.raises(ValueError, match="each piece groups by its local version"):
+        _metric(
+            reconcile_on=["region", "account_key"],
+            sub_measures=[
+                SubMeasure(datasource="acme_crm", binding="SUM(amount)",
+                           grain=["region", "account_key"], alias="crm_revenue"),
+                SubMeasure(datasource="acme_erp", binding="SUM(amount)",
+                           grain=["account_key"], alias="erp_ar"),  # only one key column
+            ],
+        )
 
 
 def test_federated_rejected_on_the_join_types():
@@ -310,6 +368,97 @@ def test_deployment_bridge_must_match_reconcile_key(tmp_path):
     res = validator.validate_deployment(art)
     assert not res.ok
     assert any(f.code == "cross_datasource_metric_no_bridge" for f in res.findings)
+
+
+def test_deployment_rejects_disconnected_datasources(tmp_path):
+    # PARTITIONED bridge set: bridges A-B and C-D over four datasources {A,B,C,D}. Every datasource is
+    # bridged (degree >= 1), yet the graph splits into two islands that can't reconcile onto one key —
+    # the connected-component check (not a degree test) catches this.
+    for nm, sch, tbl in [("acme_a", "a", "ta"), ("acme_b", "b", "tb"),
+                         ("acme_c", "c", "tc"), ("acme_d", "d", "td")]:
+        build.write_tree(_datasource(nm, sch, tbl, "account_key"), tmp_path / nm)
+    art = tmp_path
+    _set_bridges(art, [
+        _bridge(from_datasource="acme_a", to_datasource="acme_b",
+                from_dataset="a.ta", to_dataset="b.tb"),
+        _bridge(from_datasource="acme_c", to_datasource="acme_d",
+                from_dataset="c.tc", to_dataset="d.td"),
+    ])
+    _set_metrics(art, [_metric(
+        reconcile_on=["account_key"],
+        combine="{a} + {b} + {c} + {d}",
+        sub_measures=[
+            SubMeasure(datasource="acme_a", binding="SUM(amount)", grain=["account_key"], alias="a"),
+            SubMeasure(datasource="acme_b", binding="SUM(amount)", grain=["account_key"], alias="b"),
+            SubMeasure(datasource="acme_c", binding="SUM(amount)", grain=["account_key"], alias="c"),
+            SubMeasure(datasource="acme_d", binding="SUM(amount)", grain=["account_key"], alias="d"),
+        ],
+    )])
+    res = validator.validate_deployment(art)
+    assert not res.ok
+    assert any(f.code == "cross_datasource_metric_no_bridge" for f in res.findings)
+
+
+def test_deployment_accepts_triangle_bridged_three_datasources(tmp_path):
+    # Three datasources fully bridged in a triangle (A-B, B-C, A-C) on the reconcile key: they form ONE
+    # component, so the metric is accepted. (The redundant third edge means a node is reached via two
+    # paths — the component walk still terminates on one island.)
+    for nm, sch, tbl in [("acme_a", "a", "ta"), ("acme_b", "b", "tb"), ("acme_c", "c", "tc")]:
+        build.write_tree(_datasource(nm, sch, tbl, "account_key"), tmp_path / nm)
+    art = tmp_path
+    _set_bridges(art, [
+        _bridge(from_datasource="acme_a", to_datasource="acme_b", from_dataset="a.ta", to_dataset="b.tb"),
+        _bridge(from_datasource="acme_b", to_datasource="acme_c", from_dataset="b.tb", to_dataset="c.tc"),
+        _bridge(from_datasource="acme_a", to_datasource="acme_c", from_dataset="a.ta", to_dataset="c.tc"),
+    ])
+    _set_metrics(art, [_metric(
+        reconcile_on=["account_key"],
+        combine="{a} + {b} + {c}",
+        sub_measures=[
+            SubMeasure(datasource="acme_a", binding="SUM(amount)", grain=["account_key"], alias="a"),
+            SubMeasure(datasource="acme_b", binding="SUM(amount)", grain=["account_key"], alias="b"),
+            SubMeasure(datasource="acme_c", binding="SUM(amount)", grain=["account_key"], alias="c"),
+        ],
+    )])
+    res = validator.validate_deployment(art)
+    assert res.ok, res.errors
+
+
+def test_deployment_accepts_composite_reconcile_key(tmp_path):
+    # Composite reconcile key (region + account_key): each piece groups by both columns, and a single
+    # bridge naming the same two columns (in any order) links them. Proves _bridge_matches_key is a set
+    # equality — the bridge's to_columns list the pair reversed and it still matches.
+    build.write_tree(_composite_datasource("acme_crm", "crm", "accounts"), tmp_path / "acme_crm")
+    build.write_tree(_composite_datasource("acme_erp", "erp", "customers"), tmp_path / "acme_erp")
+    art = tmp_path
+    _set_bridges(art, [_bridge(
+        from_columns=["region", "account_key"],
+        to_columns=["account_key", "region"],  # same set, reversed order
+    )])
+    _set_metrics(art, [_metric(
+        reconcile_on=["region", "account_key"],
+        combine="{crm_revenue} - {erp_ar}",
+        sub_measures=[
+            SubMeasure(datasource="acme_crm", binding="SUM(amount)",
+                       grain=["region", "account_key"], alias="crm_revenue"),
+            SubMeasure(datasource="acme_erp", binding="SUM(amount)",
+                       grain=["region", "account_key"], alias="erp_ar"),
+        ],
+    )])
+    res = validator.validate_deployment(art)
+    assert res.ok, res.errors
+
+
+def test_deployment_rejects_combine_ignoring_a_piece(tmp_path):
+    # `combine` must reference EXACTLY the declared pieces: a formula that ignores a declared piece
+    # (a sub-measure computed for nothing) is rejected, not just an unknown alias.
+    art = _deployment(tmp_path)
+    _set_bridges(art, [_bridge()])
+    _set_metrics(art, [_metric(combine="{crm_revenue}")])  # erp_ar declared but never used
+    res = validator.validate_deployment(art)
+    assert not res.ok
+    assert any(f.code == "cross_datasource_metric_bad_combine"
+               and "never referenced" in f.message for f in res.findings)
 
 
 def test_validate_cli_runs_the_deployment_metric_pass(tmp_path):
