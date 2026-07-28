@@ -215,7 +215,12 @@ def cmd_prepare(args) -> int:
                      "suggestion": pf.suggestion, "sql": sql})
         return 1
     run_sql = pf.rewritten_sql if (pf.action == "auto_rewrite" and pf.rewritten_sql) else sql
-    final_sql, applied = RT.apply_default_filters(run_sql, org, area=args.area)
+    try:
+        final_sql, applied = RT.apply_default_filters(run_sql, org, area=args.area)
+    except RT.RowScopingUnavailable as exc:
+        # Refuse rather than print a statement the model's row scoping was silently left out of.
+        _print_json({"action": "refuse", "risk": "row_scoping", "reason": str(exc), "sql": run_sql})
+        return 1
     _print_json({
         "action": pf.action,
         "risk": pf.risk,

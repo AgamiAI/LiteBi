@@ -1345,7 +1345,19 @@ def _model_safety(
         else:
             return sql, Refusal("sensitive_columns", sens.reason, sens.suggestion or ""), None
 
-    new_sql, applied = RT.apply_default_filters(sql, org, area=area, ctx=ctx)
+    try:
+        new_sql, applied = RT.apply_default_filters(sql, org, area=area, ctx=ctx)
+    except RT.RowScopingUnavailable as exc:
+        # The model declares a row filter for a table this query reads, and it could not be
+        # applied. Running anyway would return rows the row scoping exists to withhold, so
+        # this refuses. The fault is in the model, not the query, so the remediation is the
+        # operator's and the statement is not worth re-emitting.
+        return sql, Refusal(
+            "model_unavailable",
+            str(exc),
+            "Correct the table's default_filters in the model so the row filter can be "
+            "applied for this datasource's engine.",
+        ), None
     if applied:
         # default_filters only add WHERE conditions, never change the projection list, so the mask
         # plan's output indices stay valid against the rewritten SQL's result.

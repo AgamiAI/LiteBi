@@ -95,6 +95,16 @@ class GuardContext:
     parse_error: "str | None" = None
 
 
+class RowScopingUnavailable(Exception):
+    """A declared row filter could not be applied, so the query cannot be row-scoped.
+
+    Raised rather than returned because the caller distinguishes "filters applied" from
+    "no filters needed" by an empty list, and silently returning the unfiltered statement
+    would drop the row scoping the model declares. The message is value-free, so a caller
+    may use it as a refusal reason.
+    """
+
+
 def _dialect_of(org: "Datasource | None") -> "tuple[str | None, str | None]":
     """Resolve the sqlglot dialect for `org` as (dialect, reason-it-could-not-be-resolved)."""
     if org is None:
@@ -2018,13 +2028,17 @@ def apply_default_filters(
 
     combined = " AND ".join(f"({c})" for c in conditions)
     # The condition is authored with the model, not by the caller, and is read in the same
-    # engine grammar as the statement it is spliced into. A filter that will not parse is
-    # dropped rather than applied half-formed: returning the original `sql` leaves the row
-    # scoping unapplied, which the caller must treat as a failure to scope, not as a pass.
+    # engine grammar as the statement it is spliced into.
+    #
+    # If it cannot be applied, this must NOT return the statement unchanged. The caller keeps
+    # the rewritten SQL only when `applied` is non-empty, so an empty list is indistinguishable
+    # from "this query needed no filter" — and the query would then run with the row scoping
+    # its model declares silently absent. That is a fail-open in a governance control, so an
+    # unusable filter raises and the caller refuses instead.
     cond_tree = _parse_sql(f"SELECT 1 WHERE {combined}", dialect)
-    if cond_tree is None:
-        return sql, []
     try:
+        if cond_tree is None:
+            raise ValueError("the filter did not parse")
         cond_expr = cond_tree.args["where"].this
         where = tree.args.get("where")
         if where is not None:
@@ -2033,8 +2047,11 @@ def apply_default_filters(
             tree.set("where", exp.Where(this=cond_expr))
         # Regenerate in the datasource's grammar: this statement is what the executor runs.
         return tree.sql(dialect=dialect), applied
-    except Exception:
-        return sql, []
+    except Exception as exc:
+        raise RowScopingUnavailable(
+            "the datasource declares a row filter for a table this query reads, but the "
+            "filter could not be applied, so the query cannot be row-scoped"
+        ) from exc
 
 
 def _similarity(a: str, b: str) -> float:

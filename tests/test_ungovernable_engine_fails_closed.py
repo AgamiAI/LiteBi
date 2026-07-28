@@ -182,6 +182,50 @@ def test_an_ordinary_read_is_unaffected():
     assert rt.check_scopable("SELECT id FROM customers", _org("PostgreSQL")) is None
 
 
+# --- a declared row filter that cannot be applied refuses, rather than running unscoped ---
+
+
+def _org_with_unusable_filter() -> "m.Datasource":
+    org = _org("PostgreSQL")
+    # A filter the parser cannot make sense of. Authoring like this is a mistake — the point
+    # is what happens when the mistake exists, not that it is plausible.
+    org.subject_areas[0].tables_defined[0].default_filters = ["{alias}.id >>>= ("]
+    return org
+
+
+def test_an_unusable_row_filter_refuses_instead_of_running_unfiltered(guarded):
+    """The caller keeps the rewritten SQL only when the applied list is non-empty, so an
+    unusable filter that returned the statement unchanged would be indistinguishable from
+    'this query needed no filter' — and the query would run with the model's row scoping
+    silently absent. That is a fail-open in a governance control."""
+    spy = _SpyExecutor()
+    with pytest.raises(execute_sql.GuardRefused) as ei:
+        guarded("SELECT id FROM customers", _org_with_unusable_filter(), spy)
+
+    assert ei.value.refusal.kind == "model_unavailable", (
+        "the fault is in the model, not the query, so it must not be reported as the query's"
+    )
+    assert spy.calls == [], "a query ran without the row scoping its model declares"
+
+
+def test_the_row_scoping_refusal_points_at_the_model_not_the_query(guarded):
+    spy = _SpyExecutor()
+    with pytest.raises(execute_sql.GuardRefused) as ei:
+        guarded("SELECT id FROM customers", _org_with_unusable_filter(), spy)
+    assert "default_filters" in ei.value.refusal.remediation
+
+
+def test_a_usable_row_filter_still_applies(guarded):
+    """The refusal must not swallow the ordinary row-scoping path."""
+    org = _org("PostgreSQL")
+    org.subject_areas[0].tables_defined[0].default_filters = ["{alias}.id > 0"]
+    spy = _SpyExecutor()
+
+    guarded("SELECT id FROM customers", org, spy)
+    assert spy.calls, "a governable statement was refused"
+    assert "id > 0" in spy.calls[0][0].replace('"', ""), "the row filter did not reach the executor"
+
+
 # --- the refusal does not depend on the unscopable posture switch ------------------
 
 
