@@ -605,6 +605,81 @@ class CrossSubjectAreaRelationship(Relationship):
 
 
 # ---------------------------------------------------------------------------
+# Cross-datasource relationship (deployment-level bridge, F16 / ACE-072)
+# ---------------------------------------------------------------------------
+
+
+class CrossDatasourceRelationship(_Base):
+    """A bridge between two SEPARATE datasources: "this key here is the same entity as
+    that key there" (e.g. ``accounts.account_key`` in a CRM = ``customers.account_key`` in
+    an ERP). It lives on the deployment-level ``OrgRecord`` — a cross-datasource edge can't
+    belong to a single per-profile ``Datasource`` — and is what F16's cross-datasource metrics
+    resolve through.
+
+    A standalone ``_Base`` rather than a subclass of ``Relationship``: that class hard-requires a
+    single ``from_table``/``from_column`` + a *required* ``Cardinality`` and runs a completeness
+    validator that has no meaning across two engines. Here the endpoints are ``schema.table``
+    datasets with (possibly composite) key columns, and cardinality is optional."""
+
+    # endpoints — each names a datasource, a ``schema.table`` dataset, and the join key column(s)
+    from_datasource: str
+    to_datasource: str
+    from_dataset: str  # a "schema.table" string, resolved against the from_datasource's model
+    to_dataset: str
+    from_columns: list[str]
+    to_columns: list[str]
+
+    # A cross-datasource edge crosses two engines by definition, so it is never ``same_engine``
+    # (rejected below). Reuses the existing ``Executable`` literal — no ``federated`` value (ACE-073).
+    executable: Executable = "split"
+    # Cardinality is optional here (unlike Relationship): a bridge is often a bare identity link.
+    relationship: Optional[Cardinality] = None
+    description: str = ""
+    # Carried from a legacy migration when present; otherwise anonymous (identified by its endpoints).
+    name: Optional[str] = None
+
+    # trust block (flattened for ergonomic YAML authoring) — copied from Relationship for parity.
+    confidence: Confidence = "proposed"
+    review_state: ReviewState = "unreviewed"
+    signed_off_by: Optional[str] = None
+    signed_off_at: Optional[str] = None
+    signed_off_role: Optional[str] = None
+    migrated_from: Optional[MigratedFrom] = None
+
+    @model_validator(mode="after")
+    def _endpoints(self) -> "CrossDatasourceRelationship":
+        # same_engine is structurally impossible for a cross-datasource edge — the deployment
+        # validator re-asserts this with the whole model in view, but reject it here too so a
+        # hand-authored bridge can't even be constructed with it.
+        if self.executable == "same_engine":
+            raise ValueError(
+                "cross-datasource relationship cannot be executable='same_engine' "
+                "(two datasources are two engines); use 'split' or 'informational'"
+            )
+        if not self.from_columns or not self.to_columns:
+            raise ValueError("cross-datasource relationship requires non-empty from_columns and to_columns")
+        if len(self.from_columns) != len(self.to_columns):
+            raise ValueError(
+                "cross-datasource relationship requires from_columns and to_columns of equal length "
+                f"(got {len(self.from_columns)} vs {len(self.to_columns)})"
+            )
+        return self
+
+    @property
+    def endpoint_key(self) -> tuple:
+        """The identity tuple used to de-duplicate bridges merged from several sources
+        (inline + sidecar + legacy migration), so a re-load never duplicates an edge."""
+        return (
+            self.from_datasource,
+            self.from_dataset,
+            tuple(self.from_columns),
+            self.to_datasource,
+            self.to_dataset,
+            tuple(self.to_columns),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Subject Area (the primary semantic unit)
 # ---------------------------------------------------------------------------
 
@@ -713,6 +788,9 @@ class OrgRecord(_Base):
     # The datasources (profile names) attached under this org. Auto-maintained: rebuilt from the profile
     # directories present on disk on every onboard/deploy, never hand-edited, so it cannot drift.
     datasources: list[str] = Field(default_factory=list)
+    # Deployment-level bridges linking a key in one datasource to the same entity in another (F16 / ACE-072).
+    # The deployment record is their home: a cross-datasource edge can't belong to a single per-profile model.
+    cross_datasource_relationships: list[CrossDatasourceRelationship] = Field(default_factory=list)
 
     @field_validator("fiscal_year_start_month")
     @classmethod
@@ -753,6 +831,7 @@ __all__ = [
     "Metric",
     "Relationship",
     "CrossSubjectAreaRelationship",
+    "CrossDatasourceRelationship",
     "SubjectArea",
     "Datasource",
     "DisplayConventions",
