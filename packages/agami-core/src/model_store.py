@@ -259,14 +259,12 @@ def write_organization_record(store: Store, record: OrgRecord, org_id: str = DEF
     UPDATE` rewrites only the content columns and preserves any hosted-owned `org_name`/`created_at`, so
     hosted onboarding (which INSERTs the row first) and core deploy (which upserts content) coexist on one
     row. Portable across SQLite (>=3.24) and Postgres. Idempotent — a redeploy replaces, never duplicates."""
-    doc = json.dumps(
-        {
-            "fiscal_year_start_month": record.fiscal_year_start_month,
-            "display_conventions": record.display_conventions.model_dump(mode="json"),
-            "glossary": record.glossary,
-            "datasources": record.datasources,
-        }
-    )
+    # Lossless: dump EVERY non-columned field into `doc` so any OrgRecord bucket (cross-datasource
+    # relationships/metrics, and whatever is added later) round-trips without editing this writer —
+    # the module's own stated contract. org_id/name/description are their own columns; the rest rides
+    # the JSON blob. (The prior hand-listed dict silently dropped new buckets on deploy — ACE-072's
+    # bridge among them.)
+    doc = json.dumps(record.model_dump(mode="json", exclude={"org_id", "name", "description"}))
     store.execute(
         "INSERT INTO organization (org_id, org_name, description, doc) VALUES (?, ?, ?, ?) "
         "ON CONFLICT (org_id) DO UPDATE SET "
@@ -289,14 +287,10 @@ def load_organization_record(store: Store, org_id: str = DEFAULT_ORG) -> OrgReco
         return None
     row = rows[0]
     doc = json.loads(row["doc"]) if row["doc"] else {}
-    return OrgRecord(
-        org_id=org_id,
-        name=row["org_name"],
-        description=row["description"],
-        fiscal_year_start_month=doc.get("fiscal_year_start_month"),
-        display_conventions=doc.get("display_conventions") or {},
-        glossary=doc.get("glossary") or {},
-        datasources=doc.get("datasources") or [],
+    # Lossless rebuild: the columned fields + every field the writer put in `doc` (the same
+    # `model_validate` path the on-disk loader uses), so new buckets ride back automatically.
+    return OrgRecord.model_validate(
+        {"org_id": org_id, "name": row["org_name"], "description": row["description"], **doc}
     )
 
 
