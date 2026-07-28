@@ -157,17 +157,45 @@ CASES: list[Case] = [
     # (The demo datasource is SQLite, which accepts both quoting styles.)
     # SQLite accepts backticks and brackets as identifier quoting; Postgres does not, where the
     # same text is not valid SQL at all — so these are pinned to the engine they mean something on.
+    # MySQL is where these matter most: the backtick is MySQL's NATIVE identifier quote, so this is
+    # the engine where a wrongly-dialected parse and a real execution can genuinely disagree. SQLite
+    # accepts backticks too, so both run the same expectation.
     Case("quoting", "SELECT `id` FROM `undeclared`", "table_out_of_scope",
-         "backtick-undeclared-table", engines=("SQLite",)),
+         "backtick-undeclared-table", engines=("SQLite", "MySQL")),
     Case("quoting", "SELECT `nosuchcol` FROM `orders`", "column_out_of_scope",
-         "backtick-undeclared-col", engines=("SQLite",)),
+         "backtick-undeclared-col", engines=("SQLite", "MySQL")),
     Case("quoting", "SELECT `email` FROM `customers`", "ok",
-         "backtick-sensitive-is-seen", engines=("SQLite",)),
-    Case("quoting", "SELECT * FROM `orders`", "select_star", "backtick-star", engines=("SQLite",)),
+         "backtick-sensitive-is-seen", engines=("SQLite", "MySQL")),
+    Case("quoting", "SELECT * FROM `orders`", "select_star", "backtick-star",
+         engines=("SQLite", "MySQL")),
+    # The other half of the guarantee: a backtick-quoted GOVERNED query is not merely allowed, it
+    # executes on the engine whose native quote that is. A vetted statement the engine then rejects
+    # would fail here as an executor error rather than passing.
+    Case("quoting", "SELECT `id`, `amount` FROM `orders`", "ok",
+         "backtick-governed-executes", engines=("SQLite", "MySQL")),
+    # SQL Server is the only bracket-quoting engine, and `TOP n` is where a generic parse fails
+    # worst: it resolves to no tables at all with `TOP` mistaken for a column, so every scope gate
+    # finds nothing to object to and allows the statement.
     Case("quoting", "SELECT [id] FROM [undeclared]", "table_out_of_scope",
-         "bracket-undeclared-table", engines=("SQLite",)),
-    # Valid identifier quoting on both engines, so it runs everywhere.
-    Case("quoting", 'SELECT "id" FROM "undeclared"', "table_out_of_scope", "quoted-undeclared-table"),
+         "bracket-undeclared-table", engines=("SQLite", "SQLServer")),
+    Case("quoting", "SELECT TOP 5 [id] FROM [undeclared]", "table_out_of_scope",
+         "bracket-top-undeclared-table", engines=("SQLServer",)),
+    Case("quoting", "SELECT TOP 5 [email] FROM [customers]", "ok",
+         "bracket-top-sensitive-is-seen", engines=("SQLServer",)),
+    Case("quoting", "SELECT TOP 5 [id], [amount] FROM [orders]", "ok",
+         "bracket-top-governed-executes", engines=("SQLServer",)),
+    # `"` is an identifier quote on SQLite/Postgres/SQL Server/DuckDB — but on MySQL it is a STRING
+    # literal, so the same text is a different statement there and gets its own expectation below.
+    Case("quoting", 'SELECT "id" FROM "undeclared"', "table_out_of_scope", "quoted-undeclared-table",
+         engines=("SQLite", "PostgreSQL", "SQLServer", "DuckDB")),
+    # On MySQL a double-quoted statement cannot be scoped at all (the "identifiers" are strings), so
+    # the guard must fail CLOSED rather than mis-read it as a query over declared objects. This is
+    # the positive proof that reading in the engine's own grammar changes the verdict, not just the
+    # parse — the generic reading of this statement is a scopable query over `orders`.
+    Case("quoting", 'SELECT "id" FROM "undeclared"', "unscopable_sql",
+         "double-quote-is-a-string-on-mysql", engines=("MySQL",)),
+    Case("quoting", 'SELECT "id", "amount" FROM "orders"', "unscopable_sql",
+         "double-quote-governed-unscopable-on-mysql", engines=("MySQL",)),
     # The read-only lexer is a separate code path from the dialect-aware parse; a write stays
     # refused whatever the quoting, on every engine.
     Case("quoting", "DELETE FROM `orders`", "permission", "backtick-delete"),
@@ -175,7 +203,10 @@ CASES: list[Case] = [
     # change which tightens parsing has to prove it did not start refusing valid SQL. Without
     # them the "no false refusal" side of the corpus rests on four statements, and a tightening
     # that broke ordinary queries could still pass.
-    Case("governed", 'SELECT "id", "amount" FROM "orders"', "ok", "quoted-identifiers"),
+    # Pinned to the engines where `"` quotes an identifier; MySQL's counterpart is the
+    # `unscopable_sql` case above, where the same text is a string literal.
+    Case("governed", 'SELECT "id", "amount" FROM "orders"', "ok", "quoted-identifiers",
+         engines=("SQLite", "PostgreSQL", "SQLServer", "DuckDB")),
     Case("governed", "SELECT o.id, o.amount FROM orders o", "ok", "aliased-table"),
     Case("governed", "SELECT id FROM orders WHERE status = 'paid'", "ok", "where-literal"),
     Case("governed", "SELECT id, amount FROM orders ORDER BY amount DESC", "ok", "order-by"),

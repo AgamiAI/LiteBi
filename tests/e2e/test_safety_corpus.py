@@ -6,6 +6,43 @@ the F9 done-bar for the controls it asserts: a regression in read-only, object-s
 scopability, or recon fails here on whichever surface it regressed; availability is asserted via the
 row-cap arm (the statement-timeout arm is proven end-to-end in `tests/test_resource_limits.py`). The
 read-only-role floor lives in `test_role_floor_pg.py` (Postgres, env-gated).
+
+ACE-082 — per-engine EXECUTION coverage
+=======================================
+ACE-079 made the guard read every statement in the datasource's own dialect, and proved the VERDICT
+on all eleven supported engines (`tests/test_guard_dialect_parsing.py`). That proof uses a spy
+executor and no database: the vetted statement is re-parsed by sqlglot, never accepted by an engine.
+This module adds the other half — the statement the guard vetted is a statement a REAL engine
+accepts — and the table below is the single place that says how far that goes per engine.
+
+| Engine     | Identifier quote | Coverage here                     | What is NOT proven                    |
+|------------|------------------|-----------------------------------|---------------------------------------|
+| SQLite     | `"` `` ` `` `[]` | real, in-process (file path)      | —                                     |
+| PostgreSQL | `"`              | real server (`integration-pg`)    | —                                     |
+| MySQL      | `` ` ``          | real server (`mysql:8`)           | —                                     |
+| SQLServer  | `[]`             | real server (`mssql/server:2022`) | —                                     |
+| DuckDB     | `"`              | real, in-process                  | —                                     |
+| Redshift   | `"`              | verdict only (ACE-079)            | execution parity                      |
+| Snowflake  | `"`              | verdict only (ACE-079)            | execution parity                      |
+| BigQuery   | `` ` ``          | verdict only (ACE-079)            | execution parity                      |
+| Databricks | `` ` ``          | verdict only (ACE-079)            | execution parity                      |
+| Oracle     | `"`              | verdict only (ACE-079)            | execution parity                      |
+| Trino      | `"`              | verdict only (ACE-079)            | execution parity                      |
+
+The five executing engines cover all three identifier-quoting families — backtick (MySQL), bracket
+(SQLServer) and double-quote (PostgreSQL/SQLite/DuckDB) — which is the axis ACE-079's defect class
+turns on. The six verdict-only engines each share a quoting family with one that executes.
+
+Two engines named in ACE-082 are deliberately absent, because reaching them would require changing
+runtime source, which that spec forbids:
+  - **BigQuery emulator** — `execute_sql._run_bigquery` builds `bigquery.Client(project=…)` with no
+    `client_options` / `api_endpoint`, so it cannot be pointed at an emulator without a source
+    change. (The emulator is also SQLite-backed, so it would prove parse/accept, not BigQuery
+    semantics.)
+  - **Databricks via local Spark** — `execute_sql._run_databricks` connects through the Databricks
+    SQL connector to a workspace; a local `SparkSession` is not reachable through it. Testing it
+    would mean asserting against a stub, which is what ACE-079 already does.
+Both remain verdict-only above, and are recorded as residual risk in the spec rather than implied.
 """
 
 from __future__ import annotations
@@ -60,6 +97,31 @@ DB_PATH_CASES = [c for c in CASES if c.runs_on("PostgreSQL")]
 @pytest.mark.parametrize("case", FILE_PATH_CASES, ids=[c.id for c in FILE_PATH_CASES])
 def test_safety_corpus_file_path(case, surface, file_safety_env):
     # File-served model (disk YAML) + SQLite datasource. Runs in the default (DB-free) test job.
+    env = surface(case.sql, datasource="acme", max_rows=case.max_rows)
+    assert_outcome(env, case.expect, case.sql)
+
+
+# ── ACE-082: the same corpus, against real engines beyond Postgres/SQLite ─────────────────────
+# One env fixture per executing engine. Each SKIPS without connection settings and FAILS instead
+# when AGAMI_IT_<ENGINE>_REQUIRED is set, so the job that owns an engine's evidence cannot pass
+# green while proving nothing. Pairing engine×case here (rather than skipping inside the test)
+# keeps the ids exact, so a CI job selects its engine with `-k "engine and MySQL"`.
+ENGINE_ENV_FIXTURES = {
+    "MySQL": "mysql_safety_env",
+    "SQLServer": "sqlserver_safety_env",
+    "DuckDB": "duckdb_safety_env",
+}
+ENGINE_CASES = [(e, c) for e in ENGINE_ENV_FIXTURES for c in CASES if c.runs_on(e)]
+
+
+@pytest.mark.parametrize(
+    "engine,case", ENGINE_CASES, ids=[f"{e}:{c.id}" for e, c in ENGINE_CASES]
+)
+def test_safety_corpus_engine(engine, case, surface, request):
+    # The verdict must be identical to the SQLite/Postgres paths AND the vetted statement must be
+    # one this engine actually accepts — an "ok" case here executes for real, so a statement the
+    # guard approved but the engine rejects fails as an executor error rather than passing.
+    request.getfixturevalue(ENGINE_ENV_FIXTURES[engine])
     env = surface(case.sql, datasource="acme", max_rows=case.max_rows)
     assert_outcome(env, case.expect, case.sql)
 

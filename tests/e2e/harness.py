@@ -14,6 +14,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,66 @@ if str(REPO_ROOT / "tests") not in sys.path:
 from safety.corpus import SCHEMA  # noqa: E402
 
 _TYPE_MAP = {"INTEGER": "integer", "REAL": "float", "TEXT": "string"}
+
+
+# ── the physical-fixture seam (ACE-082) ────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class EngineFixture:
+    """How the single-sourced `SCHEMA` is materialized physically on ONE engine.
+
+    The corpus never forks: the cases, the schema and the expected verdicts are shared. The only
+    thing that legitimately varies per engine is the physical fixture — how each column type is
+    spelled in DDL, which parameter placeholder the driver takes, and whether DROP needs a
+    CASCADE. Naming exactly those three here keeps every engine on one seeding code path, so
+    adding an engine is a row in `ENGINE_FIXTURES` rather than a second seeder that can drift.
+    """
+
+    storage_type: str  # what the semantic model declares (m.StorageConnection.storage_type)
+    credential_type: str  # what the executor dispatches on (`type` in the DSN / credentials file)
+    ddl_types: dict[str, str] = field(default_factory=dict)
+    placeholder: str = "?"
+    drop_suffix: str = ""  # Postgres needs CASCADE; the others reject the keyword
+
+
+ENGINE_FIXTURES: dict[str, EngineFixture] = {
+    "SQLite": EngineFixture(
+        "SQLite", "sqlite", {"INTEGER": "INTEGER", "REAL": "REAL", "TEXT": "TEXT"}, "?"
+    ),
+    "PostgreSQL": EngineFixture(
+        "PostgreSQL",
+        "postgres",
+        {"INTEGER": "integer", "REAL": "double precision", "TEXT": "text"},
+        "%s",
+        " CASCADE",
+    ),
+    "MySQL": EngineFixture(
+        "MySQL", "mysql", {"INTEGER": "int", "REAL": "double", "TEXT": "varchar(255)"}, "%s"
+    ),
+    "SQLServer": EngineFixture(
+        "SQLServer", "sqlserver", {"INTEGER": "int", "REAL": "float", "TEXT": "nvarchar(255)"}, "%s"
+    ),
+    "DuckDB": EngineFixture(
+        "DuckDB", "duckdb", {"INTEGER": "INTEGER", "REAL": "DOUBLE", "TEXT": "VARCHAR"}, "?"
+    ),
+}
+
+
+def seed_schema(execute, engine: str, *, drop_first: bool = False) -> None:
+    """Materialize every `SCHEMA` table on `engine`, through the caller's `execute(sql, params=None)`.
+
+    The adapter is passed in rather than a connection, so this function imports no driver and is
+    the single place that turns `SCHEMA` into physical tables — on every engine, including the two
+    that were previously seeded by hand (SQLite here, Postgres inline in `conftest.db_safety_env`).
+    """
+    fx = ENGINE_FIXTURES[engine]
+    for name, spec in SCHEMA.items():
+        if drop_first:
+            execute(f"DROP TABLE IF EXISTS {name}{fx.drop_suffix}")
+        ddl = ", ".join(f"{c} {fx.ddl_types[t]}" for c, t in spec["columns"])
+        execute(f"CREATE TABLE {name} ({ddl})")
+        placeholders = ", ".join(fx.placeholder for _ in spec["columns"])
+        for row in spec["rows"]:
+            execute(f"INSERT INTO {name} VALUES ({placeholders})", row)
 
 
 # ── model + datasource builders (single-sourced from SCHEMA) ───────────────────────────────────
@@ -113,12 +174,21 @@ def seed_sqlite(path: Path) -> None:
     """Create + seed the physical SQLite datasource governed queries execute against."""
     con = sqlite3.connect(str(path))
     try:
-        for name, spec in SCHEMA.items():
-            ddl = ", ".join(f"{c} {t}" for c, t in spec["columns"])
-            con.execute(f"CREATE TABLE {name} ({ddl})")
-            placeholders = ", ".join("?" for _ in spec["columns"])
-            con.executemany(f"INSERT INTO {name} VALUES ({placeholders})", spec["rows"])
+        seed_schema(lambda sql, params=None: con.execute(sql, params or ()), "SQLite")
         con.commit()
+    finally:
+        con.close()
+
+
+def seed_duckdb(path: Path) -> None:
+    """Create + seed the physical DuckDB datasource. Seeded through a WRITE connection here because
+    the executor deliberately opens DuckDB `read_only=True` — the fixture must not need the executor
+    to be writable to exist."""
+    import duckdb  # type: ignore
+
+    con = duckdb.connect(str(path))
+    try:
+        seed_schema(lambda sql, params=None: con.execute(sql, params or []), "DuckDB")
     finally:
         con.close()
 
