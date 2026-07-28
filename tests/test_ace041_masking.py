@@ -257,7 +257,10 @@ def test_unparseable_with_declared_pii_fails_closed(guarded, monkeypatch):
     # is unchanged (unparseable + declared PII => refused fail-closed, executor never runs); only the
     # refusal *kind* moves from `sensitive_columns` to `unscopable_sql`. The PII parse-failure check
     # remains in _model_safety as defense-in-depth (it fires if the scopable gate is ever disabled).
-    monkeypatch.setattr(rt, "_parse_sql", lambda sql: None)
+    # The guard battery parses through `_parse_reporting` (tree + why-it-failed) and
+    # `_parse_sql` (tree only), so both are stubbed to report a parse failure.
+    monkeypatch.setattr(rt, "_parse_reporting", lambda sql, dialect=None: (None, "forced"))
+    monkeypatch.setattr(rt, "_parse_sql", lambda sql, dialect=None: None)
     spy = _SpyExecutor(_R(["ssn"], [("111",)]))
     with pytest.raises(execute_sql.GuardRefused) as ei:
         guarded("SELECT ssn FROM customers", spy)
