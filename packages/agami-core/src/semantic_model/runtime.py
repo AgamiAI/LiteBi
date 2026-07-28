@@ -492,6 +492,16 @@ def resolve_entity_instance(
 
 @dataclass
 class PreFlightResult:
+    """The fan/chasm verdict, plus how well the analysis could see the query.
+
+    `certainty` uses the shared guardrail vocabulary: `"provable"` means every aggregate in the
+    statement was traced to a table the model declares, so `action` is a statement about the
+    QUERY; `"uncertain"` means at least one aggregate's grain could not be established (it reads
+    a CTE whose body the scope walk cannot classify), so `action` is only a statement about what
+    the analysis SAW. An `allow` carrying `"uncertain"` is "I could not tell", not "this is fine",
+    and the policy layer — not this gate — decides what that is worth.
+    """
+
     risk: Optional[str]  # "fan_trap" | "chasm_trap" | None
     action: str  # "auto_rewrite" | "refuse" | "allow"
     original_sql: str
@@ -499,6 +509,7 @@ class PreFlightResult:
     reason: str = ""
     suggestion: Optional[str] = None
     triggering_joins: list[str] = field(default_factory=list)
+    certainty: str = "provable"  # "provable" | "uncertain"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -509,6 +520,7 @@ class PreFlightResult:
             "reason": self.reason,
             "suggestion": self.suggestion,
             "triggering_joins": self.triggering_joins,
+            "certainty": self.certainty,
         }
 
 
@@ -1321,6 +1333,28 @@ def _one_side_facing_many(
     return hits
 
 
+def _known_table_names(
+    org: Datasource, rels: list[Relationship], ctx: "GuardContext | None" = None
+) -> set[str]:
+    """Every table the cardinality analysis can say anything about.
+
+    The declared tables PLUS the tables named on either end of a declared relationship — the
+    relationships are what the fan/chasm rules actually read, and a model can carry one for a
+    table it has not (yet) described in full."""
+    known = set(ctx.model_table_index if ctx is not None else _model_table_index(org))
+    for r in rels:
+        known.add(_bare(r.from_table))
+        known.add(_bare(r.to_table))
+    return known
+
+
+def _reads_any_table(
+    agg: "exp.AggFunc", tables: set[str], scope: dict[str, str]
+) -> bool:
+    """Does any column inside `agg` bind to one of `tables`?"""
+    return any(_resolve_col_table(col, scope) in tables for col in agg.find_all(exp.Column))
+
+
 def _many_side_facing_one(rels: list[Relationship], table: str, dim: str) -> bool:
     """Is `table` the MANY side of a join to dimension `dim` (the ONE side)?"""
     for r in rels:
@@ -1356,6 +1390,7 @@ def pre_flight_check(sql: str, org: Datasource,
     # Each arm is rendered back to text in the datasource's grammar before being re-read —
     # rendering generically would feed the analysis a statement in a grammar the arm was
     # never written in, the same mis-read this battery exists to prevent.
+    unresolved: Optional[PreFlightResult] = None
     for arm in _output_selects(tree):
         res = _preflight_select(arm, org, arm.sql(dialect=dialect), allow_rewrite=False, ctx=ctx)
         if res.risk and res.action == "refuse":
@@ -1367,7 +1402,21 @@ def pre_flight_check(sql: str, org: Datasource,
                 reason=res.reason,
                 suggestion=res.suggestion,
                 triggering_joins=res.triggering_joins,
+                certainty=res.certainty,
             )
+        if res.certainty == "uncertain" and unresolved is None:
+            unresolved = res
+    # An arm the analysis could not read makes the WHOLE set operation unproven — the arms are
+    # unioned into one answer, so an unexamined arm is an unexamined answer.
+    if unresolved is not None:
+        return PreFlightResult(
+            None,
+            "allow",
+            sql,
+            reason=unresolved.reason,
+            suggestion=unresolved.suggestion,
+            certainty="uncertain",
+        )
     return PreFlightResult(
         None, "allow", sql, reason="no fan/chasm or aggregation issue in any arm"
     )
@@ -1384,9 +1433,13 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
     rels = ctx.cardinality_index if ctx is not None else _cardinality_index(org)
     tables_in_scope = _tables_in_scope(tree)  # alias -> table
     table_set = set(tables_in_scope.values())
+    # Sources whose grain the analysis could NOT establish. An aggregate over one of these has
+    # unknown lineage, and the honest answer is "I could not tell".
+    opaque_sources = _unresolved_scope_sources(tree, _known_table_names(org, rels, ctx))
 
-    # aggregates: list of (table, is_aggregate)
-    agg_sources = _aggregate_source_tables(tree, tables_in_scope)
+    # aggregates: (source table, the aggregate node it appears in)
+    agg_pairs = _aggregate_source_tables(tree, tables_in_scope)
+    agg_sources = {t for t, _ in agg_pairs}
     has_raw_columns = _has_raw_non_grouped_columns(tree, tables_in_scope)
     has_aggregate = bool(agg_sources)
     no_aggregation = not has_aggregate
@@ -1420,8 +1473,18 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
                 triggering_joins=[f"{s} -> {shared}" for s in srcs],
             )
 
-    # FAN: an aggregate over a measure on the ONE side of a one-to-many in scope
-    for measure_table in agg_sources:
+    # FAN: an aggregate over a measure on the ONE side of a one-to-many in scope.
+    #
+    # Only aggregates a fan-out can actually inflate get a vote. MIN/MAX, a DISTINCT-qualified
+    # aggregate and a boolean fold are idempotent under row duplication, so the join cannot
+    # change their value and the query was already correct.
+    fan_aggs: dict[str, list["exp.AggFunc"]] = {}
+    for table, agg in agg_pairs:
+        if _is_fan_immune(agg):
+            continue
+        fan_aggs.setdefault(table, []).append(agg)
+
+    for measure_table in sorted(fan_aggs):  # sorted: one shape of query, one diagnosis
         others = table_set - {measure_table}
         fan_rels = _one_side_facing_many(rels, measure_table, others)
         if not fan_rels:
@@ -1430,6 +1493,17 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
             _bare(r.from_table) if _bare(r.to_table) == measure_table else _bare(r.to_table)
             for r in fan_rels
         }
+        # Measure or co-factor? A one-side column INSIDE the aggregate is not the same as the
+        # one-side column BEING aggregated. `SUM(order_items.quantity * orders.total_amount)`
+        # sums one value per order_items row — a many-side quantity that a per-order rate
+        # scales — and nothing is duplicated. A genuine trap, `SUM(orders.total_amount)`,
+        # names no many-side column, so it still fires; adding one is the author stating a
+        # many-side grain, which is well defined.
+        if all(
+            _reads_any_table(agg, many_tables, tables_in_scope)
+            for agg in fan_aggs[measure_table]
+        ):
+            continue
         # Can we safely auto-rewrite? Only if the many side participates ONLY in
         # the FROM/JOIN (not in SELECT / WHERE / GROUP BY / HAVING / ORDER BY)
         # AND the SELECT is aggregation-only (no raw rows).
@@ -1478,6 +1552,28 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
     semantic = _check_aggregation_semantics(tree, org, tables_in_scope, sql, ctx=ctx)
     if semantic is not None:
         return semantic
+
+    # Nothing found — but say WHY nothing was found. If an aggregate reads a source whose grain
+    # could not be established, "no trap" is a claim about what this analysis saw, not about the
+    # query, and returning a bare `allow` would present the second as if it were the first. The
+    # graded response to that lives in the policy layer, not here.
+    unresolved = sorted(agg_sources & opaque_sources)
+    if unresolved:
+        return PreFlightResult(
+            None,
+            "allow",
+            sql,
+            reason=(
+                f"could not establish the grain of {unresolved}: it is a CTE whose body is not a "
+                "grain-preserving select from a declared table, so an aggregate over it cannot "
+                "be proven free of a fan-out."
+            ),
+            suggestion=(
+                "Select the measure from the declared table directly, or pre-aggregate it to the "
+                "join key in the CTE so its grain is explicit."
+            ),
+            certainty="uncertain",
+        )
 
     return PreFlightResult(None, "allow", sql, reason="no fan/chasm or aggregation issue")
 
@@ -1756,7 +1852,10 @@ def assemble_receipt(
     if tree is None:
         return receipt
 
-    scope = _tables_in_scope(tree)  # alias/name -> bare table name
+    # `_tables_anywhere`, not `_tables_in_scope`: the receipt reports what the answer READ, so a
+    # table sourced only inside a CTE body belongs in it. Scoping this walk would silently drop
+    # it from the provenance list.
+    scope = _tables_anywhere(tree)  # alias/name -> bare table name
     used = set(scope.values())
     tidx = _model_table_index(org)
 
@@ -1883,25 +1982,215 @@ def assemble_receipt(
 # ---------------------------------------------------------------------------
 
 
-def _tables_in_scope(tree: "exp.Select") -> dict[str, str]:
-    """alias (or table name) -> bare table name."""
+def _tables_anywhere(tree: "exp.Expression") -> dict[str, str]:
+    """alias (or table name) -> bare table name, harvested from the WHOLE tree.
+
+    Deliberately scope-BLIND: a table named only inside a CTE body or a subquery lands in the
+    same flat map as one the outer query joins. That is wrong for a cardinality question (see
+    `_tables_in_scope`), but it is what the two provenance/coverage callers want — the receipt
+    reports every table the answer read, and the row-scoping pass looks for every table whose
+    declared filter might apply. Narrowing either of those would DROP a table from a report or a
+    filter from a query, so they keep the flat walk; only the trap detector got a real scope."""
     out: dict[str, str] = {}
     for tbl in tree.find_all(exp.Table):
-        name = tbl.name
-        alias = tbl.alias_or_name
-        out[alias] = name
+        out[tbl.alias_or_name] = tbl.name
     return out
 
 
-def _aggregate_source_tables(tree: "exp.Select", scope: dict[str, str]) -> set[str]:
-    """Tables whose columns appear inside an aggregate function in the SELECT."""
-    sources: set[str] = set()
+@dataclass(frozen=True)
+class _CteGrain:
+    """What a CTE alias means to a cardinality question.
+
+    Exactly three outcomes, and the difference between them is the whole of the scope fix:
+
+      * ``source`` set — the body preserves grain (a single-table SELECT with no GROUP BY, no
+        DISTINCT and no aggregate), so the alias has the row cardinality of that base table and
+        every declared relationship on it applies. Resolves transitively.
+      * ``source is None, opaque False`` — the body CHANGES grain (it groups / de-duplicates /
+        aggregates). It is its own entity, at the grain of its GROUP BY keys, and it does NOT
+        inherit the underlying table's cardinality. Reading a pre-aggregated CTE as its source
+        table is what refuses the very remediation this guard suggests.
+      * ``opaque`` — the body joins, unions, reads a derived table, or is self-referential, so
+        the alias cannot be tied to any single declared table. Not resolvable and not safely
+        assumed innocent: the aggregate's lineage is unknown.
+    """
+
+    source: Optional[str]
+    opaque: bool
+
+
+def _own_child(node: "exp.Expression", types: tuple) -> Optional["exp.Expression"]:
+    """`node`'s OWN direct argument of one of `types`, found by NODE TYPE rather than arg key.
+
+    sqlglot has renamed these keys inside the version range this package accepts (`with` ->
+    `with_`, `from` -> `from_`), and a missing key reads as "there is no WITH clause" — which
+    would silently restore the very CTE-body leak this scope walk exists to stop. `_arm_sources`
+    matches on type for the same reason. Direct args only: a nested node belongs to its own
+    scope, not this one."""
+    for value in node.args.values():
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, types):
+                return item
+    return None
+
+
+def _cte_bodies(tree: "exp.Expression") -> dict[str, "exp.Expression"]:
+    """CTE name (case-folded) -> body, for every WITH clause visible from `tree`.
+
+    Walks OUTWARD from `tree` because a set-operation arm carries no WITH of its own — the
+    clause sits on the set-operation root, and the arm still references its names."""
+    bodies: dict[str, "exp.Expression"] = {}
+    node: Optional["exp.Expression"] = tree
+    while node is not None:
+        with_ = _own_child(node, (exp.With,))
+        if with_ is not None:
+            # setdefault, walking inner -> outer, so an inner WITH shadows an outer one
+            for cte in with_.expressions:
+                bodies.setdefault(cte.alias_or_name.lower(), cte.this)
+        node = node.parent
+    return bodies
+
+
+def _single_source_table(body: "exp.Expression") -> Optional["exp.Table"]:
+    """The one base-table source `body` draws from, or None for anything else.
+
+    None covers a join, a union (not an exp.Select at all), a derived table / VALUES / table
+    function, and a body with no FROM — every shape whose rows cannot be attributed to one
+    declared table."""
+    if not isinstance(body, exp.Select):
+        return None
+    sources = _arm_sources(body)
+    if len(sources) != 1:
+        return None
+    node = sources[0].this
+    return node if isinstance(node, exp.Table) else None
+
+
+def _preserves_grain(body: "exp.Select") -> bool:
+    """Is `body` one output row per source row? A WHERE or a LIMIT still is; a GROUP BY, a
+    SELECT DISTINCT or an aggregate is not. Matched by node type, per `_own_child`."""
+    if _own_child(body, (exp.Group, exp.Distinct)) is not None:
+        return False
+    return body.find(exp.AggFunc) is None
+
+
+def _cte_grains(tree: "exp.Expression") -> dict[str, _CteGrain]:
+    """CTE name (case-folded) -> `_CteGrain`, resolved transitively."""
+    bodies = _cte_bodies(tree)
+    grains: dict[str, _CteGrain] = {}
+
+    def resolve(name: str, seen: frozenset[str]) -> _CteGrain:
+        key = name.lower()
+        if key in grains:
+            return grains[key]
+        if key in seen:
+            return _CteGrain(None, True)  # recursive CTE: no fixed cardinality to read off
+        body = bodies[key]
+        src = _single_source_table(body)
+        if src is None:
+            g = _CteGrain(None, True)
+        elif not _preserves_grain(body):
+            g = _CteGrain(None, False)  # its own entity, at its GROUP BY grain
+        elif src.name.lower() in bodies:
+            g = resolve(src.name, seen | {key})  # grain-preserving over another CTE
+        else:
+            g = _CteGrain(src.name, False)
+        grains[key] = g
+        return g
+
+    for name in list(bodies):
+        resolve(name, frozenset())
+    return grains
+
+
+def _scope_bindings(tree: "exp.Expression") -> list[tuple[str, str, Optional[_CteGrain]]]:
+    """(alias, table it binds to, the CTE grain it came from or None) for THIS query's scope.
+
+    The tables inside a CTE body belong to that CTE, not to the query joining it, so they are
+    skipped rather than harvested — a `WITH` clause is a boundary, not decoration. Everything
+    else the old flat walk saw is still seen, so a derived table or an IN-subquery contributes
+    exactly what it did before (full column-level lineage through those is a separate problem
+    and solving it here would fork it into two implementations)."""
+    inside_cte: set[int] = set()
+    with_ = _own_child(tree, (exp.With,))
+    if with_ is not None:
+        for cte in with_.expressions:
+            inside_cte.update(id(t) for t in cte.find_all(exp.Table))
+
+    grains = _cte_grains(tree)
+    out: list[tuple[str, str, Optional[_CteGrain]]] = []
+    for tbl in tree.find_all(exp.Table):
+        if id(tbl) in inside_cte:
+            continue
+        grain = grains.get(tbl.name.lower())
+        # An unresolvable or grain-changing CTE keeps its own name: it is not the source table,
+        # and pretending otherwise is the false refusal this fix exists to remove.
+        out.append((tbl.alias_or_name, (grain.source if grain else None) or tbl.name, grain))
+    return out
+
+
+def _tables_in_scope(tree: "exp.Expression") -> dict[str, str]:
+    """alias (or table name) -> bare table name, for this query's own scope.
+
+    Scoped, unlike `_tables_anywhere`: CTE bodies do not leak out, and a CTE alias resolves to
+    its underlying table only when the CTE preserves grain."""
+    return {alias: table for alias, table, _ in _scope_bindings(tree)}
+
+
+def _unresolved_scope_sources(tree: "exp.Expression", known_tables: set[str]) -> set[str]:
+    """The entries of `_tables_in_scope` whose lineage the cardinality rules cannot establish.
+
+    Two shapes, both meaning "this alias has no cardinality I can read": a CTE whose body could
+    not be classified at all, and a CTE that does resolve but to a table the model says nothing
+    about. Note what is NOT here — a grain-changing CTE. That one IS understood: it is its own
+    entity at its GROUP BY grain, and joining it is not a fan-out."""
+    return {
+        table
+        for _alias, table, grain in _scope_bindings(tree)
+        if grain is not None and (grain.opaque or table not in known_tables)
+    }
+
+
+def _is_fan_immune(agg: "exp.AggFunc") -> bool:
+    """Is `agg` idempotent under row duplication — i.e. does a fan-out leave it unchanged?
+
+    MIN/MAX read an extreme, and duplicating a row cannot move one. A DISTINCT-qualified
+    aggregate folds duplicates away before aggregating, by definition. A boolean fold is an
+    AND/OR over the rows, and both are idempotent.
+
+    NOT immune, and each has a test saying so: SUM, AVG, COUNT(col), and the ordered/array
+    aggregates. AVG is the one a reader gets wrong — a fan duplicates rows UNEVENLY (one order
+    with three line items, another with one), so the mean moves even though "an average" sounds
+    scale-free.
+
+    Decided on the NODE, never on its name: this gate reads each statement in its datasource's
+    own grammar, and a name allowlist breaks on the first engine that spells an aggregate
+    differently. `distinct` is read both ways because sqlglot has expressed it as a wrapped
+    `exp.Distinct` argument and as an `args["distinct"]` flag at different points in the
+    version range this package accepts."""
+    if agg.args.get("distinct") or isinstance(agg.args.get("this"), exp.Distinct):
+        return True
+    return isinstance(agg, (exp.Min, exp.Max, exp.LogicalAnd, exp.LogicalOr))
+
+
+def _aggregate_source_tables(
+    tree: "exp.Select", scope: dict[str, str]
+) -> list[tuple[str, "exp.AggFunc"]]:
+    """(table, the aggregate node it appears in) for every column inside a SELECT-list aggregate.
+
+    Returns the NODE beside the table because the two questions the caller asks — "can a fan-out
+    inflate this aggregate at all?" and "is this table the aggregated value or a scalar co-factor
+    of it?" — are both properties of the aggregate, not of the table. The same table can appear
+    more than once (once per aggregate that reads it)."""
+    sources: list[tuple[str, "exp.AggFunc"]] = []
+    seen: set[tuple[str, int]] = set()  # identity, not equality: sqlglot nodes compare structurally
     for select_expr in tree.expressions:
         for agg in select_expr.find_all(exp.AggFunc):
             for col in agg.find_all(exp.Column):
                 t = _resolve_col_table(col, scope)
-                if t:
-                    sources.add(t)
+                if t and (t, id(agg)) not in seen:
+                    seen.add((t, id(agg)))
+                    sources.append((t, agg))
     return sources
 
 
@@ -2057,7 +2346,10 @@ def apply_default_filters(
     if not isinstance(tree, exp.Select):
         return sql, []
 
-    scope = _tables_in_scope(tree)  # alias -> bare table
+    # `_tables_anywhere`, not `_tables_in_scope`: row scoping is a data-protection control, and
+    # narrowing the set of tables it considers can only ever apply FEWER declared filters. Its
+    # own scoping is owned elsewhere; this pass is deliberately left exactly as it was.
+    scope = _tables_anywhere(tree)  # alias -> bare table
     applied: list[str] = []
     conditions: list[str] = []
     for alias, table_name in scope.items():
