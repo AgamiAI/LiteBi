@@ -54,6 +54,15 @@ class Case:
     expect: str  # a refusal kind, or "bounded", or "ok"
     note: str = ""
     max_rows: int | None = None  # per-call row cap (the availability row-cap case lowers it)
+    # Engines this case is meaningful on, or None for every engine. Identifier quoting is
+    # engine-specific — a backtick is an identifier quote on MySQL and SQLite but not valid SQL
+    # on Postgres — so a quoting case pinned to one engine would assert a different verdict on
+    # the other. Naming the engine keeps the case honest instead of letting it pass on the path
+    # that happens to accept it.
+    engines: tuple[str, ...] | None = None
+
+    def runs_on(self, engine: str) -> bool:
+        return self.engines is None or engine in self.engines
 
     @property
     def id(self) -> str:
@@ -140,4 +149,66 @@ CASES: list[Case] = [
         "join-aggregate",
     ),
     Case("governed", "SELECT COUNT(email) AS n FROM customers", "ok", "sensitive-in-count-ok"),
+    # ── class 8: the same verdicts when the statement is written in the engine's own quoting ──
+    # A statement read in the wrong grammar does not describe itself: under a generic parse a
+    # backtick-quoted statement resolves to no tables and no columns, so every scope gate finds
+    # nothing to object to and allows it. These run through the full harness — both surfaces,
+    # both model paths — because that is the only place the guarantee is proved end to end.
+    # (The demo datasource is SQLite, which accepts both quoting styles.)
+    # SQLite accepts backticks and brackets as identifier quoting; Postgres does not, where the
+    # same text is not valid SQL at all — so these are pinned to the engine they mean something on.
+    Case("quoting", "SELECT `id` FROM `undeclared`", "table_out_of_scope",
+         "backtick-undeclared-table", engines=("SQLite",)),
+    Case("quoting", "SELECT `nosuchcol` FROM `orders`", "column_out_of_scope",
+         "backtick-undeclared-col", engines=("SQLite",)),
+    Case("quoting", "SELECT `email` FROM `customers`", "ok",
+         "backtick-sensitive-is-seen", engines=("SQLite",)),
+    Case("quoting", "SELECT * FROM `orders`", "select_star", "backtick-star", engines=("SQLite",)),
+    Case("quoting", "SELECT [id] FROM [undeclared]", "table_out_of_scope",
+         "bracket-undeclared-table", engines=("SQLite",)),
+    # Valid identifier quoting on both engines, so it runs everywhere.
+    Case("quoting", 'SELECT "id" FROM "undeclared"', "table_out_of_scope", "quoted-undeclared-table"),
+    # The read-only lexer is a separate code path from the dialect-aware parse; a write stays
+    # refused whatever the quoting, on every engine.
+    Case("quoting", "DELETE FROM `orders`", "permission", "backtick-delete"),
+    # Ordinary shapes a governed query takes. These carry no attack — they exist so that a
+    # change which tightens parsing has to prove it did not start refusing valid SQL. Without
+    # them the "no false refusal" side of the corpus rests on four statements, and a tightening
+    # that broke ordinary queries could still pass.
+    Case("governed", 'SELECT "id", "amount" FROM "orders"', "ok", "quoted-identifiers"),
+    Case("governed", "SELECT o.id, o.amount FROM orders o", "ok", "aliased-table"),
+    Case("governed", "SELECT id FROM orders WHERE status = 'paid'", "ok", "where-literal"),
+    Case("governed", "SELECT id, amount FROM orders ORDER BY amount DESC", "ok", "order-by"),
+    Case("governed", "SELECT DISTINCT status FROM orders", "ok", "distinct"),
+    Case(
+        "governed",
+        "SELECT status, COUNT(id) AS n FROM orders GROUP BY status HAVING COUNT(id) > 0",
+        "ok",
+        "having",
+    ),
+    Case(
+        "governed",
+        "WITH paid AS (SELECT id, amount FROM orders WHERE status = 'paid') "
+        "SELECT COUNT(id) AS n FROM paid",
+        "ok",
+        "cte",
+    ),
+    Case(
+        "governed",
+        "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE region = 'west')",
+        "ok",
+        "subquery-in-where",
+    ),
+    Case(
+        "governed",
+        "SELECT id, CASE WHEN amount > 60 THEN 'big' ELSE 'small' END AS bucket FROM orders",
+        "ok",
+        "case-expression",
+    ),
+    Case(
+        "governed",
+        "SELECT id FROM orders UNION ALL SELECT id FROM customers",
+        "ok",
+        "union-all",
+    ),
 ]

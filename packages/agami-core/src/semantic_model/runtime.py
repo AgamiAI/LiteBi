@@ -41,6 +41,7 @@ from guardrail import Verdict, safety_verdict
 try:
     import sqlglot
     from sqlglot import expressions as exp
+    from sqlglot.errors import ErrorLevel, ParseError, TokenError
 
     _HAVE_SQLGLOT = True
 except ImportError:  # pragma: no cover
@@ -56,6 +57,7 @@ from .models import (
 from .models import (
     bare_name as _bare,
 )
+from .sql_dialect import DialectUnresolved, engines_disagree, resolve_datasource_dialect
 
 # A prober resolves a literal/value against the DB. Returns True if the value
 # exists in <table>.<column>. Injected so runtime stays DB-agnostic.
@@ -83,17 +85,107 @@ class GuardContext:
     cardinality_index: "list[Relationship]"
     sensitive_by_table: "tuple[dict[str, dict[str, str]], set[str]]"
     model_table_index: "dict[str, tuple]"
+    # The sqlglot dialect every parse and every regeneration in this battery uses, or None
+    # when the datasource does not determine one. `parse_error` is a value-free reason the
+    # statement could not be read — an unresolvable engine, or SQL that does not parse in
+    # the resolved one. Both are set together with `tree`, so a caller can tell "read it and
+    # found nothing to object to" apart from "could not read it", which are the same empty
+    # tree but opposite verdicts.
+    dialect: "str | None" = None
+    parse_error: "str | None" = None
 
 
-def _parse_sql(sql: str) -> "exp.Expression | None":
-    """Parse SQL for the guard battery; None if sqlglot is unavailable or the SQL does not
-    parse (guards degrade to allow). Centralized so a GuardContext parses exactly once."""
-    if not _HAVE_SQLGLOT:
-        return None
+# Engines whose identifier quote is the backtick, so a double-quoted token is a *string
+# literal* in their default mode — but an *identifier* when the server runs in an
+# ANSI-quoting mode (MySQL's ANSI_QUOTES, and the equivalent on the Spark-family engines).
+# The parse cannot tell which, because sqlglot does not preserve the quote character: `"x"`
+# and `'x'` both arrive as the same string Literal.
+_BACKTICK_QUOTING_DIALECTS = frozenset({"mysql", "bigquery", "databricks", "spark", "hive"})
+
+# A grammar in which a double-quoted token is unambiguously an identifier, used only to ask
+# "would this read as a column somewhere else?".
+_ANSI_QUOTING_DIALECT = "postgres"
+
+
+def _quote_ambiguous(sql: str, dialect: "str | None") -> bool:
+    """True when a double-quoted token would be a column under ANSI quoting but reads as a
+    string literal in this engine's default mode.
+
+    Such a statement means two different things depending on a server setting the guard
+    cannot see. Under the engine's default mode the gates are right that no column is
+    projected; if the server runs in ANSI-quoting mode the same text selects the column and
+    the gates would have scored a real column as a literal. Rather than guess the server's
+    mode, the statement is treated as unreadable — it is trivially re-emitted in the engine's
+    own quoting, which is unambiguous.
+    """
+    if dialect not in _BACKTICK_QUOTING_DIALECTS:
+        return False
+    native = _parse_sql(sql, dialect)
+    if native is None:
+        return False
+    ansi = _parse_sql(sql, _ANSI_QUOTING_DIALECT)
+    if ansi is None:
+        return False
+    native_cols = {c.name.lower() for c in native.find_all(exp.Column)}
+    ansi_cols = {c.name.lower() for c in ansi.find_all(exp.Column)}
+    return bool(ansi_cols - native_cols)
+
+
+class RowScopingUnavailable(Exception):
+    """A declared row filter could not be applied, so the query cannot be row-scoped.
+
+    Raised rather than returned because the caller distinguishes "filters applied" from
+    "no filters needed" by an empty list, and silently returning the unfiltered statement
+    would drop the row scoping the model declares. The message is value-free, so a caller
+    may use it as a refusal reason.
+    """
+
+
+def _dialect_of(org: "Datasource | None") -> "tuple[str | None, str | None]":
+    """Resolve the sqlglot dialect for `org` as (dialect, reason-it-could-not-be-resolved)."""
+    if org is None:
+        return None, "the statement was checked without a model, so its engine is unknown"
     try:
-        return sqlglot.parse_one(sql, error_level="ignore")
+        return resolve_datasource_dialect(org), None
+    except DialectUnresolved as exc:
+        return None, str(exc)
+
+
+def _parse_sql(sql: str, dialect: "str | None" = None) -> "exp.Expression | None":
+    """Parse SQL for the guard battery; None if sqlglot is unavailable or the SQL does not
+    parse. Centralized so a GuardContext parses exactly once.
+
+    Callers that need to distinguish "did not parse" from "parsed to nothing" should use
+    `_parse_reporting`; this form is for the standalone callers that only need the tree.
+    """
+    return _parse_reporting(sql, dialect)[0]
+
+
+def _parse_reporting(
+    sql: str, dialect: "str | None" = None
+) -> "tuple[exp.Expression | None, str | None]":
+    """Parse `sql` in `dialect`, returning (tree, reason-it-failed).
+
+    Two deliberate choices, both load-bearing for the guards that read the result:
+
+    * The dialect is passed through. Parsing in a grammar the engine does not use does not
+      merely lose detail — it produces a tree that describes a different statement, and a
+      gate inspecting it finds nothing to object to.
+    * Errors raise rather than being collected and discarded. sqlglot's error level must be
+      the ErrorLevel enum: it compares the level against enum members, so a *string* level
+      matches no branch and every error is dropped, leaving a silently truncated tree. The
+      reason is value-free (never the statement or the parser's echo of it) so a caller may
+      surface it. TokenError is raised for lexical faults such as an unterminated literal
+      regardless of error level, so both are caught.
+    """
+    if not _HAVE_SQLGLOT:
+        return None, None
+    try:
+        return sqlglot.parse_one(sql, dialect=dialect, error_level=ErrorLevel.RAISE), None
+    except (ParseError, TokenError):
+        return None, "the statement could not be parsed as SQL for this datasource's engine"
     except Exception:
-        return None
+        return None, "the statement could not be read"
 
 
 def build_guard_context(sql: str, org: Datasource) -> "GuardContext | None":
@@ -103,13 +195,20 @@ def build_guard_context(sql: str, org: Datasource) -> "GuardContext | None":
     building the indices would be pure wasted work in that fallback path."""
     if not _HAVE_SQLGLOT:
         return None
+    dialect, dialect_error = _dialect_of(org)
+    tree, parse_error = _parse_reporting(sql, dialect)
     return GuardContext(
         sql=sql,
-        tree=_parse_sql(sql),
+        tree=tree,
         column_index=_column_index(org),
         cardinality_index=_cardinality_index(org),
         sensitive_by_table=_sensitive_by_table(org),
         model_table_index=_model_table_index(org),
+        dialect=dialect,
+        # An unresolvable engine is itself a reason the statement could not be read, and it
+        # outranks a parse failure: the parse only happened generically because there was no
+        # engine to read it in.
+        parse_error=dialect_error or parse_error,
     )
 
 
@@ -763,10 +862,7 @@ def check_sensitive_projection(
     if ctx is not None:
         tree = ctx.tree
     else:
-        try:
-            tree = sqlglot.parse_one(sql, error_level="ignore")
-        except Exception:
-            return SensitiveCheckResult("allow")
+        tree = _parse_sql(sql, _dialect_of(org)[0])
     # A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not
     # exp.Select — gate on "contains a SELECT" and scan every OUTPUT-bearing arm, else
     # `… UNION SELECT ssn FROM customers` would project a sensitive column past this gate.
@@ -856,10 +952,7 @@ def check_table_scope(
     if ctx is not None:
         tree = ctx.tree
     else:
-        try:
-            tree = sqlglot.parse_one(sql, error_level="ignore")
-        except Exception:
-            return None
+        tree = _parse_sql(sql, _dialect_of(org)[0])
     # A set operation (UNION/INTERSECT/EXCEPT) parses to exp.Union, not exp.Select,
     # so gate on "contains a SELECT" rather than "is a SELECT" — otherwise every
     # set-operation arm would bypass the guard. A non-SELECT statement has no SELECT
@@ -911,7 +1004,9 @@ def check_table_scope(
 # ---------------------------------------------------------------------------
 
 
-def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> Verdict | None:
+def check_no_select_star(
+    sql: str, ctx: "GuardContext | None" = None, *, dialect: "str | None" = None
+) -> Verdict | None:
     """Refuse a query whose projection list contains `*` or `t.*`.
 
     A star defeats column-level scoping (an undeclared column hides behind it) and
@@ -929,10 +1024,7 @@ def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> Verdict
     if ctx is not None:
         tree = ctx.tree
     else:
-        try:
-            tree = sqlglot.parse_one(sql, error_level="ignore")
-        except Exception:
-            return None
+        tree = _parse_sql(sql, dialect)
     if tree is None or tree.find(exp.Select) is None:
         return None
     for select in tree.find_all(exp.Select):
@@ -976,10 +1068,7 @@ def check_column_scope(
     if ctx is not None:
         tree = ctx.tree
     else:
-        try:
-            tree = sqlglot.parse_one(sql, error_level="ignore")
-        except Exception:
-            return None
+        tree = _parse_sql(sql, _dialect_of(org)[0])
     if tree is None or tree.find(exp.Select) is None:
         return None
 
@@ -1106,15 +1195,29 @@ def check_column_scope(
 # ---------------------------------------------------------------------------
 
 
-def _unscopable(detail: str) -> Verdict:
+def _unscopable(detail: str, remediation: "str | None" = None) -> Verdict:
+    # The declared-sources tail explains why a *source* was rejected. It misdescribes a
+    # statement that never parsed at all, so it is attached only alongside the default
+    # remediation it belongs with; a caller supplying its own remediation gets the bare reason.
+    reason = "the query can't be scoped to the declared object surface: " + detail
+    if remediation is None:
+        reason += " — only queries whose FROM/JOIN sources resolve to declared tables may run."
     return safety_verdict(
         "unscopable_sql",
-        "the query can't be scoped to the declared object surface: "
-        + detail
-        + " — only queries whose FROM/JOIN sources resolve to declared tables may run.",
-        "Query only declared tables (no table-functions, VALUES, UNNEST, or LATERAL "
+        reason,
+        remediation
+        or "Query only declared tables (no table-functions, VALUES, UNNEST, or LATERAL "
         "sources); add a source to the model if it should be queryable.",
     )
+
+
+# A statement that did not parse is regenerable: the caller can re-emit it and try again, so
+# the remediation names that move rather than the declared-source advice above, which would
+# describe a problem this statement does not have.
+_REEMIT_REMEDIATION = (
+    "Re-emit the query using the declared table and column names, unquoted or quoted the way "
+    "this datasource's engine quotes identifiers."
+)
 
 
 def check_scopable(
@@ -1140,11 +1243,27 @@ def check_scopable(
         return None
     if not _HAVE_SQLGLOT:
         return _unscopable("the SQL parser is unavailable")
-    tree = ctx.tree if ctx is not None else _parse_sql(sql)
+    if ctx is not None:
+        tree, why_not = ctx.tree, ctx.parse_error
+    else:
+        tree, why_not = _parse_reporting(sql, _dialect_of(org)[0])
     if tree is None:
-        return _unscopable("the query did not parse")
+        # Prefer the specific reason over the generic one, so the caller can tell the
+        # operator-actionable case apart from the one the query itself can fix.
+        return _unscopable(why_not or "the query did not parse", _REEMIT_REMEDIATION)
     if tree.find(exp.Select) is None:
         return _unscopable("the query has no SELECT to scope")
+    # A double-quoted token on a backtick-quoting engine means one thing under the engine's
+    # default mode and another under its ANSI-quoting mode, and the guard cannot see which
+    # the server runs. Read as a literal, a projected sensitive column is invisible to the
+    # column and PII gates while the server may still return it, so the ambiguity is refused
+    # rather than resolved by guessing.
+    if _quote_ambiguous(sql, ctx.dialect if ctx is not None else _dialect_of(org)[0]):
+        return _unscopable(
+            "a double-quoted identifier means either a column or a string literal on this "
+            "datasource's engine, depending on server configuration the guard cannot see",
+            _REEMIT_REMEDIATION,
+        )
     # Table-functions and `ROWS FROM` parse to an `exp.Table` with an EMPTY name (the
     # function lives in `.this`); the object-scope gates skip empty-name tables, so a
     # whole-tree sweep catches them here — including inside a set-operation arm.
@@ -1167,6 +1286,16 @@ def check_scopable(
                 return _unscopable(
                     f"a FROM/JOIN source is a {type(src).__name__.upper()}, not a table"
                 )
+    # Dialect-independent backstop. A statement that reads from something, yet parses to no
+    # named table at all, cannot be attributed to the declared surface — and that is exactly
+    # the shape a mis-read produces. Catching it here means a quoting style nobody has mapped
+    # yet fails closed on its own, without the dialect map having to be complete first. A
+    # statement with no FROM (`SELECT 1`) reads nothing and is left alone.
+    if tree.find(exp.From) is not None and tree.find(exp.Table) is None:
+        return _unscopable(
+            "the query reads from a source that resolves to no named table",
+            _REEMIT_REMEDIATION,
+        )
     return None
 
 
@@ -1217,14 +1346,18 @@ def pre_flight_check(sql: str, org: Datasource,
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
     # call are byte-identical: _parse_sql swallows an unparseable statement to None exactly as a
     # prebuilt ctx.tree would be None, and both then report the one "no SELECT; skipped" reason.
-    tree = ctx.tree if ctx is not None else _parse_sql(sql)
+    dialect = ctx.dialect if ctx is not None else _dialect_of(org)[0]
+    tree = ctx.tree if ctx is not None else _parse_sql(sql, dialect)
     if tree is None or tree.find(exp.Select) is None:
         return PreFlightResult(None, "allow", sql, reason="no SELECT; skipped")
     if isinstance(tree, exp.Select):
         return _preflight_select(tree, org, sql, allow_rewrite=True, ctx=ctx)
     # Set operation: analyze each arm; a trap in any arm inflates that arm's aggregate.
+    # Each arm is rendered back to text in the datasource's grammar before being re-read —
+    # rendering generically would feed the analysis a statement in a grammar the arm was
+    # never written in, the same mis-read this battery exists to prevent.
     for arm in _output_selects(tree):
-        res = _preflight_select(arm, org, arm.sql(), allow_rewrite=False, ctx=ctx)
+        res = _preflight_select(arm, org, arm.sql(dialect=dialect), allow_rewrite=False, ctx=ctx)
         if res.risk and res.action == "refuse":
             # tie the arm's diagnosis back to the full set-operation query
             return PreFlightResult(
@@ -1303,7 +1436,11 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
         many_aliases = {a for a, t in tables_in_scope.items() if t in many_tables}
         referenced_elsewhere = _tables_referenced_outside_from(tree, tables_in_scope) & many_tables
         if allow_rewrite and not has_raw_columns and not referenced_elsewhere:
-            rewritten = _drop_fanout_joins(sql, many_aliases | many_tables)
+            rewritten = _drop_fanout_joins(
+                sql,
+                many_aliases | many_tables,
+                dialect=ctx.dialect if ctx is not None else _dialect_of(org)[0],
+            )
             if rewritten and rewritten.strip() != sql.strip():
                 return PreFlightResult(
                     "fan_trap",
@@ -1391,6 +1528,7 @@ def _semi_additive_columns(org: Datasource) -> dict[tuple[str, str], "Metric"]:
     tables that both have a `balance` don't cross-contaminate. The table is the binding's
     own qualifier when present, else the metric's source_tables. Includes org-level
     cross-subject-area metrics."""
+    dialect, _ = _dialect_of(org)
     all_metrics: list["Metric"] = list(getattr(org, "cross_subject_area_metrics", []) or [])
     for sa in org.subject_areas:
         all_metrics.extend(sa.metrics)
@@ -1400,10 +1538,10 @@ def _semi_additive_columns(org: Datasource) -> dict[tuple[str, str], "Metric"]:
             continue
         srcs = list(mm.source_tables or [])
         for binding in (mm.bindings or {}).values():
-            try:
-                frag = sqlglot.parse_one(binding, error_level="ignore")
-            except Exception:
-                continue
+            # A metric binding is authored with the model, not by the caller, so it is read
+            # in the datasource's engine like everything else; a binding that does not parse
+            # is skipped rather than refusing the caller's statement, which is not at fault.
+            frag = _parse_sql(binding, dialect)
             if frag is None:
                 continue
             for agg in frag.find_all(exp.Sum):
@@ -1611,10 +1749,10 @@ def assemble_receipt(
     }
     if not _HAVE_SQLGLOT:
         return receipt
-    try:
-        tree = sqlglot.parse_one(sql, error_level="ignore")
-    except Exception:
-        tree = None
+    # Read in the datasource's engine: a receipt built from a generically-parsed statement
+    # attributes no tables at all on a backtick- or bracket-quoting engine, under-reporting
+    # what the answer actually read.
+    tree = _parse_sql(sql, _dialect_of(org)[0])
     if tree is None:
         return receipt
 
@@ -1855,13 +1993,17 @@ def _shared_dimension(
     return None
 
 
-def _drop_fanout_joins(sql: str, drop_tables: set[str]) -> Optional[str]:
+def _drop_fanout_joins(
+    sql: str, drop_tables: set[str], *, dialect: "str | None" = None
+) -> Optional[str]:
     """Remove JOINs whose target table/alias is in drop_tables. Used for the
-    safe aggregation-only fan-trap rewrite."""
-    try:
-        tree = sqlglot.parse_one(sql, error_level="ignore")
-    except Exception:
-        return None
+    safe aggregation-only fan-trap rewrite.
+
+    `dialect` is both read and written: the statement returned here is the one the executor
+    runs, so it must be regenerated in the engine's own grammar. Emitting generically would
+    hand the executor a statement the guards never validated.
+    """
+    tree = _parse_sql(sql, dialect)
     if not isinstance(tree, exp.Select):
         return None
     joins = tree.args.get("joins") or []
@@ -1878,7 +2020,7 @@ def _drop_fanout_joins(sql: str, drop_tables: set[str]) -> Optional[str]:
     if not changed:
         return None
     tree.set("joins", kept)
-    return tree.sql()
+    return tree.sql(dialect=dialect)
 
 
 def apply_default_filters(
@@ -1908,11 +2050,10 @@ def apply_default_filters(
         # shared ctx.tree the read-only guards used stays pristine (ACE-045). ctx must be
         # built from this same `sql`, which _model_safety guarantees.
         tree = ctx.tree.copy() if ctx.tree is not None else None
+        dialect = ctx.dialect
     else:
-        try:
-            tree = sqlglot.parse_one(sql, error_level="ignore")
-        except Exception:
-            return sql, []
+        dialect, _ = _dialect_of(org)
+        tree = _parse_sql(sql, dialect)
     if not isinstance(tree, exp.Select):
         return sql, []
 
@@ -1937,16 +2078,31 @@ def apply_default_filters(
         return sql, []
 
     combined = " AND ".join(f"({c})" for c in conditions)
+    # The condition is authored with the model, not by the caller, and is read in the same
+    # engine grammar as the statement it is spliced into.
+    #
+    # If it cannot be applied, this must NOT return the statement unchanged. The caller keeps
+    # the rewritten SQL only when `applied` is non-empty, so an empty list is indistinguishable
+    # from "this query needed no filter" — and the query would then run with the row scoping
+    # its model declares silently absent. That is a fail-open in a governance control, so an
+    # unusable filter raises and the caller refuses instead.
+    cond_tree = _parse_sql(f"SELECT 1 WHERE {combined}", dialect)
     try:
-        cond_expr = sqlglot.parse_one(f"SELECT 1 WHERE {combined}").args["where"].this
+        if cond_tree is None:
+            raise ValueError("the filter did not parse")
+        cond_expr = cond_tree.args["where"].this
         where = tree.args.get("where")
         if where is not None:
             tree.set("where", exp.Where(this=exp.and_(where.this, cond_expr)))
         else:
             tree.set("where", exp.Where(this=cond_expr))
-        return tree.sql(), applied
-    except Exception:
-        return sql, []
+        # Regenerate in the datasource's grammar: this statement is what the executor runs.
+        return tree.sql(dialect=dialect), applied
+    except Exception as exc:
+        raise RowScopingUnavailable(
+            "the datasource declares a row filter for a table this query reads, but the "
+            "filter could not be applied, so the query cannot be row-scoped"
+        ) from exc
 
 
 def _similarity(a: str, b: str) -> float:
@@ -1989,7 +2145,6 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
       - COUNT(...) and ratios (any division) get NO currency unit (a count / rate isn't
         money). Returns {} if the model carries no units or sqlglot can't parse.
     """
-    import sqlglot
     from sqlglot import expressions as exp
 
     col_units: dict[str, str] = {}
@@ -2011,10 +2166,7 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
     if not col_units and not metric_units:
         return {}
 
-    try:
-        tree = sqlglot.parse_one(sql, error_level="ignore")
-    except Exception:
-        return {}
+    tree = _parse_sql(sql, _dialect_of(org)[0])
     select = tree.find(exp.Select) if tree is not None else None
     if select is None:
         return {}
@@ -2106,6 +2258,8 @@ __all__ = [
     "PreFlightResult",
     "pre_flight_check",
     "apply_default_filters",
+    "RowScopingUnavailable",
+    "engines_disagree",
     "build_receipt",
     "assemble_receipt",
 ]

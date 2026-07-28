@@ -1229,6 +1229,42 @@ def _model_safety(
     # returns the same verdict as one that builds its own.
     ctx = RT.build_guard_context(sql, org)
 
+    # Ungovernable-engine gate — if the datasource does not determine which engine its SQL
+    # runs on, there is no grammar to read the statement in, so no gate below can reach a
+    # trustworthy verdict and the statement is refused rather than run blind. This is
+    # deliberately ahead of, and not subject to, the unscopable posture switch: the posture
+    # is a staged-rollout hatch for queries that cannot be scoped, whereas a datasource that
+    # cannot be parsed at all is a configuration fault the operator must fix. Refusing here
+    # also keeps the guarantee independent of which gate would otherwise have run.
+    if ctx is not None and getattr(ctx, "dialect", None) is None and getattr(ctx, "parse_error", None):
+        return sql, Refusal(
+            "unscopable_sql",
+            ctx.parse_error,
+            # No rewrite of the query helps, so this must not invite a retry — it names the
+            # one change that makes the datasource governable.
+            # No trailing "then retry": the statement is not the problem, and an unactionable
+            # invitation to try again turns a configuration fault into a retry loop.
+            "Declare the datasource's engine (storage_connections[].storage_type) so its SQL "
+            "can be parsed for the right engine.",
+        ), None
+
+    # Unreadable-statement gate — a statement that did not parse leaves every gate below with
+    # no tree, and they each degrade to allow on one, so nothing downstream would object. Also
+    # ahead of the posture switch: `warn` exists to let through queries that parse but cannot be
+    # scoped, not statements nobody can read. Leaving this behind the switch would make `warn`
+    # weaker than it was before parse errors were reported, because the old silently-truncated
+    # tree still named enough for the scope gates to catch some of these.
+    if ctx is not None and ctx.tree is None:
+        return sql, Refusal(
+            "unscopable_sql",
+            getattr(ctx, "parse_error", None) or "the statement could not be read as SQL",
+            getattr(
+                RT,
+                "_REEMIT_REMEDIATION",
+                "Re-emit the query using the declared table and column names.",
+            ),
+        ), None
+
     # Scopability gate — refuse a query that can't be fully scoped (unparseable, or a non-`Table`
     # FROM/JOIN source the scope walk can't reject) rather than run it blind. Runs
     # BEFORE the object-scope gates so an unscopable query fails closed instead of reaching their
@@ -1328,7 +1364,22 @@ def _model_safety(
         else:
             return sql, Refusal("sensitive_columns", sens.reason, sens.suggestion or ""), None
 
-    new_sql, applied = RT.apply_default_filters(sql, org, area=area, ctx=ctx)
+    try:
+        # `getattr` because this file is vendored into the plugin while runtime.py resolves from
+        # the separately-versioned installed package: a newer plugin can meet an older runtime
+        # that has no such exception, and naming it directly would raise AttributeError instead.
+        new_sql, applied = RT.apply_default_filters(sql, org, area=area, ctx=ctx)
+    except getattr(RT, "RowScopingUnavailable", ()) as exc:
+        # The model declares a row filter for a table this query reads, and it could not be
+        # applied. Running anyway would return rows the row scoping exists to withhold, so
+        # this refuses. The fault is in the model, not the query, so the remediation is the
+        # operator's and the statement is not worth re-emitting.
+        return sql, Refusal(
+            "model_unavailable",
+            str(exc),
+            "Correct the table's default_filters in the model so the row filter can be "
+            "applied for this datasource's engine.",
+        ), None
     if applied:
         # default_filters only add WHERE conditions, never change the projection list, so the mask
         # plan's output indices stay valid against the rewritten SQL's result.
@@ -1407,6 +1458,40 @@ def _execute_trino(creds: dict[str, str], sql: str) -> int:
 
 def _execute_duckdb(creds: dict[str, str], sql: str) -> int:
     return _emit_or_err(lambda: _run_duckdb(creds, sql))
+
+
+def _refuse_if_engines_disagree(profile: str, creds: dict[str, str]) -> None:
+    """Refuse when the model's declared engine is not the one the credentials connect to.
+
+    Raises GuardRefused. Silent when either side is absent or unmapped: the executor rejects an
+    unusable credential type itself, and a missing declaration is already refused upstream.
+    """
+    # Imported here rather than at module scope, like the rest of the guard path: a bare install
+    # legitimately has no model package. `getattr` throughout because this file is vendored into
+    # the plugin while runtime.py resolves from the separately-versioned installed package, so an
+    # older runtime simply skips the check instead of raising.
+    try:
+        from semantic_model import runtime as RT
+    except Exception:
+        return
+    engines_disagree = getattr(RT, "engines_disagree", None)
+    dialect_of = getattr(RT, "_dialect_of", None)
+    if engines_disagree is None or dialect_of is None:
+        return
+    org = _resolve_guard_model(profile)
+    if org is None:
+        return
+    if engines_disagree(dialect_of(org)[0], creds.get("type", "")):
+        raise GuardRefused(
+            Refusal(
+                "model_unavailable",
+                "the datasource's declared engine is not the engine its credentials connect "
+                "to, so the statement was checked against the wrong SQL grammar",
+                "Make the model's storage_connections[].storage_type match the engine the "
+                "credentials point at.",
+            ),
+            code=1,
+        )
 
 
 def _builtin_execute(vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult:
@@ -1506,6 +1591,13 @@ def execute_guarded(
         if refusal is not None:
             raise GuardRefused(refusal, code=1)
     creds = _load_credentials(profile, org_id or "local")
+    if not no_safety:
+        # The guard chose its grammar from the model's declared engine; the executor chooses its
+        # driver from these credentials. They are separate pieces of operator configuration, so a
+        # mismatch means the statement was vetted — and, where a filter or join rewrite fired,
+        # regenerated — in a grammar this database does not speak. Credentials are resolved after
+        # the gates by design, so this is the first point the two can be compared.
+        _refuse_if_engines_disagree(profile, creds)
     try:
         result = executor.execute(sql, creds, profile=profile)
         if mask_plan is not None:

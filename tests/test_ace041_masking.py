@@ -62,7 +62,11 @@ def _org() -> "m.Datasource":
         columns=[m.Column(name="id", type="integer"), m.Column(name="ssn", type="string")],
     )
     sa = m.SubjectArea(name="area", description="d", tables_defined=[customers, orders, x])
-    return m.Datasource(datasource="AcmeCorp", version=1, subject_areas=[sa])
+    return m.Datasource(
+        datasource="AcmeCorp", version=1,
+        storage_connections=[m.StorageConnection(name="c", storage_type="SQLite")],
+        subject_areas=[sa],
+    )
 
 
 class _SpyExecutor:
@@ -257,7 +261,10 @@ def test_unparseable_with_declared_pii_fails_closed(guarded, monkeypatch):
     # is unchanged (unparseable + declared PII => refused fail-closed, executor never runs); only the
     # refusal *kind* moves from `sensitive_columns` to `unscopable_sql`. The PII parse-failure check
     # remains in _model_safety as defense-in-depth (it fires if the scopable gate is ever disabled).
-    monkeypatch.setattr(rt, "_parse_sql", lambda sql: None)
+    # The guard battery parses through `_parse_reporting` (tree + why-it-failed) and
+    # `_parse_sql` (tree only), so both are stubbed to report a parse failure.
+    monkeypatch.setattr(rt, "_parse_reporting", lambda sql, dialect=None: (None, "forced"))
+    monkeypatch.setattr(rt, "_parse_sql", lambda sql, dialect=None: None)
     spy = _SpyExecutor(_R(["ssn"], [("111",)]))
     with pytest.raises(execute_sql.GuardRefused) as ei:
         guarded("SELECT ssn FROM customers", spy)
@@ -695,7 +702,7 @@ def _write_disk_model(root: Path) -> None:
         "subject_areas": ["subject_areas/area"],
     }))
     (root / "datasources" / "c" / "storage.yaml").write_text(
-        yaml.safe_dump({"name": "c", "storage_type": "PostgreSQL", "storage_config": {}}))
+        yaml.safe_dump({"name": "c", "storage_type": "SQLite", "storage_config": {}}))
     (root / "subject_areas" / "area" / "subject_area.yaml").write_text(yaml.safe_dump({
         "name": "area", "description": "d",
         "tables": [{"storage_connection": "c", "schema": "public", "table": "customers"}],
