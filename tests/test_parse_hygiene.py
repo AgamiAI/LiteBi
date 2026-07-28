@@ -37,11 +37,19 @@ SCAN_ROOTS = [
 # Every sqlglot entry point that turns text into a tree. Naming only `parse_one` would let a
 # guard-path `sqlglot.parse(...)` or `transpile(...)` land without a grammar.
 #
-# `parse` is matched only as `sqlglot.parse` — as a bare name it is far too common (this repo
-# has two unrelated local `parse()` helpers), and a scanner that cries wolf gets exempted into
-# uselessness. The other three names are unambiguous enough to match either way.
-_QUALIFIED_PARSE_CALLS = frozenset({"parse_one", "parse", "transpile", "maybe_parse"})
-_BARE_PARSE_CALLS = frozenset({"parse_one", "transpile", "maybe_parse"})
+# These three names are distinctive enough to match however they are called. `parse` is not —
+# this repo has two unrelated local `parse()` helpers, and any object can have a `.parse()` —
+# so it counts only as `sqlglot.parse`. A scanner that cries wolf gets exempted into uselessness.
+_UNAMBIGUOUS_PARSE_CALLS = frozenset({"parse_one", "transpile", "maybe_parse"})
+
+
+def _receiver_is_sqlglot(node: ast.expr) -> bool:
+    """True for `sqlglot.parse(...)` and `x.sqlglot.parse(...)`, false for any other receiver."""
+    if isinstance(node, ast.Name):
+        return node.id == "sqlglot"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "sqlglot"
+    return False
 
 _EXEMPT: dict[str, str] = {
     "packages/agami-core/src/semantic_model/validator.py::_columns_referenced": (
@@ -89,9 +97,13 @@ def _walk(node, owner: str, relpath: str):
         if isinstance(child, ast.Call):
             func = child.func
             if isinstance(func, ast.Attribute):
-                if func.attr in _QUALIFIED_PARSE_CALLS:
+                # `parse` is common enough that matching every `x.parse(...)` would flag
+                # unrelated parsers, so it counts only when the receiver is sqlglot itself.
+                if func.attr in _UNAMBIGUOUS_PARSE_CALLS or (
+                    func.attr == "parse" and _receiver_is_sqlglot(func.value)
+                ):
                     yield relpath, owner, child
-            elif isinstance(func, ast.Name) and func.id in _BARE_PARSE_CALLS:
+            elif isinstance(func, ast.Name) and func.id in _UNAMBIGUOUS_PARSE_CALLS:
                 yield relpath, owner, child
         yield from _walk(child, owner, relpath)
 
@@ -104,6 +116,30 @@ def _kwarg(call: ast.Call, name: str):
 
 
 ALL_CALLS = list(_iter_parse_calls())
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        ("sqlglot.parse(sql)", True),
+        ("sqlglot.parse_one(sql)", True),
+        ("parse_one(sql)", True),
+        ("sqlglot.transpile(sql)", True),
+        # A local helper, or any other object's parser, is not a SQL parse we govern. Flagging
+        # these would demand arguments they do not take, and an exemption list grown to silence
+        # false positives is how a scanner stops being read.
+        ("parse(text)", False),
+        ("argparser.parse(text)", False),
+        ("self.parse(text)", False),
+        ("json.loads(text)", False),
+    ],
+)
+def test_the_scan_matches_sql_parses_and_not_look_alikes(source, expected, tmp_path):
+    path = tmp_path / "probe.py"
+    path.write_text(f"def f(sql, text):\n    return {source}\n", encoding="utf-8")
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found = list(_walk(tree, "<module>", "probe.py"))
+    assert bool(found) is expected, f"{source} -> {'matched' if found else 'not matched'}"
 
 
 def test_the_scan_actually_found_the_parses():

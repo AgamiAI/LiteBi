@@ -54,8 +54,12 @@ def _org(*storage_types: str, sensitive: bool = True) -> "m.Datasource":
     return m.Datasource(
         datasource="AcmeCorp",
         version=1,
+        # The first connection is named "c" because that is what the tables above reference;
+        # extras get suffixed names. A fixture whose tables point at a connection it never
+        # declares would be internally inconsistent, and would quietly stop meaning anything
+        # if the runtime ever resolves the table-to-connection link.
         storage_connections=[
-            m.StorageConnection(name=f"c{i}", storage_type=st)
+            m.StorageConnection(name="c" if i == 0 else f"c{i}", storage_type=st)
             for i, st in enumerate(storage_types)
         ],
         subject_areas=[sa],
