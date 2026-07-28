@@ -95,7 +95,12 @@ def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship
     # loader._load_cross_rels). Entries are already in the model's field shape.
     sidecar = art / BRIDGES_FILENAME
     if sidecar.exists():
-        doc = yaml.safe_load(sidecar.read_text(encoding="utf-8")) or {}
+        try:
+            doc = yaml.safe_load(sidecar.read_text(encoding="utf-8")) or {}
+        except Exception:
+            # A syntactically corrupt sidecar file degrades to no bridges — same never-raise
+            # contract as the per-entry skip below (load_org_record is on runtime paths).
+            doc = {}
         for r in doc.get("relationships", doc if isinstance(doc, list) else []):
             try:
                 out.append(CrossDatasourceRelationship(**r))
@@ -110,7 +115,12 @@ def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship
     # future write is idempotent). Read-only here — the migration is surfaced, not persisted.
     legacy = art / LEGACY_BRIDGES_PATH[0] / LEGACY_BRIDGES_PATH[1]
     if legacy.exists():
-        doc = yaml.safe_load(legacy.read_text(encoding="utf-8")) or {}
+        try:
+            doc = yaml.safe_load(legacy.read_text(encoding="utf-8")) or {}
+        except Exception:
+            # A corrupt legacy file is likewise skipped, not raised — a stale hand-edited file
+            # can't take down a runtime load_org_record call.
+            doc = {}
         for r in doc.get("relationships", doc if isinstance(doc, list) else []):
             try:
                 out.append(_migrate_legacy_bridge(r, str(legacy)))

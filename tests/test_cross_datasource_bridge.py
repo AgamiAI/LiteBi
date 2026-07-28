@@ -301,6 +301,18 @@ def test_malformed_sidecar_entry_does_not_raise_and_valid_sibling_loads(tmp_path
     assert record.cross_datasource_relationships[0].from_dataset == "crm.accounts"
 
 
+def test_corrupt_bridge_yaml_file_does_not_raise(tmp_path):
+    # Beyond a bad ENTRY: a syntactically corrupt bridge FILE (unparseable YAML) must also degrade
+    # to no bridges rather than propagate out of the runtime-path load_org_record.
+    art = _deployment(tmp_path)
+    (art / OR.BRIDGES_FILENAME).write_text("relationships: [ : broken", encoding="utf-8")
+    legacy = art / "local" / "cross_profile_relationships.yaml"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("::: not : valid : yaml", encoding="utf-8")
+    record = OR.load_org_record(art)  # must not raise
+    assert record.cross_datasource_relationships == []
+
+
 def test_malformed_legacy_entry_does_not_raise_and_valid_sibling_loads(tmp_path):
     # Same leniency for the legacy migration: an entry missing a required key (KeyError in the
     # migrator) is skipped, and its valid sibling in the same file still migrates.
