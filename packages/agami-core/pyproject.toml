@@ -37,7 +37,11 @@ model = [
 # The HTTP MCP transport (mcp_http): the official MCP SDK + an ASGI server. Kept out of the base
 # install so the local executor/skill stay stdlib-lean — only a hosted deployment installs it.
 server = [
-  "mcp>=1.2",
+  # Capped below 2.0: that release removed `Server.list_tools`, which `mcp_http` builds the tool
+  # surface with, so every HTTP request fails at import. With no ceiling here a resolve simply
+  # picks it up and the whole HTTP transport — and the safety corpus that runs over it — breaks
+  # without a code change. Raise the cap deliberately, once mcp_http is ported to the new API.
+  "mcp>=1.2,<2",
   "anyio>=4",           # async_offload.run_blocking offloads blocking work off the loop (ACE-048)
   "uvicorn>=0.30",
   "psycopg2-binary>=2.9",
