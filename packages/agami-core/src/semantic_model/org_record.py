@@ -84,6 +84,17 @@ def _merge_bridges(
     return out
 
 
+def _bridge_entries(doc) -> list:
+    """The entry list from a parsed bridge doc — a ``relationships:`` mapping OR a bare YAML list
+    (both accepted, mirroring ``loader._load_cross_rels``); anything else yields ``[]``. Explicit
+    rather than ``doc.get(...)`` because ``.get`` on a bare list raises ``AttributeError``."""
+    if isinstance(doc, dict):
+        return doc.get("relationships") or []
+    if isinstance(doc, list):
+        return doc
+    return []
+
+
 def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship]:
     """Load the non-inline bridge sources: the root sidecar (source 2) and the legacy skill-side
     file (source 3). Both are optional; a deployment with neither yields an empty list. Kept out of
@@ -101,7 +112,7 @@ def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship
             # A syntactically corrupt sidecar file degrades to no bridges — same never-raise
             # contract as the per-entry skip below (load_org_record is on runtime paths).
             doc = {}
-        for r in doc.get("relationships", doc if isinstance(doc, list) else []):
+        for r in _bridge_entries(doc):
             try:
                 out.append(CrossDatasourceRelationship(**r))
             except Exception:
@@ -121,7 +132,7 @@ def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship
             # A corrupt legacy file is likewise skipped, not raised — a stale hand-edited file
             # can't take down a runtime load_org_record call.
             doc = {}
-        for r in doc.get("relationships", doc if isinstance(doc, list) else []):
+        for r in _bridge_entries(doc):
             try:
                 out.append(_migrate_legacy_bridge(r, str(legacy)))
             except Exception:

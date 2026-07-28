@@ -313,6 +313,18 @@ def test_corrupt_bridge_yaml_file_does_not_raise(tmp_path):
     assert record.cross_datasource_relationships == []
 
 
+def test_bare_list_sidecar_loads(tmp_path):
+    # The sidecar accepts a bare YAML list (not only a `relationships:` mapping). This used to crash
+    # because `.get` was called on a list before the shape was checked; it must now load the entries.
+    art = _deployment(tmp_path)
+    (art / OR.BRIDGES_FILENAME).write_text(
+        yaml.safe_dump([_bridge().model_dump(mode="json")]),  # bare list, no `relationships:` key
+        encoding="utf-8",
+    )
+    record = OR.load_org_record(art)  # must not raise
+    assert len(record.cross_datasource_relationships) == 1
+
+
 def test_malformed_legacy_entry_does_not_raise_and_valid_sibling_loads(tmp_path):
     # Same leniency for the legacy migration: an entry missing a required key (KeyError in the
     # migrator) is skipped, and its valid sibling in the same file still migrates.
