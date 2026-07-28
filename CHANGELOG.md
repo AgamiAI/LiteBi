@@ -14,6 +14,28 @@ below corresponds to one such version.
 
 ### Security
 
+- **Gated PII masking on a whole-output proof; an output that cannot be proven clean is
+  now refused.** The mask decision quantified over the projections the detector *found*
+  (`all_maskable`), which proves "every offending projection we saw is maskable" but never
+  "no sensitive value reaches the output". While any detected projection refused the whole
+  query that gap was harmless; once a maskable projection let the query **run**, one seen
+  column unblocked the entire result set and every co-projected value the name-based
+  detector missed came back raw, beside a `***` implying the row had been protected.
+  `SensitiveCheckResult.output_provable` is the missing half: it is False when an
+  output-bearing arm draws through a source whose body is not walked (a derived table, a CTE
+  the arm selects from, a `VALUES`/`LATERAL` source), projects a scalar subquery, or projects
+  a qualifier naming none of that arm's own sources. `certainty="provable"` now requires it,
+  so an unprovable output falls back to a refusal. Two further binding bugs made the proof
+  itself unsound and are closed with it: a subquery alias could **shadow** an outer alias of
+  the same name (`FROM customers t` outside, `FROM orders t` inside an `EXISTS` body), silently
+  rebinding the outer `t.ssn` to a table declaring no `ssn` so it was never detected while the
+  qualifier still "resolved"; and two aliases folding to the same name (`FROM x "AB", customers
+  ab` with `AB.ssn`) resolved by exact-match-first to the quoted one, where the engine folds
+  onto the other. Alias binding is now shadow-aware and fails closed on a genuinely ambiguous
+  fold. The proof is scoped to what can actually put a value in the output, so a subquery in
+  `WHERE`/`HAVING`/`ORDER BY`, a JOIN's `ON` condition, or a CTE no arm selects from no longer
+  downgrades an ordinary maskable query to a refusal.
+
 - **Closed a read-only-guard bypass via a welded quoted identifier.** A double-quoted
   identifier is self-delimiting in SQL on **both** ends, so `SELECT*FROM"pg_read_file"(…)`
   and `SELECT "x"INTO evil FROM t` are valid statements with no whitespace either side of
