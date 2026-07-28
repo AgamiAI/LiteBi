@@ -256,16 +256,20 @@ def validate_deployment(artifacts_dir: str | Path) -> ValidationResult:
 
     art = Path(artifacts_dir)
     models: dict[str, Datasource] = {}
+    # Datasources LISTED on the record but that failed to load — distinct from a name never attached
+    # at all, so the endpoint message can tell "attached but broken" from "not attached" (fix #2).
+    failed_to_load: set[str] = set()
     for name in record.datasources:
         try:
             models[name] = _loader.load_datasource(art / name)
         except Exception:
             # A profile listed on the record but unreadable on disk is the per-profile validate's
             # problem, not this pass's — skip it so an endpoint pointing at it just reports unresolved.
+            failed_to_load.add(name)
             continue
 
     for bridge in record.cross_datasource_relationships:
-        _check_bridge(bridge, models, res)
+        _check_bridge(bridge, models, failed_to_load, res)
     return res
 
 
@@ -279,6 +283,7 @@ def _bridge_label(bridge: CrossDatasourceRelationship) -> str:
 def _check_bridge(
     bridge: CrossDatasourceRelationship,
     models: dict[str, Datasource],
+    failed_to_load: set[str],
     res: ValidationResult,
 ) -> None:
     # same_engine is impossible across two datasources (two engines). The model validator already
@@ -291,15 +296,18 @@ def _check_bridge(
         )
         return
     _check_bridge_endpoint(
-        res, bridge, models, bridge.from_datasource, bridge.from_dataset, bridge.from_columns)
+        res, bridge, models, failed_to_load,
+        bridge.from_datasource, bridge.from_dataset, bridge.from_columns)
     _check_bridge_endpoint(
-        res, bridge, models, bridge.to_datasource, bridge.to_dataset, bridge.to_columns)
+        res, bridge, models, failed_to_load,
+        bridge.to_datasource, bridge.to_dataset, bridge.to_columns)
 
 
 def _check_bridge_endpoint(
     res: ValidationResult,
     bridge: CrossDatasourceRelationship,
     models: dict[str, Datasource],
+    failed_to_load: set[str],
     datasource: str,
     dataset: str,
     columns: list[str],
@@ -309,10 +317,16 @@ def _check_bridge_endpoint(
     label = _bridge_label(bridge)
     model = models.get(datasource)
     if model is None:
+        # Fail-closed either way, but distinguish the two causes: a datasource the record lists but
+        # couldn't load is a broken-model problem to fix (not a bad bridge), whereas an unlisted name
+        # is a genuinely wrong endpoint.
+        if datasource in failed_to_load:
+            reason = (f"datasource {datasource!r} is attached but its model failed to load")
+        else:
+            reason = (f"datasource {datasource!r} is not an attached datasource of this deployment")
         res.error(
             "cross_datasource_endpoint_unresolved",
-            f"cross-datasource bridge {label}: datasource {datasource!r} is not an attached "
-            "datasource of this deployment",
+            f"cross-datasource bridge {label}: {reason}",
         )
         return
     table = _resolve_dataset(model, dataset)
@@ -338,13 +352,18 @@ def _resolve_dataset(model: Datasource, dataset: str) -> Optional[Table]:
     is matched leniently — a schema-less model (SQLite) or a bare ``table`` dataset resolves on the
     table name alone — so the bridge author isn't forced to schema-qualify when it's unambiguous."""
     target_schema, target_table = dataset.rsplit(".", 1) if "." in dataset else (None, dataset)
+    lenient: Optional[Table] = None
     for sa in model.subject_areas:
         for t in sa.tables_defined:
             if t.name != target_table:
                 continue
-            if target_schema is None or t.schema_name is None or t.schema_name == target_schema:
-                return t
-    return None
+            if target_schema is not None and t.schema_name == target_schema:
+                return t  # exact schema match wins outright
+            if target_schema is None or t.schema_name is None:
+                # schema-less model (SQLite) or bare-table dataset: remember it, but keep scanning in
+                # case an exact-schema table exists further on (fix #3 — prefer the exact match).
+                lenient = lenient or t
+    return lenient
 
 
 # ---------------------------------------------------------------------------

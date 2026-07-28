@@ -97,7 +97,12 @@ def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship
     if sidecar.exists():
         doc = yaml.safe_load(sidecar.read_text(encoding="utf-8")) or {}
         for r in doc.get("relationships", doc if isinstance(doc, list) else []):
-            out.append(CrossDatasourceRelationship(**r))
+            try:
+                out.append(CrossDatasourceRelationship(**r))
+            except Exception:
+                # load_org_record is lenient by contract (never raises — it's on runtime paths). A
+                # malformed entry is skipped so its valid siblings in the same file still load.
+                continue
 
     # Source 3 — legacy migration: the skill-side file the connect flow wrote before bridges were a
     # model type. Its `from_profile`/`to_profile` become `from_datasource`/`to_datasource`; the edge is
@@ -107,7 +112,12 @@ def _load_bridges(artifacts_dir: str | Path) -> list[CrossDatasourceRelationship
     if legacy.exists():
         doc = yaml.safe_load(legacy.read_text(encoding="utf-8")) or {}
         for r in doc.get("relationships", doc if isinstance(doc, list) else []):
-            out.append(_migrate_legacy_bridge(r, str(legacy)))
+            try:
+                out.append(_migrate_legacy_bridge(r, str(legacy)))
+            except Exception:
+                # Same leniency: a legacy entry missing a required key is skipped, not raised, so a
+                # single malformed row can't take down a runtime load_org_record call.
+                continue
     return out
 
 

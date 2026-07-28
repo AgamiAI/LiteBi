@@ -669,6 +669,8 @@ class CrossDatasourceRelationship(_Base):
     def endpoint_key(self) -> tuple:
         """The identity tuple used to de-duplicate bridges merged from several sources
         (inline + sidecar + legacy migration), so a re-load never duplicates an edge."""
+        # Direction-sensitive BY DESIGN: a reverse B->A edge is a distinct declared bridge, not a
+        # duplicate of A->B — so the from/to halves are NOT order-normalized here.
         return (
             self.from_datasource,
             self.from_dataset,

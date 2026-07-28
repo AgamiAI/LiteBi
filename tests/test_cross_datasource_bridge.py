@@ -104,9 +104,15 @@ def test_bridge_loads_validates_and_round_trips():
     assert reloaded == b
 
 
-def test_endpoint_key_ignores_description_and_trust():
-    # De-dup identity is the endpoints only — two edges that differ just in prose collapse to one.
+def test_endpoint_key_ignores_description_and_trust_fields():
+    # De-dup identity is the endpoints only — two edges that differ just in prose OR in a trust
+    # field (review_state here) collapse to one, so a re-load never keeps both.
     assert _bridge(description="a").endpoint_key == _bridge(description="b").endpoint_key
+    assert (
+        _bridge(review_state="unreviewed").endpoint_key
+        == _bridge(review_state="approved", signed_off_by="you@example.com",
+                   signed_off_at="2026-01-01", signed_off_role="admin").endpoint_key
+    )
 
 
 def test_model_rejects_same_engine():
@@ -173,6 +179,62 @@ def test_deployment_tolerates_an_unreadable_profile(tmp_path):
     assert any(f.code == "cross_datasource_endpoint_unresolved" for f in res.findings)
 
 
+def test_deployment_distinguishes_failed_load_from_unattached(tmp_path):
+    # Two ways an endpoint's datasource can be unresolvable, same fail-closed code but distinct text:
+    #   (a) a datasource the record LISTS but whose model won't load -> "attached but ... failed to load"
+    #   (b) a name that was never attached at all -> "not an attached datasource"
+    art = _deployment(tmp_path)
+    (art / "acme_erp" / "datasource.yaml").unlink()  # record still lists acme_erp, now unreadable
+    _set_bridges(art, [_bridge(), _bridge(to_datasource="acme_missing")])
+    res = validator.validate_deployment(art)
+    assert not res.ok
+    msgs = [f.message for f in res.findings if f.code == "cross_datasource_endpoint_unresolved"]
+    assert any("attached but its model failed to load" in m for m in msgs)
+    assert any("is not an attached datasource" in m for m in msgs)
+
+
+def _table(name: str, schema, key: str = "account_key") -> Table:
+    return Table(
+        name=name,
+        schema=schema,
+        storage_connection="db",
+        grain=[key],
+        columns=[Column(name=key, type="string")],
+    )
+
+
+def test_resolve_dataset_prefers_exact_schema_over_lenient():
+    # Two same-named tables — one schema-qualified `crm`, one schema-less (SQLite-style). A
+    # `crm.accounts` dataset must bind the exact-schema table, not the lenient (schema=None) one.
+    exact = _table("accounts", "crm")
+    lenient = _table("accounts", None)
+    model = Datasource(
+        datasource="acme",
+        storage_connections=[StorageConnection(name="db", storage_type="PostgreSQL")],
+        subject_areas=[
+            SubjectArea(name="a", tables_defined=[lenient],
+                        tables=[TableRef(table="accounts", schema=None, storage_connection="db")]),
+            SubjectArea(name="b", tables_defined=[exact],
+                        tables=[TableRef(table="accounts", schema="crm", storage_connection="db")]),
+        ],
+    )
+    assert validator._resolve_dataset(model, "crm.accounts") is exact
+    # Keep the leniency: a bare table (no schema) still resolves on the name alone.
+    assert validator._resolve_dataset(model, "accounts") is not None
+
+
+def test_resolve_dataset_lenient_when_model_is_schema_less():
+    # A schema-less model (SQLite) resolves a schema-qualified dataset on the table name alone.
+    model = Datasource(
+        datasource="acme",
+        storage_connections=[StorageConnection(name="db", storage_type="SQLite")],
+        subject_areas=[SubjectArea(
+            name="a", tables_defined=[_table("accounts", None)],
+            tables=[TableRef(table="accounts", schema=None, storage_connection="db")])],
+    )
+    assert validator._resolve_dataset(model, "crm.accounts") is not None
+
+
 def test_deployment_rejects_same_engine_bridge(tmp_path):
     # same_engine can't be CONSTRUCTED (the model validator refuses), so it reaches the deployment
     # only via a hand-built object; model_construct bypasses validation to exercise that branch.
@@ -190,7 +252,7 @@ def test_deployment_rejects_same_engine_bridge(tmp_path):
         executable="same_engine",
     )
     res = validator.ValidationResult()
-    validator._check_bridge(bad, models, res)
+    validator._check_bridge(bad, models, set(), res)
     assert not res.ok
     assert any(f.code == "cross_datasource_executable_mismatch" for f in res.findings)
 
@@ -216,6 +278,49 @@ def test_sidecar_bridges_merge_on_load(tmp_path):
     record = OR.load_org_record(art)
     assert len(record.cross_datasource_relationships) == 1
     assert record.cross_datasource_relationships[0].from_dataset == "crm.accounts"
+
+
+def test_malformed_sidecar_entry_does_not_raise_and_valid_sibling_loads(tmp_path):
+    # load_org_record is on runtime paths and is lenient by contract — a malformed sidecar entry
+    # (empty columns fail the model validator) must be skipped, not propagated, and a valid sibling
+    # in the same file still loads.
+    art = _deployment(tmp_path)
+    (art / OR.BRIDGES_FILENAME).write_text(
+        yaml.safe_dump(
+            {"relationships": [
+                {"from_datasource": "acme_crm", "to_datasource": "acme_erp",
+                 "from_dataset": "crm.accounts", "to_dataset": "erp.customers",
+                 "from_columns": [], "to_columns": []},  # malformed: empty columns
+                _bridge().model_dump(mode="json"),        # valid sibling
+            ]}
+        ),
+        encoding="utf-8",
+    )
+    record = OR.load_org_record(art)  # must not raise
+    assert len(record.cross_datasource_relationships) == 1
+    assert record.cross_datasource_relationships[0].from_dataset == "crm.accounts"
+
+
+def test_malformed_legacy_entry_does_not_raise_and_valid_sibling_loads(tmp_path):
+    # Same leniency for the legacy migration: an entry missing a required key (KeyError in the
+    # migrator) is skipped, and its valid sibling in the same file still migrates.
+    art = _deployment(tmp_path)
+    legacy = art / "local" / "cross_profile_relationships.yaml"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        yaml.safe_dump(
+            {"relationships": [
+                {"from_profile": "acme_crm", "to_profile": "acme_erp"},  # malformed: missing datasets/columns
+                {"from_profile": "acme_crm", "to_profile": "acme_erp",
+                 "from_dataset": "crm.accounts", "to_dataset": "erp.customers",
+                 "from_columns": ["account_key"], "to_columns": ["account_key"]},  # valid sibling
+            ]}
+        ),
+        encoding="utf-8",
+    )
+    record = OR.load_org_record(art)  # must not raise
+    assert len(record.cross_datasource_relationships) == 1
+    assert record.cross_datasource_relationships[0].from_datasource == "acme_crm"
 
 
 def test_legacy_file_migrates_idempotently(tmp_path):
@@ -254,4 +359,8 @@ def test_legacy_file_migrates_idempotently(tmp_path):
     _set_bridges(
         art, [migrated.model_copy(update={"migrated_from": None})]
     )  # same endpoints, inline
-    assert len(OR.load_org_record(art).cross_datasource_relationships) == 1
+    survivors = OR.load_org_record(art).cross_datasource_relationships
+    assert len(survivors) == 1
+    # Precedence, not just count: the inline edge (migrated_from is None) is concatenated ahead of
+    # the legacy one, and the merge keeps the FIRST occurrence — so the inline copy is the survivor.
+    assert survivors[0].migrated_from is None
