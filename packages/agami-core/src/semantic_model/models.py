@@ -109,7 +109,10 @@ SemiAdditiveAgg = Literal["last", "first", "average", "min", "max"]
 DescriptionSource = Literal["human", "ai_unvalidated", "ai_validated", "ai_unknown", "metadata"]
 Cardinality = Literal["many_to_one", "one_to_many", "one_to_one"]
 JoinType = Literal["INNER", "LEFT", "RIGHT", "FULL", "CROSS"]
-Executable = Literal["same_engine", "split", "informational"]
+# `federated` is metric-only (a cross-datasource metric fans across engines and reconciles the
+# pieces in-memory, F16 / ACE-073). The join types (Relationship / CrossDatasourceRelationship)
+# reject it; CrossDatasourceMetric requires it.
+Executable = Literal["same_engine", "split", "informational", "federated"]
 SourceType = Literal["table", "sql"]
 StorageType = Literal[
     "PostgreSQL",
@@ -568,6 +571,13 @@ class Relationship(_Base):
 
     @model_validator(mode="after")
     def _completeness(self) -> "Relationship":
+        # Defense-in-depth: `federated` is for cross-datasource METRICS only (ACE-073). A join edge
+        # can never be federated — reject it here so one can't even be constructed by hand.
+        if self.executable == "federated":
+            raise ValueError(
+                f"relationship {self.from_table}->{self.to_table}: executable='federated' is for "
+                "cross-datasource metrics only, not a join edge; use 'same_engine'/'split'/'informational'"
+            )
         # Exactly one of (from_column + to_column) OR (on:).
         simple = self.from_column is not None and self.to_column is not None
         partial_simple = (self.from_column is not None) ^ (self.to_column is not None)
@@ -656,6 +666,13 @@ class CrossDatasourceRelationship(_Base):
                 "cross-datasource relationship cannot be executable='same_engine' "
                 "(two datasources are two engines); use 'split' or 'informational'"
             )
+        # `federated` is metric-only (ACE-073) — a bridge is a join edge, never a metric; reject it
+        # here too so a hand-authored bridge can't smuggle in the metric-only value.
+        if self.executable == "federated":
+            raise ValueError(
+                "cross-datasource relationship cannot be executable='federated' "
+                "(federated is for cross-datasource metrics only); use 'split' or 'informational'"
+            )
         if not self.from_columns or not self.to_columns:
             raise ValueError("cross-datasource relationship requires non-empty from_columns and to_columns")
         if len(self.from_columns) != len(self.to_columns):
@@ -679,6 +696,114 @@ class CrossDatasourceRelationship(_Base):
             self.to_dataset,
             tuple(self.to_columns),
         )
+
+
+# ---------------------------------------------------------------------------
+# Cross-datasource metric (deployment-level, F16 / ACE-073)
+# ---------------------------------------------------------------------------
+
+
+class SubMeasure(_Base):
+    """One "piece" of a cross-datasource metric: a per-key number computed INSIDE a single
+    datasource. ``binding`` is the native SQL producing that number grouped to ``grain`` (the local
+    key column(s) it groups by — a list, mirroring the bridge's composite-key support), and ``alias``
+    names the output so the parent metric's ``combine`` formula has something to reference. Running
+    it is ACE-074's job; here it is only recorded."""
+
+    datasource: str
+    binding: str
+    # local key column(s) this piece groups by; a list to match the bridge's composite-key support.
+    grain: list[str] = Field(default_factory=list)
+    alias: str
+
+
+class CrossDatasourceMetric(_Base):
+    """A metric that stitches pieces from DIFFERENT datasources into one number, lined up per key
+    (F16 / ACE-073). Each ``SubMeasure`` produces a per-key number inside one datasource;
+    ``reconcile_on`` is the shared key they line up on (resolved through a declared
+    ``CrossDatasourceRelationship`` bridge); ``combine`` is a ``{alias}``-style formula over the
+    pieces — the SAME placeholder mechanism derived metrics use (``derived.py``), so it can be checked
+    without running any SQL. Like the bridge it lives on the deployment-level ``OrgRecord``: a metric
+    spanning datasources can't belong to a single per-profile model.
+
+    This spec only RECORDS and CHECKS such a metric — fanning out the pieces, reconciling on the key,
+    and evaluating ``combine`` is ACE-074. Mirrors ``Metric`` for ``name``/``calculation``/``other_names``
+    and ``CrossDatasourceRelationship`` for the flattened trust block."""
+
+    name: str  # required — also the dedup key on load (unlike a bridge, which is anonymous)
+    # prose intent (provider-portable; never empty) — mirrors Metric.calculation.
+    calculation: str
+    sub_measures: list[SubMeasure] = Field(default_factory=list)
+    # the shared key column(s) the pieces line up on (e.g. ["account_key"]); resolved through a bridge.
+    reconcile_on: list[str] = Field(default_factory=list)
+    # a `{alias}`-style formula over the sub-measure aliases, e.g. "{crm_revenue} - {erp_ar}".
+    combine: str = ""
+    # `federated` is the ONLY valid value here (rejected on the join types) — required below.
+    executable: Executable = "federated"
+    other_names: list[str] = Field(default_factory=list)
+
+    # trust block (flattened for ergonomic YAML authoring) — copied from CrossDatasourceRelationship.
+    confidence: Confidence = "proposed"
+    review_state: ReviewState = "unreviewed"
+    signed_off_by: Optional[str] = None
+    signed_off_at: Optional[str] = None
+    signed_off_role: Optional[str] = None
+    migrated_from: Optional[MigratedFrom] = None
+
+    @field_validator("calculation")
+    @classmethod
+    def _calc_nonempty(cls, v: str) -> str:
+        # Same backend-neutrality rule as Metric.calculation: prose intent is never empty, so the
+        # metric isn't binding-only (a reviewer can always read what it means).
+        if not v or not v.strip():
+            raise ValueError("cross-datasource metric calculation (prose intent) must be non-empty")
+        return v
+
+    @property
+    def source_datasources(self) -> list[str]:
+        """The distinct datasources of the pieces, in first-seen order. Computed (not stored) so it
+        can never drift from ``sub_measures``."""
+        out: list[str] = []
+        for sm in self.sub_measures:
+            if sm.datasource not in out:
+                out.append(sm.datasource)
+        return out
+
+    @model_validator(mode="after")
+    def _shape(self) -> "CrossDatasourceMetric":
+        # federated is structurally required here (it's what makes this a cross-engine metric rather
+        # than a join edge) — the join types reject the same value from the other direction.
+        if self.executable != "federated":
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: executable must be 'federated' "
+                f"(got {self.executable!r})"
+            )
+        if len(self.sub_measures) < 2:
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: requires >= 2 sub_measures "
+                f"(a cross-datasource metric spans at least two pieces); got {len(self.sub_measures)}"
+            )
+        if len(self.source_datasources) < 2:
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: sub_measures must span >= 2 distinct "
+                f"datasources (got {self.source_datasources})"
+            )
+        if not self.reconcile_on:
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: reconcile_on (the shared key) must be non-empty"
+            )
+        # Each piece needs a non-empty alias (str_strip_whitespace turns "  " into ""), and the
+        # aliases must be unique — they are the names `combine` references, so a dupe is ambiguous.
+        aliases = [sm.alias for sm in self.sub_measures]
+        if any(not a for a in aliases):
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: every sub_measure requires a non-empty alias"
+            )
+        if len(set(aliases)) != len(aliases):
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: sub_measure aliases must be unique (got {aliases})"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +918,10 @@ class OrgRecord(_Base):
     # Deployment-level bridges linking a key in one datasource to the same entity in another (F16 / ACE-072).
     # The deployment record is their home: a cross-datasource edge can't belong to a single per-profile model.
     cross_datasource_relationships: list[CrossDatasourceRelationship] = Field(default_factory=list)
+    # Deployment-level metrics that stitch pieces from several datasources into one number (F16 / ACE-073).
+    # Same home as the bridges (and for the same reason): a metric spanning datasources can't belong to a
+    # single per-profile model. Deduped by `name` on load.
+    cross_datasource_metrics: list[CrossDatasourceMetric] = Field(default_factory=list)
 
     @field_validator("fiscal_year_start_month")
     @classmethod
@@ -834,6 +963,8 @@ __all__ = [
     "Relationship",
     "CrossSubjectAreaRelationship",
     "CrossDatasourceRelationship",
+    "SubMeasure",
+    "CrossDatasourceMetric",
     "SubjectArea",
     "Datasource",
     "DisplayConventions",
