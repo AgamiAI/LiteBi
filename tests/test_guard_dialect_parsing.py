@@ -283,7 +283,7 @@ def guarded(monkeypatch):
     return _run
 
 
-@pytest.mark.parametrize("engine", BACKTICK_ENGINES + BRACKET_ENGINES)
+@pytest.mark.parametrize("engine", ALL_ENGINES)
 def test_undeclared_table_never_reaches_the_executor(guarded, engine):
     """A refused statement is proved refused by the executor never being called."""
     org = _org(engine)
@@ -295,7 +295,7 @@ def test_undeclared_table_never_reaches_the_executor(guarded, engine):
     assert spy.calls == [], f"{engine}: the executor ran a statement the model does not declare"
 
 
-@pytest.mark.parametrize("engine", BACKTICK_ENGINES + BRACKET_ENGINES)
+@pytest.mark.parametrize("engine", ALL_ENGINES)
 def test_sensitive_column_is_never_returned_raw(guarded, engine):
     """Masked or refused — never the value itself."""
     org = _org(engine)
@@ -309,3 +309,59 @@ def test_sensitive_column_is_never_returned_raw(guarded, engine):
         return
     returned = [str(v) for row in env.rows for v in row]
     assert "111-22-3333" not in returned, f"{engine}: sensitive value returned verbatim"
+
+
+@pytest.mark.parametrize("engine", ALL_ENGINES)
+def test_a_governed_statement_reaches_the_executor_on_every_engine(guarded, engine):
+    """The other half of the matrix: an allowed statement must arrive, and arrive as the
+    statement the guard vetted — which is how the regeneration paths get asserted."""
+    org = _org(engine)
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
+    sql = f"SELECT {_quote(engine, 'id')} FROM {_quote(engine, 'customers')}"
+
+    guarded(sql, org, spy)
+    assert spy.calls, f"{engine}: a governed statement was refused"
+    vetted = spy.calls[0][0]
+    reparsed, why = rt._parse_reporting(vetted, rt._dialect_of(org)[0])
+    assert reparsed is not None, f"{engine}: executor got SQL invalid for its own engine ({why})"
+    assert {t.name for t in reparsed.find_all(sqlglot.exp.Table)} == {"customers"}
+
+
+@pytest.mark.parametrize("engine", ALL_ENGINES)
+def test_select_star_is_refused_on_every_engine(guarded, engine):
+    org = _org(engine)
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
+    with pytest.raises(execute_sql.GuardRefused):
+        guarded(f"SELECT * FROM {_quote(engine, 'customers')}", org, spy)
+    assert spy.calls == []
+
+
+@pytest.mark.parametrize("engine", ALL_ENGINES)
+def test_a_write_is_refused_on_every_engine(guarded, engine):
+    """The read-only lexer is a separate path; pin that threading the dialect left it alone."""
+    org = _org(engine)
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
+    with pytest.raises(execute_sql.GuardRefused):
+        guarded(f"DELETE FROM {_quote(engine, 'customers')}", org, spy)
+    assert spy.calls == []
+
+
+# --- constructs that do not diverge today, pinned so a dependency bump cannot regress them ---
+
+
+@pytest.mark.parametrize(
+    "label,sql,engine",
+    [
+        ("qualify", "SELECT id FROM customers QUALIFY ROW_NUMBER() OVER (ORDER BY id) = 1", "Snowflake"),
+        ("fetch-first", "SELECT id FROM customers FETCH FIRST 5 ROWS ONLY", "Oracle"),
+        ("except-replace", "SELECT * EXCEPT(ssn) FROM customers", "BigQuery"),
+        ("three-part-name", "SELECT id FROM catalog.public.customers", "Snowflake"),
+        ("group-by-rollup", "SELECT id, COUNT(*) FROM customers GROUP BY ROLLUP(id)", "PostgreSQL"),
+    ],
+)
+def test_non_diverging_constructs_still_parse(label, sql, engine):
+    """These parse identically today, which is exactly why nobody would re-check them after a
+    sqlglot upgrade. Pinning them is what makes this a regression matrix rather than a
+    snapshot of one afternoon's findings."""
+    tree, why = rt._parse_reporting(sql, rt._dialect_of(_org(engine))[0])
+    assert tree is not None, f"{label} no longer parses on {engine}: {why}"
