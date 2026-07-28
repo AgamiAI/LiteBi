@@ -51,6 +51,7 @@ except ImportError:  # pragma: no cover - sqlglot is in requirements
     _HAVE_SQLGLOT = False
 
 from .models import (
+    CrossDatasourceMetric,
     CrossDatasourceRelationship,
     CrossSubjectAreaRelationship,
     Datasource,
@@ -236,22 +237,33 @@ def validate(org: Datasource, *, cache: "ValidationCache | None" = None) -> Vali
 
 
 def validate_deployment(artifacts_dir: str | Path) -> ValidationResult:
-    """Validate the deployment-level cross-datasource bridges on the ``OrgRecord``.
+    """Validate the deployment-level cross-datasource bridges AND metrics on the ``OrgRecord``.
 
-    A bridge links a key in one datasource to the same entity in another, so it can only be checked
-    with EVERY datasource's model in view — more than the per-profile ``validate(org)`` sees. This
-    loads the record (with its merged bridges) plus each attached datasource model and, for each
-    bridge, rejects ``same_engine`` (structurally impossible across two engines) and any endpoint
-    whose datasource / dataset (``schema.table``) / column doesn't resolve in that datasource's model.
+    A bridge links a key in one datasource to the same entity in another, and a cross-datasource
+    metric stitches per-key pieces from several datasources into one number — both can only be checked
+    with EVERY datasource's model in view, more than the per-profile ``validate(org)`` sees. This loads
+    the record (with its merged bridges + metrics) plus each attached datasource model and:
 
-    Returns an empty (``ok``) result when there is no record or no bridges — a pre-F16 deployment is a
-    no-op, never an error."""
+      * for each BRIDGE, rejects ``same_engine`` (impossible across two engines) and any endpoint whose
+        datasource / dataset (``schema.table``) / column doesn't resolve in that datasource's model;
+      * for each METRIC (ACE-073), rejects a piece pointing at an unattached datasource or an
+        unresolved ``grain`` column, a ``reconcile_on`` key with no declared bridge linking the pieces'
+        datasources, a ``combine`` formula referencing an unknown alias, and a metric that doesn't span
+        >= 2 datasources.
+
+    Returns an empty (``ok``) result when there is no record, or neither bridges nor metrics — a pre-F16
+    deployment is a no-op, never an error."""
     from . import loader as _loader
     from . import org_record as _org_record
 
     res = ValidationResult()
     record = _org_record.load_org_record(artifacts_dir)
-    if record is None or not record.cross_datasource_relationships:
+    # Fail-open fix (ACE-073): bail only when there is NOTHING deployment-level to check — a deployment
+    # with metrics but zero bridges must still run the metric checks (else a metric pointing at a
+    # missing bridge would silently pass, the opposite of the fail-closed rule).
+    if record is None or (
+        not record.cross_datasource_relationships and not record.cross_datasource_metrics
+    ):
         return res
 
     art = Path(artifacts_dir)
@@ -270,6 +282,8 @@ def validate_deployment(artifacts_dir: str | Path) -> ValidationResult:
 
     for bridge in record.cross_datasource_relationships:
         _check_bridge(bridge, models, failed_to_load, res)
+    for metric in record.cross_datasource_metrics:
+        _check_metric(metric, record.cross_datasource_relationships, models, failed_to_load, res)
     return res
 
 
@@ -364,6 +378,128 @@ def _resolve_dataset(model: Datasource, dataset: str) -> Optional[Table]:
                 # case an exact-schema table exists further on (fix #3 — prefer the exact match).
                 lenient = lenient or t
     return lenient
+
+
+# ---------------------------------------------------------------------------
+# Deployment-level pass (F16 / ACE-073): cross-datasource metrics
+# ---------------------------------------------------------------------------
+
+
+def _datasource_columns(model: Datasource) -> set[str]:
+    """Every column name across a datasource's canonical tables. A sub-measure's ``grain`` names local
+    key column(s) but carries no table reference (unlike a bridge endpoint's ``schema.table`` dataset),
+    so grain resolution is deliberately pragmatic: the column must exist on SOME table in the
+    datasource, not a specific one."""
+    out: set[str] = set()
+    for sa in model.subject_areas:
+        for t in sa.tables_defined:
+            out |= {c.name for c in t.columns}
+    return out
+
+
+def _bridge_matches_key(bridge: CrossDatasourceRelationship, reconcile_on: list[str]) -> bool:
+    """True if ``bridge`` reconciles on the metric's key — its ``from_columns`` OR ``to_columns`` set
+    equals ``reconcile_on``. Set equality (not order) so a composite key declared in any order matches;
+    either half, because the two endpoints may name the shared key with different local columns."""
+    key = set(reconcile_on)
+    return key == set(bridge.from_columns) or key == set(bridge.to_columns)
+
+
+def _check_metric(
+    metric: CrossDatasourceMetric,
+    bridges: list[CrossDatasourceRelationship],
+    models: dict[str, Datasource],
+    failed_to_load: set[str],
+    res: ValidationResult,
+) -> None:
+    """Validate one cross-datasource metric against every attached datasource model + the declared
+    bridges. Each independent problem emits its own finding (they don't short-circuit) so a broken
+    metric reports all of its faults at once."""
+    _check_metric_pieces(metric, models, failed_to_load, res)
+    _check_metric_bridged(metric, bridges, res)
+    _check_metric_combine(metric, res)
+    # Defensive: the model validator already requires >= 2 distinct datasources, but re-assert here in
+    # case a metric reached the deployment via model_construct (bypassing validation).
+    if len(metric.source_datasources) < 2:
+        res.error(
+            "cross_datasource_metric_single_source",
+            f"cross-datasource metric {metric.name!r}: spans only {metric.source_datasources} — a "
+            "cross-datasource metric must span >= 2 distinct datasources",
+        )
+
+
+def _check_metric_pieces(
+    metric: CrossDatasourceMetric,
+    models: dict[str, Datasource],
+    failed_to_load: set[str],
+    res: ValidationResult,
+) -> None:
+    """Each sub-measure's datasource must be attached, and its ``grain`` column(s) must resolve in that
+    datasource's model. Same fail-closed 'attached but broken' vs 'not attached' split as the bridge
+    endpoint check."""
+    for sm in metric.sub_measures:
+        model = models.get(sm.datasource)
+        if model is None:
+            if sm.datasource in failed_to_load:
+                reason = f"datasource {sm.datasource!r} is attached but its model failed to load"
+            else:
+                reason = f"datasource {sm.datasource!r} is not an attached datasource of this deployment"
+            res.error(
+                "cross_datasource_metric_endpoint_unresolved",
+                f"cross-datasource metric {metric.name!r}: sub_measure {sm.alias!r}: {reason}",
+            )
+            continue
+        present = _datasource_columns(model)
+        missing = [c for c in sm.grain if c not in present]
+        if missing:
+            res.error(
+                "cross_datasource_metric_endpoint_unresolved",
+                f"cross-datasource metric {metric.name!r}: sub_measure {sm.alias!r}: grain column(s) "
+                f"{missing} not found in datasource {sm.datasource!r}",
+            )
+
+
+def _check_metric_bridged(
+    metric: CrossDatasourceMetric,
+    bridges: list[CrossDatasourceRelationship],
+    res: ValidationResult,
+) -> None:
+    """Fail-closed bridge rule: EVERY sub-measure datasource must appear in at least one declared
+    bridge, on the reconcile key, together with another of this metric's datasources — so no datasource
+    is left unbridged. (For the 2-datasource case this is exactly one matching bridge between them.)"""
+    sources = set(metric.source_datasources)
+    bridged: set[str] = set()
+    for b in bridges:
+        if not _bridge_matches_key(b, metric.reconcile_on):
+            continue
+        endpoints = {b.from_datasource, b.to_datasource}
+        # both endpoints must be distinct datasources of THIS metric for the bridge to link a pair.
+        if len(endpoints & sources) == 2:
+            bridged |= endpoints & sources
+    unbridged = sorted(sources - bridged)
+    if unbridged:
+        res.error(
+            "cross_datasource_metric_no_bridge",
+            f"cross-datasource metric {metric.name!r}: datasource(s) {unbridged} are not linked by a "
+            f"declared cross-datasource bridge on reconcile_on={metric.reconcile_on} to another of the "
+            "metric's datasources — declare the bridge(s) before the metric can be reconciled",
+        )
+
+
+def _check_metric_combine(metric: CrossDatasourceMetric, res: ValidationResult) -> None:
+    """The ``combine`` formula may only reference declared sub-measure aliases via ``{alias}``
+    placeholders — reuse ``derived.py``'s extractor (the same mechanism the derived-metric check uses),
+    so this is a pure static check with no SQL executed."""
+    from . import derived as D
+
+    aliases = {sm.alias for sm in metric.sub_measures}
+    unknown = sorted(set(D.binding_refs(metric.combine)) - aliases)
+    if unknown:
+        res.error(
+            "cross_datasource_metric_bad_combine",
+            f"cross-datasource metric {metric.name!r}: combine references {unknown} which are not "
+            f"sub_measure aliases {sorted(aliases)}",
+        )
 
 
 # ---------------------------------------------------------------------------
