@@ -702,7 +702,7 @@ def _write_disk_model(root: Path) -> None:
         "subject_areas": ["subject_areas/area"],
     }))
     (root / "datasources" / "c" / "storage.yaml").write_text(
-        yaml.safe_dump({"name": "c", "storage_type": "PostgreSQL", "storage_config": {}}))
+        yaml.safe_dump({"name": "c", "storage_type": "SQLite", "storage_config": {}}))
     (root / "subject_areas" / "area" / "subject_area.yaml").write_text(yaml.safe_dump({
         "name": "area", "description": "d",
         "tables": [{"storage_connection": "c", "schema": "public", "table": "customers"}],

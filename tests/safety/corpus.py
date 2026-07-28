@@ -140,6 +140,19 @@ CASES: list[Case] = [
         "join-aggregate",
     ),
     Case("governed", "SELECT COUNT(email) AS n FROM customers", "ok", "sensitive-in-count-ok"),
+    # ── class 8: the same verdicts when the statement is written in the engine's own quoting ──
+    # A statement read in the wrong grammar does not describe itself: under a generic parse a
+    # backtick-quoted statement resolves to no tables and no columns, so every scope gate finds
+    # nothing to object to and allows it. These run through the full harness — both surfaces,
+    # both model paths — because that is the only place the guarantee is proved end to end.
+    # (The demo datasource is SQLite, which accepts both quoting styles.)
+    Case("quoting", "SELECT `id` FROM `undeclared`", "table_out_of_scope", "backtick-undeclared-table"),
+    Case("quoting", "SELECT `nosuchcol` FROM `orders`", "column_out_of_scope", "backtick-undeclared-col"),
+    Case("quoting", "SELECT `email` FROM `customers`", "ok", "backtick-sensitive-is-seen"),
+    Case("quoting", "SELECT * FROM `orders`", "select_star", "backtick-star"),
+    Case("quoting", "DELETE FROM `orders`", "permission", "backtick-delete"),
+    Case("quoting", "SELECT [id] FROM [undeclared]", "table_out_of_scope", "bracket-undeclared-table"),
+    Case("quoting", 'SELECT "id" FROM "undeclared"', "table_out_of_scope", "quoted-undeclared-table"),
     # Ordinary shapes a governed query takes. These carry no attack — they exist so that a
     # change which tightens parsing has to prove it did not start refusing valid SQL. Without
     # them the "no false refusal" side of the corpus rests on four statements, and a tightening

@@ -34,7 +34,8 @@ import execute_sql  # noqa: E402
 from semantic_model import models as m  # noqa: E402
 from semantic_model import runtime as rt  # noqa: E402
 
-SENSITIVE_VALUE = "111-22-3333"
+# 000-00-0000 is never issued, so no scanner or reader can mistake it for a real SSN.
+SENSITIVE_VALUE = "000-00-0000"
 
 
 def _org(*storage_types: str, sensitive: bool = True) -> "m.Datasource":
@@ -72,11 +73,13 @@ class _SpyExecutor:
 
 @pytest.fixture
 def guarded(monkeypatch):
-    def _run(sql: str, org, spy, **kw):
+    def _run(sql: str, org, spy, creds_type: str = "postgres", **kw):
         monkeypatch.setattr(execute_sql, "_resolve_guard_model", lambda profile: org)
+        # Credentials for the engine the model declares — the guard refuses a model/credential
+        # engine mismatch, which would otherwise mask what these tests are checking.
         monkeypatch.setattr(
             execute_sql, "_load_credentials",
-            lambda p, org_id="local": {"type": "sqlite", "path": ":memory:"},
+            lambda p, org_id="local": {"type": creds_type, "path": ":memory:"},
         )
         return execute_sql.execute_guarded(sql, "acme", None, executor=spy, **kw)
 

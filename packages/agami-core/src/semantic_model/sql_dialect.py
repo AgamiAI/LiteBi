@@ -99,6 +99,48 @@ def resolve_datasource_dialect(org: "Datasource") -> str:
     return sqlglot_dialect(engines.pop())
 
 
+# The credential `type` values the executor dispatches on, mapped to the same sqlglot dialect
+# names as above. The guard picks its grammar from the *model*; the executor picks its driver
+# from the *credentials*. Those are two independent pieces of operator configuration, so they
+# are compared rather than assumed equal — a model declaring one engine against another's
+# credentials would have the guard vet a statement in a grammar the database does not speak,
+# which is the defect this module exists to prevent, arriving by a different door.
+_CREDENTIAL_DIALECT: dict[str, str] = {
+    "postgres": "postgres",
+    "supabase": "postgres",  # hosted PostgreSQL
+    "redshift": "redshift",
+    "mysql": "mysql",
+    "sqlite": "sqlite",
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "sqlserver": "tsql",
+    "mssql": "tsql",
+    "oracle": "oracle",
+    "databricks": "databricks",
+    "trino": "trino",
+    "presto": "trino",
+    "duckdb": "duckdb",
+}
+
+
+def credential_dialect(credential_type: str) -> "str | None":
+    """The sqlglot dialect implied by a credential `type`, or None if it is not one we map."""
+    return _CREDENTIAL_DIALECT.get((credential_type or "").strip().lower())
+
+
+def engines_disagree(model_dialect: "str | None", credential_type: str) -> bool:
+    """True when the model's declared engine and the credentials name different engines.
+
+    Unmapped or absent values are not a disagreement — the executor rejects an unusable
+    credential type on its own, and refusing here as well would turn an unrelated
+    configuration error into a governance refusal that misdescribes it.
+    """
+    actual = credential_dialect(credential_type)
+    if model_dialect is None or actual is None:
+        return False
+    return model_dialect != actual
+
+
 def supported_storage_types() -> tuple[str, ...]:
     """Every engine with an explicit dialect mapping."""
     return tuple(_SQLGLOT_DIALECT)

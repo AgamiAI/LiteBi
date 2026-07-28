@@ -113,6 +113,18 @@ def test_sensitive_column_is_seen_under_native_quoting(engine):
     )
 
 
+@pytest.mark.parametrize("engine", BACKTICK_ENGINES + BRACKET_ENGINES)
+def test_sensitive_column_is_seen_when_qualified_by_a_quoted_alias(engine):
+    """A qualified column resolves through a different branch of the gate than a bare one, so
+    the aliased form is its own case rather than a restatement of the one above."""
+    org = _org(engine)
+    c, ssn, customers = _quote(engine, "c"), _quote(engine, "ssn"), _quote(engine, "customers")
+    sql = f"SELECT {c}.{ssn} FROM {customers} {c}"
+    assert rt.check_sensitive_projection(sql, org).action != "allow", (
+        f"{engine}: sensitive projection went unnoticed when qualified by a quoted alias"
+    )
+
+
 @pytest.mark.parametrize("engine", ALL_ENGINES)
 def test_receipt_attributes_the_table_under_native_quoting(engine):
     """A receipt that attributes nothing under-reports what the answer read."""
@@ -257,6 +269,111 @@ def test_row_scoping_regenerates_valid_sql_for_the_engine(engine):
     assert {t.name for t in reparsed.find_all(sqlglot.exp.Table)} == {"customers"}
 
 
+@pytest.mark.parametrize("engine", ALL_ENGINES)
+def test_the_fan_trap_rewrite_emits_for_the_engine(engine):
+    """The other rewrite that reaches the executor. It regenerates the statement, so emitting
+    generically would hand the executor SQL in a grammar it does not speak."""
+    dialect = rt._dialect_of(_org(engine))[0]
+    customers, orders = _quote(engine, "customers"), _quote(engine, "orders")
+    sql = f"SELECT COUNT(id) AS n FROM {customers} JOIN {orders} ON {orders}.cust_id = {customers}.id"
+
+    rewritten = rt._drop_fanout_joins(sql, {"orders"}, dialect=dialect)
+    assert rewritten, f"{engine}: the join was not dropped"
+    reparsed, why = rt._parse_reporting(rewritten, dialect)
+    assert reparsed is not None, f"{engine}: rewritten SQL does not parse for its own engine ({why})"
+    assert {t.name for t in reparsed.find_all(sqlglot.exp.Table)} == {"customers"}
+
+
+@pytest.mark.parametrize("engine", BACKTICK_ENGINES + BRACKET_ENGINES)
+def test_set_operation_arms_are_rendered_in_the_engines_grammar(engine):
+    """Each arm is rendered back to text before being re-read. Rendered generically, an arm
+    written in the engine's quoting would be re-read in a grammar it was never written in."""
+    org = _org(engine)
+    customers, orders = _quote(engine, "customers"), _quote(engine, "orders")
+    sql = f"SELECT id FROM {customers} UNION ALL SELECT id FROM {orders}"
+
+    # Both arms read declared tables, so nothing should be refused for being unreadable.
+    result = rt.pre_flight_check(sql, org)
+    assert result.action != "refuse" or result.risk, (
+        f"{engine}: a set operation over declared tables was refused with no risk named"
+    )
+    assert rt.check_table_scope(sql, org) is None, f"{engine}: declared tables read as undeclared"
+
+
+# --- a double-quoted token on a backtick engine is ambiguous, so it is refused -----
+
+
+@pytest.mark.parametrize("engine", BACKTICK_ENGINES)
+def test_double_quoted_projection_is_refused_on_backtick_engines(engine):
+    """On these engines `"x"` is a string literal by default but an identifier under an
+    ANSI-quoting server mode, and the guard cannot see which mode the server runs. Read as a
+    literal, a projected sensitive column is invisible to the column and PII gates while the
+    server may still return it — so the ambiguity is refused rather than guessed."""
+    org = _org(engine)
+    assert rt.check_scopable('SELECT "ssn" FROM customers', org) is not None, (
+        f"{engine}: an ambiguously-quoted projection was allowed"
+    )
+
+
+@pytest.mark.parametrize("engine", BACKTICK_ENGINES)
+def test_a_genuine_string_literal_is_not_refused(engine):
+    """The check must key on the ambiguity, not on quotes: a single-quoted literal means the
+    same thing in either server mode, so it is left alone even when it looks like a column."""
+    org = _org(engine)
+    assert rt.check_scopable("SELECT id, 'ssn' AS label FROM customers", org) is None, (
+        f"{engine}: a genuine string literal was refused"
+    )
+
+
+@pytest.mark.parametrize("engine", ANSI_ENGINES + BRACKET_ENGINES)
+def test_double_quoting_is_untouched_where_it_is_unambiguous(engine):
+    org = _org(engine)
+    assert rt.check_scopable('SELECT "ssn" FROM customers', org) is None
+
+
+@pytest.mark.parametrize("engine", BACKTICK_ENGINES)
+def test_the_ambiguous_projection_never_reaches_the_executor(guarded, engine):
+    org = _org(engine)
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["ssn"], rows=[("000-00-0000",)]))
+    with pytest.raises(execute_sql.GuardRefused):
+        guarded('SELECT "ssn" FROM customers', org, spy, engine)
+    assert spy.calls == [], f"{engine}: an ambiguously-quoted sensitive column was executed"
+
+
+# --- the model's declared engine must be the one the credentials connect to -------
+
+
+def test_a_model_credential_engine_mismatch_is_refused(guarded):
+    """The guard picks its grammar from the model; the executor picks its driver from the
+    credentials. Two independent pieces of operator configuration — so a mismatch means the
+    statement was vetted, and possibly regenerated, in a grammar this database does not speak."""
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
+    with pytest.raises(execute_sql.GuardRefused) as ei:
+        # Model says MySQL, credentials connect to PostgreSQL.
+        guarded("SELECT id FROM customers", _org("MySQL"), spy, "PostgreSQL")
+    assert ei.value.refusal.kind == "model_unavailable"
+    assert spy.calls == []
+
+
+def test_a_matching_engine_runs(guarded):
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
+    guarded("SELECT id FROM customers", _org("MySQL"), spy, "MySQL")
+    assert spy.calls, "a consistent model and credential pair was refused"
+
+
+def test_an_unmapped_credential_type_is_not_treated_as_a_mismatch(guarded, monkeypatch):
+    """The executor rejects an unusable credential type itself; refusing here as well would
+    report an unrelated configuration error as a governance failure."""
+    monkeypatch.setattr(execute_sql, "_resolve_guard_model", lambda profile: _org("MySQL"))
+    monkeypatch.setattr(
+        execute_sql, "_load_credentials",
+        lambda p, org_id="local": {"type": "somethingelse"},
+    )
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
+    execute_sql.execute_guarded("SELECT id FROM customers", "acme", None, executor=spy)
+    assert spy.calls
+
+
 # --- end to end, at the shared chokepoint ----------------------------------------
 
 
@@ -270,13 +387,25 @@ class _SpyExecutor:
         return self._result
 
 
+# The credential `type` the executor would dispatch on for each declared engine. The guard now
+# refuses when the model's engine and the credentials name different databases, so a fixture
+# claiming one engine while connecting to another would be refused for that reason and prove
+# nothing about quoting.
+_CREDS_TYPE = {
+    "PostgreSQL": "postgres", "MySQL": "mysql", "Snowflake": "snowflake",
+    "BigQuery": "bigquery", "Redshift": "redshift", "SQLite": "sqlite",
+    "DuckDB": "duckdb", "SQLServer": "sqlserver", "Databricks": "databricks",
+    "Trino": "trino", "Oracle": "oracle",
+}
+
+
 @pytest.fixture
 def guarded(monkeypatch):
-    def _run(sql: str, org, spy, **kw):
+    def _run(sql: str, org, spy, engine: str = "PostgreSQL", **kw):
         monkeypatch.setattr(execute_sql, "_resolve_guard_model", lambda profile: org)
         monkeypatch.setattr(
             execute_sql, "_load_credentials",
-            lambda p, org_id="local": {"type": "sqlite", "path": ":memory:"},
+            lambda p, org_id="local": {"type": _CREDS_TYPE[engine], "path": ":memory:"},
         )
         return execute_sql.execute_guarded(sql, "acme", None, executor=spy, **kw)
 
@@ -291,7 +420,7 @@ def test_undeclared_table_never_reaches_the_executor(guarded, engine):
     sql = f"SELECT {_quote(engine, 'id')} FROM {_quote(engine, 'undeclared_table')}"
 
     with pytest.raises(execute_sql.GuardRefused):
-        guarded(sql, org, spy)
+        guarded(sql, org, spy, engine)
     assert spy.calls == [], f"{engine}: the executor ran a statement the model does not declare"
 
 
@@ -299,16 +428,16 @@ def test_undeclared_table_never_reaches_the_executor(guarded, engine):
 def test_sensitive_column_is_never_returned_raw(guarded, engine):
     """Masked or refused — never the value itself."""
     org = _org(engine)
-    spy = _SpyExecutor(execute_sql.ExecResult(columns=["ssn"], rows=[("111-22-3333",)]))
+    spy = _SpyExecutor(execute_sql.ExecResult(columns=["ssn"], rows=[("000-00-0000",)]))
     sql = f"SELECT {_quote(engine, 'ssn')} FROM {_quote(engine, 'customers')}"
 
     try:
-        env = guarded(sql, org, spy)
+        env = guarded(sql, org, spy, engine)
     except execute_sql.GuardRefused:
         assert spy.calls == []
         return
     returned = [str(v) for row in env.rows for v in row]
-    assert "111-22-3333" not in returned, f"{engine}: sensitive value returned verbatim"
+    assert "000-00-0000" not in returned, f"{engine}: sensitive value returned verbatim"
 
 
 @pytest.mark.parametrize("engine", ALL_ENGINES)
@@ -319,7 +448,7 @@ def test_a_governed_statement_reaches_the_executor_on_every_engine(guarded, engi
     spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
     sql = f"SELECT {_quote(engine, 'id')} FROM {_quote(engine, 'customers')}"
 
-    guarded(sql, org, spy)
+    guarded(sql, org, spy, engine)
     assert spy.calls, f"{engine}: a governed statement was refused"
     vetted = spy.calls[0][0]
     reparsed, why = rt._parse_reporting(vetted, rt._dialect_of(org)[0])
@@ -332,7 +461,7 @@ def test_select_star_is_refused_on_every_engine(guarded, engine):
     org = _org(engine)
     spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
     with pytest.raises(execute_sql.GuardRefused):
-        guarded(f"SELECT * FROM {_quote(engine, 'customers')}", org, spy)
+        guarded(f"SELECT * FROM {_quote(engine, 'customers')}", org, spy, engine)
     assert spy.calls == []
 
 
@@ -342,7 +471,7 @@ def test_a_write_is_refused_on_every_engine(guarded, engine):
     org = _org(engine)
     spy = _SpyExecutor(execute_sql.ExecResult(columns=["id"], rows=[(1,)]))
     with pytest.raises(execute_sql.GuardRefused):
-        guarded(f"DELETE FROM {_quote(engine, 'customers')}", org, spy)
+        guarded(f"DELETE FROM {_quote(engine, 'customers')}", org, spy, engine)
     assert spy.calls == []
 
 

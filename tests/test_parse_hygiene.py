@@ -34,10 +34,23 @@ SCAN_ROOTS = [
 # edit that moves code does not silently invalidate the entry the way a line number would.
 # A parse reaching a caller's SQL does NOT belong here — it belongs behind the guard's own
 # parse helper, which supplies both the dialect and the error level.
+# Every sqlglot entry point that turns text into a tree. Naming only `parse_one` would let a
+# guard-path `sqlglot.parse(...)` or `transpile(...)` land without a grammar.
+#
+# `parse` is matched only as `sqlglot.parse` — as a bare name it is far too common (this repo
+# has two unrelated local `parse()` helpers), and a scanner that cries wolf gets exempted into
+# uselessness. The other three names are unambiguous enough to match either way.
+_QUALIFIED_PARSE_CALLS = frozenset({"parse_one", "parse", "transpile", "maybe_parse"})
+_BARE_PARSE_CALLS = frozenset({"parse_one", "transpile", "maybe_parse"})
+
 _EXEMPT: dict[str, str] = {
     "packages/agami-core/src/semantic_model/validator.py::_columns_referenced": (
-        "reads model-authored SQL when the model is written, not a caller's statement, and "
-        "runs before any datasource engine is known"
+        "reads model-authored SQL at validation time, not a caller's statement; its signature "
+        "does not receive the model, so it has no declared engine to parse for"
+    ),
+    "plugins/agami/scripts/render_chart.py::_format_sql": (
+        "pretty-prints SQL for display only; the result is never parsed for a verdict nor "
+        "handed to an executor"
     ),
     "packages/agami-core/src/semantic_model/validator.py::_binding_column_refs": (
         "reads a model-authored metric binding at validation time, not a caller's statement"
@@ -75,12 +88,10 @@ def _walk(node, owner: str, relpath: str):
             continue
         if isinstance(child, ast.Call):
             func = child.func
-            name = (
-                func.attr if isinstance(func, ast.Attribute)
-                else func.id if isinstance(func, ast.Name)
-                else None
-            )
-            if name == "parse_one":
+            if isinstance(func, ast.Attribute):
+                if func.attr in _QUALIFIED_PARSE_CALLS:
+                    yield relpath, owner, child
+            elif isinstance(func, ast.Name) and func.id in _BARE_PARSE_CALLS:
                 yield relpath, owner, child
         yield from _walk(child, owner, relpath)
 
@@ -137,6 +148,37 @@ def test_no_exemption_is_stale():
 def test_every_exemption_gives_a_reason():
     for key, reason in _EXEMPT.items():
         assert reason.strip(), f"{key} is exempt without a written reason"
+
+
+def test_the_internal_parse_helpers_are_always_given_a_grammar():
+    """`_parse_sql` / `_parse_reporting` default `dialect` to None so standalone callers keep
+    working, which means a guard that forgets the argument parses generically and the AST rule
+    above cannot see it — it only watches sqlglot's own entry points. This watches ours."""
+    bare: list[str] = []
+    for root in SCAN_ROOTS:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            relpath = str(path.relative_to(REPO_ROOT))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = (
+                    func.attr if isinstance(func, ast.Attribute)
+                    else func.id if isinstance(func, ast.Name)
+                    else None
+                )
+                if name not in ("_parse_sql", "_parse_reporting"):
+                    continue
+                # The grammar may be given positionally or by keyword; either states it.
+                if len(node.args) < 2 and not any(k.arg == "dialect" for k in node.keywords):
+                    bare.append(f"{relpath}:{node.lineno}")
+    assert not bare, (
+        "these calls parse without a grammar, so the statement is read in one no engine uses: "
+        + ", ".join(bare)
+    )
 
 
 def test_the_guard_battery_parses_in_exactly_one_place():

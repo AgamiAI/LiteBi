@@ -57,7 +57,7 @@ from .models import (
 from .models import (
     bare_name as _bare,
 )
-from .sql_dialect import DialectUnresolved, resolve_datasource_dialect
+from .sql_dialect import DialectUnresolved, engines_disagree, resolve_datasource_dialect
 
 # A prober resolves a literal/value against the DB. Returns True if the value
 # exists in <table>.<column>. Injected so runtime stays DB-agnostic.
@@ -93,6 +93,42 @@ class GuardContext:
     # tree but opposite verdicts.
     dialect: "str | None" = None
     parse_error: "str | None" = None
+
+
+# Engines whose identifier quote is the backtick, so a double-quoted token is a *string
+# literal* in their default mode — but an *identifier* when the server runs in an
+# ANSI-quoting mode (MySQL's ANSI_QUOTES, and the equivalent on the Spark-family engines).
+# The parse cannot tell which, because sqlglot does not preserve the quote character: `"x"`
+# and `'x'` both arrive as the same string Literal.
+_BACKTICK_QUOTING_DIALECTS = frozenset({"mysql", "bigquery", "databricks", "spark", "hive"})
+
+# A grammar in which a double-quoted token is unambiguously an identifier, used only to ask
+# "would this read as a column somewhere else?".
+_ANSI_QUOTING_DIALECT = "postgres"
+
+
+def _quote_ambiguous(sql: str, dialect: "str | None") -> bool:
+    """True when a double-quoted token would be a column under ANSI quoting but reads as a
+    string literal in this engine's default mode.
+
+    Such a statement means two different things depending on a server setting the guard
+    cannot see. Under the engine's default mode the gates are right that no column is
+    projected; if the server runs in ANSI-quoting mode the same text selects the column and
+    the gates would have scored a real column as a literal. Rather than guess the server's
+    mode, the statement is treated as unreadable — it is trivially re-emitted in the engine's
+    own quoting, which is unambiguous.
+    """
+    if dialect not in _BACKTICK_QUOTING_DIALECTS:
+        return False
+    native = _parse_sql(sql, dialect)
+    if native is None:
+        return False
+    ansi = _parse_sql(sql, _ANSI_QUOTING_DIALECT)
+    if ansi is None:
+        return False
+    native_cols = {c.name.lower() for c in native.find_all(exp.Column)}
+    ansi_cols = {c.name.lower() for c in ansi.find_all(exp.Column)}
+    return bool(ansi_cols - native_cols)
 
 
 class RowScopingUnavailable(Exception):
@@ -1160,11 +1196,15 @@ def check_column_scope(
 
 
 def _unscopable(detail: str, remediation: "str | None" = None) -> Verdict:
+    # The declared-sources tail explains why a *source* was rejected. It misdescribes a
+    # statement that never parsed at all, so it is attached only alongside the default
+    # remediation it belongs with; a caller supplying its own remediation gets the bare reason.
+    reason = "the query can't be scoped to the declared object surface: " + detail
+    if remediation is None:
+        reason += " — only queries whose FROM/JOIN sources resolve to declared tables may run."
     return safety_verdict(
         "unscopable_sql",
-        "the query can't be scoped to the declared object surface: "
-        + detail
-        + " — only queries whose FROM/JOIN sources resolve to declared tables may run.",
+        reason,
         remediation
         or "Query only declared tables (no table-functions, VALUES, UNNEST, or LATERAL "
         "sources); add a source to the model if it should be queryable.",
@@ -1213,6 +1253,17 @@ def check_scopable(
         return _unscopable(why_not or "the query did not parse", _REEMIT_REMEDIATION)
     if tree.find(exp.Select) is None:
         return _unscopable("the query has no SELECT to scope")
+    # A double-quoted token on a backtick-quoting engine means one thing under the engine's
+    # default mode and another under its ANSI-quoting mode, and the guard cannot see which
+    # the server runs. Read as a literal, a projected sensitive column is invisible to the
+    # column and PII gates while the server may still return it, so the ambiguity is refused
+    # rather than resolved by guessing.
+    if _quote_ambiguous(sql, ctx.dialect if ctx is not None else _dialect_of(org)[0]):
+        return _unscopable(
+            "a double-quoted identifier means either a column or a string literal on this "
+            "datasource's engine, depending on server configuration the guard cannot see",
+            _REEMIT_REMEDIATION,
+        )
     # Table-functions and `ROWS FROM` parse to an `exp.Table` with an EMPTY name (the
     # function lives in `.this`); the object-scope gates skip empty-name tables, so a
     # whole-tree sweep catches them here — including inside a set-operation arm.
@@ -2207,6 +2258,8 @@ __all__ = [
     "PreFlightResult",
     "pre_flight_check",
     "apply_default_filters",
+    "RowScopingUnavailable",
+    "engines_disagree",
     "build_receipt",
     "assemble_receipt",
 ]
