@@ -157,7 +157,10 @@ def db_safety_env(pg_admin, tmp_path, monkeypatch):
     super_dsn = (
         f"postgresql://{sc['user']}:{sc['password']}@{sc['host']}:{sc['port']}/{sc['dbname']}"
     )
-    harness.seed_db_model(super_dsn, ds="acme")
+    # The datasource this env reads is Postgres (DATASOURCE_URL__ACME below), so the model must
+    # declare Postgres: the guard parses in the model's engine and refuses when that is not the
+    # engine the credentials connect to.
+    harness.seed_db_model(super_dsn, ds="acme", storage_type="PostgreSQL")
 
     ro_dsn = f"postgresql://agami_ro:{_RO_PASSWORD}@{sc['host']}:{sc['port']}/{sc['dbname']}"
     monkeypatch.setenv("AGAMI_DB_URL", super_dsn)  # hosted → model + audit from the app DB

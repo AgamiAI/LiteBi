@@ -54,6 +54,15 @@ class Case:
     expect: str  # a refusal kind, or "bounded", or "ok"
     note: str = ""
     max_rows: int | None = None  # per-call row cap (the availability row-cap case lowers it)
+    # Engines this case is meaningful on, or None for every engine. Identifier quoting is
+    # engine-specific — a backtick is an identifier quote on MySQL and SQLite but not valid SQL
+    # on Postgres — so a quoting case pinned to one engine would assert a different verdict on
+    # the other. Naming the engine keeps the case honest instead of letting it pass on the path
+    # that happens to accept it.
+    engines: tuple[str, ...] | None = None
+
+    def runs_on(self, engine: str) -> bool:
+        return self.engines is None or engine in self.engines
 
     @property
     def id(self) -> str:
@@ -146,13 +155,22 @@ CASES: list[Case] = [
     # nothing to object to and allows it. These run through the full harness — both surfaces,
     # both model paths — because that is the only place the guarantee is proved end to end.
     # (The demo datasource is SQLite, which accepts both quoting styles.)
-    Case("quoting", "SELECT `id` FROM `undeclared`", "table_out_of_scope", "backtick-undeclared-table"),
-    Case("quoting", "SELECT `nosuchcol` FROM `orders`", "column_out_of_scope", "backtick-undeclared-col"),
-    Case("quoting", "SELECT `email` FROM `customers`", "ok", "backtick-sensitive-is-seen"),
-    Case("quoting", "SELECT * FROM `orders`", "select_star", "backtick-star"),
-    Case("quoting", "DELETE FROM `orders`", "permission", "backtick-delete"),
-    Case("quoting", "SELECT [id] FROM [undeclared]", "table_out_of_scope", "bracket-undeclared-table"),
+    # SQLite accepts backticks and brackets as identifier quoting; Postgres does not, where the
+    # same text is not valid SQL at all — so these are pinned to the engine they mean something on.
+    Case("quoting", "SELECT `id` FROM `undeclared`", "table_out_of_scope",
+         "backtick-undeclared-table", engines=("SQLite",)),
+    Case("quoting", "SELECT `nosuchcol` FROM `orders`", "column_out_of_scope",
+         "backtick-undeclared-col", engines=("SQLite",)),
+    Case("quoting", "SELECT `email` FROM `customers`", "ok",
+         "backtick-sensitive-is-seen", engines=("SQLite",)),
+    Case("quoting", "SELECT * FROM `orders`", "select_star", "backtick-star", engines=("SQLite",)),
+    Case("quoting", "SELECT [id] FROM [undeclared]", "table_out_of_scope",
+         "bracket-undeclared-table", engines=("SQLite",)),
+    # Valid identifier quoting on both engines, so it runs everywhere.
     Case("quoting", 'SELECT "id" FROM "undeclared"', "table_out_of_scope", "quoted-undeclared-table"),
+    # The read-only lexer is a separate code path from the dialect-aware parse; a write stays
+    # refused whatever the quoting, on every engine.
+    Case("quoting", "DELETE FROM `orders`", "permission", "backtick-delete"),
     # Ordinary shapes a governed query takes. These carry no attack — they exist so that a
     # change which tightens parsing has to prove it did not start refusing valid SQL. Without
     # them the "no false refusal" side of the corpus rests on four statements, and a tightening

@@ -29,7 +29,7 @@ _TYPE_MAP = {"INTEGER": "integer", "REAL": "float", "TEXT": "string"}
 
 
 # ── model + datasource builders (single-sourced from SCHEMA) ───────────────────────────────────
-def build_org():
+def build_org(storage_type: str = "SQLite"):
     """The semantic model the guards scope against — built from SCHEMA (names + sensitive flags)."""
     from semantic_model import models as m
 
@@ -50,17 +50,18 @@ def build_org():
     return m.Datasource(
         datasource="Shop",
         version=1,
-        # The corpus executes against SQLite (see `seed_sqlite`), and the declared engine is
-        # what the guards parse every statement in — so it must name the engine that actually
-        # runs the SQL, not a placeholder.
-        storage_connections=[m.StorageConnection(name="c", storage_type="SQLite")],
+        # The declared engine is what the guards parse every statement in, and it is now
+        # reconciled against the credentials the executor connects with — so it must name the
+        # engine that actually runs the SQL. The file-served corpus runs SQLite (`seed_sqlite`);
+        # the DB-served corpus in the Postgres job runs Postgres.
+        storage_connections=[m.StorageConnection(name="c", storage_type=storage_type)],
         subject_areas=[
             m.SubjectArea(name="sales", tables_defined=[_table(n, s) for n, s in SCHEMA.items()])
         ],
     )
 
 
-def write_disk_model(root: Path) -> None:
+def write_disk_model(root: Path, storage_type: str = "SQLite") -> None:
     """Write the FILE-served model under `root` (an AGAMI_ARTIFACTS_DIR/<profile> dir)."""
     import yaml
 
@@ -70,7 +71,7 @@ def write_disk_model(root: Path) -> None:
             {
                 "datasource": "Shop",
                 "version": 1,
-                "storage_connections": [{"name": "c", "storage_type": "SQLite"}],
+                "storage_connections": [{"name": "c", "storage_type": storage_type}],
                 "subject_areas": ["subject_areas/sales"],
             }
         )
@@ -122,14 +123,14 @@ def seed_sqlite(path: Path) -> None:
         con.close()
 
 
-def seed_db_model(url: str, ds: str = "acme") -> None:
+def seed_db_model(url: str, ds: str = "acme", storage_type: str = "SQLite") -> None:
     """Write the DB-served model into an app DB at `url` (the hosted path's model source)."""
     import model_store
     from store import Store
 
     s = Store.connect(url)
     s.run_migrations()
-    model_store.write_datasource(s, ds, build_org())
+    model_store.write_datasource(s, ds, build_org(storage_type))
     s.close()
 
 

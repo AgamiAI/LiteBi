@@ -51,14 +51,20 @@ def assert_outcome(env: dict, expect: str, sql: str) -> None:
         assert env["audit_id"]
 
 
-@pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])
+# The two paths read the same corpus but execute against different engines, and identifier
+# quoting is engine-specific — so each path runs the cases that are valid SQL on its engine.
+FILE_PATH_CASES = [c for c in CASES if c.runs_on("SQLite")]
+DB_PATH_CASES = [c for c in CASES if c.runs_on("PostgreSQL")]
+
+
+@pytest.mark.parametrize("case", FILE_PATH_CASES, ids=[c.id for c in FILE_PATH_CASES])
 def test_safety_corpus_file_path(case, surface, file_safety_env):
     # File-served model (disk YAML) + SQLite datasource. Runs in the default (DB-free) test job.
     env = surface(case.sql, datasource="acme", max_rows=case.max_rows)
     assert_outcome(env, case.expect, case.sql)
 
 
-@pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])
+@pytest.mark.parametrize("case", DB_PATH_CASES, ids=[c.id for c in DB_PATH_CASES])
 def test_safety_corpus_db_path(case, surface, db_safety_env):
     # DB-served model (Postgres app DB) + Postgres datasource read as the read-only role. IDENTICAL
     # verdicts to the file path prove file/db parity (a control that reads the model can't behave
