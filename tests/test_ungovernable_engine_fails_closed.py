@@ -57,7 +57,13 @@ def _org(*storage_types: str, sensitive: bool = True) -> "m.Datasource":
         # The first connection is named "c" because that is what the tables above reference;
         # extras get suffixed names. A fixture whose tables point at a connection it never
         # declares would be internally inconsistent, and would quietly stop meaning anything
-        # if the runtime ever resolves the table-to-connection link.
+        # if the runtime ever resolved the table-to-connection link.
+        #
+        # Passing NO storage types is the exception, and deliberately so: it models a
+        # datasource that declares no engine, which is the state these tests exist to refuse.
+        # `Table.storage_connection` is required, so the table necessarily names a connection
+        # that is not declared — that dangling reference IS the condition under test, not an
+        # oversight to tidy away.
         storage_connections=[
             m.StorageConnection(name="c" if i == 0 else f"c{i}", storage_type=st)
             for i, st in enumerate(storage_types)
