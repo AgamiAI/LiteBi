@@ -226,14 +226,6 @@ result size, and concurrent load grow. Behaviour-preserving unless a note says o
   super-linearly. Same verdicts and snapshots.
 - **Faster schema discovery.** `get_datasource_schema` resolves tables via an O(1) index instead of
   re-scanning the model per table — byte-identical output, faster on wide models.
-=======
-- **Read-only datasource role is now a stated deploy obligation, not a suggestion (ACE-036).** The
-  self-host guide and `readonly-grants.md` now frame the SELECT-only role as the **required**
-  `DATASOURCE_URL` posture for a deploy (single-player stays *recommended*), spell out the app-role vs
-  operator/owner-role split, and clarify that the role guarantees integrity/confinement but **not**
-  availability/recon (per-statement timeout + row cap + recon denial are app-side). Docs only — no
-  behaviour or config change.
->>>>>>> origin/ACE-036-least-privilege-readonly-role
 
 ## [0.3.9] — 2026-07-10
 
