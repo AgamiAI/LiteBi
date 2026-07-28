@@ -1307,7 +1307,11 @@ def _model_safety(
         all_maskable = bool(sens.projections) and all(
             p.maskable and p.output_index is not None for p in sens.projections
         )
-        provable = all_maskable and sens.output_provable
+        # `getattr`, not attribute access: this file is VENDORED into the plugin while
+        # semantic_model/runtime.py resolves from the separately-versioned installed package, so a
+        # newer plugin can meet an older `SensitiveCheckResult`. A missing field then means "this
+        # build cannot prove the output", which is exactly the fail-closed answer.
+        provable = all_maskable and getattr(sens, "output_provable", False)
         verdict = Verdict(
             cls="data_protection",
             rule="sensitive_projection",
