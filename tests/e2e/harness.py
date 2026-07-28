@@ -120,7 +120,7 @@ def seed_db_model(url: str, ds: str = "acme") -> None:
 
     s = Store.connect(url)
     s.run_migrations()
-    model_store.write_organization(s, ds, build_org())
+    model_store.write_datasource(s, ds, build_org())
     s.close()
 
 
