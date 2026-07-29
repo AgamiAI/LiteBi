@@ -844,3 +844,14 @@ def test_a_malformed_sid_degrades_to_none_rather_than_rejecting(env):
         )
         principal = JwtAuthProvider().validate_token(token)
         assert principal is not None and principal.session_id is None, bad
+
+
+def test_a_blank_sid_is_never_minted(env):
+    """Mint and validate must use the same rule. A whitespace-only `sid` would otherwise ship on the wire
+    and then normalize away on the way back in — a claim that exists but can never reach a consumer."""
+    from oauth_server import issue_jwt
+
+    for bad in ("", "   ", None):
+        claims = jwt.decode(issue_jwt("admin", sid=bad), SECRET, algorithms=["HS256"], issuer=BASE)
+        assert "sid" not in claims, bad
+    assert _sid(issue_jwt("admin", sid="real")) == "real"

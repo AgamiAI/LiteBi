@@ -132,7 +132,10 @@ def issue_jwt(subject: str, *, sid: str | None = None) -> str:
         "iat": int(now.timestamp()),
         "exp": int((now + _access_ttl()).timestamp()),
     }
-    if sid:
+    # Same rule as `validate_token`'s read: a non-string or blank value is "no session", so it must not
+    # be minted either. Otherwise a whitespace-only `sid` would ship in the token and then normalize away
+    # on the way back in — a claim that exists on the wire but never reaches a consumer.
+    if isinstance(sid, str) and sid.strip():
         payload["sid"] = sid
     return jwt.encode(payload, _signing_secret(), algorithm="HS256")
 

@@ -204,3 +204,30 @@ def test_session_from_scope_tolerates_a_principal_without_the_field():
 
 def test_current_session_id_is_none_outside_a_request():
     assert mcp_http.current_session_id() is None
+
+
+def test_session_from_scope_normalizes_a_malformed_session_id():
+    """Mint and read must agree on what "no session" means. A third-party AuthProvider's principal may
+    carry a blank or non-string `session_id`; letting it through would put an unexpected type into the
+    contextvar and, from there, into consumers using it as a key."""
+
+    class _AuthBad:
+        def __init__(self, value):
+            self.value = value
+
+        def validate_token(self, token):
+            return type("P", (), {"subject": "j@example.com", "session_id": self.value})()
+
+    for bad in ("", "   ", 42, None, object()):
+        auth = _AuthBad(bad)
+        principal = auth.validate_token("good")
+        assert mcp_http._session_from_scope({"state": {"principal": principal}}, auth) is None, bad
+        scope = {"headers": [(b"authorization", b"Bearer good")]}
+        assert mcp_http._session_from_scope(scope, auth) is None, bad
+
+    # ...and a well-formed one still comes through untouched.
+    ok = _AuthBad("sess-1")
+    assert (
+        mcp_http._session_from_scope({"state": {"principal": ok.validate_token("x")}}, ok)
+        == "sess-1"
+    )

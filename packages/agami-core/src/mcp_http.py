@@ -93,19 +93,28 @@ def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
     return None
 
 
+def _normalized_session(principal: object | None) -> str | None:
+    """A principal's session id, or None — enforcing the `str | None` shape the contextvar promises.
+
+    `AuthProvider` is a `@runtime_checkable` Protocol, so conformance is method presence only: a
+    third-party provider's principal may expose no `session_id` at all, or a non-string one. Without this
+    an unexpected type would reach `_session_ctx` and, through it, consumers using the value as a key.
+    Same rule as `JwtAuthProvider.validate_token`'s read — non-string or blank is "no session"."""
+    sid = getattr(principal, "session_id", None)
+    return sid if isinstance(sid, str) and sid.strip() else None
+
+
 def _session_from_scope(scope: dict, auth: AuthProvider) -> str | None:
     """The session id for this /mcp request — read off the principal the auth middleware validated, with
     the same re-validate-the-bearer fallback `_actor_from_scope` uses when the scope state didn't
-    propagate. `getattr` rather than attribute access on purpose: a third-party AuthProvider satisfies a
-    `@runtime_checkable` Protocol that checks method presence only, so its principal may be any object
-    exposing `.subject`."""
+    propagate."""
     principal = (scope.get("state") or {}).get("principal")
     if principal is not None:
-        return getattr(principal, "session_id", None)
+        return _normalized_session(principal)
     for key, value in scope.get("headers", []):
         if key == b"authorization" and value[:7].lower() == b"bearer ":
             revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
-            return getattr(revalidated, "session_id", None) if revalidated is not None else None
+            return _normalized_session(revalidated) if revalidated is not None else None
     return None
 
 
