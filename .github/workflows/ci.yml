@@ -100,6 +100,136 @@ jobs:
           pytest tests/e2e/test_safety_corpus.py tests/e2e/test_role_floor_pg.py
           -q -k "db_path or role"
 
+  # ── ACE-082: per-engine EXECUTION evidence ───────────────────────────────────────────────────
+  # Deliberately SEPARATE jobs, with no `needs:` on integration-pg and none between themselves, so
+  # one flaky engine container cannot turn the Postgres role-floor result (the F9 done-bar) green
+  # or red. Each job selects only its own engine, and sets AGAMI_IT_<ENGINE>_REQUIRED so an
+  # unreachable server FAILS rather than skipping — pytest exits 0 when everything skips, and a
+  # silently-skipped job would claim per-engine coverage while proving nothing.
+  # These need no secrets, so they run on fork PRs too.
+
+  integration-mysql:
+    # The highest-value engine here: backticks are MySQL's NATIVE identifier quote, so this is
+    # where a wrongly-dialected parse and a real execution can genuinely disagree.
+    name: integration (MySQL — dialect execution matrix)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_DATABASE: shop
+          MYSQL_USER: agami_test
+          # Ephemeral localhost CI service on a throwaway container. MySQL has no `trust` auth
+          # equivalent, so a literal is unavoidable; this is a non-secret sentinel, not a credential.
+          MYSQL_PASSWORD: ci_local_only
+          MYSQL_ROOT_PASSWORD: ci_local_only_root
+        ports:
+          - 3306:3306
+        # `mysqladmin ping` exits 0 once the server answers, even for an unauthenticated ping —
+        # which is exactly the readiness signal we want.
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      AGAMI_IT_MYSQL_HOST: 127.0.0.1
+      AGAMI_IT_MYSQL_PORT: "3306"
+      AGAMI_IT_MYSQL_USER: agami_test
+      AGAMI_IT_MYSQL_PASSWORD: ci_local_only
+      AGAMI_IT_MYSQL_DB: shop
+      AGAMI_IT_MYSQL_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+      - name: pytest (MySQL safety corpus)
+        run: >-
+          uvx --python 3.12
+          --with pytest --with pymysql
+          --with-editable "packages/agami-core[model,server]"
+          pytest tests/e2e/test_safety_corpus.py -q -k "engine and MySQL"
+
+  integration-sqlserver:
+    # The only bracket-quoting engine, and the worst measured divergence: under a generic parse
+    # `SELECT TOP n [col] FROM [tbl]` resolves to no tables with `TOP` mistaken for a column.
+    name: integration (SQL Server — dialect execution matrix)
+    runs-on: ubuntu-latest
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer # free edition, no licence
+          # Non-secret sentinel for an ephemeral localhost service. Must still satisfy SQL Server's
+          # complexity rule (upper + lower + digit + non-alphanumeric) or the server refuses to start.
+          MSSQL_SA_PASSWORD: Ci_local_only_1
+        ports:
+          - 1433:1433
+    env:
+      AGAMI_IT_SQLSERVER_HOST: 127.0.0.1
+      AGAMI_IT_SQLSERVER_PORT: "1433"
+      AGAMI_IT_SQLSERVER_USER: sa
+      AGAMI_IT_SQLSERVER_PASSWORD: Ci_local_only_1
+      AGAMI_IT_SQLSERVER_DB: shop
+      AGAMI_IT_SQLSERVER_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+      # SQL Server accepts TCP connections before it can serve queries, so a port check is not a
+      # readiness signal — poll an actual query. Explicit here rather than a `--health-cmd`, whose
+      # nested shell quoting cannot be verified without running it on a x86 runner.
+      - name: wait for SQL Server
+        run: |
+          uvx --python 3.12 --with pymssql python - <<'PY'
+          import os, sys, time, pymssql
+
+          deadline, last = time.time() + 180, None
+          while time.time() < deadline:
+              try:
+                  conn = pymssql.connect(
+                      server=os.environ["AGAMI_IT_SQLSERVER_HOST"],
+                      port=int(os.environ["AGAMI_IT_SQLSERVER_PORT"]),
+                      user=os.environ["AGAMI_IT_SQLSERVER_USER"],
+                      password=os.environ["AGAMI_IT_SQLSERVER_PASSWORD"],
+                      login_timeout=5,
+                  )
+                  conn.cursor().execute("SELECT 1")
+                  conn.close()
+                  print("SQL Server ready")
+                  sys.exit(0)
+              except Exception as exc:
+                  last = exc
+                  time.sleep(5)
+          sys.exit(f"SQL Server never became ready: {last}")
+          PY
+      - name: pytest (SQL Server safety corpus)
+        run: >-
+          uvx --python 3.12
+          --with pytest --with pymssql
+          --with-editable "packages/agami-core[model,server]"
+          pytest tests/e2e/test_safety_corpus.py -q -k "engine and SQLServer"
+
+  integration-duckdb:
+    # In-process, no service. Cheap, and it closes a coverage claim the corpus previously made
+    # without having: DuckDB appeared only in a plugin-script test and an always-skipped one.
+    name: integration (DuckDB — dialect execution matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+      - name: pytest (DuckDB safety corpus)
+        run: >-
+          uvx --python 3.12
+          --with pytest --with duckdb
+          --with-editable "packages/agami-core[model,server]"
+          pytest tests/e2e/test_safety_corpus.py -q -k "engine and DuckDB"
+
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
