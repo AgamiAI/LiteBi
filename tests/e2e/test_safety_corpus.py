@@ -15,19 +15,22 @@ executor and no database: the vetted statement is re-parsed by sqlglot, never ac
 This module adds the other half — the statement the guard vetted is a statement a REAL engine
 accepts — and the table below is the single place that says how far that goes per engine.
 
-| Engine     | Identifier quote | Coverage here                     | What is NOT proven                    |
-|------------|------------------|-----------------------------------|---------------------------------------|
-| SQLite     | `"` `` ` `` `[]` | real, in-process (file path)      | —                                     |
-| PostgreSQL | `"`              | real server (`integration-pg`)    | —                                     |
-| MySQL      | `` ` ``          | real server (`mysql:8`)           | —                                     |
-| SQLServer  | `[]`             | real server (`mssql/server:2022`) | —                                     |
-| DuckDB     | `"`              | real, in-process                  | —                                     |
-| Redshift   | `"`              | verdict only (ACE-079)            | execution parity                      |
-| Snowflake  | `"`              | verdict only (ACE-079)            | execution parity                      |
-| BigQuery   | `` ` ``          | verdict only (ACE-079)            | execution parity                      |
-| Databricks | `` ` ``          | verdict only (ACE-079)            | execution parity                      |
-| Oracle     | `"`              | verdict only (ACE-079)            | execution parity                      |
-| Trino      | `"`              | verdict only (ACE-079)            | execution parity                      |
+| Engine     | Identifier quote | Coverage here                     | What is NOT proven            |
+|------------|------------------|-----------------------------------|-------------------------------|
+| SQLite     | `"` `` ` `` `[]` | real, in-process (file path)      | anything outside these cases  |
+| PostgreSQL | `"`              | real server (`integration-pg`)    | anything outside these cases  |
+| MySQL      | `` ` ``          | real server (`mysql:8`)           | anything outside these cases  |
+| SQLServer  | `[]`             | real server (`mssql/server:2022`) | anything outside these cases  |
+| DuckDB     | `"`              | real, in-process                  | anything outside these cases  |
+| Redshift   | `"`              | verdict only (ACE-079)            | execution parity              |
+| Snowflake  | `"`              | verdict only (ACE-079)            | execution parity              |
+| BigQuery   | `` ` ``          | verdict only (ACE-079)            | execution parity              |
+| Databricks | `` ` ``          | verdict only (ACE-079)            | execution parity              |
+| Oracle     | `"`              | verdict only (ACE-079)            | execution parity              |
+| Trino      | `"`              | verdict only (ACE-079)            | execution parity              |
+
+An executing engine is proven for the corpus's own cases — that is a regression harness, not a
+claim about the engine's whole grammar.
 
 The five executing engines cover all three identifier-quoting families — backtick (MySQL), bracket
 (SQLServer) and double-quote (PostgreSQL/SQLite/DuckDB) — which is the axis ACE-079's defect class
@@ -71,6 +74,12 @@ def assert_outcome(env: dict, expect: str, sql: str) -> None:
         assert env["status"] == "ok", (sql, env)
         assert "refusal" not in env
         assert env["audit_id"]
+        # A result set actually came back. Without this, "ok" only proves the guard ALLOWED the
+        # statement — a fixture that seeded the wrong database, or an engine that accepted the
+        # statement and matched nothing, would still pass, and the per-engine cases whose whole
+        # point is that the vetted statement EXECUTES would prove only half of it. Every governed
+        # case in the corpus selects from seeded rows, so an empty result is a broken fixture.
+        assert env["data"]["rows"], (sql, env)
     elif expect == "bounded":
         # Availability: a runaway result is bounded — EITHER a resource_limit refusal, OR an ok
         # Envelope flagged truncated with a row_cap in `applied` (capped + flagged, never silent).
@@ -124,6 +133,24 @@ def test_safety_corpus_engine(engine, case, surface, request):
     request.getfixturevalue(ENGINE_ENV_FIXTURES[engine])
     env = surface(case.sql, datasource="acme", max_rows=case.max_rows)
     assert_outcome(env, case.expect, case.sql)
+
+
+def test_engine_cases_stay_out_of_the_postgres_gate():
+    """The `integration-pg` job selects with `-k "db_path or role"` and carries the F9 done-bar —
+    the read-only role floor and file/db parity. Its result must stay independent of the engine
+    jobs, which is true today only because no engine node id contains `db_path` or `role`.
+
+    That is an accident waiting to be broken by a case note, so it is asserted rather than assumed:
+    a new case called e.g. "role-column" would silently join the done-bar job and let a container
+    hiccup there turn the F9 gate red. `-k` matches case-insensitively, so this does too.
+    """
+    for engine, case in ENGINE_CASES:
+        node_id = f"{engine}:{case.id}"
+        for selector in ("db_path", "role"):
+            assert selector not in node_id.lower(), (
+                f"engine case {node_id!r} would be selected by integration-pg's "
+                f'-k "db_path or role", coupling the F9 done-bar to an engine container'
+            )
 
 
 @pytest.mark.parametrize("case", DB_PATH_CASES, ids=[c.id for c in DB_PATH_CASES])

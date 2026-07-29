@@ -125,10 +125,12 @@ jobs:
           MYSQL_ROOT_PASSWORD: ci_local_only_root
         ports:
           - 3306:3306
-        # `mysqladmin ping` exits 0 once the server answers, even for an unauthenticated ping —
-        # which is exactly the readiness signal we want.
+        # `mysqladmin ping` exits 0 once the server answers, even for an unauthenticated ping.
+        # `-h 127.0.0.1` is load-bearing: the entrypoint's temporary init server accepts on the
+        # unix socket while the real server has not yet bound 3306, so a socket ping reports ready
+        # during that window. Over TCP the probe stays refused until the port is really listening.
         options: >-
-          --health-cmd "mysqladmin ping"
+          --health-cmd "mysqladmin ping -h 127.0.0.1"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
@@ -136,6 +138,7 @@ jobs:
       AGAMI_IT_MYSQL_HOST: 127.0.0.1
       AGAMI_IT_MYSQL_PORT: "3306"
       AGAMI_IT_MYSQL_USER: agami_test
+      # Same non-secret sentinel as the service block above — not a credential.
       AGAMI_IT_MYSQL_PASSWORD: ci_local_only
       AGAMI_IT_MYSQL_DB: shop
       AGAMI_IT_MYSQL_REQUIRED: "1"
@@ -171,6 +174,7 @@ jobs:
       AGAMI_IT_SQLSERVER_HOST: 127.0.0.1
       AGAMI_IT_SQLSERVER_PORT: "1433"
       AGAMI_IT_SQLSERVER_USER: sa
+      # Same non-secret sentinel as the service block above — not a credential.
       AGAMI_IT_SQLSERVER_PASSWORD: Ci_local_only_1
       AGAMI_IT_SQLSERVER_DB: shop
       AGAMI_IT_SQLSERVER_REQUIRED: "1"
@@ -218,6 +222,10 @@ jobs:
     # without having: DuckDB appeared only in a plugin-script test and an always-skipped one.
     name: integration (DuckDB — dialect execution matrix)
     runs-on: ubuntu-latest
+    env:
+      # This job is DuckDB's only evidence. Its sole availability risk is the driver below, so
+      # REQUIRED makes a missing one fail rather than skip the whole corpus green.
+      AGAMI_IT_DUCKDB_REQUIRED: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0

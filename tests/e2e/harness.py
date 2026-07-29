@@ -14,6 +14,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,7 +72,9 @@ ENGINE_FIXTURES: dict[str, EngineFixture] = {
 }
 
 
-def seed_schema(execute, engine: str, *, drop_first: bool = False) -> None:
+def seed_schema(
+    execute: Callable[..., object], engine: str, *, drop_first: bool = False
+) -> None:
     """Materialize every `SCHEMA` table on `engine`, through the caller's `execute(sql, params=None)`.
 
     The adapter is passed in rather than a connection, so this function imports no driver and is

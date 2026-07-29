@@ -3,9 +3,12 @@ model paths, wired so the corpus asserts the same Envelope regardless of surface
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -183,10 +186,17 @@ def db_safety_env(pg_admin, tmp_path, monkeypatch):
 # database — the vetted statement was re-parsed by sqlglot, never accepted by an engine. These
 # fixtures close that half: the same corpus, through the same tool, against a real server.
 #
-# Each engine follows `pg_admin`'s contract exactly: absent connection settings SKIP, unless
+# Each engine follows `pg_admin`'s contract: absent connection settings SKIP, unless
 # AGAMI_IT_<ENGINE>_REQUIRED is set — in the CI job that owns an engine's evidence, an
-# unreachable server FAILS, because pytest exits 0 when everything skips and a silently-skipped
-# job would claim per-engine coverage while proving nothing.
+# unavailable engine FAILS, because pytest exits 0 when everything skips and a silently-skipped
+# job would claim per-engine coverage while proving nothing. "Unavailable" deliberately includes a
+# MISSING DRIVER, not just an unreachable server: these drivers are supplied only by `--with` flags
+# on the CI `uvx` line, so dropping one in a future edit is the likeliest way to empty a job, and
+# `pytest.importorskip` would turn exactly that into a green run.
+#
+# Like the Postgres fixtures above, these DROP/CREATE shared table names in a shared database, so
+# they are SERIAL-ONLY — do not run this dir under pytest-xdist (`-n`) without per-worker table
+# names, or workers would race. The current invocation is serial.
 
 
 def _engine_creds(engine: str, default_port: str) -> dict[str, str]:
@@ -201,9 +211,21 @@ def _engine_creds(engine: str, default_port: str) -> dict[str, str]:
     }
 
 
-def _unavailable(engine: str):
+def _unavailable(engine: str) -> Callable[[str], NoReturn]:
     """`pytest.fail` in the job that owns this engine's evidence, else `pytest.skip`."""
     return pytest.fail if os.environ.get(f"AGAMI_IT_{engine.upper()}_REQUIRED") else pytest.skip
+
+
+def _require_driver(engine: str, module: str):
+    """Import an engine's driver, honouring the REQUIRED contract.
+
+    Deliberately not `pytest.importorskip`: that skips unconditionally, which in the job that owns
+    this engine's evidence would report success for a run that executed nothing.
+    """
+    try:
+        return importlib.import_module(module)
+    except ImportError as exc:
+        _unavailable(engine)(f"{module} not installed, so {engine} proves nothing ({exc})")
 
 
 def _write_credentials(art: Path, profile: str, fields: dict[str, str], monkeypatch) -> None:
@@ -226,11 +248,12 @@ def _write_credentials(art: Path, profile: str, fields: dict[str, str], monkeypa
     monkeypatch.setattr(execute_sql, "CREDENTIALS_PATH", path)
 
 
-def _engine_model_env(art: Path, storage_type: str, monkeypatch) -> None:
-    """File-served model declaring `storage_type` — the engine the guard parses every statement in,
-    and the engine the executor is then reconciled against."""
+def _engine_model_env(art: Path, engine: str, monkeypatch) -> None:
+    """File-served model declaring the engine's storage type — what the guard parses every statement
+    in, and what the executor is then reconciled against. The storage type is read from the engine's
+    `EngineFixture` rather than restated, so the model and the physical fixture cannot disagree."""
     (art / "acme").mkdir(parents=True, exist_ok=True)
-    harness.write_disk_model(art / "acme", storage_type=storage_type)
+    harness.write_disk_model(art / "acme", storage_type=harness.ENGINE_FIXTURES[engine].storage_type)
     monkeypatch.delenv("AGAMI_DB_URL", raising=False)
     monkeypatch.delenv("APP_DATABASE_URL", raising=False)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
@@ -238,12 +261,22 @@ def _engine_model_env(art: Path, storage_type: str, monkeypatch) -> None:
     monkeypatch.delenv("AGAMI_SQL_UNSCOPABLE_POSTURE", raising=False)
 
 
+def _drop_corpus_tables(cur) -> None:
+    """Best-effort teardown. Tolerates a table that was never created — the next seed re-runs
+    DROP ... IF EXISTS first, so a failure here cannot leave stale rows behind."""
+    for name in SCHEMA:
+        try:
+            cur.execute(f"DROP TABLE IF EXISTS {name}")
+        except Exception:
+            pass
+
+
 @pytest.fixture
 def mysql_safety_env(tmp_path, monkeypatch):
     """MySQL 8 — the engine that matters most here: backticks are MySQL's NATIVE identifier quote,
     so this is where a wrongly-dialected parse and a real execution can genuinely disagree."""
-    pymysql = pytest.importorskip("pymysql")
     unavailable = _unavailable("MySQL")
+    pymysql = _require_driver("MySQL", "pymysql")
     c = _engine_creds("MySQL", "53307")
     if not c["password"]:
         unavailable("set AGAMI_IT_MYSQL_PASSWORD to run the MySQL safety corpus")
@@ -259,24 +292,22 @@ def mysql_safety_env(tmp_path, monkeypatch):
         )
     except Exception as exc:
         unavailable(f"no reachable MySQL ({exc})")
-    cur = conn.cursor()
-    harness.seed_schema(
-        lambda sql, params=None: cur.execute(sql, params), "MySQL", drop_first=True
-    )
-    art = tmp_path / "art"
-    _engine_model_env(art, "MySQL", monkeypatch)
-    monkeypatch.setenv(
-        "DATASOURCE_URL__ACME",
-        f"mysql://{c['user']}:{c['password']}@{c['host']}:{c['port']}/{c['database']}",
-    )
+    # Everything after the connect lives in the try, so a failure while seeding closes the
+    # connection instead of leaking one per test.
     try:
+        cur = conn.cursor()
+        harness.seed_schema(
+            lambda sql, params=None: cur.execute(sql, params), "MySQL", drop_first=True
+        )
+        art = tmp_path / "art"
+        _engine_model_env(art, "MySQL", monkeypatch)
+        monkeypatch.setenv(
+            "DATASOURCE_URL__ACME",
+            f"mysql://{c['user']}:{c['password']}@{c['host']}:{c['port']}/{c['database']}",
+        )
         yield
     finally:
-        for name in SCHEMA:
-            try:
-                cur.execute(f"DROP TABLE IF EXISTS {name}")
-            except Exception:
-                pass
+        _drop_corpus_tables(conn.cursor())
         conn.close()
 
 
@@ -285,80 +316,81 @@ def sqlserver_safety_env(tmp_path, monkeypatch):
     """SQL Server 2022 — the only bracket-quoting engine, and the worst measured divergence:
     under a generic parse `SELECT TOP n [col] FROM [tbl]` resolves to no tables and `TOP` as a
     column, so every scope gate finds nothing to object to."""
-    pymssql = pytest.importorskip("pymssql")
     unavailable = _unavailable("SQLServer")
+    pymssql = _require_driver("SQLServer", "pymssql")
     c = _engine_creds("SQLServer", "11433")
     if not c["password"]:
         unavailable("set AGAMI_IT_SQLSERVER_PASSWORD to run the SQL Server safety corpus")
-    try:
-        boot = pymssql.connect(
-            server=c["host"],
-            port=int(c["port"]),
-            user=c["user"],
-            password=c["password"],
-            autocommit=True,
-            login_timeout=15,
-        )
-    except Exception as exc:
-        unavailable(f"no reachable SQL Server ({exc})")
-    bcur = boot.cursor()
-    bcur.execute(f"IF DB_ID('{c['database']}') IS NULL CREATE DATABASE [{c['database']}]")
-    boot.close()
-
-    conn = pymssql.connect(
+    connect = dict(
         server=c["host"],
         port=int(c["port"]),
         user=c["user"],
         password=c["password"],
-        database=c["database"],
         autocommit=True,
         login_timeout=15,
     )
-    cur = conn.cursor()
-    harness.seed_schema(
-        lambda sql, params=None: cur.execute(sql, params), "SQLServer", drop_first=True
-    )
-    art = tmp_path / "art"
-    _engine_model_env(art, "SQLServer", monkeypatch)
-    # SQL Server has no DSN scheme (`_env_datasource_dsn` handles postgres/mysql/sqlite/…), so the
-    # per-field credentials file is the supported channel. Clear the env DSN or it would win.
-    monkeypatch.delenv("DATASOURCE_URL__ACME", raising=False)
-    _write_credentials(
-        art,
-        "acme",
-        {
-            "type": "sqlserver",
-            "host": c["host"],
-            "port": c["port"],
-            "user": c["user"],
-            "password": c["password"],
-            "database": c["database"],
-        },
-        monkeypatch,
-    )
     try:
+        boot = pymssql.connect(**connect)
+    except Exception as exc:
+        unavailable(f"no reachable SQL Server ({exc})")
+    try:  # the fixture database may not exist yet; create it before connecting into it
+        boot.cursor().execute(
+            f"IF DB_ID('{c['database']}') IS NULL CREATE DATABASE [{c['database']}]"
+        )
+    finally:
+        boot.close()
+
+    conn = pymssql.connect(database=c["database"], **connect)
+    try:
+        cur = conn.cursor()
+        harness.seed_schema(
+            lambda sql, params=None: cur.execute(sql, params), "SQLServer", drop_first=True
+        )
+        art = tmp_path / "art"
+        _engine_model_env(art, "SQLServer", monkeypatch)
+        # SQL Server has no DSN scheme (`_env_datasource_dsn` handles postgres/mysql/sqlite/…), so
+        # the per-field credentials file is the supported channel. Clear the env DSN or it would win.
+        monkeypatch.delenv("DATASOURCE_URL__ACME", raising=False)
+        _write_credentials(
+            art,
+            "acme",
+            {
+                "type": harness.ENGINE_FIXTURES["SQLServer"].credential_type,
+                "host": c["host"],
+                "port": c["port"],
+                "user": c["user"],
+                "password": c["password"],
+                "database": c["database"],
+            },
+            monkeypatch,
+        )
         yield
     finally:
-        for name in SCHEMA:
-            try:
-                cur.execute(f"DROP TABLE IF EXISTS {name}")
-            except Exception:
-                pass
+        _drop_corpus_tables(conn.cursor())
         conn.close()
 
 
 @pytest.fixture
 def duckdb_safety_env(tmp_path, monkeypatch):
     """DuckDB in-process — no server, no container. Included because it is cheap and because the
-    corpus previously claimed DuckDB coverage it did not have."""
-    pytest.importorskip("duckdb")
+    corpus previously claimed DuckDB coverage it did not have.
+
+    Its only availability risk is the driver, so it goes through the same REQUIRED contract: the
+    `integration-duckdb` job is this engine's ONLY evidence, and a skipped run there would be a
+    green job that proved nothing."""
+    _require_driver("DuckDB", "duckdb")
     db = tmp_path / "shop.duckdb"
     harness.seed_duckdb(db)
     art = tmp_path / "art"
     _engine_model_env(art, "DuckDB", monkeypatch)
     # DuckDB has no DSN scheme either — same per-field credentials channel as SQL Server.
     monkeypatch.delenv("DATASOURCE_URL__ACME", raising=False)
-    _write_credentials(art, "acme", {"type": "duckdb", "path": str(db)}, monkeypatch)
+    _write_credentials(
+        art,
+        "acme",
+        {"type": harness.ENGINE_FIXTURES["DuckDB"].credential_type, "path": str(db)},
+        monkeypatch,
+    )
     yield
 
 
