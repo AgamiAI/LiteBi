@@ -37,7 +37,7 @@ model = [
 # The HTTP MCP transport (mcp_http): the official MCP SDK + an ASGI server. Kept out of the base
 # install so the local executor/skill stay stdlib-lean — only a hosted deployment installs it.
 server = [
-  "mcp>=1.2",
+  "mcp>=1.2,<2",        # capped: 2.0 dropped Server.list_tools, which build_server() registers on
   "anyio>=4",           # async_offload.run_blocking offloads blocking work off the loop (ACE-048)
   "uvicorn>=0.30",
   "psycopg2-binary>=2.9",

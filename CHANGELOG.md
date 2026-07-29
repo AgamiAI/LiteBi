@@ -10,6 +10,29 @@ is the source of truth a host installs against — bumping it is what invalidate
 user's plugin cache (see [CONTRIBUTING.md](CONTRIBUTING.md)). Each released section
 below corresponds to one such version.
 
+## [Unreleased]
+
+### Security
+
+- **Closed a read-only-guard bypass via a welded quoted identifier.** A double-quoted
+  identifier is self-delimiting in SQL on **both** ends, so `SELECT*FROM"pg_read_file"(…)`
+  and `SELECT "x"INTO evil FROM t` are valid statements with no whitespace either side of
+  the quote. The guard's lexer dropped the quote characters without re-supplying those
+  boundaries, fusing neighbouring tokens into one (`FROM"pg_class"` → `FROMpg_class`,
+  `"x"INTO` → `xINTO`) and destroying the word-boundary anchor every deny-list pattern
+  matches on — so the gate stopped *seeing* the token rather than allowing it, and returned
+  no rejection. Verified against PostgreSQL 16: the leading form reads a server-side file
+  and the trailing form creates a table from `SELECT … INTO`, both while the guard passed
+  them. Row locks (`FOR SHARE`) were reachable the same way. The lexer now re-supplies a
+  separator on either side, when and only when the quote was actually separating two word
+  characters — so a qualified name (`t."current_user"`) still neutralizes to one token,
+  `t.current_user`, rather than being split. This restores an invariant the lexer already
+  documented for comments and literals ("never empty"); the identifier branch was the one
+  place not honouring it. Prior corpus cases all happened to carry a space before the
+  quote, which is why this stayed invisible; the corpus now pins both weld directions and
+  asserts the neutralized token structure directly, so neither a one-sided fix nor a
+  blanket separator can pass.
+
 ## [0.5.0] — 2026-07-25
 
 ### Changed
