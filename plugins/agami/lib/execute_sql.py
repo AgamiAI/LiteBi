@@ -883,11 +883,19 @@ def _resolve_guard_model(profile: str):
         try:
             from model_store import load_datasource as _load_db
             from store import Store
+            from tools import _current_org_id
 
             store = Store.from_env()
             if store is not None:
                 try:
-                    org = _load_db(store, profile)
+                    # Scoped to the REQUEST's org, exactly as `tools._load_org` does. Letting this
+                    # default to 'local' looked right while `model_deploy._default_org()` was also
+                    # `AGAMI_ORG_ID or "local"`, but F14/F15 moved the write side onto the deployment's
+                    # resolved id — so rows land under that id and a 'local' read finds nothing. On a
+                    # multi-tenant server it finds nothing for EVERY tenant, and the fail-closed rule
+                    # below then refuses every query. `_default_org`'s own docstring states the contract
+                    # this restores: the write and read org "MUST agree".
+                    org = _load_db(store, profile, org_id=_current_org_id())
                 finally:
                     store.close()
                 if org is not None:

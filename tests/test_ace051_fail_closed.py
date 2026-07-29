@@ -195,3 +195,44 @@ def test_hosted_fail_closed_when_model_package_unimportable(tmp_path, monkeypatc
     _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
     assert code == 1  # fail closed — no DB load is even attempted (we never resolve a model)
     assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "model_unavailable"
+
+
+def test_db_model_resolves_under_the_requests_org(tmp_path, monkeypatch, capsys):
+    """The guard must look up the model under the REQUEST's org, not the 'local' sentinel.
+
+    Regression: `_resolve_guard_model` called `load_datasource(store, profile)`, taking the
+    `org_id='local'` default, while `model_deploy._default_org()` — since F14/F15 — stamps rows with the
+    deployment's *resolved* id. `_default_org`'s docstring states the contract the two must keep: "the
+    model is written under one org and read under another and the server sees no model." On a
+    multi-tenant server every tenant's rows live under its own id, so the 'local' read missed for ALL of
+    them and the fail-closed rule above refused every query.
+
+    The artifacts dir is pointed at nothing on purpose: the disk fallback is exactly what masked this on
+    single-tenant deployments for a whole release, so it must not be available to rescue the assertion.
+    """
+    import model_store
+    import tools
+    from store import Store
+
+    url = "sqlite://" + str(tmp_path / "mt.db")
+    s = Store.connect(url)
+    s.run_migrations()
+    model_store.write_datasource(s, "shop", _org(), org_id="contoso")  # a NAMED tenant, never 'local'
+    s.close()
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+    monkeypatch.delenv("AGAMI_ORG_ID", raising=False)
+
+    tools.resolved_org_id.cache_clear()
+    token = tools._current_org_ctx.set("contoso")  # what the multi-tenant resolver set for this request
+    try:
+        _, code = execute_sql._model_safety("SELECT id FROM orders", "shop", None)
+        assert code is None  # resolved under 'contoso': a declared table passes
+
+        # ...and the guards genuinely ran off that model, rather than being inert.
+        _, code = execute_sql._model_safety("SELECT id FROM sqlite_master", "shop", None)
+        assert code == 1
+        assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "table_out_of_scope"
+    finally:
+        tools._current_org_ctx.reset(token)
+        tools.resolved_org_id.cache_clear()
