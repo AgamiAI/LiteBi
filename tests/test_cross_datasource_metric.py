@@ -254,6 +254,34 @@ def test_model_rejects_grain_arity_mismatch():
         )
 
 
+def test_model_rejects_duplicate_reconcile_on():
+    # A duplicated key component would set-match a shorter bridge key (set-equality) — reject at parse.
+    with pytest.raises(ValueError, match="duplicate"):
+        _metric(
+            reconcile_on=["account_key", "account_key"],
+            sub_measures=[
+                SubMeasure(datasource="acme_crm", binding="SUM(amount)",
+                           grain=["account_key", "account_key"], alias="crm_revenue"),
+                SubMeasure(datasource="acme_erp", binding="SUM(amount)",
+                           grain=["account_key", "account_key"], alias="erp_ar"),
+            ],
+        )
+
+
+def test_model_rejects_duplicate_grain():
+    # reconcile_on is distinct, but a piece's grain duplicates a column — each key component distinct.
+    with pytest.raises(ValueError, match="duplicate"):
+        _metric(
+            reconcile_on=["region", "account_key"],
+            sub_measures=[
+                SubMeasure(datasource="acme_crm", binding="SUM(amount)",
+                           grain=["account_key", "account_key"], alias="crm_revenue"),
+                SubMeasure(datasource="acme_erp", binding="SUM(amount)",
+                           grain=["region", "account_key"], alias="erp_ar"),
+            ],
+        )
+
+
 def test_federated_rejected_on_the_join_types():
     # `federated` is metric-only — a relationship or a bridge can't even be constructed with it.
     with pytest.raises(ValueError, match="federated"):

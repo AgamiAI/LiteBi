@@ -792,6 +792,13 @@ class CrossDatasourceMetric(_Base):
             raise ValueError(
                 f"cross-datasource metric {self.name!r}: reconcile_on (the shared key) must be non-empty"
             )
+        if len(set(self.reconcile_on)) != len(self.reconcile_on):
+            # A duplicate would set-match a shorter bridge key (_bridge_matches_key uses set equality)
+            # and skew the grain-arity check — the composite-key components must be distinct.
+            raise ValueError(
+                f"cross-datasource metric {self.name!r}: reconcile_on {self.reconcile_on} has duplicate "
+                "key column(s) — the shared-key components must be distinct"
+            )
         # `combine` is the formula that stitches the pieces together — a blank one is a metric that
         # combines nothing. (str_strip_whitespace turns "  " into "".) Same non-empty rule as
         # Metric.calculation, but on the composition rather than the prose.
@@ -813,6 +820,11 @@ class CrossDatasourceMetric(_Base):
                     f"cross-datasource metric {self.name!r}: sub_measure {sm.alias!r} grain {sm.grain} "
                     f"has {len(sm.grain)} column(s) but reconcile_on {self.reconcile_on} has "
                     f"{len(self.reconcile_on)} — each piece groups by its local version of the composite key"
+                )
+            if len(set(sm.grain)) != len(sm.grain):
+                raise ValueError(
+                    f"cross-datasource metric {self.name!r}: sub_measure {sm.alias!r} grain {sm.grain} "
+                    "has duplicate column(s) — each key component must be distinct"
                 )
         # Each piece needs a non-empty alias (str_strip_whitespace turns "  " into ""), and the
         # aliases must be unique — they are the names `combine` references, so a dupe is ambiguous.

@@ -109,7 +109,10 @@ def _bridge_entries(doc, key: str = "relationships") -> list:
     for bridges and ``metrics`` for cross-datasource metrics. Explicit rather than ``doc.get(...)``
     because ``.get`` on a bare list raises ``AttributeError``."""
     if isinstance(doc, dict):
-        return doc.get(key) or []
+        entries = doc.get(key)
+        # A non-list value under `key` (e.g. `metrics: <scalar>`) is malformed — return [] rather than
+        # letting the caller iterate a string character-by-character.
+        return entries if isinstance(entries, list) else []
     if isinstance(doc, list):
         return doc
     return []
