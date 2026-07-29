@@ -33,15 +33,25 @@ if str(PKG_SRC) not in sys.path:
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from semantic_model import runtime as rt  # noqa: E402
+from semantic_model.sql_dialect import sqlglot_dialect  # noqa: E402
 
 from safety import corpus  # noqa: E402
 
-# The corpus executes against SQLite; the seeded sample model declares SQLite too. Parsing
-# each statement under the engine it is written for is the whole point — a statement is only
-# valid with respect to some engine.
-CORPUS_DIALECT = "sqlite"
+# Parsing each statement under the engine it is written for is the whole point — a statement is
+# only valid with respect to some engine. The corpus now carries statements written for engines
+# other than SQLite (`SELECT TOP n [col]` is valid T-SQL and is not SQLite at all), so a case
+# pinned to engines is checked under EACH of them, and only an unpinned case — one claimed to be
+# valid everywhere — falls back to the default. Checking those under one fixed dialect would
+# either fail on valid SQL or, worse, quietly stop covering the engines the corpus added.
+DEFAULT_CORPUS_ENGINE = "SQLite"
+CORPUS_DIALECT = sqlglot_dialect(DEFAULT_CORPUS_ENGINE)  # the seeded sample model declares SQLite
 
 VALID_CORPUS_SQL = [c for c in corpus.CASES if c.expect == "ok"]
+
+# (case, engine) pairs — the unit actually being measured, since one case can be valid on several.
+VALID_CORPUS_PAIRS = [
+    (c, e) for c in VALID_CORPUS_SQL for e in (c.engines or (DEFAULT_CORPUS_ENGINE,))
+]
 
 SAMPLE_EXAMPLES = sorted(
     (REPO_ROOT / "plugins" / "agami" / "samples").rglob("prompt_examples/*/examples.yaml")
@@ -78,10 +88,12 @@ def test_the_seeded_examples_were_found():
     assert SEEDED_SQL, "no seeded example SQL found to check"
 
 
-@pytest.mark.parametrize("case", VALID_CORPUS_SQL, ids=lambda c: c.id)
-def test_valid_corpus_sql_still_parses(case):
-    tree, why = rt._parse_reporting(case.sql, CORPUS_DIALECT)
-    assert tree is not None, f"valid corpus SQL now refuses ({why}): {case.sql}"
+@pytest.mark.parametrize(
+    "case,engine", VALID_CORPUS_PAIRS, ids=[f"{c.id}@{e}" for c, e in VALID_CORPUS_PAIRS]
+)
+def test_valid_corpus_sql_still_parses(case, engine):
+    tree, why = rt._parse_reporting(case.sql, sqlglot_dialect(engine))
+    assert tree is not None, f"valid corpus SQL now refuses on {engine} ({why}): {case.sql}"
 
 
 @pytest.mark.parametrize(
@@ -94,6 +106,8 @@ def test_seeded_example_sql_still_parses(path, sql):
 
 def test_the_measured_refusal_delta_is_zero():
     """The number reported in the pull request, computed rather than asserted by hand."""
-    checked = [c.sql for c in VALID_CORPUS_SQL] + [s for _, s in SEEDED_SQL]
-    refused = [s for s in checked if rt._parse_reporting(s, CORPUS_DIALECT)[0] is None]
+    checked = [(c.sql, sqlglot_dialect(e)) for c, e in VALID_CORPUS_PAIRS] + [
+        (s, CORPUS_DIALECT) for _, s in SEEDED_SQL
+    ]
+    refused = [s for s, dialect in checked if rt._parse_reporting(s, dialect)[0] is None]
     assert not refused, f"{len(refused)}/{len(checked)} valid statements refused: {refused}"

@@ -31,6 +31,10 @@ def _write_disk_model(root: Path) -> None:
         "e2e_harness", REPO_ROOT / "tests" / "e2e" / "harness.py"
     )
     h = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec_module — the documented importlib idiom. A module executed while absent
+    # from sys.modules cannot resolve its own module globals, which anything reading them at class
+    # -creation time needs (`@dataclass` is one), so loading it detached fails at import.
+    sys.modules[spec.name] = h
     spec.loader.exec_module(h)
     h.write_disk_model(root)
 
