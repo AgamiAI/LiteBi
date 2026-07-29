@@ -195,3 +195,80 @@ def test_http_tools_list_is_the_same_four(base_url):
         payload = json.loads(re.search(r"\{.*\}", tl.text, re.DOTALL).group(0))
         names = {t["name"] for t in payload["result"]["tools"]}
     assert names == PRODUCT_TOOLS
+
+
+def test_presence_auth_yields_no_session_id(base_url):
+    """The fallback that matters most: presence auth mints no token at all, so there is no session to
+    report. It must read as "no session" — never break the caller."""
+    from oss_adapters import PresenceAuthProvider
+
+    principal = PresenceAuthProvider().validate_token("present")
+    assert principal is not None and principal.subject == "local"
+    assert principal.session_id is None
+
+
+def test_the_session_id_reaches_a_tool_handler(base_url, monkeypatch):
+    """End to end over the real transport: a tool runs on a WORKER THREAD, so the contextvar set in
+    `handle_mcp` only reaches it because anyio copies the request context across the thread hop. Assert
+    that rather than trusting it — it is the whole delivery mechanism for a consumer's session key."""
+    seen = {}
+
+    def _probe(args: dict) -> str:
+        seen["session"] = mcp_http.current_session_id()
+        return "ok"
+
+    tool = {
+        "handler": _probe,
+        "description": "probe",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+
+    class _P:
+        subject = "jordan@example.com"
+        session_id = "sess-42"
+
+    class _Auth:
+        def validate_token(self, token):
+            return _P() if (token or "").strip() else None
+
+    from dataclasses import replace
+
+    adapters = replace(mcp_http.default_adapters(), auth_provider=_Auth())
+    app = mcp_http.create_app(extra_tools={"probe": tool}, adapters=adapters)
+    headers = {
+        "Authorization": "Bearer anything",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(app) as c:
+        c.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"},
+                },
+            },
+        )
+        c.post(
+            "/mcp", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+        r = c.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "probe", "arguments": {}},
+            },
+        )
+        assert r.status_code == 200, r.text
+    assert seen["session"] == "sess-42"
+    # ...and it does not leak past the request.
+    assert mcp_http.current_session_id() is None

@@ -63,6 +63,21 @@ _log = logging.getLogger(__name__)
 # only receives (name, arguments), and a contextvar set in the BaseHTTPMiddleware wouldn't reach it.
 _actor_ctx: ContextVar[str | None] = ContextVar("agami_tool_actor", default=None)
 
+# The CLIENT AUTHORIZATION behind the in-flight tool call — what tells two windows under one login apart.
+# Set alongside `_actor_ctx` and for the same reason. None whenever the caller's auth has no session
+# notion (presence auth, a hand-minted bearer): consumers must read that as "no session", not an error.
+_session_ctx: ContextVar[str | None] = ContextVar("agami_tool_session", default=None)
+
+
+def current_session_id() -> str | None:
+    """The session id for the request being served, or None.
+
+    Public because a consumer's tool handler needs it and the request never reaches the handler — only
+    this contextvar does. Same shape as `tools.current_org_id`, so consumers don't have to reach into a
+    private module attribute the way they otherwise would.
+    """
+    return _session_ctx.get()
+
 
 def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
     """The authenticated user's subject for this /mcp request: the principal the auth middleware already
@@ -75,6 +90,22 @@ def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
         if key == b"authorization" and value[:7].lower() == b"bearer ":
             revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
             return getattr(revalidated, "subject", None) if revalidated is not None else None
+    return None
+
+
+def _session_from_scope(scope: dict, auth: AuthProvider) -> str | None:
+    """The session id for this /mcp request — read off the principal the auth middleware validated, with
+    the same re-validate-the-bearer fallback `_actor_from_scope` uses when the scope state didn't
+    propagate. `getattr` rather than attribute access on purpose: a third-party AuthProvider satisfies a
+    `@runtime_checkable` Protocol that checks method presence only, so its principal may be any object
+    exposing `.subject`."""
+    principal = (scope.get("state") or {}).get("principal")
+    if principal is not None:
+        return getattr(principal, "session_id", None)
+    for key, value in scope.get("headers", []):
+        if key == b"authorization" and value[:7].lower() == b"bearer ":
+            revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
+            return getattr(revalidated, "session_id", None) if revalidated is not None else None
     return None
 
 
@@ -113,8 +144,10 @@ def _build_org_resolver() -> SingleTenantOrgResolver:
     # Load-bearing for a hand-rolled DB-only deploy: log the resolved id + where it came from, so an
     # operator can see "org_id=local (default)" and realize organization.yaml/AGAMI_ORG_ID isn't reaching the
     # server (see F14's documented residual risk).
-    source = "env" if os.environ.get("AGAMI_ORG_ID", "").strip() else (
-        "default" if org_id == "local" else "organization.yaml"
+    source = (
+        "env"
+        if os.environ.get("AGAMI_ORG_ID", "").strip()
+        else ("default" if org_id == "local" else "organization.yaml")
     )
     _log.info("single-tenant org_id=%s (source=%s)", org_id, source)
     return SingleTenantOrgResolver(Org(id=org_id))
@@ -434,11 +467,13 @@ def create_app(
         actor = _actor_from_scope(scope, auth_provider)
         token = _actor_ctx.set(actor)
         org_token = _current_org_ctx.set(_org_id_from_scope(scope))
+        session_token = _session_ctx.set(_session_from_scope(scope, auth_provider))
         try:
             await session_manager.handle_request(scope, receive, send)
         finally:
             _actor_ctx.reset(token)
             _current_org_ctx.reset(org_token)
+            _session_ctx.reset(session_token)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):

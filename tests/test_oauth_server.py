@@ -635,7 +635,9 @@ def test_ace050_hygiene_never_deletes_query_or_activity_logs(env):
 
     s = Store.from_env()
     try:
-        assert s.query("SELECT id FROM query_executions WHERE id = 'q1'"), "query log must be retained"
+        assert s.query("SELECT id FROM query_executions WHERE id = 'q1'"), (
+            "query log must be retained"
+        )
         assert s.query("SELECT id FROM tool_calls WHERE id = 't1'"), "activity log must be retained"
     finally:
         s.close()
@@ -745,3 +747,100 @@ def test_token_ttls_are_env_configurable_and_fail_safe(env, monkeypatch):
 
     monkeypatch.setenv("AGAMI_ACCESS_TOKEN_TTL", "1800")  # and the override reaches the wire
     assert _token_pair(TestClient(mcp_http.build_app()))["expires_in"] == 1800
+
+
+# --- `sid`: telling two clients of one login apart -----------------------------
+
+
+def _sid(access_token: str) -> str | None:
+    return jwt.decode(access_token, SECRET, algorithms=["HS256"], issuer=BASE).get("sid")
+
+
+def test_access_token_carries_the_hashed_refresh_family_as_sid(env):
+    """The claim is derived from the family, never the family itself: that value is what reuse detection
+    burns on (`WHERE family = ?`), so it must not leave the server."""
+    import hashlib
+
+    c = TestClient(mcp_http.build_app())
+    body = _token_pair(c)
+    s = Store.from_env()
+    families = [r["family"] for r in s.query("SELECT family FROM oauth_refresh_token")]
+    s.close()
+    assert len(families) == 1
+    expected = hashlib.sha256(families[0].encode()).hexdigest()[:16]
+    assert _sid(body["access_token"]) == expected
+    assert families[0] not in body["access_token"]  # the raw lineage key never ships
+
+
+def test_sid_survives_a_rotation(env, monkeypatch):
+    """THE property that makes the family the right key and a per-token id the wrong one: a `jti` would
+    change on every refresh, so anything keyed on it would silently reset each hour."""
+    monkeypatch.setenv("AGAMI_REFRESH_TOKEN_MODE", "rotate")
+    c = TestClient(mcp_http.build_app())
+    first = _token_pair(c)
+    second = _refresh(c, first["refresh_token"])
+    third = _refresh(c, second["refresh_token"])
+    assert _sid(first["access_token"])  # present
+    assert _sid(second["access_token"]) == _sid(first["access_token"])
+    assert _sid(third["access_token"]) == _sid(first["access_token"])
+    # ...even though the refresh token itself changed every time.
+    assert first["refresh_token"] != second["refresh_token"] != third["refresh_token"]
+
+
+def test_sid_survives_an_overwrite_renewal(env, monkeypatch):
+    # 'overwrite' is the default and takes a different code path (UPDATE in place, no new row), so the
+    # continuity has to be asserted separately from rotate's.
+    monkeypatch.setenv("AGAMI_REFRESH_TOKEN_MODE", "overwrite")
+    c = TestClient(mcp_http.build_app())
+    first = _token_pair(c)
+    second = _refresh(c, first["refresh_token"])
+    assert _sid(second["access_token"]) == _sid(first["access_token"])
+
+
+def test_two_authorizations_get_different_sids(env):
+    """The requirement itself: one login, two independent client authorizations, two identities. Without
+    this the server cannot tell two concurrent windows apart at all."""
+    c = TestClient(mcp_http.build_app())
+    a, b = _token_pair(c), _token_pair(c)
+    assert _sid(a["access_token"]) and _sid(b["access_token"])
+    assert _sid(a["access_token"]) != _sid(b["access_token"])
+
+
+def test_a_token_minted_without_a_sid_still_validates(env):
+    """Tokens predating this claim, and any minted outside the OAuth flow (scripts, tests, an operator's
+    hand-rolled bearer), must keep working — `sid` is deliberately not in the `require` list."""
+    from oauth_server import JwtAuthProvider, issue_jwt
+
+    token = issue_jwt("admin")
+    assert "sid" not in jwt.decode(token, SECRET, algorithms=["HS256"], issuer=BASE)
+    principal = JwtAuthProvider().validate_token(token)
+    assert principal is not None and principal.subject == "admin"
+    assert principal.session_id is None  # absent reads as "no session", not as an error
+
+
+def test_validate_token_surfaces_the_sid_on_the_principal(env):
+    from oauth_server import JwtAuthProvider, issue_jwt
+
+    token = issue_jwt("admin", sid="abc123")
+    principal = JwtAuthProvider().validate_token(token)
+    assert principal is not None and principal.session_id == "abc123"
+
+
+def test_a_malformed_sid_degrades_to_none_rather_than_rejecting(env):
+    # A blank/non-string claim must not cost an otherwise-valid caller their request.
+    from oauth_server import JwtAuthProvider
+
+    for bad in ("", "   ", 42):
+        token = jwt.encode(
+            {
+                "sub": "admin",
+                "iss": BASE,
+                "iat": 1,
+                "exp": 4102444800,  # 2100-01-01, comfortably unexpired
+                "sid": bad,
+            },
+            SECRET,
+            algorithm="HS256",
+        )
+        principal = JwtAuthProvider().validate_token(token)
+        assert principal is not None and principal.session_id is None, bad

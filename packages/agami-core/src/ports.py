@@ -56,9 +56,18 @@ class Org:
 @dataclass(frozen=True)
 class Principal:
     """An authenticated caller. By default this is just token presence (one user); real
-    providers populate identity/claims."""
+    providers populate identity/claims.
+
+    `session_id` distinguishes CONCURRENT CLIENTS of the same subject — two windows under one login are
+    otherwise indistinguishable here, so anything the server remembers per-caller (an active selection, a
+    per-conversation binding) would be shared between them, last write wins. Optional because most auth
+    paths have no such notion: presence auth, a hand-minted bearer, and a username/password check all
+    leave it None, and a consumer must read it as "no session", never as an error. It is an identity, not
+    a liveness signal — see `oauth_server._session_id`.
+    """
 
     subject: str
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)

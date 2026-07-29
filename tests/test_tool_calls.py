@@ -165,3 +165,42 @@ def test_a_raising_tool_is_still_logged_as_an_error(db, monkeypatch):
     _mcp_tool_call("jordan@example.com", "list_datasources")
     rows = [r for r in _rows(db) if r["tool_name"] == "list_datasources"]
     assert rows and rows[0]["success"] == 0 and rows[0]["error_kind"] == "exception"
+
+
+# --- the session plumbing ----------------------------------------------------
+
+
+def test_session_from_scope_prefers_state_then_header():
+    """Mirrors `_actor_from_scope`: state first, re-validate the bearer as a fallback, None otherwise."""
+
+    class _PS:
+        subject = "jordan@example.com"
+        session_id = "sess-1"
+
+    class _AuthS:
+        def validate_token(self, token):
+            return _PS() if token == "good" else None
+
+    auth = _AuthS()
+    assert mcp_http._session_from_scope({"state": {"principal": _PS()}}, auth) == "sess-1"
+    scope = {"headers": [(b"authorization", b"Bearer good")]}
+    assert mcp_http._session_from_scope(scope, auth) == "sess-1"
+    assert (
+        mcp_http._session_from_scope({"headers": [(b"authorization", b"Bearer bad")]}, auth) is None
+    )
+    assert mcp_http._session_from_scope({}, auth) is None
+
+
+def test_session_from_scope_tolerates_a_principal_without_the_field():
+    """`AuthProvider` is a @runtime_checkable Protocol — it checks method presence only, so a third-party
+    provider may return any object exposing `.subject`. Reading the session must not explode on one."""
+    auth = _Auth()  # its principal `_P` has `subject` and nothing else
+    assert mcp_http._session_from_scope({"state": {"principal": _P()}}, auth) is None
+    assert (
+        mcp_http._session_from_scope({"headers": [(b"authorization", b"Bearer good")]}, auth)
+        is None
+    )
+
+
+def test_current_session_id_is_none_outside_a_request():
+    assert mcp_http.current_session_id() is None

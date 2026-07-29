@@ -115,8 +115,14 @@ def _signing_secret() -> str:
     return secret
 
 
-def issue_jwt(subject: str) -> str:
-    """A self-signed HS256 JWT for `subject` — the Bearer token the transport will accept."""
+def issue_jwt(subject: str, *, sid: str | None = None) -> str:
+    """A self-signed HS256 JWT for `subject` — the Bearer token the transport will accept.
+
+    `sid` identifies the CLIENT AUTHORIZATION this token belongs to, so one login driving two clients is
+    distinguishable per request (see `_session_id`). Omitted when there is none — a token minted outside
+    the OAuth flow (a script, a test, an operator's hand-rolled bearer) carries exactly the claims it
+    always did, and consumers must treat its absence as "no session", never as an error.
+    """
     from mcp_http import public_base_url  # lazy: mcp_http imports these handlers at module load
 
     now = _now()
@@ -126,6 +132,8 @@ def issue_jwt(subject: str) -> str:
         "iat": int(now.timestamp()),
         "exp": int((now + _access_ttl()).timestamp()),
     }
+    if sid:
+        payload["sid"] = sid
     return jwt.encode(payload, _signing_secret(), algorithm="HS256")
 
 
@@ -155,7 +163,13 @@ class JwtAuthProvider:
         # malformed identity forward.
         if not isinstance(sub, str) or not sub.strip():
             return None
-        return Principal(subject=sub)
+        # `sid` is OPTIONAL and deliberately absent from the `require` list above: tokens minted before
+        # this claim existed, and any minted outside the OAuth flow, must keep validating. A malformed
+        # one degrades to None (no session) rather than rejecting an otherwise-valid token.
+        sid = claims.get("sid")
+        return Principal(
+            subject=sub, session_id=sid if isinstance(sid, str) and sid.strip() else None
+        )
 
 
 def _b64url_nopad(raw: bytes) -> str:
@@ -405,25 +419,48 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _session_id(family: str) -> str:
+    """The `sid` claim for a refresh-token lineage — a stable, opaque handle for ONE client authorization.
+
+    Derived from the family rather than being the family, because the family is the key reuse detection
+    burns on (`WHERE family = ?`) and it should not leave the server. A hash keeps what callers actually
+    need — the same value for every token in a lineage, a different value per authorization — while giving
+    a client that decodes its own JWT nothing it can present anywhere.
+
+    Why the FAMILY and not a per-token id: the family survives rotation ('rotate' carries it into the
+    successor row, 'overwrite' never rewrites the column), whereas a per-token id would change on every
+    refresh. Anything keyed on it would silently reset each time the access token renewed — which for an
+    active-org selection means quietly moving the user to a different tenant.
+
+    An IDENTITY, not a liveness signal: reuse detection can burn a family while access tokens carrying its
+    `sid` are still unexpired, and `validate_token` does no DB lookup. Never treat a `sid` as proof that
+    the underlying authorization is still live.
+    """
+    return hashlib.sha256(family.encode()).hexdigest()[:16]
+
+
 def _issue_refresh_token(
     store: Store, *, client_id: str, username: str, family: str | None = None
-) -> str:
+) -> tuple[str, str]:
     """Mint + persist (hash only) a refresh token for `username`, in `family` (a fresh lineage when
-    None). The caller commits. Returns the plaintext token — the only place it ever exists."""
+    None). The caller commits. Returns (plaintext token, resolved family) — the token is the only place
+    it ever exists, and the family is returned because a NEW lineage is minted here and the caller
+    otherwise has no way to learn it (it is needed for the access token's `sid`)."""
     token = secrets.token_urlsafe(32)
+    resolved_family = family or secrets.token_urlsafe(16)
     store.execute(
         "INSERT INTO oauth_refresh_token (token_hash, family, client_id, username, expires_at, "
         "revoked, created) VALUES (?, ?, ?, ?, ?, 0, ?)",
         (
             _hash_token(token),
-            family or secrets.token_urlsafe(16),
+            resolved_family,
             client_id,
             username,
             (_now() + _refresh_ttl()).isoformat(),
             _now().isoformat(),
         ),
     )
-    return token
+    return token, resolved_family
 
 
 def _cleanup_expired_revoked(store: Store) -> None:
@@ -438,11 +475,14 @@ def _cleanup_expired_revoked(store: Store) -> None:
     )
 
 
-def _token_body(username: str, refresh_token: str) -> JSONResponse:
-    """The OAuth token response body: a fresh access JWT + the given refresh token."""
+def _token_body(username: str, refresh_token: str, family: str) -> JSONResponse:
+    """The OAuth token response body: a fresh access JWT + the given refresh token.
+
+    `family` is the refresh lineage this token belongs to; it rides the JWT as a hashed `sid` so the
+    server can tell one client authorization from another on a later request."""
     return JSONResponse(
         {
-            "access_token": issue_jwt(username),
+            "access_token": issue_jwt(username, sid=_session_id(family)),
             "token_type": "Bearer",
             "expires_in": int(_access_ttl().total_seconds()),
             "refresh_token": refresh_token,
@@ -456,11 +496,13 @@ def _token_response(
     """The shared token body for the INSERT path (initial issue + 'rotate' refresh): mint a NEW
     refresh row, then commit it together with whatever the caller already staged (code burn /
     rotate / expired-revoked cleanup)."""
-    refresh_token = _issue_refresh_token(
+    refresh_token, resolved_family = _issue_refresh_token(
         store, client_id=client_id, username=username, family=family
     )
     store.commit()
-    return _token_body(username, refresh_token)
+    # `resolved_family`, not `family`: on the authorization_code path the caller passes None and the
+    # lineage is minted inside — so this is the only frame that knows it.
+    return _token_body(username, refresh_token, resolved_family)
 
 
 async def token(request: Request) -> Response:
@@ -580,7 +622,9 @@ def _grant_refresh_token(store: Store, form: dict[str, str]) -> Response:
             store.commit()
             return _oauth_error("invalid_grant", "refresh token is invalid")
         store.commit()
-        return _token_body(row["username"], new_token)
+        # The UPDATE above rewrites only token_hash + expires_at, so the lineage is unchanged — the
+        # renewed access token keeps the same `sid` its predecessor carried.
+        return _token_body(row["username"], new_token, row["family"])
 
     # 'rotate' mode: revoke the presented token and issue a successor in the same family, keeping the
     # revoked row for stolen-token reuse detection. Atomic: only the request that flips revoked 0→1
