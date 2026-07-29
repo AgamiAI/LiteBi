@@ -38,6 +38,13 @@ jobs:
         run: uvx ruff@0.15.19 format --check plugins packages tests
         continue-on-error: true
 
+      # Coverage is ENFORCED, not just reported. Measured 2026-07-29 at 85.66% on every leg of this
+      # matrix — 3.10, 3.11 and 3.12 alike, 1584 tests — so the floor sits just below it and no matrix
+      # leg is closer to the line than any other. Before this the job printed a coverage report and
+      # failed on nothing: OCR-024 claimed a >=80% floor that was never in the workflow, so coverage
+      # could regress to zero and CI stayed green.
+      # Ratchet upward as the suite grows; never lower it to make a red build pass.
+      #
       # The suite imports the agami-core library, so install it editable with the
       # [model] extra (pydantic/pyyaml/sqlglot — sqlglot backs the binding-validation and
       # unit-resolution paths; without it ~287 tests skip). DB drivers are intentionally
@@ -48,6 +55,7 @@ jobs:
           --with pytest --with pytest-cov
           --with-editable "packages/agami-core[model,server]"
           pytest tests/ -q --cov=plugins --cov=packages/agami-core/src --cov-report=term-missing
+          --cov-fail-under=85
 
   gitleaks:
     name: gitleaks (secret scan)
