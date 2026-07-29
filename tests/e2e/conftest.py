@@ -17,6 +17,7 @@ if str(REPO_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import harness  # noqa: E402  (tests/e2e is on sys.path during collection)
+import itdeps  # noqa: E402  (same directory; skip-vs-fail gating for the DB-backed tests)
 
 BASE = "https://demo.example.com"
 
@@ -89,17 +90,22 @@ def pg_admin():
     BUT when AGAMI_IT_PG_REQUIRED is set (the integration-pg CI job sets it), an unavailable DB FAILS
     instead of skips — this job carries the ONLY proof of the role-floor + file/db parity + DB-served
     model, and pytest exits 0 when everything skips, so a service race / env rename / driver hiccup
-    would otherwise turn the F9 done-bar gate green while proving nothing."""
-    psycopg2 = pytest.importorskip("psycopg2")
+    would otherwise turn the F9 done-bar gate green while proving nothing.
+
+    The MISSING-DRIVER case runs through the same sentinel (`itdeps.importorfail`, not
+    `pytest.importorskip`): an absent psycopg2 is exactly the "proved nothing" outcome the sentinel
+    exists to catch, and importorskip would have skipped past it before the sentinel was consulted."""
+    psycopg2 = itdeps.importorfail("psycopg2")
     # In the required job, a missing DB is a hard failure — an all-skip must NOT pass as green.
-    unavailable = pytest.fail if os.environ.get("AGAMI_IT_PG_REQUIRED") else pytest.skip
     if not os.environ.get("AGAMI_IT_PG_PASSWORD"):
-        unavailable("set AGAMI_IT_PG_PASSWORD to run the Postgres safety-corpus / role-floor tests")
+        itdeps.unavailable(
+            "set AGAMI_IT_PG_PASSWORD to run the Postgres safety-corpus / role-floor tests"
+        )
     sc = pg_super_creds()
     try:
         conn = psycopg2.connect(connect_timeout=10, **sc)
     except Exception as exc:  # unreachable DB → skip locally, FAIL in the required CI job
-        unavailable(f"no reachable Postgres ({exc})")
+        itdeps.unavailable(f"no reachable Postgres ({exc})")
     conn.autocommit = True
     try:
         yield psycopg2, conn, sc

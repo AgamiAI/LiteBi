@@ -13,12 +13,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import itdeps  # tests/e2e is on sys.path during collection (same directory as conftest)
 import pytest
 
-pytest.importorskip("mcp")
-pytest.importorskip("starlette")
-pytest.importorskip("sqlglot")
-pytest.importorskip("pydantic")
+# Skip when a dependency is absent — but FAIL when AGAMI_IT_PG_REQUIRED says this run must actually
+# execute the DB-served corpus. A missing transport/model dependency skips this whole module, which
+# in that job is indistinguishable from "the corpus proved nothing" and used to still exit 0.
+itdeps.importorfail("mcp")
+itdeps.importorfail("starlette")
+itdeps.importorfail("sqlglot")
+itdeps.importorfail("pydantic")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT / "tests") not in sys.path:

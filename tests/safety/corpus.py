@@ -66,6 +66,9 @@ class Case:
 
     @property
     def id(self) -> str:
+        # NOTE: this string becomes the pytest test id, and the DB-backed CI job selects its tests
+        # with `-k "db_path or role"` — so a `cls`/`note` containing "role" or "db_path" silently
+        # changes which tests that job runs. Keep those two words out of new labels.
         return f"{self.cls}:{self.note or self.sql[:40]}"
 
 
@@ -139,6 +142,15 @@ CASES: list[Case] = [
     # silently cut. Driven with a low AGAMI_SQL_MAX_ROWS by the harness. (A timeout variant is a
     # separate slow-marked case; the row-cap path is the deterministic availability proof.)
     Case("availability", "SELECT id FROM orders", "bounded", "row-cap-truncate", max_rows=1),
+    # A runaway SHAPE, not just a low cap: a cross join multiplies rows out of the caller's control,
+    # and the bound applied at the shared executor is what keeps the result finite and flagged.
+    Case(
+        "availability",
+        "SELECT o.id FROM orders o CROSS JOIN customers c",
+        "bounded",
+        "cross-join-runaway",
+        max_rows=2,
+    ),
     # ── class 7: governed queries still pass → ok (no false refusals) ────────────────────────────
     Case("governed", "SELECT id, amount FROM orders", "ok", "projection"),
     Case("governed", "SELECT status, COUNT(id) AS n FROM orders GROUP BY status", "ok", "group-by"),
@@ -210,5 +222,40 @@ CASES: list[Case] = [
         "SELECT id FROM orders UNION ALL SELECT id FROM customers",
         "ok",
         "union-all",
+    ),
+    # ── class 9: reaching past the datasource entirely → refused{permission} ─────────────────────
+    # The guard already refuses all of these; the corpus did not carry them, so nothing would have
+    # caught a change that reopened one. Each is a different way to get somewhere the caller's
+    # SELECT was never supposed to reach: the database server's filesystem, another server, the
+    # session/transaction the connection is pooled in, a statement a comment hides from a naive
+    # splitter, or a write smuggled inside a CTE that opens with the allowed keyword.
+    Case("file_fn", "SELECT pg_read_file('/etc/passwd')", "permission", "read-server-file"),
+    Case("file_fn", "SELECT lo_import('/etc/passwd')", "permission", "large-object-import"),
+    Case("network_fn", "SELECT dblink('dbname=x', 'SELECT 1')", "permission", "remote-query"),
+    Case("network_fn", "SELECT dblink_exec('dbname=x', 'SELECT 1')", "permission", "remote-exec"),
+    # TCL escapes the read-only transaction; a session SET corrupts state that outlives the call on
+    # a pooled connection. Neither is an analytics primitive.
+    Case("session", "SELECT id FROM orders; COMMIT", "permission", "tcl-commit"),
+    Case("session", "SET ROLE postgres", "permission", "escalate-via-set"),
+    # The line comment swallows the statement separator, so a splitter that trusts `;` sees ONE
+    # statement — the keyword check reads what is actually there and still refuses.
+    Case(
+        "comment",
+        "SELECT id FROM orders -- ;\nDROP TABLE orders",
+        "permission",
+        "line-comment-hides-separator",
+    ),
+    # Data-modifying CTEs: the statement opens with WITH (allowed) and the write hides in the body.
+    Case(
+        "cte_write",
+        "WITH t AS (DELETE FROM orders RETURNING id) SELECT id FROM t",
+        "permission",
+        "cte-delete",
+    ),
+    Case(
+        "cte_write",
+        "WITH t AS (INSERT INTO orders (id) VALUES (9) RETURNING id) SELECT id FROM t",
+        "permission",
+        "cte-insert",
     ),
 ]
