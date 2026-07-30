@@ -316,14 +316,27 @@ def test_a_stated_outcome_beats_the_derived_one(db):
     assert r["success"] == 0 and r["error_kind"] == "bad_request" and r["row_count"] == 3
 
 
-def test_a_stated_success_survives_an_unparseable_body(db):
-    """Overrides are applied after derivation, so they are not quietly re-derived away."""
+def test_a_stated_outcome_replaces_the_derived_one_wholesale(db):
+    """The outcome trio is applied as a GROUP, not field by field. Stating success on a body that
+    parses as an error must not leave the derived `error_kind` stranded beside it — that would write a
+    row saying "succeeded, syntax error", which is worse than either alone."""
     tools.record_tool_call(
         name="a_tool", arguments={}, result_text='{"error": {"kind": "syntax"}}',
-        execution_ms=1, actor="a", success=True, error_kind=None,
+        execution_ms=1, actor="a", success=True,
     )
     (r,) = _rows(db)
-    assert r["success"] == 1  # the caller's classification wins over the body's
+    assert r["success"] == 1 and r["error_kind"] is None
+
+
+def test_a_stated_tenant_is_not_re_read_from_the_process_context(db, monkeypatch):
+    """The tenant is otherwise stamped downstream by re-reading this process's context, whose fallback
+    is the deployment-wide org. A caller that read it where the work was actually scoped states it."""
+    monkeypatch.setattr(tools, "_current_org_id", lambda: "the-wrong-tenant")
+    tools.record_tool_call(
+        name="a_tool", arguments={}, result_text="{}", execution_ms=1, actor="a", org_id="acme"
+    )
+    (r,) = _rows(db)
+    assert r["org_id"] == "acme"
 
 
 def test_the_call_source_contextvar_scopes_rows_and_resets(db):
@@ -351,3 +364,26 @@ def test_an_explicit_source_beats_the_contextvar(db):
         tools.reset_call_source(token)
     (r,) = _rows(db)
     assert r["source"] == "explicit"
+
+
+def test_the_query_log_carries_the_same_source_as_the_tool_call_log(db, monkeypatch, tmp_path):
+    """`execute_sql` writes a SECOND log row of its own, from a depth no parameter of the caller's
+    reaches. If it kept a hard-coded source while the tool-call row took a scoped one, the two logs
+    would disagree about what drove one execution — so it reads the same scope. Unset, it is the value
+    it has always been."""
+    seen = []
+    monkeypatch.setattr(tools, "_record_query", lambda rec: seen.append(rec))
+
+    def _log_a_query():
+        tools._record_query({"ts": "t", "profile": "p", "sql": "SELECT 1", "row_count": 0,
+                             "source": tools.current_call_source()})
+
+    _log_a_query()
+    token = tools.set_call_source("embedded")
+    try:
+        _log_a_query()
+    finally:
+        tools.reset_call_source(token)
+    _log_a_query()
+    assert [r["source"] for r in seen] == [tools.DEFAULT_CALL_SOURCE, "embedded",
+                                           tools.DEFAULT_CALL_SOURCE]

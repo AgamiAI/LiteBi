@@ -1282,6 +1282,7 @@ def record_tool_call(
     success: bool | None = None,
     row_count: int | None = None,
     error_kind: str | None = None,
+    org_id: str | None = None,
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
     audit-grade fields are server-observed; `success`/`row_count`/`error_kind` are derived from the
@@ -1302,7 +1303,14 @@ def record_tool_call(
       `result_text`**. A caller that already classified the outcome passes it rather than handing over a
       result body to be re-parsed — and, more importantly, one that has *no* body to hand over can still
       record a failure. Without these, an outcome this function cannot see defaults to success, which is
-      the one direction an audit log must never fail in.
+      the one direction an audit log must never fail in. They are applied **as a group**: state any one
+      and the derived trio is replaced wholesale, so a stated success cannot leave a derived
+      `error_kind` stranded beside it on the row.
+    - `org_id` replaces the tenant otherwise stamped downstream from this process's context. A caller
+      that read the tenant at the point which actually scoped the work states it, rather than leaving it
+      to be re-read later from a context that may no longer be the same one. The fallback when that
+      read finds nothing is the deployment-wide org, and for an audit row that is the wrong direction
+      to fail in.
     """
     args = arguments or {}
     derived_success, derived_row_count, derived_error_kind = True, None, None
@@ -1318,34 +1326,32 @@ def record_tool_call(
                 derived_row_count = parsed.get("row_count")
         except (ValueError, TypeError):
             pass
-    if success is not None:
-        derived_success = success
-    if row_count is not None:
-        derived_row_count = row_count
-    if error_kind is not None:
-        derived_error_kind = error_kind
-    _record_tool_call(
-        {
-            "ts": _now_iso(),
-            "tool_name": name,
-            "source": source or current_call_source(),
-            "actor": actor,
-            "datasource": args.get("datasource"),
-            "sql": args.get("sql"),
-            "row_count": derived_row_count if isinstance(derived_row_count, int) else None,
-            "execution_ms": execution_ms,
-            "success": derived_success,
-            "error_kind": derived_error_kind,
-            "user_question": user_question if user_question is not None else args.get("user_question"),
-            "agent_query": args.get(
-                "raw_query"
-            ),  # the existing arg is the agent's framing of the query
-            "thread_id": thread_id if thread_id is not None else args.get("thread_id"),
-            "correlation_id": (  # the turn (one user question)
-                correlation_id if correlation_id is not None else args.get("correlation_id")
-            ),
-        }
-    )
+    if success is not None or row_count is not None or error_kind is not None:
+        derived_success = True if success is None else success
+        derived_row_count, derived_error_kind = row_count, error_kind
+    rec: dict[str, Any] = {
+        "ts": _now_iso(),
+        "tool_name": name,
+        "source": current_call_source() if source is None else source,
+        "actor": actor,
+        "datasource": args.get("datasource"),
+        "sql": args.get("sql"),
+        "row_count": derived_row_count if isinstance(derived_row_count, int) else None,
+        "execution_ms": execution_ms,
+        "success": derived_success,
+        "error_kind": derived_error_kind,
+        "user_question": user_question if user_question is not None else args.get("user_question"),
+        "agent_query": args.get("raw_query"),  # the existing arg is the agent's framing of the query
+        "thread_id": thread_id if thread_id is not None else args.get("thread_id"),
+        "correlation_id": (  # the turn (one user question)
+            correlation_id if correlation_id is not None else args.get("correlation_id")
+        ),
+    }
+    if org_id is not None:
+        # Set rather than left absent, so `_record_tool_call`'s `setdefault` keeps it instead of
+        # re-reading the tenant from this process's context later.
+        rec["org_id"] = org_id
+    _record_tool_call(rec)
 
 
 def _record_tool_call(rec: dict[str, Any]) -> None:
