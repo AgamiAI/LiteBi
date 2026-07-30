@@ -63,19 +63,63 @@ _log = logging.getLogger(__name__)
 # only receives (name, arguments), and a contextvar set in the BaseHTTPMiddleware wouldn't reach it.
 _actor_ctx: ContextVar[str | None] = ContextVar("agami_tool_actor", default=None)
 
+# The CLIENT AUTHORIZATION behind the in-flight tool call — what tells two windows under one login apart.
+# Set alongside `_actor_ctx` and for the same reason. None whenever the caller's auth has no session
+# notion (presence auth, a hand-minted bearer): consumers must read that as "no session", not an error.
+_session_ctx: ContextVar[str | None] = ContextVar("agami_tool_session", default=None)
 
-def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
-    """The authenticated user's subject for this /mcp request: the principal the auth middleware already
-    validated (carried on the ASGI scope state), or — if that didn't propagate — re-validated from the
-    bearer header on the scope (robust fallback). None under presence auth or if absent."""
+
+def current_session_id() -> str | None:
+    """The session id for the request being served, or None.
+
+    Public because a consumer's tool handler needs it and the request never reaches the handler — only
+    this contextvar does. Same shape as `tools.current_org_id`, so consumers don't have to reach into a
+    private module attribute the way they otherwise would.
+    """
+    return _session_ctx.get()
+
+
+def _principal_from_scope(scope: dict, auth: AuthProvider) -> object | None:
+    """The authenticated caller for this /mcp request: the principal the auth middleware already validated
+    (carried on the ASGI scope state), or — if that didn't propagate — re-validated from the bearer header
+    on the scope (robust fallback). None under presence auth or if absent.
+
+    ONE validation, from which every derived value is read. The subject and the session must describe the
+    same caller, so deriving them from two independent `validate_token` calls would both double the work on
+    the fallback path (a second signature check, or a second lookup for a DB-backed provider) and let them
+    diverge if a provider's validation isn't deterministic.
+    """
     principal = (scope.get("state") or {}).get("principal")
     if principal is not None:
-        return getattr(principal, "subject", None)
+        return principal
     for key, value in scope.get("headers", []):
         if key == b"authorization" and value[:7].lower() == b"bearer ":
-            revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
-            return getattr(revalidated, "subject", None) if revalidated is not None else None
+            return auth.validate_token(value[7:].strip().decode("latin-1"))
     return None
+
+
+def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
+    """The authenticated user's subject for this /mcp request, or None. Thin wrapper over
+    `_principal_from_scope` — `handle_mcp` resolves the principal once and reads both values off it, so this
+    exists for callers that want only the subject."""
+    return getattr(_principal_from_scope(scope, auth), "subject", None)
+
+
+def _normalized_session(principal: object | None) -> str | None:
+    """A principal's session id, or None — enforcing the `str | None` shape the contextvar promises.
+
+    `AuthProvider` is a `@runtime_checkable` Protocol, so conformance is method presence only: a
+    third-party provider's principal may expose no `session_id` at all, or a non-string one. Without this
+    an unexpected type would reach `_session_ctx` and, through it, consumers using the value as a key.
+    Same rule as `JwtAuthProvider.validate_token`'s read — non-string or blank is "no session"."""
+    sid = getattr(principal, "session_id", None)
+    return sid if isinstance(sid, str) and sid.strip() else None
+
+
+def _session_from_scope(scope: dict, auth: AuthProvider) -> str | None:
+    """The session id for this /mcp request, or None. Thin wrapper over `_principal_from_scope`, the mirror
+    of `_actor_from_scope`."""
+    return _normalized_session(_principal_from_scope(scope, auth))
 
 
 def _org_id_from_scope(scope: dict) -> str | None:
@@ -113,8 +157,10 @@ def _build_org_resolver() -> SingleTenantOrgResolver:
     # Load-bearing for a hand-rolled DB-only deploy: log the resolved id + where it came from, so an
     # operator can see "org_id=local (default)" and realize organization.yaml/AGAMI_ORG_ID isn't reaching the
     # server (see F14's documented residual risk).
-    source = "env" if os.environ.get("AGAMI_ORG_ID", "").strip() else (
-        "default" if org_id == "local" else "organization.yaml"
+    source = (
+        "env"
+        if os.environ.get("AGAMI_ORG_ID", "").strip()
+        else ("default" if org_id == "local" else "organization.yaml")
     )
     _log.info("single-tenant org_id=%s (source=%s)", org_id, source)
     return SingleTenantOrgResolver(Org(id=org_id))
@@ -431,14 +477,18 @@ def create_app(
         # Set the actor + resolved org for this request's tool calls, then run the MCP dispatch in the same
         # task so the contextvars reach `_call_tool` and the per-process model cache. Prefer what the auth
         # middleware attached to the scope state; the actor falls back to re-validating the bearer.
-        actor = _actor_from_scope(scope, auth_provider)
-        token = _actor_ctx.set(actor)
+        # Resolve the caller ONCE: the subject and the session must describe the same principal, and on the
+        # fallback path two lookups would mean validating the same bearer twice.
+        principal = _principal_from_scope(scope, auth_provider)
+        token = _actor_ctx.set(getattr(principal, "subject", None))
         org_token = _current_org_ctx.set(_org_id_from_scope(scope))
+        session_token = _session_ctx.set(_normalized_session(principal))
         try:
             await session_manager.handle_request(scope, receive, send)
         finally:
             _actor_ctx.reset(token)
             _current_org_ctx.reset(org_token)
+            _session_ctx.reset(session_token)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):

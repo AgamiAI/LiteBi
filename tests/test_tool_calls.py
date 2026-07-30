@@ -165,3 +165,95 @@ def test_a_raising_tool_is_still_logged_as_an_error(db, monkeypatch):
     _mcp_tool_call("jordan@example.com", "list_datasources")
     rows = [r for r in _rows(db) if r["tool_name"] == "list_datasources"]
     assert rows and rows[0]["success"] == 0 and rows[0]["error_kind"] == "exception"
+
+
+# --- the session plumbing ----------------------------------------------------
+
+
+def test_session_from_scope_prefers_state_then_header():
+    """Mirrors `_actor_from_scope`: state first, re-validate the bearer as a fallback, None otherwise."""
+
+    class _PS:
+        subject = "jordan@example.com"
+        session_id = "sess-1"
+
+    class _AuthS:
+        def validate_token(self, token):
+            return _PS() if token == "good" else None
+
+    auth = _AuthS()
+    assert mcp_http._session_from_scope({"state": {"principal": _PS()}}, auth) == "sess-1"
+    scope = {"headers": [(b"authorization", b"Bearer good")]}
+    assert mcp_http._session_from_scope(scope, auth) == "sess-1"
+    assert (
+        mcp_http._session_from_scope({"headers": [(b"authorization", b"Bearer bad")]}, auth) is None
+    )
+    assert mcp_http._session_from_scope({}, auth) is None
+
+
+def test_session_from_scope_tolerates_a_principal_without_the_field():
+    """`AuthProvider` is a @runtime_checkable Protocol — it checks method presence only, so a third-party
+    provider may return any object exposing `.subject`. Reading the session must not explode on one."""
+    auth = _Auth()  # its principal `_P` has `subject` and nothing else
+    assert mcp_http._session_from_scope({"state": {"principal": _P()}}, auth) is None
+    assert (
+        mcp_http._session_from_scope({"headers": [(b"authorization", b"Bearer good")]}, auth)
+        is None
+    )
+
+
+def test_current_session_id_is_none_outside_a_request():
+    assert mcp_http.current_session_id() is None
+
+
+def test_session_from_scope_normalizes_a_malformed_session_id():
+    """Mint and read must agree on what "no session" means. A third-party AuthProvider's principal may
+    carry a blank or non-string `session_id`; letting it through would put an unexpected type into the
+    contextvar and, from there, into consumers using it as a key."""
+
+    class _AuthBad:
+        def __init__(self, value):
+            self.value = value
+
+        def validate_token(self, token):
+            return type("P", (), {"subject": "j@example.com", "session_id": self.value})()
+
+    for bad in ("", "   ", 42, None, object()):
+        auth = _AuthBad(bad)
+        principal = auth.validate_token("good")
+        assert mcp_http._session_from_scope({"state": {"principal": principal}}, auth) is None, bad
+        scope = {"headers": [(b"authorization", b"Bearer good")]}
+        assert mcp_http._session_from_scope(scope, auth) is None, bad
+
+    # ...and a well-formed one still comes through untouched.
+    ok = _AuthBad("sess-1")
+    assert (
+        mcp_http._session_from_scope({"state": {"principal": ok.validate_token("x")}}, ok)
+        == "sess-1"
+    )
+
+
+def test_the_fallback_validates_the_bearer_exactly_once():
+    """The subject and the session are read off ONE principal. Deriving them from two independent
+    `validate_token` calls would double the work whenever the middleware's scope state didn't propagate —
+    a second signature check, or a second lookup for a DB-backed provider — and would let the two values
+    describe different callers if a provider's validation isn't deterministic."""
+    calls = {"n": 0}
+
+    class _Counting:
+        def validate_token(self, token):
+            calls["n"] += 1
+            return type("P", (), {"subject": "j@example.com", "session_id": "s-1"})()
+
+    auth = _Counting()
+    scope = {"headers": [(b"authorization", b"Bearer good")]}   # no scope state -> the fallback path
+    principal = mcp_http._principal_from_scope(scope, auth)
+    assert calls["n"] == 1
+    assert getattr(principal, "subject", None) == "j@example.com"
+    assert mcp_http._normalized_session(principal) == "s-1"
+
+    # ...and when the middleware DID propagate, the bearer is never re-validated at all.
+    calls["n"] = 0
+    p = type("P", (), {"subject": "j@example.com", "session_id": "s-2"})()
+    assert mcp_http._principal_from_scope({"state": {"principal": p}}, auth) is p
+    assert calls["n"] == 0
