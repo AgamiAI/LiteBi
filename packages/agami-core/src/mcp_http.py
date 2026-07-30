@@ -79,18 +79,30 @@ def current_session_id() -> str | None:
     return _session_ctx.get()
 
 
-def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
-    """The authenticated user's subject for this /mcp request: the principal the auth middleware already
-    validated (carried on the ASGI scope state), or — if that didn't propagate — re-validated from the
-    bearer header on the scope (robust fallback). None under presence auth or if absent."""
+def _principal_from_scope(scope: dict, auth: AuthProvider) -> object | None:
+    """The authenticated caller for this /mcp request: the principal the auth middleware already validated
+    (carried on the ASGI scope state), or — if that didn't propagate — re-validated from the bearer header
+    on the scope (robust fallback). None under presence auth or if absent.
+
+    ONE validation, from which every derived value is read. The subject and the session must describe the
+    same caller, so deriving them from two independent `validate_token` calls would both double the work on
+    the fallback path (a second signature check, or a second lookup for a DB-backed provider) and let them
+    diverge if a provider's validation isn't deterministic.
+    """
     principal = (scope.get("state") or {}).get("principal")
     if principal is not None:
-        return getattr(principal, "subject", None)
+        return principal
     for key, value in scope.get("headers", []):
         if key == b"authorization" and value[:7].lower() == b"bearer ":
-            revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
-            return getattr(revalidated, "subject", None) if revalidated is not None else None
+            return auth.validate_token(value[7:].strip().decode("latin-1"))
     return None
+
+
+def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
+    """The authenticated user's subject for this /mcp request, or None. Thin wrapper over
+    `_principal_from_scope` — `handle_mcp` resolves the principal once and reads both values off it, so this
+    exists for callers that want only the subject."""
+    return getattr(_principal_from_scope(scope, auth), "subject", None)
 
 
 def _normalized_session(principal: object | None) -> str | None:
@@ -105,17 +117,9 @@ def _normalized_session(principal: object | None) -> str | None:
 
 
 def _session_from_scope(scope: dict, auth: AuthProvider) -> str | None:
-    """The session id for this /mcp request — read off the principal the auth middleware validated, with
-    the same re-validate-the-bearer fallback `_actor_from_scope` uses when the scope state didn't
-    propagate."""
-    principal = (scope.get("state") or {}).get("principal")
-    if principal is not None:
-        return _normalized_session(principal)
-    for key, value in scope.get("headers", []):
-        if key == b"authorization" and value[:7].lower() == b"bearer ":
-            revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
-            return _normalized_session(revalidated) if revalidated is not None else None
-    return None
+    """The session id for this /mcp request, or None. Thin wrapper over `_principal_from_scope`, the mirror
+    of `_actor_from_scope`."""
+    return _normalized_session(_principal_from_scope(scope, auth))
 
 
 def _org_id_from_scope(scope: dict) -> str | None:
@@ -473,10 +477,12 @@ def create_app(
         # Set the actor + resolved org for this request's tool calls, then run the MCP dispatch in the same
         # task so the contextvars reach `_call_tool` and the per-process model cache. Prefer what the auth
         # middleware attached to the scope state; the actor falls back to re-validating the bearer.
-        actor = _actor_from_scope(scope, auth_provider)
-        token = _actor_ctx.set(actor)
+        # Resolve the caller ONCE: the subject and the session must describe the same principal, and on the
+        # fallback path two lookups would mean validating the same bearer twice.
+        principal = _principal_from_scope(scope, auth_provider)
+        token = _actor_ctx.set(getattr(principal, "subject", None))
         org_token = _current_org_ctx.set(_org_id_from_scope(scope))
-        session_token = _session_ctx.set(_session_from_scope(scope, auth_provider))
+        session_token = _session_ctx.set(_normalized_session(principal))
         try:
             await session_manager.handle_request(scope, receive, send)
         finally:

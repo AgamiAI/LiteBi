@@ -231,3 +231,29 @@ def test_session_from_scope_normalizes_a_malformed_session_id():
         mcp_http._session_from_scope({"state": {"principal": ok.validate_token("x")}}, ok)
         == "sess-1"
     )
+
+
+def test_the_fallback_validates_the_bearer_exactly_once():
+    """The subject and the session are read off ONE principal. Deriving them from two independent
+    `validate_token` calls would double the work whenever the middleware's scope state didn't propagate —
+    a second signature check, or a second lookup for a DB-backed provider — and would let the two values
+    describe different callers if a provider's validation isn't deterministic."""
+    calls = {"n": 0}
+
+    class _Counting:
+        def validate_token(self, token):
+            calls["n"] += 1
+            return type("P", (), {"subject": "j@example.com", "session_id": "s-1"})()
+
+    auth = _Counting()
+    scope = {"headers": [(b"authorization", b"Bearer good")]}   # no scope state -> the fallback path
+    principal = mcp_http._principal_from_scope(scope, auth)
+    assert calls["n"] == 1
+    assert getattr(principal, "subject", None) == "j@example.com"
+    assert mcp_http._normalized_session(principal) == "s-1"
+
+    # ...and when the middleware DID propagate, the bearer is never re-validated at all.
+    calls["n"] = 0
+    p = type("P", (), {"subject": "j@example.com", "session_id": "s-2"})()
+    assert mcp_http._principal_from_scope({"state": {"principal": p}}, auth) is p
+    assert calls["n"] == 0
