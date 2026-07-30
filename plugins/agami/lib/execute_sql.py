@@ -29,8 +29,11 @@ Drivers (install only what you need):
 
 Exit codes:
     0  — success, CSV on stdout
-    1  — refused by a guard. The read-only guard writes a single `{"refusal": {…}}` JSON
-         object on stderr; the semantic-model pass still writes its own `{"error": {…}}`.
+    1  — refused by a guard, always as a single JSON object on stderr. The read-only guard,
+         the three semantic-model scope gates (table / SELECT * / column) and both
+         model-unavailable branches write the contract `{"refusal": {…}}`; the remaining
+         semantic-model branches (fan/chasm pre-flight, sensitive columns) still write
+         their own `{"error": {…}}`. Parsers key off the `"refusal"` KEY, not the code.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
@@ -54,7 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import agami_paths
-from guardrail import Refusal
+from guardrail import RULE_MODEL_UNAVAILABLE, Refusal, refuse
 
 if TYPE_CHECKING:
     # ``Executor`` is the 5th port; imported only for type-checkers. At runtime ``execute_sql`` never
@@ -918,6 +921,19 @@ def _resolve_guard_model(profile: str):
     return None
 
 
+def _write_refusal(refusal: Refusal) -> None:
+    """Write a guard refusal to stderr in the ONE shape every caller parses.
+
+    Exactly one JSON object, on one line: ``{"refusal": {reason, rule, detail, remediation}}`` —
+    the wire shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on
+    the parent side of the process boundary. Nothing else may be written alongside it: several
+    callers (and the fail-closed suite) parse the WHOLE stderr stream as a single object, so a
+    second line of diagnostics would not merely be noisy, it would make the refusal unreadable.
+    """
+    json.dump({"refusal": asdict(refusal)}, sys.stderr)
+    sys.stderr.write("\n")
+
+
 def _model_safety(sql: str, profile: str, area: str | None):
     """Semantic-model safety pass before execution: fan-trap / chasm-trap pre-flight
     + default_filters auto-application, over a model resolved from the DB (hosted) or disk (local).
@@ -926,6 +942,13 @@ def _model_safety(sql: str, profile: str, area: str | None):
     short-circuit (a refusal the caller must consume). Inert (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
+
+    This function deliberately writes TWO stderr shapes for one slice. The five branches converted
+    here — both ``model_unavailable`` sites and the three scope gates — emit the contract
+    ``{"refusal": …}``; the fan/chasm pre-flight, sensitive-column and default-filter branches below
+    still emit today's ``{"error": …}`` / plain text, because those become receipt facts rather than
+    refusals and converting them here would pre-empt that decision. Both shapes share exit code 1,
+    which is exactly why ``tools._stderr_refusal`` keys off the ``"refusal"`` KEY and not the code.
     """
     try:
         from semantic_model import runtime as RT
@@ -936,23 +959,36 @@ def _model_safety(sql: str, profile: str, area: str | None):
         # sqlglot-unavailable / unparseable-SQL degrade-to-allow is a distinct fail-open owned by
         # ACE-037, not closed here.)
         if _hosted():
-            json.dump({"error": {"kind": "model_unavailable", "reason":
-                       "semantic-model package not importable; refusing to run unguarded on the "
-                       "hosted server"}}, sys.stderr)
-            sys.stderr.write("\n")
+            # `remediation` is authored here rather than carried across: this branch had no
+            # `suggestion` at all, and the contract makes an unactionable refusal a construction
+            # error. It names an operator action and no DSN, path or hostname — the same
+            # value-free rule the detail already follows, and what the single-clean-JSON test pins.
+            _write_refusal(refuse(
+                RULE_MODEL_UNAVAILABLE,
+                detail="semantic-model package not importable; refusing to run unguarded on the "
+                       "hosted server",
+                remediation="Install the semantic-model dependencies on the server and retry.",
+            ))
             return sql, 1
+        # The non-hosted twin: a bare local install legitimately has no model package, so this is a
+        # silent no-op rather than a refusal. Not a branch to convert — there is nothing to refuse.
         return sql, None  # local: model package not available -> no-op
 
     org = _resolve_guard_model(profile)
     if org is None:
         if _hosted():
             # Fail closed: a served query with no resolvable model must be refused, never run with
-            # the fan/chasm/scope/PII guards silently off.
-            json.dump({"error": {"kind": "model_unavailable", "reason":
-                       "no semantic model could be resolved (checked DB and disk); refusing to run "
-                       "unguarded on the hosted server"}}, sys.stderr)
-            sys.stderr.write("\n")
+            # the fan/chasm/scope/PII guards silently off. `remediation` is authored here for the
+            # same reason as the branch above, and is likewise free of any resolved path or DSN —
+            # "checked DB and disk" names the two SOURCES, never where either one lives.
+            _write_refusal(refuse(
+                RULE_MODEL_UNAVAILABLE,
+                detail="no semantic model could be resolved (checked DB and disk); refusing to run "
+                       "unguarded on the hosted server",
+                remediation="Build or deploy a semantic model for this datasource, then retry.",
+            ))
             return sql, 1
+        # The non-hosted twin again: locally a not-yet-built model is expected, so no refusal.
         return sql, None  # local: no model yet -> no-op (unchanged)
 
     # Build the shared guard context ONCE — parse the SQL + build each model index a single
@@ -964,29 +1000,25 @@ def _model_safety(sql: str, profile: str, area: str | None):
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
     # so the fan/chasm and sensitive checks below only evaluate in-scope tables.
+    # Each gate now returns the contract object itself, so this layer only relays it — there is no
+    # second place where a refusal's reason, rule or wording could be chosen.
     ts = RT.check_table_scope(sql, org, ctx=ctx)
-    if ts.action == "refuse":
-        json.dump({"error": {"kind": "table_out_of_scope", "tables": ts.offending_tables,
-                             "reason": ts.reason, "suggestion": ts.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
+    if ts is not None:
+        _write_refusal(ts)
         return sql, 1
 
     # SELECT * ban — force every projected column to be named, so the column-scope
     # guard below can check what is actually returned (and nothing hides behind *).
     star = RT.check_no_select_star(sql, ctx=ctx)
-    if star.action == "refuse":
-        json.dump({"error": {"kind": "select_star",
-                             "reason": star.reason, "suggestion": star.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
+    if star is not None:
+        _write_refusal(star)
         return sql, 1
 
     # Column-scope guard — a column that binds to a declared table must be one that
     # table declares (a hallucinated column, or a physical column the model excluded).
     cs = RT.check_column_scope(sql, org, ctx=ctx)
-    if cs.action == "refuse":
-        json.dump({"error": {"kind": "column_out_of_scope", "columns": cs.columns,
-                             "reason": cs.reason, "suggestion": cs.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
+    if cs is not None:
+        _write_refusal(cs)
         return sql, 1
 
     pf = RT.pre_flight_check(sql, org, ctx=ctx)

@@ -128,7 +128,10 @@ def test_parent_leaves_a_non_refusal_exit_alone() -> None:
     """Exit 1 is not exclusively the read-only guard's — the semantic-model branches still exit 1
     after writing today's `{"error": …}` line. Only a payload carrying `refusal` is claimed, so the
     unconverted branches keep reaching the generic error path untouched."""
-    assert tools._stderr_refusal(1, '{"error": {"kind": "table_out_of_scope"}}') is None
+    # `sensitive_columns` is one of the four `_model_safety` branches deliberately left on the old
+    # shape (the scope gates and both model_unavailable sites have since moved to `{"refusal": …}`),
+    # so it is a live example of the fall-through rather than a historical one.
+    assert tools._stderr_refusal(1, '{"error": {"kind": "sensitive_columns"}}') is None
     assert tools._stderr_refusal(1, "Postgres connect failed: refused") is None
     assert tools._stderr_refusal(1, "") is None
     # A refusal shape on a non-guard exit code is not a refusal either.

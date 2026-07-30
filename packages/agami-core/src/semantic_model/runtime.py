@@ -35,6 +35,12 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Callable, Optional
 
+# Absolute, not relative: `guardrail` is a flat top-level module that sits ALONGSIDE the
+# `semantic_model` package in both layouts — next to it in `packages/agami-core/src/`, and next to it
+# again in site-packages (it is listed in the distribution's `py-modules`). A relative import would
+# look for `semantic_model.guardrail`, which exists in neither.
+import guardrail
+
 try:
     import sqlglot
     from sqlglot import expressions as exp
@@ -574,20 +580,8 @@ def check_sensitive_projection(sql: str, org: Datasource,
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class TableScopeResult:
-    action: str  # "allow" | "refuse"
-    offending_tables: list[str] = field(default_factory=list)  # bare names not in the model
-    reason: str = ""
-    suggestion: Optional[str] = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "offending_tables": self.offending_tables,
-                "reason": self.reason, "suggestion": self.suggestion}
-
-
 def check_table_scope(sql: str, org: Datasource,
-                      ctx: "GuardContext | None" = None) -> TableScopeResult:
+                      ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
     """Refuse a query that references a table not declared in the semantic model.
 
     Only *physical* table references count: CTE names (defined by WITH) and
@@ -601,25 +595,29 @@ def check_table_scope(sql: str, org: Datasource,
     same posture as the fan/chasm and sensitive gates; the upstream read-only
     guard already rejects multi-statement / DDL input). A model with zero
     declared tables also allows — there is nothing to scope against.
+
+    Returns `None` when the gate is satisfied — including on every degrade-to-allow
+    above, which is why they are each an explicit `return None` rather than a fall
+    through to the end of the function.
     """
     if not _HAVE_SQLGLOT:
-        return TableScopeResult("allow")
+        return None
     allow = {name.lower() for name in (ctx.model_table_index if ctx is not None else _model_table_index(org))}
     if not allow:
-        return TableScopeResult("allow")
+        return None
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return TableScopeResult("allow")
+            return None
     # A set operation (UNION/INTERSECT/EXCEPT) parses to exp.Union, not exp.Select,
     # so gate on "contains a SELECT" rather than "is a SELECT" — otherwise every
     # set-operation arm would bypass the guard. A non-SELECT statement has no SELECT
     # node and still degrades to allow (the upstream read-only guard owns those).
     if tree is None or tree.find(exp.Select) is None:
-        return TableScopeResult("allow")
+        return None
 
     cte_names = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
     offending: set[str] = set()
@@ -630,17 +628,20 @@ def check_table_scope(sql: str, org: Datasource,
         if name.lower() not in allow:
             offending.add(name)
     if not offending:
-        return TableScopeResult("allow")
+        return None
 
     tables = sorted(offending)
-    return TableScopeResult(
-        "refuse",
-        offending_tables=tables,
-        reason="query references table(s) not in the semantic model: "
+    # `detail` and `remediation` carry the former `reason` / `suggestion` text verbatim. Both are
+    # echo-only by construction: static prose plus the table names the CALLER put in its own
+    # statement. Nothing here reads the model's declared set, so a refusal can never turn into a
+    # schema listing — the property the contract calls "echo, never enumerate".
+    return guardrail.refuse(
+        guardrail.RULE_TABLE_SCOPE,
+        detail="query references table(s) not in the semantic model: "
                + ", ".join(tables)
                + " — only tables declared in the model may be queried.",
-        suggestion="Add the table to the model (agami-connect / '/agami-model'), "
-                   "or remove it from the query.",
+        remediation="Add the table to the model (agami-connect / '/agami-model'), "
+                    "or remove it from the query.",
     )
 
 
@@ -655,17 +656,8 @@ def check_table_scope(sql: str, org: Datasource,
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class StarCheckResult:
-    action: str  # "allow" | "refuse"
-    reason: str = ""
-    suggestion: Optional[str] = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "reason": self.reason, "suggestion": self.suggestion}
-
-
-def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> StarCheckResult:
+def check_no_select_star(sql: str,
+                         ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
     """Refuse a query whose projection list contains `*` or `t.*`.
 
     A star defeats column-level scoping (an undeclared column hides behind it) and
@@ -677,44 +669,37 @@ def check_no_select_star(sql: str, ctx: "GuardContext | None" = None) -> StarChe
 
     Degrades to allow when sqlglot is unavailable, the SQL doesn't parse, or it is
     not a SELECT-bearing statement (the upstream read-only guard owns non-SELECTs).
+
+    Returns `None` when the gate is satisfied — both for a fully-named projection and
+    for each degrade-to-allow above.
     """
     if not _HAVE_SQLGLOT:
-        return StarCheckResult("allow")
+        return None
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return StarCheckResult("allow")
+            return None
     if tree is None or tree.find(exp.Select) is None:
-        return StarCheckResult("allow")
+        return None
     for select in tree.find_all(exp.Select):
         for proj in select.expressions:
             if isinstance(proj, exp.Star) or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)):
-                return StarCheckResult(
-                    "refuse",
-                    reason="query uses SELECT * — every column must be named so it can be "
+                # Wholly static text — this refusal names no identifier at all, because the
+                # offending token IS `*`.
+                return guardrail.refuse(
+                    guardrail.RULE_SELECT_STAR,
+                    detail="query uses SELECT * — every column must be named so it can be "
                            "checked against the semantic model.",
-                    suggestion="List the columns explicitly instead of '*'.",
+                    remediation="List the columns explicitly instead of '*'.",
                 )
-    return StarCheckResult("allow")
-
-
-@dataclass
-class ColumnScopeResult:
-    action: str  # "allow" | "refuse"
-    columns: list[str] = field(default_factory=list)  # offending "table.column" / "column"
-    reason: str = ""
-    suggestion: Optional[str] = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "columns": self.columns,
-                "reason": self.reason, "suggestion": self.suggestion}
+    return None
 
 
 def check_column_scope(sql: str, org: Datasource,
-                       ctx: "GuardContext | None" = None) -> ColumnScopeResult:
+                       ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
     """Refuse a query that references a column not declared on the table it binds to.
 
     Strict where a column visibly binds to a declared physical table — qualified by
@@ -730,21 +715,26 @@ def check_column_scope(sql: str, org: Datasource,
 
     Degrades to allow when sqlglot is unavailable, the SQL doesn't parse, it is not
     a SELECT, or the model declares no columns.
+
+    Returns `None` when the gate is satisfied. Note the distinction from the per-column
+    fail-open `continue`s further down: those drop ONE column from consideration and let
+    the walk carry on, so a different undeclared column in the same statement is still
+    refused. Only the four whole-statement degradations below return early.
     """
     if not _HAVE_SQLGLOT:
-        return ColumnScopeResult("allow")
+        return None
     colidx = ctx.column_index if ctx is not None else _column_index(org)
     if not colidx:
-        return ColumnScopeResult("allow")
+        return None
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return ColumnScopeResult("allow")
+            return None
     if tree is None or tree.find(exp.Select) is None:
-        return ColumnScopeResult("allow")
+        return None
 
     # case-insensitive declared-column index: lower(table) -> {lower(column)}
     declared = {t.lower(): {c.lower() for c in cols} for t, cols in colidx.items()}
@@ -838,15 +828,16 @@ def check_column_scope(sql: str, org: Datasource,
         offending.add(name)
 
     if not offending:
-        return ColumnScopeResult("allow")
+        return None
     cols = sorted(offending)
-    return ColumnScopeResult(
-        "refuse",
-        columns=cols,
-        reason="query references column(s) not in the semantic model: " + ", ".join(cols)
+    # Echo-only, exactly as the table-scope refusal above: the column names here all came out of
+    # the caller's own statement, and the model's declared column set is never rendered.
+    return guardrail.refuse(
+        guardrail.RULE_COLUMN_SCOPE,
+        detail="query references column(s) not in the semantic model: " + ", ".join(cols)
                + " — only columns declared on the model's tables may be queried.",
-        suggestion="Add the column to the model (agami-connect / '/agami-model'), "
-                   "or remove it from the query.",
+        remediation="Add the column to the model (agami-connect / '/agami-model'), "
+                    "or remove it from the query.",
     )
 
 

@@ -1053,10 +1053,16 @@ def _finalize_execution(
     through the single sink, and return the tool JSON. Shared by both execution paths — the subprocess
     fork and the in-process executor — so a **successful** query returns the identical result envelope
     whichever ran it. A *read-only* refusal is identical across the two paths as well: the child emits
-    the contract `Refusal` on stderr and `_stderr_refusal` rebuilds it. A *model-safety* refusal is
-    still not — the subprocess surfaces its stderr JSON as the remediation while the in-process path
-    returns a clean generic refusal — because parity there needs `_model_safety` to *return* its
-    refusal rather than write it to stderr, which the fail-closed guard tests currently pin."""
+    the contract `Refusal` on stderr and `_stderr_refusal` rebuilds it.
+
+    A *model-safety* refusal is still not identical, but the gap has narrowed and changed shape. The
+    three scope gates and both model-unavailable branches now emit the contract `Refusal` too, so on
+    the FORK path `_stderr_refusal` rebuilds those into a real refusal rather than stuffing raw
+    stderr into a remediation. The IN-PROCESS path still returns a clean generic refusal for all of
+    them, because `_model_safety` writes to stderr instead of *returning* its refusal — and the
+    fail-closed guard tests pin that it writes. Closing the gap means changing that signature, which
+    is the envelope slice's job. The remaining branches (fan/chasm pre-flight, sensitive columns)
+    keep the older `{"error": …}` stderr shape on both paths."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
