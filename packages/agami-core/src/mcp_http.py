@@ -21,6 +21,7 @@ import contextlib
 import logging
 import os
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -351,18 +352,52 @@ async def _auth_server(request: Request) -> JSONResponse:
     )
 
 
-def build_server(registry: dict | None = None, extra_instructions: str | None = None):
+def build_server(
+    registry: dict | None = None,
+    extra_instructions: str | None = None,
+    visibility: Callable[[str], bool] | None = None,
+):
     """A low-level MCP Server whose tool surface IS the given registry — list_tools / call_tool read
     from it, so HTTP advertises exactly what stdio does (no duplicate defs). Defaults to the shared
     `tools.TOOLS`; `create_app` passes a merged copy (base + a consumer's extra tools).
 
     `extra_instructions` is APPENDED to `SERVER_INSTRUCTIONS` (never replaces it) and surfaced to the
     model in the MCP `initialize` result — append-only so a consumer can add guidance but can't drop
-    the base protocol's safety directives (e.g. the sensitive-column output rule). None = no-op."""
+    the base protocol's safety directives (e.g. the sensitive-column output rule). None = no-op.
+
+    `visibility(tool_name) -> bool` narrows the surface PER REQUEST. None (the default) is exactly
+    today's behaviour: the whole registry, listed and callable. It exists because a registry assembled
+    once at composition time cannot answer "may THIS caller see this tool", and for a consumer running a
+    server-side agent that is the difference between a control and a suggestion: the model decides what
+    to call, so withholding the tool is the control and "it shouldn't call that" is not.
+
+    An empty hook by design — this module decides nothing about who may see what. The predicate is the
+    consumer's, and it reads the request context itself: this callable runs inside the request's task
+    (see `handle_mcp`), so `_actor_ctx` / `_session_ctx` / `tools._current_org_ctx` are all live in it.
+
+    SUBTRACTIVE ONLY. It filters the one shared registry; it never adds, renames, or reshapes a tool. A
+    surviving tool's description and inputSchema pass through untouched, so a consumer cannot fork the
+    surface into a private variant under cover of "visibility".
+    """
     import mcp.types as mt
     from mcp.server.lowlevel import Server
 
     registry = TOOLS if registry is None else registry
+
+    def _visible(name: str) -> bool:
+        """Applied at BOTH seams. Listing alone would leave an unlisted tool callable by name, which is
+        worse than either control on its own — the surface would look narrowed while remaining open."""
+        if visibility is None:
+            return True
+        try:
+            return bool(visibility(name))
+        except Exception:
+            # A consumer's predicate that raises must not be an accidental grant. Refuse the tool and
+            # keep serving; the alternative (propagating) turns one bad classification into a dead
+            # transport for every caller.
+            _log.exception("tool visibility predicate failed for %r; hiding the tool", name)
+            return False
+
     # Appended, never replacing: SERVER_INSTRUCTIONS carries the PII output rule, so replace-semantics
     # would let a consumer silently drop a safety directive.
     instructions = SERVER_INSTRUCTIONS
@@ -375,12 +410,16 @@ def build_server(registry: dict | None = None, extra_instructions: str | None = 
         return [
             mt.Tool(name=name, description=meta["description"], inputSchema=meta["inputSchema"])
             for name, meta in registry.items()
+            if _visible(name)
         ]
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict) -> list:
         meta = registry.get(name)
-        if meta is None:
+        # A hidden tool answers as an ABSENT one, not as a refused one: the same `Unknown tool` a typo
+        # gets. Distinguishing them would turn the list into an oracle — a caller could enumerate what
+        # exists but is withheld, which is the fact hiding it was meant to keep.
+        if meta is None or not _visible(name):
             raise ValueError(f"Unknown tool: {name}")
         # Record every tool call to the admin activity log — timed, attributed to the authenticated
         # actor, never allowed to break the tool (logging is best-effort + double-guarded).
@@ -468,7 +507,14 @@ def create_app(
     # Merge the consumer's extra tools over a COPY of TOOLS — the module global is never mutated.
     registry = {**TOOLS, **(extra_tools or {})}
     session_manager = StreamableHTTPSessionManager(
-        app=build_server(registry, extra_instructions=extra_instructions),
+        # `tool_visibility` is read from the adapters rather than taken as a `create_app` parameter, so it
+        # rides the seam a consumer already swaps (`replace(default_adapters(), …)`) instead of adding a
+        # second, parallel way to configure the surface. None on the OSS defaults ⇒ unchanged behaviour.
+        app=build_server(
+            registry,
+            extra_instructions=extra_instructions,
+            visibility=getattr(adapters, "tool_visibility", None),
+        ),
         json_response=True,
         stateless=True,
     )
