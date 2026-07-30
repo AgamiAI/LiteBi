@@ -39,6 +39,19 @@ def test_ports_module_imports_without_model_deps():
     assert subprocess.run([sys.executable, "-c", code]).returncode == 0
 
 
+def test_guardrail_module_imports_without_model_deps():
+    """`guardrail` is held to the same bar as `ports`, and one notch tighter: it is vendored into
+    the plugin mirror, where there is no pip and no package — so it must import on a bare python3.
+    `execute_sql` is in the assertion because `Envelope.data`'s annotation is TYPE_CHECKING-only;
+    if that import ever escapes to runtime it would also create a cycle (`execute_sql` imports
+    this module)."""
+    code = (
+        "import sys, guardrail; "
+        "assert not {'pydantic', 'contracts', 'execute_sql'} & set(sys.modules)"
+    )
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
 # --- default adapters satisfy their Protocol (runtime_checkable) -------------
 
 
