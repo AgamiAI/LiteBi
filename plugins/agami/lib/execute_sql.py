@@ -29,15 +29,19 @@ Drivers (install only what you need):
 
 Exit codes:
     0  — success, CSV on stdout
-    1  — refused by a guard, always as a single JSON object on stderr. The read-only guard,
-         the three semantic-model scope gates (table / SELECT * / column) and both
-         model-unavailable branches write the contract `{"refusal": {…}}`; the remaining
-         semantic-model branches (fan/chasm pre-flight, sensitive columns) still write
-         their own `{"error": {…}}`. Parsers key off the `"refusal"` KEY, not the code.
+    1  — refused by a guard. `main` always writes the contract `{"refusal": {…}}` as a single JSON
+         object on stderr. The four unconverted semantic-model branches (fan/chasm pre-flight,
+         auto-rewrite notice, sensitive columns, default-filter notice) additionally write their own
+         `{"error": {…}}` / plain-text diagnostic line BEFORE it, so for those the stream is two
+         lines rather than one. Parsers key off the `"refusal"` KEY, not the code and not the line
+         count; the extra line goes away when those branches are subtracted.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
     5  — SQL execution error (syntax, unknown column, etc.)
+
+`EXIT_TO_FAILURE_KIND` / `FAILURE_KIND_TO_EXIT` below are that table in code — this module owns the
+exit-code contract because it documents it here and is the only place that produces it.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ import os
 import stat
 import sys
 import urllib.parse
+import uuid
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -57,7 +62,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import agami_paths
-from guardrail import RULE_MODEL_UNAVAILABLE, Refusal, refuse
+from guardrail import (
+    RULE_MODEL_SAFETY,
+    RULE_MODEL_UNAVAILABLE,
+    Envelope,
+    Failure,
+    FailureKind,
+    Refusal,
+    Status,
+    refuse,
+)
 
 if TYPE_CHECKING:
     # ``Executor`` is the 5th port; imported only for type-checkers. At runtime ``execute_sql`` never
@@ -130,19 +144,25 @@ class ExecutorError(Exception):
         self.code = code
 
 
-class GuardRefused(Exception):
-    """A guard refusal short-circuiting the envelope. ``refusal`` is the contract object the caller
-    must serialize (today the read-only guard's), or ``None`` when the refusal JSON was already
-    written to stderr by ``_model_safety`` (carry only the exit ``code``).
+# The CLI exit-code contract in code, in both directions — the module docstring's table, executable.
+# Note what is NOT here: no exception type carries a refusal out of this module. A refusal is
+# *returned* inside an ``Envelope``, never raised. Leaving a second transport in place next to the
+# Envelope is how the fork path and the in-process path drifted into different answers in the first
+# place, so there is exactly one way out.
+EXIT_TO_FAILURE_KIND: dict[int, FailureKind] = {
+    2: "dsn",             # usage / config error (missing credentials, bad profile)
+    3: "driver_missing",  # no driver installed for the configured db type
+    4: "auth",            # connect / authentication failed
+    5: "syntax",          # SQL execution error
+}
 
-    Carrying the ``Refusal`` rather than a pre-shaped dict is what lets the two callers — the
-    subprocess ``main`` and the in-process MCP handler — each render the ONE contract object into
-    their own wire without either inventing a second refusal shape."""
-
-    def __init__(self, refusal: Refusal | None, *, code: int) -> None:
-        super().__init__()
-        self.refusal = refusal
-        self.code = code
+# The inverse, for ``main`` turning a ``Failure`` back into today's exit code. Every failure
+# ``execute_guarded`` can produce comes from an ``ExecutorError`` whose code is one of the four
+# above, so the round-trip is exact for every reachable case. The default covers the kinds that have
+# no exit code of their own — ``other`` and the six declared-but-unproduced kinds — and is 2, the
+# CLI's generic config/usage code and ``_err``'s own default.
+FAILURE_KIND_TO_EXIT: dict[str, int] = {kind: code for code, kind in EXIT_TO_FAILURE_KIND.items()}
+_DEFAULT_FAILURE_EXIT = 2
 
 
 def _env_token(profile: str) -> str:
@@ -922,33 +942,38 @@ def _resolve_guard_model(profile: str):
 
 
 def _write_refusal(refusal: Refusal) -> None:
-    """Write a guard refusal to stderr in the ONE shape every caller parses.
+    """Write a guard refusal to stderr in the ONE shape every caller parses — the single wire-writer,
+    called only from ``main``.
 
-    Exactly one JSON object, on one line: ``{"refusal": {reason, rule, detail, remediation}}`` —
-    the wire shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on
-    the parent side of the process boundary. Nothing else may be written alongside it: several
-    callers (and the fail-closed suite) parse the WHOLE stderr stream as a single object, so a
-    second line of diagnostics would not merely be noisy, it would make the refusal unreadable.
+    One JSON object, on one line: ``{"refusal": {reason, rule, detail, remediation}}`` — the wire
+    shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on the parent
+    side of the process boundary. Nothing else may be written alongside it: several callers (and the
+    fail-closed suite) parse the WHOLE stderr stream as a single object, so a second line of
+    diagnostics would not merely be noisy, it would make the refusal unreadable. The four
+    unconverted ``_model_safety`` branches still write such a line before this one — for those the
+    stream is two lines and only the line-scanning parser can read it, which is one more reason they
+    are being subtracted.
     """
     json.dump({"refusal": asdict(refusal)}, sys.stderr)
     sys.stderr.write("\n")
 
 
-def _model_safety(sql: str, profile: str, area: str | None):
+def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusal | int | None]:
     """Semantic-model safety pass before execution: fan-trap / chasm-trap pre-flight
     + default_filters auto-application, over a model resolved from the DB (hosted) or disk (local).
 
-    Returns (sql_to_run, exit_code). exit_code is None to continue, or an int to
-    short-circuit (a refusal the caller must consume). Inert (returns the SQL unchanged) when the
+    Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue, a ``Refusal`` from one of
+    the five converted branches, or — from the four unconverted ones — today's bare exit code, which
+    the caller wraps in the interim ``model_safety`` rule. Inert (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
 
-    This function deliberately writes TWO stderr shapes for one slice. The five branches converted
-    here — both ``model_unavailable`` sites and the three scope gates — emit the contract
-    ``{"refusal": …}``; the fan/chasm pre-flight, sensitive-column and default-filter branches below
-    still emit today's ``{"error": …}`` / plain text, because those become receipt facts rather than
-    refusals and converting them here would pre-empt that decision. Both shapes share exit code 1,
-    which is exactly why ``tools._stderr_refusal`` keys off the ``"refusal"`` KEY and not the code.
+    The five converted branches — both ``model_unavailable`` sites and the three scope gates — write
+    NOTHING: they hand the contract object back and ``execute_guarded`` puts it in the Envelope, so
+    the in-process caller sees the same rule the forked one does. The fan/chasm pre-flight,
+    sensitive-column and default-filter branches below still write today's ``{"error": …}`` / plain
+    text and return today's int, because those become receipt facts rather than refusals and
+    converting them here would pre-empt that decision.
     """
     try:
         from semantic_model import runtime as RT
@@ -963,13 +988,12 @@ def _model_safety(sql: str, profile: str, area: str | None):
             # `suggestion` at all, and the contract makes an unactionable refusal a construction
             # error. It names an operator action and no DSN, path or hostname — the same
             # value-free rule the detail already follows, and what the single-clean-JSON test pins.
-            _write_refusal(refuse(
+            return sql, refuse(
                 RULE_MODEL_UNAVAILABLE,
                 detail="semantic-model package not importable; refusing to run unguarded on the "
                        "hosted server",
                 remediation="Install the semantic-model dependencies on the server and retry.",
-            ))
-            return sql, 1
+            )
         # The non-hosted twin: a bare local install legitimately has no model package, so this is a
         # silent no-op rather than a refusal. Not a branch to convert — there is nothing to refuse.
         return sql, None  # local: model package not available -> no-op
@@ -981,13 +1005,12 @@ def _model_safety(sql: str, profile: str, area: str | None):
             # the fan/chasm/scope/PII guards silently off. `remediation` is authored here for the
             # same reason as the branch above, and is likewise free of any resolved path or DSN —
             # "checked DB and disk" names the two SOURCES, never where either one lives.
-            _write_refusal(refuse(
+            return sql, refuse(
                 RULE_MODEL_UNAVAILABLE,
                 detail="no semantic model could be resolved (checked DB and disk); refusing to run "
                        "unguarded on the hosted server",
                 remediation="Build or deploy a semantic model for this datasource, then retry.",
-            ))
-            return sql, 1
+            )
         # The non-hosted twin again: locally a not-yet-built model is expected, so no refusal.
         return sql, None  # local: no model yet -> no-op (unchanged)
 
@@ -1000,26 +1023,24 @@ def _model_safety(sql: str, profile: str, area: str | None):
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
     # so the fan/chasm and sensitive checks below only evaluate in-scope tables.
-    # Each gate now returns the contract object itself, so this layer only relays it — there is no
-    # second place where a refusal's reason, rule or wording could be chosen.
+    # Each gate returns the contract object itself and this layer only hands it back — there is no
+    # second place where a refusal's reason, rule or wording could be chosen, and no serialization
+    # between the gate and the Envelope for the two paths to disagree about.
     ts = RT.check_table_scope(sql, org, ctx=ctx)
     if ts is not None:
-        _write_refusal(ts)
-        return sql, 1
+        return sql, ts
 
     # SELECT * ban — force every projected column to be named, so the column-scope
     # guard below can check what is actually returned (and nothing hides behind *).
     star = RT.check_no_select_star(sql, ctx=ctx)
     if star is not None:
-        _write_refusal(star)
-        return sql, 1
+        return sql, star
 
     # Column-scope guard — a column that binds to a declared table must be one that
     # table declares (a hallucinated column, or a physical column the model excluded).
     cs = RT.check_column_scope(sql, org, ctx=ctx)
     if cs is not None:
-        _write_refusal(cs)
-        return sql, 1
+        return sql, cs
 
     pf = RT.pre_flight_check(sql, org, ctx=ctx)
     if pf.risk and pf.action == "refuse":
@@ -1056,7 +1077,7 @@ def _model_safety(sql: str, profile: str, area: str | None):
 # ---------------------------------------------------------------------------
 #
 # `execute_guarded` is the single execution chokepoint: guard -> resolve datasource ->
-# executor.execute(vetted_sql) -> return native rows. The built-in executor (`BUILTIN_EXECUTOR`) is
+# executor.execute(vetted_sql) -> return ONE Envelope. The built-in executor (`BUILTIN_EXECUTOR`) is
 # the default connect-per-query path, unchanged; a consumer injects its own `ports.Executor`
 # (pooled / RBAC / tunnelled) *behind* the same guard — no fork of the guard, per REQ-002/REQ-014.
 # The subprocess `main` and the in-process MCP handler both go through `execute_guarded`, so the
@@ -1172,6 +1193,37 @@ class _BuiltinExecutor:
 BUILTIN_EXECUTOR = _BuiltinExecutor()
 
 
+def _envelope(
+    status: Status,
+    *,
+    data: ExecResult | None = None,
+    refusal: Refusal | None = None,
+    failure: Failure | None = None,
+) -> Envelope:
+    """The ONE place ``execute_guarded`` constructs an ``Envelope``, and the one place this module
+    mints an ``audit_id``.
+
+    Funnelling all five outcomes through here is what makes "every path returns exactly one
+    Envelope" a property of the code rather than a claim in a docstring: a new outcome cannot reach
+    a caller without passing the contract's own present-iff check in ``Envelope.__post_init__``.
+
+    ``uuid4().hex`` keeps the vendored plugin slice stdlib-only. When the caller is the in-process
+    tool edge, this id is the one it reports. When the caller is ``main`` in a forked child, the id
+    goes nowhere: this module writes no audit row, and it keeps the id OFF the wire — the
+    refusal/failure JSON stays exactly the shape the parent's parser expects, with no ``audit_id``
+    key — so the parent mints the one that gets recorded rather than there being two ids for one
+    query. A directly-invoked ``python -m execute_sql`` therefore carries an id nothing records,
+    which is correct: nothing audits that path today.
+    """
+    return Envelope(
+        status=status,
+        data=data,
+        refusal=refusal,
+        failure=failure,
+        audit_id=uuid.uuid4().hex,
+    )
+
+
 def execute_guarded(
     sql: str,
     profile: str,
@@ -1180,29 +1232,58 @@ def execute_guarded(
     executor: Executor,
     org_id: str | None = None,
     no_safety: bool = False,
-) -> ExecResult:
+) -> Envelope:
     """The un-bypassable guarded envelope — the single execution chokepoint (REQ-002/REQ-014).
 
     In fixed order: read-only / dangerous-SQL guard (the hard security gate — NOT bypassable via
     ``no_safety``, which skips only the semantic-model pass, never write/RCE/DoS protection) ->
     semantic-model safety pass (fan/chasm pre-flight + scope + PII + ``default_filters`` rewrite) ->
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
-    SQL both guards have passed. Raises ``GuardRefused`` on a refusal (the read-only refusal carries
-    its ``Refusal`` for the caller to serialize; a model-safety refusal already wrote its JSON to
-    stderr and carries only the exit code) and ``ExecutorError`` on a connect/run failure — so the
-    subprocess ``main`` and the in-process MCP handler apply the same guard and surface errors
-    identically. The row cap rides the request-scoped ``_max_rows_override`` ContextVar the caller sets."""
+    SQL both guards have passed.
+
+    **Every path returns exactly one ``Envelope``** — nothing is raised out of here for a caller to
+    interpret, so the subprocess ``main`` and the in-process MCP handler cannot disagree about what
+    happened. The five outcomes:
+
+      * the read-only gate refuses            -> ``refused`` carrying that gate's ``Refusal``
+      * ``_model_safety`` returns a Refusal   -> ``refused`` carrying it verbatim
+      * ``_model_safety`` returns an int      -> ``refused`` carrying the interim ``model_safety``
+      * ``executor.execute`` raises           -> ``failed`` carrying a classified ``Failure``
+      * the statement ran                     -> ``ok`` carrying the ``ExecResult``
+
+    ``_load_credentials`` sits INSIDE the try deliberately, so a bad profile / missing DSN becomes a
+    ``failed``/``dsn`` Envelope carrying its detailed message rather than escaping as an exception
+    the two callers would each have to translate. The row cap rides the request-scoped
+    ``_max_rows_override`` ContextVar the caller sets."""
     import sql_guard
 
     refusal = sql_guard.check_read_only(sql)
     if refusal is not None:
-        raise GuardRefused(refusal, code=1)
+        return _envelope("refused", refusal=refusal)
     if not no_safety:
-        sql, rc = _model_safety(sql, profile, area)
-        if rc is not None:
-            raise GuardRefused(None, code=rc)
-    creds = _load_credentials(profile, org_id or "local")
-    return executor.execute(sql, creds, profile=profile)
+        sql, verdict = _model_safety(sql, profile, area)
+        if isinstance(verdict, Refusal):
+            return _envelope("refused", refusal=verdict)
+        if verdict is not None:
+            # One of the four unconverted branches: it wrote its own diagnostic to the server log
+            # and handed back only an exit code, so this is the most we can say without inventing a
+            # rule for it. The interim RULE_MODEL_SAFETY exists precisely so this path still returns
+            # an Envelope — without it the signature would have to be `Envelope | int` and the
+            # "exactly one Envelope per path" property would be literally false. Both this constant
+            # and this branch go away when those branches are subtracted.
+            return _envelope("refused", refusal=refuse(
+                RULE_MODEL_SAFETY,
+                detail="the semantic-model safety pass refused this statement",
+                remediation="Check the server log for the rule that fired, then adjust the query.",
+            ))
+    try:
+        creds = _load_credentials(profile, org_id or "local")
+        result = executor.execute(sql, creds, profile=profile)
+    except ExecutorError as exc:
+        return _envelope("failed", failure=Failure(
+            kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
+        ))
+    return _envelope("ok", data=result)
 
 
 def main() -> int:
@@ -1245,27 +1326,30 @@ def main() -> int:
     profile = args.profile or _resolve_default_profile()
 
     # Route through the single guarded envelope with the built-in executor: guard -> model-safety ->
-    # resolve -> connect-and-run, returning native rows we then serialize to stdout as CSV (the
-    # subprocess wire). Same guard, same verdicts, same connect-per-query behaviour as before — the
-    # split just makes the connect-and-run step swappable in-process (AH-012). The guard is the hard
-    # security gate for EVERY caller (both MCP servers, the agami-query skill, cron), NOT bypassable
-    # via --no-safety (which skips only the semantic-model pass, never write/RCE/DoS protection).
-    try:
-        result = execute_guarded(
-            sql, profile, args.area, executor=BUILTIN_EXECUTOR, no_safety=args.no_safety
-        )
-    except GuardRefused as refused:
-        # Exactly one JSON object, on one line, and nothing else — a caller (and
-        # `tools._stderr_refusal`) parses this whole stream, so a second line of diagnostics would
-        # make the refusal unreadable rather than merely noisy.
-        if refused.refusal is not None:  # read-only refusal (model-safety already wrote its own)
-            json.dump({"refusal": asdict(refused.refusal)}, sys.stderr)
-            sys.stderr.write("\n")
-        return refused.code
-    except ExecutorError as exc:
-        sys.stderr.write(f"{exc.msg}\n")
-        return exc.code
-    _emit_result_csv(result)
+    # resolve -> connect-and-run, returning ONE Envelope the switch below renders to the subprocess
+    # wire. Same guard, same verdicts, same connect-per-query behaviour as before — the split just
+    # makes the connect-and-run step swappable in-process (AH-012). The guard is the hard security
+    # gate for EVERY caller (both MCP servers, the agami-query skill, cron), NOT bypassable via
+    # --no-safety (which skips only the semantic-model pass, never write/RCE/DoS protection).
+    env = execute_guarded(
+        sql, profile, args.area, executor=BUILTIN_EXECUTOR, no_safety=args.no_safety
+    )
+
+    # The single print site: a three-way switch on the ONE Envelope `execute_guarded` returned.
+    # Nothing else in this module writes to stdout or decides an exit code, so the CLI contract
+    # lives in one readable place instead of being spread across every `except` in the call graph.
+    if env.status == "refused":
+        # One JSON object, on one line, and nothing else — `tools._stderr_refusal` and the
+        # fail-closed suite parse this whole stream.
+        _write_refusal(env.refusal)
+        return 1
+    if env.status == "failed":
+        # Deliberately NOT JSON: the bare message + the classified exit code are today's documented
+        # CLI contract, which the agami-query skill's error classifier and `semantic_model.cli`
+        # already read. Restructuring it would buy nothing in this slice.
+        sys.stderr.write(f"{env.failure.message}\n")
+        return FAILURE_KIND_TO_EXIT.get(env.failure.kind, _DEFAULT_FAILURE_EXIT)
+    _emit_result_csv(env.data)
     return 0
 
 

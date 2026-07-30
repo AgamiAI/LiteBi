@@ -4,11 +4,18 @@
 invariants: the guard runs BEFORE the executor, the executor only ever sees already-vetted SQL, and
 there is no path to an executor around the guard (fail-closed, REQ-002/REQ-014).
 
+`execute_guarded` now returns an `Envelope` on **every** path and raises nothing for a caller to
+interpret — the refusal-carrying exception is gone. The assertions below therefore read the
+envelope's `status` / `refusal` / `failure` / `data` where they used to read an exception's
+attributes; what is being pinned is unchanged, and one property is new: the outcome is a value the
+type system carries, so the two callers (the subprocess `main` and the in-process MCP handler)
+cannot render it differently.
+
 On result fidelity: the built-in executor returns NATIVE-typed rows (`ExecResult`) — NULL as None,
-ints as int — and the subprocess wire still serializes byte-identical CSV. The in-process TOOL edge
-(`tools._run_in_process`) currently textualizes those rows to match the CSV wire so both execution
-paths return identical JSON; native-typed rows at the MCP JSON edge are a deliberately deferred
-decision (see the AH-012 spec), so the tool-edge tests assert the stringified form on purpose.
+ints as int — and the subprocess wire still serializes byte-identical CSV. The TOOL edge textualizes
+those rows to match the CSV wire so both execution paths return identical JSON; native-typed rows at
+the MCP JSON edge are a deliberately deferred decision (see the AH-012 spec), so the tool-edge tests
+assert the stringified form on purpose.
 """
 
 from __future__ import annotations
@@ -27,6 +34,11 @@ if str(PKG_SRC) not in sys.path:
 
 import execute_sql  # noqa: E402
 import guardrail  # noqa: E402
+
+
+def _refusal(rule: str = guardrail.RULE_TABLE_SCOPE) -> guardrail.Refusal:
+    """A contract-valid `Refusal` for a `_model_safety` monkeypatch to hand back."""
+    return guardrail.refuse(rule, detail="out of scope", remediation="Ask about a declared table.")
 
 
 @pytest.fixture(autouse=True)
@@ -57,30 +69,51 @@ def test_readonly_guard_refuses_before_the_executor_is_reached():
     # A write statement is refused by the hard read-only gate; the executor is NEVER constructed a
     # query for. This is the "no public path reaches an executor without the guard" invariant.
     spy = _SpyExecutor()
-    with pytest.raises(execute_sql.GuardRefused) as ei:
-        execute_sql.execute_guarded("DELETE FROM t", "acme", None, executor=spy)
-    assert ei.value.code == 1
-    assert ei.value.refusal.rule == guardrail.RULE_READ_ONLY
+    env = execute_sql.execute_guarded("DELETE FROM t", "acme", None, executor=spy)
+    assert env.status == "refused"
+    assert env.refusal.rule == guardrail.RULE_READ_ONLY
     assert spy.calls == []  # executor never reached
 
 
 def test_readonly_guard_still_fires_under_no_safety():
     # --no-safety skips ONLY the semantic-model pass, never the write/RCE/DoS read-only gate.
     spy = _SpyExecutor()
-    with pytest.raises(execute_sql.GuardRefused) as ei:
-        execute_sql.execute_guarded("DROP TABLE t", "acme", None, executor=spy, no_safety=True)
-    assert ei.value.code == 1
+    env = execute_sql.execute_guarded(
+        "DROP TABLE t", "acme", None, executor=spy, no_safety=True
+    )
+    assert env.status == "refused"
+    assert env.refusal.rule == guardrail.RULE_READ_ONLY
     assert spy.calls == []
 
 
 def test_model_safety_refusal_short_circuits_before_the_executor(monkeypatch):
-    # A model-safety refusal already wrote its JSON to stderr, so no Refusal is carried and only the
-    # exit code is; the executor must not run.
+    # A converted gate hands back the contract object; the envelope relays it VERBATIM (same rule,
+    # same remediation — no re-authoring at this layer) and the executor must not run.
+    refusal = _refusal(guardrail.RULE_COLUMN_SCOPE)
+    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, refusal))
+    spy = _SpyExecutor()
+
+    env = execute_sql.execute_guarded("SELECT 1", "acme", None, executor=spy)
+
+    assert env.status == "refused"
+    assert env.refusal is refusal  # relayed, not rebuilt
+    assert spy.calls == []
+
+
+def test_unconverted_model_safety_branch_still_yields_a_refusal_envelope(monkeypatch):
+    # The four branches NOT converted in this slice still return a bare exit code after writing
+    # their own diagnostic to the server log. They must still produce an Envelope — that is the
+    # whole reason the interim `model_safety` rule exists — carrying a remediation that points at
+    # the log rather than inventing a rule the gate never chose.
     monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, 1))
     spy = _SpyExecutor()
-    with pytest.raises(execute_sql.GuardRefused) as ei:
-        execute_sql.execute_guarded("SELECT 1", "acme", None, executor=spy)
-    assert ei.value.code == 1 and ei.value.refusal is None
+
+    env = execute_sql.execute_guarded("SELECT 1", "acme", None, executor=spy)
+
+    assert env.status == "refused"
+    assert env.refusal.rule == guardrail.RULE_MODEL_SAFETY
+    assert env.refusal.reason == "undetermined"
+    assert "server log" in env.refusal.remediation
     assert spy.calls == []
 
 
@@ -100,12 +133,12 @@ def test_executor_receives_vetted_sql_and_resolved_creds(monkeypatch):
     )
     spy = _SpyExecutor()
 
-    result = execute_sql.execute_guarded("SELECT 1 AS c", "acme", "sales", executor=spy)
+    env = execute_sql.execute_guarded("SELECT 1 AS c", "acme", "sales", executor=spy)
 
     assert spy.calls == [
         ("SELECT 1 AS c /*vetted*/", {"type": "sqlite", "path": ":memory:"}, "acme")
     ]
-    assert result.rows == [(1,)]
+    assert env.status == "ok" and env.data.rows == [(1,)]
 
 
 def test_no_safety_bypasses_the_model_pass_but_still_runs(monkeypatch):
@@ -121,14 +154,14 @@ def test_no_safety_bypasses_the_model_pass_but_still_runs(monkeypatch):
     monkeypatch.setattr(execute_sql, "_model_safety", _boom)
     spy = _SpyExecutor()
 
-    result = execute_sql.execute_guarded(
+    env = execute_sql.execute_guarded(
         "SELECT 1 AS c", "acme", None, executor=spy, no_safety=True
     )
 
     assert (
         spy.calls[0][0] == "SELECT 1 AS c"
     )  # raw SQL passed straight to the executor, unrewritten
-    assert result.rows == [(1,)]
+    assert env.status == "ok" and env.data.rows == [(1,)]
 
 
 # --- the built-in executor: native rows in, byte-identical CSV out ------------------------------
@@ -155,7 +188,7 @@ def test_builtin_executor_returns_native_typed_rows_and_emits_identical_csv(
         lambda p, org_id="local": {"type": "sqlite", "path": str(db)},
     )
 
-    result = execute_sql.execute_guarded(
+    env = execute_sql.execute_guarded(
         "SELECT n, s FROM t ORDER BY n",
         "acme",
         None,
@@ -163,13 +196,14 @@ def test_builtin_executor_returns_native_typed_rows_and_emits_identical_csv(
         no_safety=True,
     )
 
-    # Native fidelity (Sandeep's concern): ints stay ints, SQL NULL stays None — NOT "" and not "2".
-    assert result.columns == ["n", "s"]
-    assert result.rows == [(1, "a"), (2, None)]
+    # Native fidelity: ints stay ints, SQL NULL stays None — NOT "" and not "2".
+    assert env.status == "ok"
+    assert env.data.columns == ["n", "s"]
+    assert env.data.rows == [(1, "a"), (2, None)]
 
     # The subprocess/CLI wire still serializes byte-identical CSV at the edge (NULL renders as an
     # empty field there — the ambiguity lives only in the text wire, not in the native rows).
-    execute_sql._emit_result_csv(result)
+    execute_sql._emit_result_csv(env.data)
     assert capsys.readouterr().out == "n,s\r\n1,a\r\n2,\r\n"
 
 
@@ -293,8 +327,9 @@ def test_injected_executor_error_maps_to_the_same_envelope(monkeypatch):
     tools.set_injected_executor(_Boom())
     out = json.loads(tools.tool_execute_sql({"sql": "SELECT 1", "datasource": "acme"}))
 
-    assert out["error"]["kind"] == tools._classify_exit(4)
-    assert "connect failed" in out["error"]["remediation"]
+    assert out["status"] == "failed"
+    assert out["failure"]["kind"] == tools._classify_exit(4)
+    assert "connect failed" in out["failure"]["message"]
 
 
 def test_set_injected_executor_rejects_a_bad_shape():
@@ -310,8 +345,10 @@ def test_set_injected_executor_rejects_a_bad_shape():
 
 def test_injected_executor_credential_error_surfaces_detailed_remediation(monkeypatch):
     # Parity with the subprocess path: a bad-profile ExecutorError carries its detailed message, so
-    # the in-process tool envelope surfaces the SAME remediation the CLI stderr would (not a generic
-    # string). This is why _load_credentials/_parse_dsn raise instead of sys.exit.
+    # the in-process tool envelope surfaces the SAME text the CLI stderr would (not a generic
+    # string). This is why `_load_credentials` raises instead of sys.exit, and why it sits INSIDE
+    # `execute_guarded`'s try — a credentials problem is a `failed`/`dsn`, and the detail now
+    # arrives on `failure.message`.
     import tools
 
     monkeypatch.setattr(tools, "resolve_profile", lambda ds: "acme")
@@ -327,7 +364,8 @@ def test_injected_executor_credential_error_surfaces_detailed_remediation(monkey
 
     out = json.loads(tools.tool_execute_sql({"sql": "SELECT 1", "datasource": "acme"}))
 
-    assert "DATASOURCE_URL" in out["error"]["remediation"]  # detailed, not the generic net string
+    assert out["status"] == "failed" and out["failure"]["kind"] == "dsn"
+    assert "DATASOURCE_URL" in out["failure"]["message"]  # detailed, not the generic net string
 
 
 def test_injected_executor_systemexit_is_caught_not_fatal(monkeypatch):
@@ -345,7 +383,8 @@ def test_injected_executor_systemexit_is_caught_not_fatal(monkeypatch):
 
     out = json.loads(tools.tool_execute_sql({"sql": "SELECT 1", "datasource": "acme"}))
 
-    assert "error" in out  # a tool error envelope, not a process exit
+    # A `failed` Envelope, not a process exit — and classified, not a bare "something broke".
+    assert out["status"] == "failed" and out["failure"]["kind"] == "dsn"
 
 
 def test_default_no_injected_executor_forks_the_subprocess(monkeypatch):
@@ -372,7 +411,21 @@ def test_default_no_injected_executor_forks_the_subprocess(monkeypatch):
     assert out["rows"] == [["1"]]
 
 
-def test_injected_executor_model_safety_refusal_returns_clean_error(monkeypatch):
+@pytest.mark.parametrize(
+    ("verdict", "expected_rule"),
+    [
+        # A CONVERTED gate: the rule the gate itself chose reaches the caller intact. Before this
+        # slice the in-process path collapsed every one of these to `{"kind": "permission"}`.
+        (_refusal(guardrail.RULE_TABLE_SCOPE), guardrail.RULE_TABLE_SCOPE),
+        (_refusal(guardrail.RULE_COLUMN_SCOPE), guardrail.RULE_COLUMN_SCOPE),
+        # An UNCONVERTED branch: still a bare exit code, so the interim rule is the honest answer.
+        (1, guardrail.RULE_MODEL_SAFETY),
+    ],
+    ids=["table_scope", "column_scope", "unconverted_int"],
+)
+def test_injected_executor_model_safety_refusal_carries_the_rule(
+    monkeypatch, verdict, expected_rule
+):
     import tools
 
     monkeypatch.setattr(tools, "resolve_profile", lambda ds: "acme")
@@ -381,14 +434,15 @@ def test_injected_executor_model_safety_refusal_returns_clean_error(monkeypatch)
         "_load_credentials",
         lambda p, org_id="local": {"type": "sqlite", "path": ":memory:"},
     )
-    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, 1))  # refuse
+    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, verdict))  # refuse
     fake = _SpyExecutor()
     tools.set_injected_executor(fake)
 
     out = json.loads(tools.tool_execute_sql({"sql": "SELECT 1", "datasource": "acme"}))
 
-    assert out["error"]["kind"] == "permission"
-    assert "semantic-model safety pass" in out["error"]["remediation"]
+    assert out["status"] == "refused"
+    assert out["refusal"]["rule"] == expected_rule
+    assert out["refusal"]["remediation"].strip()
     assert fake.calls == []  # refused before the executor
 
 
@@ -437,10 +491,16 @@ def test_injected_executor_backstop_trims_to_max_rows(monkeypatch):
 
 
 # --- main() (the subprocess CLI entry) translates the envelope's outcomes byte-identically --------
+#
+# `main` is a three-way switch on `env.status` and the only place this module prints. The bytes and
+# exit codes below are the pre-envelope ones, unchanged — the CLI contract is read by the
+# agami-query skill's error classifier and by `semantic_model.cli`, so the rewrite is invisible to
+# both.
 
 
-def _raise(exc):
-    raise exc
+def _envelope_returning(env):
+    """A `execute_guarded` stand-in that returns a fixed Envelope, whatever it is called with."""
+    return lambda *a, **k: env
 
 
 def test_main_read_only_refusal_writes_json_and_returns_1(tmp_path, monkeypatch, capsys):
@@ -450,16 +510,26 @@ def test_main_read_only_refusal_writes_json_and_returns_1(tmp_path, monkeypatch,
     rc = execute_sql.main()
 
     assert rc == 1
-    assert json.loads(capsys.readouterr().err.strip())["refusal"]["rule"] == guardrail.RULE_READ_ONLY
+    err = capsys.readouterr().err
+    # Parses WHOLE, so it is a single object and nothing rides alongside it.
+    assert json.loads(err)["refusal"]["rule"] == guardrail.RULE_READ_ONLY
+    assert err.count("\n") == 1
 
 
-def test_main_executor_error_writes_message_and_returns_code(tmp_path, monkeypatch, capsys):
+def test_main_failed_writes_bare_message_and_the_classified_exit_code(
+    tmp_path, monkeypatch, capsys
+):
+    # A `failed` Envelope renders as today's bare stderr line (NOT JSON) plus the exit code its
+    # `Failure.kind` maps back to.
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setattr(
         execute_sql,
         "execute_guarded",
-        lambda *a, **k: _raise(
-            execute_sql.ExecutorError("Postgres connect failed: refused", code=4)
+        _envelope_returning(
+            execute_sql._envelope(
+                "failed",
+                failure=guardrail.Failure(kind="auth", message="Postgres connect failed: refused"),
+            )
         ),
     )
     monkeypatch.setattr(sys, "argv", ["execute_sql", "--profile", "acme", "--sql", "SELECT 1"])
@@ -467,7 +537,41 @@ def test_main_executor_error_writes_message_and_returns_code(tmp_path, monkeypat
     rc = execute_sql.main()
 
     assert rc == 4
-    assert capsys.readouterr().err.strip() == "Postgres connect failed: refused"
+    assert capsys.readouterr().err == "Postgres connect failed: refused\n"
+
+
+def test_an_executor_error_becomes_the_failed_envelope_main_renders(tmp_path, monkeypatch, capsys):
+    # The other half of the previous test: an `ExecutorError` raised by the executor is what
+    # produces that Envelope, so the pair proves the exception -> Envelope -> stderr/exit-code chain
+    # end to end rather than only its second half.
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        execute_sql,
+        "_load_credentials",
+        lambda p, org_id="local": {"type": "sqlite", "path": ":memory:"},
+    )
+    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, None))
+
+    class _Boom:
+        def execute(self, vetted_sql, creds, *, profile):
+            raise execute_sql.ExecutorError("Postgres connect failed: refused", code=4)
+
+    monkeypatch.setattr(execute_sql, "BUILTIN_EXECUTOR", _Boom())
+    monkeypatch.setattr(sys, "argv", ["execute_sql", "--profile", "acme", "--sql", "SELECT 1"])
+
+    rc = execute_sql.main()
+
+    assert rc == 4
+    assert capsys.readouterr().err == "Postgres connect failed: refused\n"
+
+
+@pytest.mark.parametrize("code", sorted(execute_sql.EXIT_TO_FAILURE_KIND))
+def test_every_produced_exit_code_round_trips_through_the_failure_kind(code):
+    # `main` reconstructs the exit code from `Failure.kind`, which is lossy in general (nine kinds,
+    # four codes). It must be LOSSLESS for every code the executor actually produces, or a rewrite
+    # that only looks byte-identical would still change what a caller's `$?` sees.
+    kind = execute_sql.EXIT_TO_FAILURE_KIND[code]
+    assert execute_sql.FAILURE_KIND_TO_EXIT[kind] == code
 
 
 def test_main_success_serializes_result_to_stdout_csv(tmp_path, monkeypatch, capsys):
@@ -475,7 +579,11 @@ def test_main_success_serializes_result_to_stdout_csv(tmp_path, monkeypatch, cap
     monkeypatch.setattr(
         execute_sql,
         "execute_guarded",
-        lambda *a, **k: execute_sql.ExecResult(columns=["n"], rows=[(1,)], truncated=False),
+        _envelope_returning(
+            execute_sql._envelope(
+                "ok", data=execute_sql.ExecResult(columns=["n"], rows=[(1,)], truncated=False)
+            )
+        ),
     )
     monkeypatch.setattr(
         sys, "argv", ["execute_sql", "--profile", "acme", "--sql", "SELECT n FROM t"]
@@ -483,8 +591,10 @@ def test_main_success_serializes_result_to_stdout_csv(tmp_path, monkeypatch, cap
 
     rc = execute_sql.main()
 
+    captured = capsys.readouterr()
     assert rc == 0
-    assert capsys.readouterr().out == "n\r\n1\r\n"
+    assert captured.out == "n\r\n1\r\n"
+    assert captured.err == ""  # a successful run says nothing on stderr
 
 
 # --- per-tenant env credentials: <ORG>_DATASOURCE_URL__<PROFILE>, fail-closed for named orgs -----

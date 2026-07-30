@@ -125,9 +125,14 @@ def test_parent_reconstructs_the_child_refusal(tmp_path) -> None:
 
 
 def test_parent_leaves_a_non_refusal_exit_alone() -> None:
-    """Exit 1 is not exclusively the read-only guard's — the semantic-model branches still exit 1
-    after writing today's `{"error": …}` line. Only a payload carrying `refusal` is claimed, so the
-    unconverted branches keep reaching the generic error path untouched."""
+    """Exit 1 is not exclusively the read-only guard's, and the parser claims a stream only when it
+    finds a payload carrying `refusal` — never on the code alone.
+
+    That is what lets a diagnostic-only stream fall through to the generic error path, and it is
+    also why the four unconverted branches survive the envelope rewrite: on the wire their
+    `{"error": …}` line is now FOLLOWED by `main`'s refusal line, and the line scan reads the
+    refusal past the diagnostic rather than choking on the mixed stream. (That end-to-end shape is
+    pinned in tests/test_ace035_envelope.py; here we pin the parser's half of it.)"""
     # `sensitive_columns` is one of the four `_model_safety` branches deliberately left on the old
     # shape (the scope gates and both model_unavailable sites have since moved to `{"refusal": …}`),
     # so it is a live example of the fall-through rather than a historical one.

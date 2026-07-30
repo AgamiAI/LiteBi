@@ -74,6 +74,36 @@ def test_record_marks_error_body_and_exception(db):
     assert raised["success"] == 0 and raised["error_kind"] == "exception"
 
 
+def test_record_marks_a_guardrail_failure_body_unsuccessful(db):
+    """`execute_sql` speaks the guardrail Envelope now, so a failed query arrives as
+    `{"status": "failed", "failure": {kind, message}}` rather than `{"error": {kind, remediation}}`.
+
+    The sink must read BOTH shapes: reading only the old one would log every failed query as a
+    success, which is a silent hole in the audit rather than a formatting change. (The other tools
+    still return the `{"error": …}` shape, pinned above.)"""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT nope FROM t"},
+        result_text='{"status": "failed", "failure": {"kind": "syntax", "message": "no column"}}',
+        execution_ms=3, actor="a",
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 0 and r["error_kind"] == "syntax"
+
+
+def test_record_leaves_a_refusal_marked_successful(db):
+    """A refusal is the server working correctly, so it stays `success=1` — exactly as it did
+    before the envelope, when a refusal body simply carried no `error` key. Reclassifying refusals
+    as failures would be a policy change, and it is not this slice's to make."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "DELETE FROM t"},
+        result_text='{"status": "refused", "refusal": {"reason": "unsafe", "rule": "read_only", '
+                    '"detail": "d", "remediation": "r"}}',
+        execution_ms=1, actor="a",
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 1 and r["error_kind"] is None
+
+
 def test_record_logs_every_tool_with_null_self_report(db):
     tools.record_tool_call(name="list_datasources", arguments={}, result_text="[]",
                            execution_ms=2, actor="a")
