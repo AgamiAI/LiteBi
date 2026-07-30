@@ -23,6 +23,7 @@ consumer needs.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -163,3 +164,11 @@ class Adapters:
     auth_provider: AuthProvider
     governance: GovernancePolicy
     executor: Executor | None = None
+    # `tool_visibility(tool_name) -> bool` narrows the ADVERTISED tool surface per request. None (the
+    # default) is exactly today's behaviour — the whole registry, listed and callable. A registry
+    # assembled once at composition time cannot answer "may THIS caller see this tool", and for a
+    # consumer running a server-side agent that gap is the difference between a control and a
+    # suggestion: the model chooses what to call, so withholding the tool is the control. Subtractive
+    # only — it filters the one shared registry and never adds or reshapes a tool. See
+    # `mcp_http.build_server` for where it is applied (both list AND call, deliberately).
+    tool_visibility: Callable[[str], bool] | None = None
