@@ -12,6 +12,8 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-07-30
+
 ### Security
 
 - **Closed a read-only-guard bypass via a welded quoted identifier.** A double-quoted
