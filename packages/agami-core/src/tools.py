@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
 
@@ -278,6 +278,33 @@ def _model_version(profile: str) -> str | None:
 # The org id for the current request's tool calls (ACE-045). The HTTP server sets this per request from
 # the OrgResolver-resolved org; unset (stdio / single-tenant) it falls back to AGAMI_ORG_ID / "local".
 _current_org_ctx: ContextVar[str | None] = ContextVar("agami_current_org_id", default=None)
+
+# What drove the current tool call, recorded on every activity-log row. The MCP transport is the only
+# caller in this package, so the default is the value this log has always carried; an embedder that
+# dispatches tool handlers itself sets this for the duration of a call so its rows are distinguishable
+# from transport traffic. Unset, every row reads exactly as it did before this seam existed.
+#
+# It lives in this module rather than `contracts` because the base install is stdlib-lean
+# (`dependencies = []`) and `contracts` needs pydantic — which is why every import of it here is
+# function-level. The read path imports this constant the same lazy way.
+DEFAULT_CALL_SOURCE = "mcp_server"
+_source_ctx: ContextVar[str] = ContextVar("agami_call_source", default=DEFAULT_CALL_SOURCE)
+
+
+def current_call_source() -> str:
+    """What drove this tool call — `DEFAULT_CALL_SOURCE` unless an embedder scoped it to something else."""
+    return _source_ctx.get()
+
+
+def set_call_source(source: str) -> Token[str]:
+    """Scope the recorded source for the calls made under it. Reset with the returned token in a
+    `finally`, so a caller that dispatches handlers directly cannot leak its label into later work."""
+    return _source_ctx.set(source)
+
+
+def reset_call_source(token: Token[str]) -> None:
+    """Undo `set_call_source`. Separate from the setter so the pairing is visible at the call site."""
+    _source_ctx.reset(token)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1025,7 +1052,9 @@ def _finalize_execution(
             "question": args.get("raw_query"),
             "sql": sql,
             "row_count": len(data_rows),
-            "source": "mcp_server",
+            # Same provenance the tool-call row carries, so the two logs can't disagree about what
+            # drove one execution. Unset, this is the value it has always been.
+            "source": current_call_source(),
         }
     )
     return json.dumps(result, indent=2, default=str)
@@ -1246,44 +1275,75 @@ def record_tool_call(
     execution_ms: int | None,
     actor: str | None,
     raised: bool = False,
+    source: str | None = None,
+    thread_id: str | None = None,
+    correlation_id: str | None = None,
+    user_question: str | None = None,
+    success: bool | None = None,
+    row_count: int | None = None,
+    error_kind: str | None = None,
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
     audit-grade fields are server-observed; `success`/`row_count`/`error_kind` are derived from the
     result (execute_sql returns an `{"error": ...}` body on a bad query without raising). The self-report
     fields (`user_question`/`agent_query`/`thread_id`) are whatever Claude supplied — may be None.
-    **Best-effort and never raises** — a logging failure must not break the tool."""
+    **Best-effort and never raises** — a logging failure must not break the tool.
+
+    The trailing parameters are an **override seam for an embedder that dispatches tool handlers
+    itself** rather than through this package's transport. Each defaults to `None`, meaning *derive it
+    the way this function always has* — so a caller that passes none of them gets byte-identical rows.
+
+    Two groups, for two different reasons:
+
+    - `source` / `thread_id` / `correlation_id` / `user_question` replace values that are otherwise read
+      out of `arguments`, i.e. **self-reported by the model**. A caller that observed them directly can
+      state them authoritatively, and the model can no longer influence how its own calls are grouped.
+    - `success` / `row_count` / `error_kind` replace values otherwise **derived here by parsing
+      `result_text`**. A caller that already classified the outcome passes it rather than handing over a
+      result body to be re-parsed — and, more importantly, one that has *no* body to hand over can still
+      record a failure. Without these, an outcome this function cannot see defaults to success, which is
+      the one direction an audit log must never fail in.
+    """
     args = arguments or {}
-    success, row_count, error_kind = True, None, None
+    derived_success, derived_row_count, derived_error_kind = True, None, None
     if raised:
-        success, error_kind = False, "exception"
+        derived_success, derived_error_kind = False, "exception"
     else:
         try:
             parsed = json.loads(result_text) if result_text else None
             if isinstance(parsed, dict):
                 if isinstance(parsed.get("error"), dict):
-                    success = False
-                    error_kind = parsed["error"].get("kind") or "error"
-                row_count = parsed.get("row_count")
+                    derived_success = False
+                    derived_error_kind = parsed["error"].get("kind") or "error"
+                derived_row_count = parsed.get("row_count")
         except (ValueError, TypeError):
             pass
+    if success is not None:
+        derived_success = success
+    if row_count is not None:
+        derived_row_count = row_count
+    if error_kind is not None:
+        derived_error_kind = error_kind
     _record_tool_call(
         {
             "ts": _now_iso(),
             "tool_name": name,
-            "source": "mcp_server",
+            "source": source or current_call_source(),
             "actor": actor,
             "datasource": args.get("datasource"),
             "sql": args.get("sql"),
-            "row_count": row_count if isinstance(row_count, int) else None,
+            "row_count": derived_row_count if isinstance(derived_row_count, int) else None,
             "execution_ms": execution_ms,
-            "success": success,
-            "error_kind": error_kind,
-            "user_question": args.get("user_question"),
+            "success": derived_success,
+            "error_kind": derived_error_kind,
+            "user_question": user_question if user_question is not None else args.get("user_question"),
             "agent_query": args.get(
                 "raw_query"
             ),  # the existing arg is the agent's framing of the query
-            "thread_id": args.get("thread_id"),
-            "correlation_id": args.get("correlation_id"),  # the turn (one user question)
+            "thread_id": thread_id if thread_id is not None else args.get("thread_id"),
+            "correlation_id": (  # the turn (one user question)
+                correlation_id if correlation_id is not None else args.get("correlation_id")
+            ),
         }
     )
 

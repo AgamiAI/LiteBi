@@ -257,3 +257,97 @@ def test_the_fallback_validates_the_bearer_exactly_once():
     p = type("P", (), {"subject": "j@example.com", "session_id": "s-2"})()
     assert mcp_http._principal_from_scope({"state": {"principal": p}}, auth) is p
     assert calls["n"] == 0
+
+
+# --- the override seam -------------------------------------------------------
+#
+# `record_tool_call` is also called by embedders that dispatch tool handlers themselves rather than
+# through this package's transport. Such a caller observes the grouping ids and the outcome directly,
+# so it states them instead of having them read out of the model's arguments or parsed back out of a
+# result body. Every override defaults to None, meaning "derive it the way you always have" — the
+# tests below pin both halves: that the overrides win when given, and that nothing moves when they
+# are absent.
+
+
+def test_the_default_path_is_unchanged_when_no_override_is_passed(db):
+    """The regression that protects every existing caller: same call, same row as before the seam."""
+    tools.record_tool_call(
+        name="execute_sql",
+        arguments={"datasource": "SALES_DATA", "sql": "SELECT 1", "user_question": "how many?",
+                   "raw_query": "count", "thread_id": "t1", "correlation_id": "c1"},
+        result_text='{"row_count": 5}', execution_ms=84, actor="jordan@example.com",
+    )
+    (r,) = _rows(db)
+    assert r["source"] == tools.DEFAULT_CALL_SOURCE
+    # every self-report still read straight out of the model's arguments
+    assert r["user_question"] == "how many?" and r["thread_id"] == "t1"
+    assert r["correlation_id"] == "c1" and r["agent_query"] == "count"
+    # ...and the outcome still derived from the result body
+    assert r["success"] == 1 and r["row_count"] == 5 and r["error_kind"] is None
+
+
+def test_stated_ids_beat_the_model_s_self_report(db):
+    """A caller that observed the question and minted the ids outranks whatever the model wrote into
+    its own tool arguments — otherwise the model could choose how its calls are grouped."""
+    tools.record_tool_call(
+        name="execute_sql",
+        arguments={"sql": "SELECT 1", "user_question": "a drifted sub-question",
+                   "raw_query": "count", "thread_id": "model-made-this-up", "correlation_id": "and-this"},
+        result_text="{}", execution_ms=1, actor="a",
+        source="embedded", thread_id="th-1", correlation_id="co-1", user_question="how many widgets?",
+    )
+    (r,) = _rows(db)
+    assert r["source"] == "embedded"
+    assert r["thread_id"] == "th-1" and r["correlation_id"] == "co-1"
+    assert r["user_question"] == "how many widgets?"
+    # agent_query is deliberately NOT overridable — it is the model's framing, and that is the point
+    assert r["agent_query"] == "count"
+
+
+def test_a_stated_outcome_beats_the_derived_one(db):
+    """The reason the outcome is overridable at all: a caller may have classified the result already
+    and have no body left to hand over. Without this the row would default to success — the one
+    direction an audit log must never fail in."""
+    tools.record_tool_call(
+        name="a_tool", arguments={}, result_text=None, execution_ms=1, actor="a",
+        success=False, error_kind="bad_request", row_count=3,
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 0 and r["error_kind"] == "bad_request" and r["row_count"] == 3
+
+
+def test_a_stated_success_survives_an_unparseable_body(db):
+    """Overrides are applied after derivation, so they are not quietly re-derived away."""
+    tools.record_tool_call(
+        name="a_tool", arguments={}, result_text='{"error": {"kind": "syntax"}}',
+        execution_ms=1, actor="a", success=True, error_kind=None,
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 1  # the caller's classification wins over the body's
+
+
+def test_the_call_source_contextvar_scopes_rows_and_resets(db):
+    """The source can also be scoped rather than passed, for the tool logging a caller does not reach
+    (a handler that records its own execution). It must not leak past the scope."""
+    token = tools.set_call_source("embedded")
+    try:
+        tools.record_tool_call(name="a_tool", arguments={}, result_text="{}", execution_ms=1, actor="a")
+        assert tools.current_call_source() == "embedded"
+    finally:
+        tools.reset_call_source(token)
+    assert tools.current_call_source() == tools.DEFAULT_CALL_SOURCE
+    tools.record_tool_call(name="b_tool", arguments={}, result_text="{}", execution_ms=1, actor="a")
+    scoped, after = _rows(db)
+    assert scoped["source"] == "embedded"
+    assert after["source"] == tools.DEFAULT_CALL_SOURCE
+
+
+def test_an_explicit_source_beats_the_contextvar(db):
+    token = tools.set_call_source("embedded")
+    try:
+        tools.record_tool_call(name="a_tool", arguments={}, result_text="{}", execution_ms=1,
+                               actor="a", source="explicit")
+    finally:
+        tools.reset_call_source(token)
+    (r,) = _rows(db)
+    assert r["source"] == "explicit"
