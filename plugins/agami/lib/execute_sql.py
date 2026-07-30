@@ -29,7 +29,8 @@ Drivers (install only what you need):
 
 Exit codes:
     0  — success, CSV on stdout
-    1  — SQL rejected by the read-only guard (kind="permission" JSON on stderr)
+    1  — refused by a guard. The read-only guard writes a single `{"refusal": {…}}` JSON
+         object on stderr; the semantic-model pass still writes its own `{"error": {…}}`.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
@@ -48,11 +49,12 @@ import sys
 import urllib.parse
 from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import agami_paths
+from guardrail import Refusal
 
 if TYPE_CHECKING:
     # ``Executor`` is the 5th port; imported only for type-checkers. At runtime ``execute_sql`` never
@@ -126,13 +128,17 @@ class ExecutorError(Exception):
 
 
 class GuardRefused(Exception):
-    """A guard refusal short-circuiting the envelope. ``envelope`` is the JSON error object the
-    caller must emit (the read-only guard's ``permission`` refusal), or ``None`` when the refusal
-    JSON was already written to stderr by ``_model_safety`` (carry only the exit ``code``)."""
+    """A guard refusal short-circuiting the envelope. ``refusal`` is the contract object the caller
+    must serialize (today the read-only guard's), or ``None`` when the refusal JSON was already
+    written to stderr by ``_model_safety`` (carry only the exit ``code``).
 
-    def __init__(self, envelope: dict | None, *, code: int) -> None:
+    Carrying the ``Refusal`` rather than a pre-shaped dict is what lets the two callers — the
+    subprocess ``main`` and the in-process MCP handler — each render the ONE contract object into
+    their own wire without either inventing a second refusal shape."""
+
+    def __init__(self, refusal: Refusal | None, *, code: int) -> None:
         super().__init__()
-        self.envelope = envelope
+        self.refusal = refusal
         self.code = code
 
 
@@ -1150,15 +1156,15 @@ def execute_guarded(
     semantic-model safety pass (fan/chasm pre-flight + scope + PII + ``default_filters`` rewrite) ->
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
     SQL both guards have passed. Raises ``GuardRefused`` on a refusal (the read-only refusal carries
-    its JSON envelope for the caller to emit; a model-safety refusal already wrote its JSON to stderr
-    and carries only the exit code) and ``ExecutorError`` on a connect/run failure — so the
+    its ``Refusal`` for the caller to serialize; a model-safety refusal already wrote its JSON to
+    stderr and carries only the exit code) and ``ExecutorError`` on a connect/run failure — so the
     subprocess ``main`` and the in-process MCP handler apply the same guard and surface errors
     identically. The row cap rides the request-scoped ``_max_rows_override`` ContextVar the caller sets."""
     import sql_guard
 
-    reason = sql_guard.check_read_only(sql)
-    if reason is not None:
-        raise GuardRefused({"error": {"kind": "permission", "remediation": reason}}, code=1)
+    refusal = sql_guard.check_read_only(sql)
+    if refusal is not None:
+        raise GuardRefused(refusal, code=1)
     if not no_safety:
         sql, rc = _model_safety(sql, profile, area)
         if rc is not None:
@@ -1216,11 +1222,14 @@ def main() -> int:
         result = execute_guarded(
             sql, profile, args.area, executor=BUILTIN_EXECUTOR, no_safety=args.no_safety
         )
-    except GuardRefused as refusal:
-        if refusal.envelope is not None:  # read-only refusal: emit its JSON (model-safety already did)
-            json.dump(refusal.envelope, sys.stderr)
+    except GuardRefused as refused:
+        # Exactly one JSON object, on one line, and nothing else — a caller (and
+        # `tools._stderr_refusal`) parses this whole stream, so a second line of diagnostics would
+        # make the refusal unreadable rather than merely noisy.
+        if refused.refusal is not None:  # read-only refusal (model-safety already wrote its own)
+            json.dump({"refusal": asdict(refused.refusal)}, sys.stderr)
             sys.stderr.write("\n")
-        return refusal.code
+        return refused.code
     except ExecutorError as exc:
         sys.stderr.write(f"{exc.msg}\n")
         return exc.code

@@ -13,18 +13,53 @@ expected to run under a read-only role. Postgres / Redshift are the primary conc
 are neutral enough to be safe across the other supported engines.
 
 `check_read_only(sql)` returns `None` when the SQL is a single safe read-only
-statement, else a short human-readable reason string. Callers decide how to wrap it
-(the MCP tools attach `kind="permission"`).
+statement, else a `guardrail.Refusal` carrying `rule=read_only`, the rejection text as
+`detail`, and the fix for that specific rejection as `remediation`. Callers relay the
+whole object rather than re-deriving a shape of their own.
 """
 
 from __future__ import annotations
 
 import re
 
+from guardrail import RULE_READ_ONLY, Refusal, refuse
+
 # Hard cap on SQL length. Prevents a compromised client from POSTing a multi-MB
 # SQL blob that takes the parser / planner / this gate down a slow path. Real
 # analytics SQL fits in ~10KB; 50KB is conservative.
 _MAX_SQL_CHARS = 50_000
+
+# One remediation per rejection, gathered here so a reviewer can audit every fix this gate hands
+# back on a single screen. They are deliberately NOT one shared string: shortening a 60,000-character
+# statement and dropping a `pg_read_file` call are different actions, and a generic "fix your SQL"
+# would make the contract's mandatory-remediation rule vacuous — satisfied in form, useless in fact.
+#
+# Every entry is static prose. That is the property that keeps a refusal from becoming a
+# schema-listing endpoint: a remediation built by interpolating what IS allowed would enumerate the
+# declared surface to a caller who has not been granted it. The only caller-specific text any
+# rejection carries lives in `detail`, and only ever echoes a token the caller itself sent.
+_REMEDIATION: dict[str, str] = {
+    "empty": "Send a SELECT or WITH…SELECT statement.",
+    "too_long": (
+        f"Shorten the statement — the cap is {_MAX_SQL_CHARS:,} characters, "
+        "and analytics SQL fits well under it."
+    ),
+    "bare_line_comment": "Put a space after `--`, or use a `/* … */` block comment.",
+    "mysql_exec_comment": (
+        "Remove the `/*! … */` executable comment; a plain `/* … */` comment is fine."
+    ),
+    "multi_statement": "Send exactly one statement.",
+    "not_a_select": "Rewrite as a read-only SELECT or WITH…SELECT.",
+    "denied_keyword": (
+        "Rewrite as a read-only SELECT — this connection executes no writes, DDL, "
+        "transaction control, session state or prepared statements."
+    ),
+    "row_lock": "Remove the row-lock clause; an analytic read never needs one.",
+    "dangerous_function": (
+        "Remove the call — server-file, OS, process-control, sleep and remote-SQL "
+        "functions are never executed here."
+    ),
+}
 
 # Opening delimiter of a Postgres / Snowflake / DuckDB dollar-quoted string —
 # `$$` or a tagged `$name$`. A positional parameter (`$1`) is NOT an opener (no
@@ -43,12 +78,15 @@ _DOLLAR_OPEN_RE = re.compile(r"\$\w*\$")
 class _GuardReject(Exception):
     """Raised from the scan when SQL uses a construct whose meaning is
     dialect-ambiguous and therefore cannot be neutralized safely with one lexer
-    (see the MySQL comment forms in `_neutralize`). Carries the caller-facing reason.
+    (see the MySQL comment forms in `_neutralize`). Carries both halves of the
+    caller-facing refusal, because the relay in `check_read_only` cannot tell which
+    of the two ambiguous forms fired and so cannot pick the right fix on its own.
     """
 
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
+    def __init__(self, detail: str, remediation: str) -> None:
+        self.detail = detail
+        self.remediation = remediation
+        super().__init__(detail)
 
 
 def _neutralize(sql: str) -> str:
@@ -99,7 +137,8 @@ def _neutralize(sql: str) -> str:
             if nxt and nxt not in " \t\r\n\f":
                 raise _GuardReject(
                     "an inline '--' comment must be followed by whitespace "
-                    "(bare '--x' is a comment in Postgres but an operator in MySQL)"
+                    "(bare '--x' is a comment in Postgres but an operator in MySQL)",
+                    _REMEDIATION["bare_line_comment"],
                 )
             j = i + 2
             while j < n and sql[j] not in "\r\n":
@@ -111,7 +150,10 @@ def _neutralize(sql: str) -> str:
             # comment — the server runs its body as live SQL. Blanking it as an
             # ordinary comment would smuggle whatever it contains past every check.
             if sql[i + 2 : i + 3] == "!":
-                raise _GuardReject("MySQL executable comments ('/*! ... */') are not allowed")
+                raise _GuardReject(
+                    "MySQL executable comments ('/*! ... */') are not allowed",
+                    _REMEDIATION["mysql_exec_comment"],
+                )
             end = sql.find("*/", i + 2)
             i = n if end == -1 else end + 2
             out.append(" ")
@@ -265,10 +307,14 @@ _DANGEROUS_FN_RE = re.compile(
 )
 
 
-def check_read_only(sql: str | None) -> str | None:
-    """Return None if `sql` is a single safe read-only statement, else a reason string.
+def check_read_only(sql: str | None) -> Refusal | None:
+    """Return None if `sql` is a single safe read-only statement, else a `Refusal`.
 
-    Rejection ladder (each step has its own message so the caller can correct):
+    Every rejection is built with `refuse()` rather than `Refusal(...)`, so the reason comes from
+    the contract's pinned table and no step here can classify itself.
+
+    Rejection ladder (each step has its own detail AND its own remediation so the caller can
+    correct — see `_REMEDIATION` for why one shared fix would not do):
       0. Empty SQL
       1. SQL longer than `_MAX_SQL_CHARS`
       1b. Dialect-ambiguous comment form (bare `--x`, MySQL `/*! ... */`) — raised
@@ -280,12 +326,16 @@ def check_read_only(sql: str | None) -> str | None:
       6. Calls a dangerous function (`pg_sleep`, `pg_read_file`, `dblink`, ...)
     """
     if not sql or not sql.strip():
-        return "empty statement"
+        return refuse(RULE_READ_ONLY, detail="empty statement", remediation=_REMEDIATION["empty"])
 
     if len(sql) > _MAX_SQL_CHARS:
-        return (
-            f"SQL is {len(sql)} characters; the guard caps at {_MAX_SQL_CHARS}. "
-            "Real analytics SQL fits well under this."
+        return refuse(
+            RULE_READ_ONLY,
+            detail=(
+                f"SQL is {len(sql)} characters; the guard caps at {_MAX_SQL_CHARS}. "
+                "Real analytics SQL fits well under this."
+            ),
+            remediation=_REMEDIATION["too_long"],
         )
 
     # Blank out comments and string / dollar literals, and unwrap double-quoted
@@ -295,37 +345,57 @@ def check_read_only(sql: str | None) -> str | None:
     try:
         stripped = _neutralize(sql).strip()
     except _GuardReject as reject:
-        return reject.reason
+        return refuse(RULE_READ_ONLY, detail=reject.detail, remediation=reject.remediation)
 
     # Allow exactly one trailing `;`. Any other `;` indicates a second statement —
     # the classic statement-stacking bypass (`COMMIT; DROP SCHEMA public CASCADE`).
     if stripped.endswith(";"):
         stripped = stripped[:-1].rstrip()
     if not stripped:
-        return "empty statement"
+        return refuse(RULE_READ_ONLY, detail="empty statement", remediation=_REMEDIATION["empty"])
     if ";" in stripped:
-        return "multiple statements are not allowed — send one SELECT"
+        return refuse(
+            RULE_READ_ONLY,
+            detail="multiple statements are not allowed — send one SELECT",
+            remediation=_REMEDIATION["multi_statement"],
+        )
 
     if not _READ_ONLY_OPEN_RE.match(stripped):
         head = stripped.lstrip("(").split(None, 1)
         head = head[0].upper() if head else "?"
-        return f"only SELECT / WITH...SELECT is allowed (statement starts with {head})"
+        return refuse(
+            RULE_READ_ONLY,
+            detail=f"only SELECT / WITH...SELECT is allowed (statement starts with {head})",
+            remediation=_REMEDIATION["not_a_select"],
+        )
 
     deny = _DENY_KEYWORD_RE.search(stripped)
     if deny:
-        return (
-            f"keyword '{deny.group(1).upper()}' is not allowed — send a single "
-            "SELECT / WITH...SELECT (no DML, DDL, transaction control, session-state, "
-            "or prepared statements)"
+        return refuse(
+            RULE_READ_ONLY,
+            detail=(
+                f"keyword '{deny.group(1).upper()}' is not allowed — send a single "
+                "SELECT / WITH...SELECT (no DML, DDL, transaction control, session-state, "
+                "or prepared statements)"
+            ),
+            remediation=_REMEDIATION["denied_keyword"],
         )
 
     if _ROW_LOCK_RE.search(stripped):
-        return "row-level lock clauses (FOR UPDATE / FOR SHARE / ...) are not allowed"
+        return refuse(
+            RULE_READ_ONLY,
+            detail="row-level lock clauses (FOR UPDATE / FOR SHARE / ...) are not allowed",
+            remediation=_REMEDIATION["row_lock"],
+        )
 
     fn = _DANGEROUS_FN_RE.search(stripped)
     if fn:
-        return (
-            f"function `{fn.group(1)}` is not allowed — server-file / OS / "
-            "process-control / sleep / remote-SQL functions are blocked"
+        return refuse(
+            RULE_READ_ONLY,
+            detail=(
+                f"function `{fn.group(1)}` is not allowed — server-file / OS / "
+                "process-control / sleep / remote-SQL functions are blocked"
+            ),
+            remediation=_REMEDIATION["dangerous_function"],
         )
     return None

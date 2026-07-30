@@ -26,6 +26,7 @@ if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
 import execute_sql  # noqa: E402
+import guardrail  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +60,7 @@ def test_readonly_guard_refuses_before_the_executor_is_reached():
     with pytest.raises(execute_sql.GuardRefused) as ei:
         execute_sql.execute_guarded("DELETE FROM t", "acme", None, executor=spy)
     assert ei.value.code == 1
-    assert ei.value.envelope["error"]["kind"] == "permission"
+    assert ei.value.refusal.rule == guardrail.RULE_READ_ONLY
     assert spy.calls == []  # executor never reached
 
 
@@ -73,13 +74,13 @@ def test_readonly_guard_still_fires_under_no_safety():
 
 
 def test_model_safety_refusal_short_circuits_before_the_executor(monkeypatch):
-    # A model-safety refusal already wrote its JSON to stderr, so the envelope is None and only the
-    # exit code is carried; the executor must not run.
+    # A model-safety refusal already wrote its JSON to stderr, so no Refusal is carried and only the
+    # exit code is; the executor must not run.
     monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, 1))
     spy = _SpyExecutor()
     with pytest.raises(execute_sql.GuardRefused) as ei:
         execute_sql.execute_guarded("SELECT 1", "acme", None, executor=spy)
-    assert ei.value.code == 1 and ei.value.envelope is None
+    assert ei.value.code == 1 and ei.value.refusal is None
     assert spy.calls == []
 
 
@@ -269,7 +270,8 @@ def test_injected_executor_is_unreachable_for_a_write(monkeypatch):
     tools.set_injected_executor(fake)
     out = json.loads(tools.tool_execute_sql({"sql": "DELETE FROM t"}))
 
-    assert out["error"]["kind"] == "permission"  # refused by the read-only guard
+    assert out["status"] == "refused"  # refused by the read-only guard
+    assert out["refusal"]["rule"] == guardrail.RULE_READ_ONLY
     assert fake.calls == []  # the injected executor was never reached — un-bypassable
 
 
@@ -448,7 +450,7 @@ def test_main_read_only_refusal_writes_json_and_returns_1(tmp_path, monkeypatch,
     rc = execute_sql.main()
 
     assert rc == 1
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "permission"
+    assert json.loads(capsys.readouterr().err.strip())["refusal"]["rule"] == guardrail.RULE_READ_ONLY
 
 
 def test_main_executor_error_writes_message_and_returns_code(tmp_path, monkeypatch, capsys):

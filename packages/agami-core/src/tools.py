@@ -32,8 +32,15 @@ import threading
 import time
 from collections.abc import Callable
 from contextvars import ContextVar, Token
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Type-checkers only. `sql_guard` (and with it `guardrail`) is imported lazily inside
+    # `check_read_only`, so the module keeps loading on a bare install; the annotation stays a lazy
+    # string under `from __future__ import annotations`.
+    from guardrail import Refusal
 
 # ---------------------------------------------------------------------------
 # Paths & config resolution (mirrors execute_sql.py / file-layout.md exactly)
@@ -185,8 +192,8 @@ def _db_type_for(profile: str, creds: dict[str, dict[str, str]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def check_read_only(sql: str) -> str | None:
-    """Return None if the SQL is a safe single read-only statement, else a reason string.
+def check_read_only(sql: str) -> Refusal | None:
+    """Return None if the SQL is a safe single read-only statement, else the gate's `Refusal`.
 
     Thin fail-fast wrapper over the shared `sql_guard` — the SAME gate the executor
     (`execute_sql.py`) enforces — so the stdio server, the HTTP/OAuth server, the
@@ -966,6 +973,40 @@ def _classify_exit(code: int) -> str:
     }.get(code, "other")
 
 
+def _stderr_refusal(returncode: int, stderr: str | None) -> dict | None:
+    """The refusal a forked executor wrote to stderr, reconstructed — or None when this exit is not
+    one.
+
+    Exit 1 is the guard's code but not exclusively the read-only guard's: the semantic-model
+    branches still exit 1 after writing today's `{"error": …}` line. Keying off the `"refusal"` key
+    rather than off the code alone is what lets both shapes share the exit without either being
+    reinterpreted as the other.
+
+    The payload is rebuilt through `Refusal` rather than passed along as a raw dict, so the
+    contract's invariants (a known reason, a non-empty detail and remediation) are re-checked on
+    THIS side of the process boundary. A child that somehow emitted a malformed refusal therefore
+    falls back to the generic error path instead of being relayed as a valid one."""
+    if returncode != 1:
+        return None
+    from guardrail import Refusal
+
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("refusal"), dict):
+            continue
+        try:
+            return asdict(Refusal(**payload["refusal"]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _executor_truncated(stderr: str | None) -> bool:
     """True if execute_sql flagged a bounded-fetch truncation (ACE-038/044). The executor emits a
     non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
@@ -1011,11 +1052,11 @@ def _finalize_execution(
     """Shape a successful result (units + exact-render markdown + trust receipt), log the execution
     through the single sink, and return the tool JSON. Shared by both execution paths — the subprocess
     fork and the in-process executor — so a **successful** query returns the identical result envelope
-    whichever ran it. (A guard *refusal* is not yet identical across paths: the subprocess surfaces
-    execute_sql's stderr JSON as the remediation, while the in-process path returns a clean generic
-    refusal with the structured detail in the server log. Full structured-refusal parity needs
-    `_model_safety` to *return* its envelope — it currently writes it to stderr, pinned by the
-    fail-closed guard tests — so it's tracked as a follow-up, not folded into this seam.)"""
+    whichever ran it. A *read-only* refusal is identical across the two paths as well: the child emits
+    the contract `Refusal` on stderr and `_stderr_refusal` rebuilds it. A *model-safety* refusal is
+    still not — the subprocess surfaces its stderr JSON as the remediation while the in-process path
+    returns a clean generic refusal — because parity there needs `_model_safety` to *return* its
+    refusal rather than write it to stderr, which the fail-closed guard tests currently pin."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
@@ -1081,12 +1122,12 @@ def _run_in_process(
         result = execute_sql.execute_guarded(
             sql, profile, area, executor=executor, org_id=_credential_org_id()
         )
-    except execute_sql.GuardRefused as refusal:
-        # A read-only refusal (envelope present) is already caught by tool_execute_sql's upstream
-        # check_read_only fast-fail, so in practice only the model-safety branch (envelope None) is
+    except execute_sql.GuardRefused as refused:
+        # A read-only refusal (a `Refusal` present) is already caught by tool_execute_sql's upstream
+        # check_read_only fast-fail, so in practice only the model-safety branch (refusal None) is
         # reached here; both are handled for defence-in-depth.
-        if refusal.envelope is not None:
-            return {"error": refusal.envelope["error"]}
+        if refused.refusal is not None:
+            return {"status": "refused", "refusal": asdict(refused.refusal)}
         # A model-safety refusal wrote its structured detail to the server log (stderr); surface a
         # clean refusal here. (The subprocess path instead surfaces that stderr JSON as remediation —
         # the not-yet-identical refusal envelope tracked as a follow-up.)
@@ -1125,8 +1166,8 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     Two execution paths behind the same guard: the default forks the execute_sql subprocess
     (isolation, byte-identical local/single-user); an injected executor (AH-012) runs in-process with
     native rows. Both funnel through `_finalize_execution`, so a **successful** query's result
-    envelope is identical either way (a guard refusal's envelope is not yet identical across paths —
-    see `_finalize_execution` and the tracked structured-refusal-parity follow-up).
+    envelope is identical either way, and so is a read-only refusal; a model-safety refusal is not
+    yet — see `_finalize_execution`.
     """
     sql = args.get("sql")
     if not isinstance(sql, str) or not sql.strip():
@@ -1134,13 +1175,10 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             {"error": {"kind": "other", "remediation": "Pass a non-empty `sql` string."}}
         )
 
-    reason = check_read_only(sql)
-    if reason is not None:
+    refusal = check_read_only(sql)
+    if refusal is not None:
         return json.dumps(
-            {
-                "error": {"kind": "permission", "remediation": reason},
-                "sql": sql,
-            },
+            {"status": "refused", "refusal": asdict(refusal), "sql": sql},
             indent=2,
         )
 
@@ -1197,6 +1235,20 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     execution_ms = int((time.monotonic() - started) * 1000)
 
     if proc.returncode != 0:
+        # A structured refusal crosses the process boundary as a refusal, not as raw stderr text
+        # stuffed into a remediation field — the fork path and the in-process path must agree on
+        # what the caller sees, and only the child knows which rule fired.
+        refusal = _stderr_refusal(proc.returncode, proc.stderr)
+        if refusal is not None:
+            return json.dumps(
+                {
+                    "status": "refused",
+                    "refusal": refusal,
+                    "sql": sql,
+                    "execution_ms": execution_ms,
+                },
+                indent=2,
+            )
         return json.dumps(
             {
                 "error": {
@@ -1519,8 +1571,9 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Execute a single read-only SELECT / WITH...SELECT against the local datasource and "
             "return {columns, rows, row_count, truncated, sql, execution_ms}. SELECT-only is "
-            "enforced (DML/DDL/multi-statement rejected with kind='permission'). Runs entirely "
-            "locally via execute_sql.py — no data leaves the machine."
+            "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
+            "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
+            "Runs entirely locally via execute_sql.py — no data leaves the machine."
         ),
         "inputSchema": {
             "type": "object",

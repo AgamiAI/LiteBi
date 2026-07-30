@@ -17,7 +17,12 @@ Bare `pg_catalog` / `information_schema` / environment-introspection blocking is
 deferred follow-up (see `test_known_deferred_gaps_currently_pass` for the pinned
 current behavior).
 
-`sql_guard.check_read_only` returns None (safe) or a short reason string (rejected).
+`sql_guard.check_read_only` returns None (safe) or a `guardrail.Refusal` (rejected).
+
+Every reject corpus below is a module-level constant rather than an inline literal in its
+`@pytest.mark.parametrize`. That is what lets `test_ace035_read_only_refusal.py` assert the refusal
+contract over the WHOLE corpus by importing it, instead of copying ~150 strings into a second file
+where the two would drift apart the first time a vector is added here.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import sys
 from typing import Any
 
 import pytest
+from guardrail import RULE_READ_ONLY
 from sql_guard import _MAX_SQL_CHARS, _neutralize, check_read_only
 
 # ---------------------------------------------------------------------------
@@ -110,43 +116,46 @@ def test_accepts_case_when_end(sql: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "INSERT INTO x VALUES (1)",
-        "UPDATE x SET a = 1",
-        "DELETE FROM x",
-        "DROP TABLE x",
-        "TRUNCATE TABLE x",
-        "ALTER TABLE x ADD COLUMN y INT",
-        "CREATE TABLE x (a INT)",
-        "COPY x FROM '/etc/passwd'",
-        "GRANT SELECT ON x TO public",
-        "REVOKE ALL ON x FROM public",
-        "VACUUM x",
-        "MERGE INTO x USING y ON x.a = y.a",
-        "CALL my_proc()",
-    ],
-)
+REJECT_NON_SELECT = [
+    "INSERT INTO x VALUES (1)",
+    "UPDATE x SET a = 1",
+    "DELETE FROM x",
+    "DROP TABLE x",
+    "TRUNCATE TABLE x",
+    "ALTER TABLE x ADD COLUMN y INT",
+    "CREATE TABLE x (a INT)",
+    "COPY x FROM '/etc/passwd'",
+    "GRANT SELECT ON x TO public",
+    "REVOKE ALL ON x FROM public",
+    "VACUUM x",
+    "MERGE INTO x USING y ON x.a = y.a",
+    "CALL my_proc()",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_NON_SELECT)
 def test_rejects_non_select(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Expected rejection: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "SELECT 1; SELECT 2",
-        "SELECT 1; DROP TABLE x",
-        "SELECT 1;DELETE FROM x",  # no whitespace around semicolon
-        "SELECT 1; -- second statement after comment\nSELECT 2",
-        "WITH a AS (SELECT 1) SELECT * FROM a; DROP TABLE a",
-    ],
-)
+REJECT_MULTI_STATEMENT = [
+    "SELECT 1; SELECT 2",
+    "SELECT 1; DROP TABLE x",
+    "SELECT 1;DELETE FROM x",  # no whitespace around semicolon
+    "SELECT 1; -- second statement after comment\nSELECT 2",
+    "WITH a AS (SELECT 1) SELECT * FROM a; DROP TABLE a",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_MULTI_STATEMENT)
 def test_rejects_multi_statement(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Expected rejection: {sql!r}"
 
 
-@pytest.mark.parametrize("sql", ["", "   ", None, "-- just a comment", "/* only a comment */"])
+REJECT_EMPTY = ["", "   ", None, "-- just a comment", "/* only a comment */"]
+
+
+@pytest.mark.parametrize("sql", REJECT_EMPTY)
 def test_rejects_empty(sql: Any) -> None:
     assert check_read_only(sql) is not None
 
@@ -156,128 +165,127 @@ def test_rejects_empty(sql: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # Comment-inside-string bypass: prior strip-order (comments first) let `--`
-        # inside a literal eat through end-of-line and hide an injected `; DROP ...`.
-        "SELECT '--'; DROP TABLE x",
-        "SELECT 'foo' || '--'; UPDATE t SET a=1",
-        "SELECT '-- not a comment' AS s; DELETE FROM t",
-        "SELECT '--' ; DROP TABLE x",
-    ],
-)
+REJECT_COMMENT_IN_STRING = [
+    # Comment-inside-string bypass: prior strip-order (comments first) let `--`
+    # inside a literal eat through end-of-line and hide an injected `; DROP ...`.
+    "SELECT '--'; DROP TABLE x",
+    "SELECT 'foo' || '--'; UPDATE t SET a=1",
+    "SELECT '-- not a comment' AS s; DELETE FROM t",
+    "SELECT '--' ; DROP TABLE x",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_COMMENT_IN_STRING)
 def test_rejects_comment_in_string_bypass(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Comment-in-string bypass not caught: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # Data-modifying CTEs — open with WITH so the opener alone lets them through;
-        # the deny-list scan catches the DML keyword.
-        "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
-        "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
-        "WITH x AS (UPDATE t SET a=1 RETURNING *) SELECT * FROM x",
-        "WITH x AS (SELECT 1), y AS (DELETE FROM t RETURNING *) SELECT * FROM x, y",
-    ],
-)
+REJECT_DATA_MODIFYING_CTES = [
+    # Data-modifying CTEs — open with WITH so the opener alone lets them through;
+    # the deny-list scan catches the DML keyword.
+    "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+    "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+    "WITH x AS (UPDATE t SET a=1 RETURNING *) SELECT * FROM x",
+    "WITH x AS (SELECT 1), y AS (DELETE FROM t RETURNING *) SELECT * FROM x, y",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_DATA_MODIFYING_CTES)
 def test_rejects_data_modifying_ctes(sql: str) -> None:
     assert check_read_only(sql) is not None, f"DML CTE not caught: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "COMMIT",
-        "COMMIT; SELECT 1",
-        "ROLLBACK",
-        "BEGIN",
-        "BEGIN TRANSACTION READ ONLY",
-        "SAVEPOINT sp1",
-        "RELEASE SAVEPOINT sp1",
-        "START TRANSACTION",
-        "END",
-    ],
-)
+REJECT_TRANSACTION_CONTROL = [
+    "COMMIT",
+    "COMMIT; SELECT 1",
+    "ROLLBACK",
+    "BEGIN",
+    "BEGIN TRANSACTION READ ONLY",
+    "SAVEPOINT sp1",
+    "RELEASE SAVEPOINT sp1",
+    "START TRANSACTION",
+    "END",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_TRANSACTION_CONTROL)
 def test_rejects_transaction_control(sql: str) -> None:
     assert check_read_only(sql) is not None, f"TCL not blocked: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "SET statement_timeout = 0",
-        "SET search_path = pg_catalog, public",
-        "RESET ALL",
-        "RESET statement_timeout",
-        "DISCARD ALL",
-        "DISCARD TEMP",
-    ],
-)
+REJECT_SESSION_STATE = [
+    "SET statement_timeout = 0",
+    "SET search_path = pg_catalog, public",
+    "RESET ALL",
+    "RESET statement_timeout",
+    "DISCARD ALL",
+    "DISCARD TEMP",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_SESSION_STATE)
 def test_rejects_session_state(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Session-state mutation not blocked: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "LISTEN channel1",
-        "NOTIFY channel1, 'payload'",
-        "UNLISTEN channel1",
-        "LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE",
-        "PREPARE plan1 AS SELECT 1",
-        "DEALLOCATE plan1",
-        "DEALLOCATE ALL",
-        "WITH x AS (LISTEN ch) SELECT 1",  # deny-list catches it mid-statement
-    ],
-)
+REJECT_PUBSUB_LOCK_PREPARED = [
+    "LISTEN channel1",
+    "NOTIFY channel1, 'payload'",
+    "UNLISTEN channel1",
+    "LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE",
+    "PREPARE plan1 AS SELECT 1",
+    "DEALLOCATE plan1",
+    "DEALLOCATE ALL",
+    "WITH x AS (LISTEN ch) SELECT 1",  # deny-list catches it mid-statement
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_PUBSUB_LOCK_PREPARED)
 def test_rejects_pubsub_lock_prepared(sql: str) -> None:
     assert check_read_only(sql) is not None, f"pub/sub | lock | prepared not blocked: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # `FOR UPDATE` / `FOR NO KEY UPDATE` are caught by the `UPDATE` keyword deny
-        # (which runs before the row-lock rule) — still rejected, just with the
-        # keyword message. `FOR SHARE` / `FOR KEY SHARE` fall through to the row-lock rule.
-        "SELECT * FROM accounts FOR UPDATE",
-        "SELECT id FROM accounts WHERE id = 1 FOR SHARE",
-        "SELECT * FROM accounts FOR NO KEY UPDATE",
-        "SELECT id FROM accounts FOR KEY SHARE OF accounts",
-    ],
-)
+REJECT_ROW_LEVEL_LOCKS = [
+    # `FOR UPDATE` / `FOR NO KEY UPDATE` are caught by the `UPDATE` keyword deny
+    # (which runs before the row-lock rule) — still rejected, just with the
+    # keyword message. `FOR SHARE` / `FOR KEY SHARE` fall through to the row-lock rule.
+    "SELECT * FROM accounts FOR UPDATE",
+    "SELECT id FROM accounts WHERE id = 1 FOR SHARE",
+    "SELECT * FROM accounts FOR NO KEY UPDATE",
+    "SELECT id FROM accounts FOR KEY SHARE OF accounts",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_ROW_LEVEL_LOCKS)
 def test_rejects_row_level_locks(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Row-level lock not blocked: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql", ["SELECT id FROM accounts FOR SHARE", "SELECT id FROM t FOR KEY SHARE"]
-)
+REJECT_NAMED_ROW_LOCK = ["SELECT id FROM accounts FOR SHARE", "SELECT id FROM t FOR KEY SHARE"]
+
+
+@pytest.mark.parametrize("sql", REJECT_NAMED_ROW_LOCK)
 def test_row_lock_rule_names_the_lock(sql: str) -> None:
     # These use SHARE (not a deny keyword) so the row-lock rule is what fires.
-    reason = check_read_only(sql)
-    assert reason is not None and "lock" in reason.lower(), reason
+    refusal = check_read_only(sql)
+    assert refusal is not None and "lock" in refusal.detail.lower(), refusal
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "SELECT * INTO new_table FROM users",
-        "SELECT id, email INTO archive_users FROM users WHERE deleted_at IS NOT NULL",
-        "SELECT 1 INTO scratch FROM dual",
-    ],
-)
+REJECT_SELECT_INTO = [
+    "SELECT * INTO new_table FROM users",
+    "SELECT id, email INTO archive_users FROM users WHERE deleted_at IS NOT NULL",
+    "SELECT 1 INTO scratch FROM dual",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_SELECT_INTO)
 def test_rejects_select_into_write_path(sql: str) -> None:
-    reason = check_read_only(sql)
-    assert reason is not None, f"SELECT INTO not blocked: {sql!r}"
-    assert "INTO" in reason
+    refusal = check_read_only(sql)
+    assert refusal is not None, f"SELECT INTO not blocked: {sql!r}"
+    assert "INTO" in refusal.detail
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
+REJECT_DANGEROUS_FUNCTIONS = [
         # Time-wasters / file I/O / OS exec / remote SQL / process control.
         "SELECT pg_sleep(10)",
         "SELECT pg_sleep_for('10s')",
@@ -319,18 +327,26 @@ def test_rejects_select_into_write_path(sql: str) -> None:
         "SELECT pg_rotate_logfile()",
         "SELECT pg_logfile_rotate()",
         "SELECT copy_program('cat /etc/passwd')",
-    ],
-)
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_DANGEROUS_FUNCTIONS)
 def test_rejects_dangerous_functions(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Dangerous function not blocked: {sql!r}"
 
 
+def over_length_payload() -> str:
+    """SQL past the length cap. A function rather than a constant so the ~50KB string is built only
+    by the tests that need it (here and the refusal-contract corpus), not at every import."""
+    return "SELECT 1, " + ("a, " * 30_000) + "1"
+
+
 def test_rejects_over_length_cap() -> None:
-    payload = "SELECT 1, " + ("a, " * 30_000) + "1"
+    payload = over_length_payload()
     assert len(payload) > _MAX_SQL_CHARS
-    reason = check_read_only(payload)
-    assert reason is not None
-    assert "50000" in reason or "caps" in reason
+    refusal = check_read_only(payload)
+    assert refusal is not None
+    assert "50000" in refusal.detail or "caps" in refusal.detail
 
 
 def test_length_cap_exact_boundary() -> None:
@@ -349,9 +365,7 @@ def test_length_cap_exact_boundary() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
+REJECT_QUOTED_DANGEROUS_FN = [
         # PG-quoted identifier for a dangerous function name. The gate must strip
         # the `"` chars (not the contents) so `"pg_sleep"(10)` reduces to `pg_sleep(10)`.
         'SELECT "pg_sleep"(10)',
@@ -367,15 +381,15 @@ def test_length_cap_exact_boundary() -> None:
         "SELECT \"dblink\"('host=evil', 'select 1')",
         'SELECT "pg_advisory_lock"(1)',
         "SELECT \"query_to_xml\"('SELECT 1', false, false, '')",
-    ],
-)
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_QUOTED_DANGEROUS_FN)
 def test_red_team_quoted_dangerous_fn_bypass(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Quoted-fn bypass NOT blocked: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
+REJECT_WELDED_QUOTED_DANGEROUS_FN = [
         # WELDED quoted identifier — no whitespace between the preceding keyword and the
         # opening `"`. A delimited identifier is self-delimiting in SQL (the quote IS the
         # token boundary), so these are valid statements the engine happily runs; verified
@@ -405,8 +419,10 @@ def test_red_team_quoted_dangerous_fn_bypass(sql: str) -> None:
         # independently in the DML list; FOR SHARE has no such backstop.
         'SELECT * FROM t AS"a"FOR SHARE',
         'SELECT * FROM t AS"a"FOR KEY SHARE',
-    ],
-)
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_WELDED_QUOTED_DANGEROUS_FN)
 def test_red_team_welded_quoted_dangerous_fn_bypass(sql: str) -> None:
     """A quoted identifier welded to the preceding token must not escape the gate.
 
@@ -463,17 +479,17 @@ def test_neutralize_preserves_token_structure(sql: str, expected: str) -> None:
     assert _neutralize(sql) == expected
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # Block comments between keywords must not defeat `\b` word boundaries —
-        # comments are stripped to SPACE, not empty.
-        "SELECT 1 FROM users WHERE id IN (SELECT/**/pg_sleep(10))",
-        "SELECT 1 FROM users WHERE x = (SELECT/**/pg_read_file('/etc/passwd'))",
-        'SELECT 1 FROM users WHERE id IN (SELECT "pg_sleep"(10))',
-        "SELECT 1 INTO/**/new_table FROM users",
-    ],
-)
+REJECT_COMMENT_BREAKS_GATE = [
+    # Block comments between keywords must not defeat `\b` word boundaries —
+    # comments are stripped to SPACE, not empty.
+    "SELECT 1 FROM users WHERE id IN (SELECT/**/pg_sleep(10))",
+    "SELECT 1 FROM users WHERE x = (SELECT/**/pg_read_file('/etc/passwd'))",
+    'SELECT 1 FROM users WHERE id IN (SELECT "pg_sleep"(10))',
+    "SELECT 1 INTO/**/new_table FROM users",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_COMMENT_BREAKS_GATE)
 def test_red_team_comment_breaks_gate(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Comment-bypass NOT blocked: {sql!r}"
 
@@ -493,21 +509,19 @@ def test_red_team_unicode_whitespace_accepts_valid(sql: str) -> None:
     assert check_read_only(sql) is None, f"Unicode-whitespace SELECT should pass: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # Deny-list keywords separated by Unicode whitespace must STILL reject.
-        "SELECT\t1\tINTO\tnew_table FROM users",
-        "SELECT" + chr(0x00A0) + "1" + chr(0x00A0) + "INTO" + chr(0x00A0) + "new_table FROM users",
-    ],
-)
+REJECT_UNICODE_WHITESPACE_DENY = [
+    # Deny-list keywords separated by Unicode whitespace must STILL reject.
+    "SELECT\t1\tINTO\tnew_table FROM users",
+    "SELECT" + chr(0x00A0) + "1" + chr(0x00A0) + "INTO" + chr(0x00A0) + "new_table FROM users",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_UNICODE_WHITESPACE_DENY)
 def test_red_team_unicode_whitespace_does_not_bypass_deny(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Unicode-whitespace INTO bypass: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
+REJECT_DOLLAR_QUOTED_STACKING = [
         # Dollar-quote statement stacking. A `'` inside a `$$...$$` / `$tag$...$tag$`
         # body used to desync the single-quote stripper and smuggle a real second
         # statement past the multi-statement check. The lexer-faithful scan
@@ -530,26 +544,28 @@ def test_red_team_unicode_whitespace_does_not_bypass_deny(sql: str) -> None:
         "SELECT 1 --$$\n;DROP TABLE x--$$",
         # A DO-block is procedural, not a SELECT — rejected on the opening-keyword check.
         "DO $$ BEGIN DELETE FROM users; END $$",
-    ],
-)
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_DOLLAR_QUOTED_STACKING)
 def test_red_team_dollar_quoted_stacking_blocked(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Dollar-quote stacking NOT blocked: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # MySQL/MariaDB `--` is a comment ONLY when followed by whitespace; `--0` is
-        # `- -0`, so blanking it PG-style would hide the stacked `;DROP`. Refuse the
-        # dialect-ambiguous form.
-        "SELECT 1--0;DROP TABLE users",
-        "SELECT 1--x\nUNION SELECT 2",
-        # MySQL executable comments run their body as live SQL server-side.
-        "SELECT 1/*!;DROP TABLE t*/",
-        "SELECT 1/*!50000 ;DROP TABLE t*/",
-        "SELECT * FROM t /*!UNION SELECT * FROM secrets*/",
-    ],
-)
+REJECT_MYSQL_COMMENT_LEXING = [
+    # MySQL/MariaDB `--` is a comment ONLY when followed by whitespace; `--0` is
+    # `- -0`, so blanking it PG-style would hide the stacked `;DROP`. Refuse the
+    # dialect-ambiguous form.
+    "SELECT 1--0;DROP TABLE users",
+    "SELECT 1--x\nUNION SELECT 2",
+    # MySQL executable comments run their body as live SQL server-side.
+    "SELECT 1/*!;DROP TABLE t*/",
+    "SELECT 1/*!50000 ;DROP TABLE t*/",
+    "SELECT * FROM t /*!UNION SELECT * FROM secrets*/",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_MYSQL_COMMENT_LEXING)
 def test_red_team_mysql_comment_lexing_blocked(sql: str) -> None:
     assert check_read_only(sql) is not None, f"MySQL comment bypass NOT blocked: {sql!r}"
 
@@ -568,17 +584,44 @@ def test_unambiguous_comments_still_pass(sql: str) -> None:
     assert check_read_only(sql) is None, f"Legit comment wrongly rejected: {sql!r}"
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "SELECT 1; SET statement_timeout = 0; SELECT 2",
-        "SELECT pg_sleep(10) FROM dual",
-        "WITH x AS (LISTEN ch) SELECT 1",
-        "SELECT 1 FROM (SELECT NOTIFY ch1, 'p' AS y) x",
-    ],
-)
+REJECT_STACKED_KEYWORDS = [
+    "SELECT 1; SET statement_timeout = 0; SELECT 2",
+    "SELECT pg_sleep(10) FROM dual",
+    "WITH x AS (LISTEN ch) SELECT 1",
+    "SELECT 1 FROM (SELECT NOTIFY ch1, 'p' AS y) x",
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_STACKED_KEYWORDS)
 def test_red_team_stacked_keywords(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Stacked attack not blocked: {sql!r}"
+
+
+# Every rejected statement in this file, in one list. `test_ace035_read_only_refusal.py` imports it
+# to assert the refusal contract holds for the whole corpus rather than for a sampled few — so a new
+# vector added to any list above is automatically held to the contract too. The over-length payload
+# is appended there (it is generated, not a literal).
+REJECT_CORPUS: list[Any] = [
+    *REJECT_NON_SELECT,
+    *REJECT_MULTI_STATEMENT,
+    *REJECT_EMPTY,
+    *REJECT_COMMENT_IN_STRING,
+    *REJECT_DATA_MODIFYING_CTES,
+    *REJECT_TRANSACTION_CONTROL,
+    *REJECT_SESSION_STATE,
+    *REJECT_PUBSUB_LOCK_PREPARED,
+    *REJECT_ROW_LEVEL_LOCKS,
+    *REJECT_NAMED_ROW_LOCK,
+    *REJECT_SELECT_INTO,
+    *REJECT_DANGEROUS_FUNCTIONS,
+    *REJECT_QUOTED_DANGEROUS_FN,
+    *REJECT_WELDED_QUOTED_DANGEROUS_FN,
+    *REJECT_COMMENT_BREAKS_GATE,
+    *REJECT_UNICODE_WHITESPACE_DENY,
+    *REJECT_DOLLAR_QUOTED_STACKING,
+    *REJECT_MYSQL_COMMENT_LEXING,
+    *REJECT_STACKED_KEYWORDS,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -715,31 +758,30 @@ def test_executor_blocks_dangerous_sql_even_with_no_safety(tmp_path, extra) -> N
     regardless of --no-safety. Proves the hard gate is at the shared chokepoint."""
     proc = _run_executor("DROP TABLE secrets", tmp_path, *extra)
     assert proc.returncode != 0, proc.stdout
-    # The guard emits a JSON envelope with kind=permission to stderr.
-    envelope = None
+    # The guard emits the contract Refusal as one JSON object on stderr.
+    payload = None
     for line in proc.stderr.splitlines():
         line = line.strip()
         if line.startswith("{"):
             try:
-                envelope = json.loads(line)
+                payload = json.loads(line)
             except ValueError:
                 continue
-    assert envelope is not None, f"no JSON error envelope on stderr; got: {proc.stderr!r}"
-    assert envelope["error"]["kind"] == "permission", envelope
+    assert payload is not None, f"no JSON refusal on stderr; got: {proc.stderr!r}"
+    assert payload["refusal"]["rule"] == RULE_READ_ONLY, payload
 
 
 def test_executor_dangerous_function_blocked(tmp_path) -> None:
     proc = _run_executor("SELECT pg_read_file('/etc/passwd')", tmp_path)
     assert proc.returncode != 0
-    assert "permission" in proc.stderr
+    assert json.loads(proc.stderr.strip())["refusal"]["rule"] == RULE_READ_ONLY
 
 
 def test_executor_lets_valid_select_past_the_gate(tmp_path) -> None:
     """A valid SELECT is NOT rejected by the read-only gate — it proceeds to the
     credential step and fails there instead (proving the gate didn't block it)."""
     proc = _run_executor("SELECT 1", tmp_path)
-    # It should fail (no such profile / credentials), but NOT with a read-only
-    # permission rejection from the guard.
-    assert '"kind": "permission"' not in proc.stderr, (
+    # It should fail (no such profile / credentials), but NOT with a refusal from the guard.
+    assert '"refusal"' not in proc.stderr, (
         f"valid SELECT was wrongly blocked by the read-only gate: {proc.stderr!r}"
     )
