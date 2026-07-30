@@ -12,6 +12,21 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-07-30
+
+### Added
+
+- **Per-request tool-visibility seam (`Adapters.tool_visibility`).** A consumer can now narrow the
+  advertised MCP tool surface per caller via an optional `tool_visibility(tool_name) -> bool` on the
+  adapters, applied in `build_server`. It is applied at *both* the list and the call seam — filtering
+  only the list would leave an unlisted tool callable by name, a surface that looks narrowed while
+  remaining open. A hidden tool answers as *absent* (the same `Unknown tool` a typo gets), not as
+  refused, so the list can't be used as an oracle for what exists but is withheld. A predicate that
+  raises hides the tool rather than granting it, and is logged rather than propagated, so one broken
+  classification can't become an accidental grant or a dead transport for every other caller.
+  Subtractive only — a surviving tool's description and input schema pass through untouched. `None`
+  (the OSS default) is byte-identical to prior behaviour.
+
 ## [0.5.1] — 2026-07-30
 
 ### Security
