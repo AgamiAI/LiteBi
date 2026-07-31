@@ -1428,8 +1428,10 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # back; it does not say the STATEMENT ran long. The child may have hung in connect, in
         # credential resolution or in loading the model, and on any of those "narrow the query" is
         # advice pointing at the wrong thing. A refusal must name a fix, so a kill we cannot attribute
-        # is not one. (Guardrail contract §3: an unresponsive executor is `failed`. The per-statement
-        # timeout a later gate imposes IS a refusal, and `RULE_RESOURCE_LIMIT` is reserved for it.)
+        # is not one. (Guardrail contract §3: an unresponsive executor is `failed`. The executor's own
+        # per-statement deadline IS a refusal and carries `RULE_RESOURCE_LIMIT`; it can attribute the
+        # cancel to the statement because it is the thing it cancelled. The two bounds coexist, and
+        # this one must not borrow the other's rule.)
         return _emit(
             _envelope("failed", failure=Failure(
                 kind="timeout",

@@ -72,6 +72,7 @@ import agami_paths
 from guardrail import (
     RULE_MODEL_SAFETY,
     RULE_MODEL_UNAVAILABLE,
+    RULE_RESOURCE_LIMIT,
     Envelope,
     Failure,
     FailureKind,
@@ -674,6 +675,12 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
 
 
 def _run_sqlite(creds: dict[str, str], sql: str) -> ExecResult:
+    """Tier-3 path for SQLite using the stdlib `sqlite3` module.
+
+    The first engine to run under the per-statement deadline. `sqlite3.Connection.interrupt()` is a
+    genuine cancel — it stops the statement mid-scan from another thread — so this engine can prove
+    the whole refusal contract in-process, with no network and no fixture warehouse.
+    """
     import sqlite3  # always available in stdlib
     _require(creds, "path")
     path = os.path.expanduser(creds["path"])
@@ -681,10 +688,38 @@ def _run_sqlite(creds: dict[str, str], sql: str) -> ExecResult:
         conn = sqlite3.connect(path)
     except Exception as e:
         raise ExecutorError(f"SQLite connect failed: {e}", code=4)
+    # Resolved ONCE for the call, so the budget the watchdog enforces and the number the refusal
+    # quotes cannot be two different values.
+    timeout_s = _resolve_timeout_s()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # The deadline covers the FETCH as well as the execute. `_collect_cursor` pulls `cap + 1`
+        # rows in a single `fetchmany`, and on a cursor that streams its result that pull is where
+        # the scan actually happens — a clock that stopped at `execute` would bound the cheap half
+        # of the work and leave the expensive half unbounded.
+        with _deadline(conn.interrupt, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                # A cancelled statement raises `sqlite3.OperationalError("interrupted")`, whose text
+                # is not a classification we would want to key on. The FLAG is the classification,
+                # and it is the ONLY one: `_deadline` sets it before the cancel lands, so an error
+                # raised while it is unset is the database's own — however late it arrives.
+                if expired.is_set():
+                    raise _ResourceLimit("the statement outlived its per-statement budget")
+                raise
+        # Checked after the watchdog is disarmed, so the flag is final. A cancel can also land
+        # between the two calls above, or just as the second returns, and leave nothing to raise:
+        # the budget still elapsed, so the outcome is still a refusal rather than a result gathered
+        # past it.
+        if expired.is_set():
+            raise _ResourceLimit("the statement outlived its per-statement budget")
+    except _ResourceLimit:
+        # Ahead of the catch-all below on purpose: our own marker must reach `execute_guarded`
+        # intact. Wrapped in an `ExecutorError` it would become a `failed`/`syntax` envelope, which
+        # is the database's outcome rather than the bound we imposed.
+        raise
     except Exception as e:
         raise ExecutorError(f"SQLite execution error: {e}", code=5)
     finally:
@@ -1342,11 +1377,12 @@ def execute_guarded(
 
     **Every path returns exactly one ``Envelope``, and this function is TOTAL** — nothing is raised
     out of here for a caller to interpret, so the subprocess ``main`` and the in-process MCP handler
-    cannot disagree about what happened. The six outcomes:
+    cannot disagree about what happened. The seven outcomes:
 
       * the read-only gate refuses            -> ``refused`` carrying that gate's ``Refusal``
       * ``_model_safety`` returns a Refusal   -> ``refused`` carrying it verbatim
       * ``_model_safety`` returns an int      -> ``refused`` carrying the interim ``model_safety``
+      * the per-statement deadline fired      -> ``refused`` carrying ``resource_limit``
       * ``executor.execute`` raises           -> ``failed`` carrying a classified ``Failure``
       * anything else raises                  -> ``failed``/``other``, generic message, raw to the log
       * the statement ran                     -> ``ok`` carrying the ``ExecResult``
@@ -1400,6 +1436,28 @@ def execute_guarded(
         # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
         # broken adapter, not a reason for the chokepoint to raise at its caller.
         return _envelope("ok", data=result)
+    except _ResourceLimit:
+        # AHEAD of both handlers below: `_ResourceLimit` is an `ExecutorError` sibling, not a
+        # subclass, but the catch-all would swallow it and report a bound WE imposed as an
+        # unclassified server break. This is the per-statement bound the contract reserves
+        # `resource_limit` for — its subject IS the statement, so "narrow it and run it again" is a
+        # fix we can honestly name, unlike the supervisor's kill of a child that never returned.
+        #
+        # The budget is re-resolved rather than carried on the marker: the marker stays a plain
+        # exception, and nothing between the engine call and here can change the env var or the
+        # request-scoped ContextVar the resolver reads, so it is the same number the watchdog used.
+        timeout_s = _resolve_timeout_s()
+        return _envelope("refused", refusal=refuse(
+            RULE_RESOURCE_LIMIT,
+            # The configured number belongs here — it is a deployment setting, not a data value, and
+            # a bound the caller cannot see is one it cannot plan around. The remediation names only
+            # what would make THIS statement executable: on the served path the caller is an
+            # assistant with no shell and no deployment, so naming the environment variable would be
+            # advice it cannot take, addressed to someone who is not reading.
+            detail=f"The statement ran longer than the {timeout_s}s limit and was cancelled.",
+            remediation="Narrow the time range, reduce the grouping, or add a selective filter, "
+                        "then run it again.",
+        ))
     except ExecutorError as exc:
         # The classified branch: `msg` is authored by this module (a missing driver, a connect
         # failure, the credential-resolution remediation naming DATASOURCE_URL) or relayed from the

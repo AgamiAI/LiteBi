@@ -15,18 +15,20 @@ The locked rule, in two halves:
     schema-listing endpoint, reachable by anyone who can send one deliberately-wrong statement —
     which is the recon surface a later slice exists to close.
 
-**This file is lock-in, not a fix.** All five gates are echo-only today; that was verified when they
-were converted, and it is asserted here so a later reword cannot quietly turn a refusal into a
-listing. Unlike the rest of this spec's tests, the property this one pins is expected to hold on
-`446cc20` (the pre-conversion base) as well — and it does. It was checked by running this file's
-model, canaries, vectors and scanner against a materialized `446cc20` tree, driving all five rules
-through all four routes below and scanning the 20 refusal bodies the base produced: all clean. (The
-file cannot be *collected* at that commit — `guardrail` does not exist there and the tool edge
-speaks `{"error": {kind, remediation}}` rather than the Envelope — so the base run drops only the
-two shape assertions, `status == "refused"` and `refusal.rule == …`, and keeps the scanner
-verbatim.) A future failure here is therefore a live disclosure bug, not a conversion regression.
+**This file is lock-in, not a fix.** All five gates were echo-only when they were converted, and the
+per-statement timeout that has since joined them is too; it is asserted here so a later reword cannot
+quietly turn a refusal into a listing. Unlike the rest of this spec's tests, the property this one
+pins is expected to hold on `446cc20` (the pre-conversion base) as well — and it does. It was checked
+by running this file's model, canaries, vectors and scanner against a materialized `446cc20` tree,
+driving the five rules that existed then through all four routes below and scanning the 20 refusal
+bodies the base produced: all clean. (The `resource_limit` vector came later and has no counterpart
+there — nothing imposed a per-statement bound at that commit. The file cannot be *collected* at that
+commit either — `guardrail` does not exist there and the tool edge speaks
+`{"error": {kind, remediation}}` rather than the Envelope — so the base run drops only the two shape
+assertions, `status == "refused"` and `refusal.rule == …`, and keeps the scanner verbatim.) A future
+failure here is therefore a live disclosure bug, not a conversion regression.
 
-**What this file covers.** Every field of the serialized tool-edge body, for the five refusal rules
+**What this file covers.** Every field of the serialized tool-edge body, for the six refusal rules
 and for a `failed` — across both surfaces and both execution paths. `failure.message` is in scope
 because it is part of that body: it was the one field the scanner never saw, and it is where a
 PostgreSQL `HINT: Perhaps you meant to reference the column "orders.internal_ref".` arrives, which
@@ -178,6 +180,11 @@ def declared(tmp_path, monkeypatch):
 
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
     monkeypatch.setenv("DATASOURCE_URL__ACME", f"sqlite:///{warehouse}")
+    # The smallest per-statement budget the resolver accepts, for the `resource_limit` vector: it is
+    # the one statement here that reaches the executor and has to be stopped there. Every other
+    # statement in this file is refused before execution or rejected instantly by the database, so a
+    # short budget costs them nothing.
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "1")
     # Local, not hosted: the disk model is the one the gates use. (`model_unavailable` needs the
     # hosted signal and gets its own fixture.)
     monkeypatch.delenv("AGAMI_DB_URL", raising=False)
@@ -297,18 +304,34 @@ ROUTES = {
 # The sentinel
 # ---------------------------------------------------------------------------
 
+# A statement that passes every gate and then runs for minutes: a recursive CTE with two billion
+# iterations, filtered on a subquery over the declared table so the vector is the shape a real
+# runaway query has rather than a synthetic spin. `orders` and `id` are therefore the caller's own,
+# and echoing them back is legitimate; the canaries stay unsent, which is what makes a refusal that
+# reached for the model a failing assertion here.
+_RUNAWAY_SQL = (
+    "WITH RECURSIVE burn(n) AS ("
+    "SELECT 1 UNION ALL SELECT n + 1 FROM burn WHERE n < 2000000000"
+    ") SELECT count(n) AS c FROM burn WHERE n > (SELECT count(id) FROM orders)"
+)
+
 # One statement per rule, chosen so the rule under test is the FIRST gate to fire:
-#   read_only    — a denied keyword, refused at the tool edge before a profile is resolved
-#   table_scope  — an undeclared table (runs before the star ban and the column gate)
-#   select_star  — a declared table, projected with `*`
-#   column_scope — a declared table, an undeclared column
+#   read_only      — a denied keyword, refused at the tool edge before a profile is resolved
+#   table_scope    — an undeclared table (runs before the star ban and the column gate)
+#   select_star    — a declared table, projected with `*`
+#   column_scope   — a declared table, an undeclared column
+#   resource_limit — the odd one out: every gate PASSES it, and the fixture's one-second budget stops
+#                    it inside the executor. So this row scans the one refusal that is produced after
+#                    the model has been loaded and consulted — the state in which a "helpful" message
+#                    has the declared surface closest to hand.
 # `audit_trail` and `ref_no` are the caller's own inventions, so echoing them back is legitimate;
-# nothing the MODEL declares appears in any of them except `orders`.
+# nothing the MODEL declares appears in any of them except `orders` and `id`.
 VECTORS = (
     (guardrail.RULE_READ_ONLY, "DELETE FROM orders"),
     (guardrail.RULE_TABLE_SCOPE, "SELECT ref_no FROM audit_trail"),
     (guardrail.RULE_SELECT_STAR, "SELECT * FROM orders"),
     (guardrail.RULE_COLUMN_SCOPE, "SELECT ref_no FROM orders"),
+    (guardrail.RULE_RESOURCE_LIMIT, _RUNAWAY_SQL),
 )
 
 UNAVAILABLE_SQL = "SELECT id FROM orders"
@@ -348,7 +371,7 @@ def _assert_echo_only(body: dict, sql: str) -> None:
 
 @pytest.mark.parametrize(("rule", "sql", "route"), _MATRIX, ids=_MATRIX_IDS)
 def test_no_declared_name_the_caller_did_not_send_reaches_a_refusal(declared, rule, sql, route):
-    """Five rules — four here, `model_unavailable` below — across both surfaces and both execution
+    """Six rules — five here, `model_unavailable` below — across both surfaces and both execution
     paths.
 
     The fork column is not redundant with in-process: the child serializes the refusal to stderr and
@@ -706,13 +729,6 @@ _NO_VECTOR = {
         "than refusing, so nothing constructs this rule yet; turning that fail-open into a refusal "
         "is the unparseable-statement slice's job, and the refusal it introduces needs a vector here."
     ),
-    guardrail.RULE_RESOURCE_LIMIT: (
-        "No producer. It is reserved for the per-statement timeout a later gate imposes, and the "
-        "one branch that might borrow it — the subprocess supervisor killing an unresponsive "
-        "executor — is a `failed`/`timeout` instead, pinned by "
-        "test_ace035_guardrail_audit.py::test_no_gate_produces_the_resource_limit_refusal. A rule "
-        "nothing emits cannot leak; the day something emits it, it needs a vector here."
-    ),
     guardrail.RULE_MODEL_SAFETY: (
         "Reachable, but its detail is authored as static prose at a single construction site in "
         "`execute_sql.execute_guarded` — the unconverted `_model_safety` branches hand back a bare "
@@ -744,7 +760,7 @@ def test_every_rule_and_every_route_is_covered():
     assert not covered & set(_NO_VECTOR)
     assert all(reason.strip() for reason in _NO_VECTOR.values())
     assert set(ROUTES) == {"in_process", "fork", "stdio", "http"}
-    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 16
+    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 20
     # The `failed` channel is covered by its own matrix rather than this one, because it has no
     # rule. Its vector must not be one of these: a statement that a gate refuses would report on the
     # refusal channel a second time and leave `failure.message` unscanned again, which is exactly
