@@ -12,6 +12,31 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-07-31
+
+### Added
+
+- **Override seam on the tool-call audit log (`record_tool_call`).** An embedder that dispatches the
+  tool handlers itself can now supply the values the log would otherwise infer from the model's own
+  tool arguments and result body — `source`, `thread_id`, `correlation_id`, `user_question`,
+  `org_id`, plus the outcome (`success`, `row_count`, `error_kind`, `raised`). Every parameter
+  defaults to `None` = "derive it the way you always have", so the in-repo transport path is
+  regression-pinned identical to before the seam existed. `_record_query`'s source is likewise
+  readable from a context var, so the query log and the tool-call log can't disagree about what drove
+  one execution.
+
+### Changed
+
+- **The audit row now fails toward honesty.** A caller with no result body to parse can now record a
+  failure (previously the row defaulted to success — the one direction an audit log must never fail
+  in); a raise outranks every override; naming an `error_kind` is itself a statement of failure; and
+  a success never carries an error kind, so the row can't contradict itself.
+- **Honest question provenance in the Activity drawer.** The `· self-reported` trust marker was
+  stamped on every question unconditionally (the `source` column was never even selected). The column
+  is now projected and a per-turn flag derived, so the marker is dropped only where the caller
+  observed the question directly — and kept under any disagreement or uncertainty, because
+  overstating trust is the one direction it must not fail.
+
 ## [0.5.2] — 2026-07-30
 
 ### Added
