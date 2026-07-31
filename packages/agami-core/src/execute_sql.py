@@ -52,15 +52,17 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import contextlib
 import csv
 import json
 import logging
 import os
 import stat
 import sys
+import threading
 import urllib.parse
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -858,6 +860,77 @@ def _resolve_row_cap() -> int:
     if override is not None and override > 0:
         cap = min(cap, override)
     return cap
+
+
+_DEFAULT_TIMEOUT_S = 30  # wall-clock seconds one statement may run before the watchdog cancels it
+# Per-call timeout, the twin of `_max_rows_override` and request-scoped for the same reason: once the
+# HTTP server runs execution in-process, concurrent handlers run in worker threads that each copy the
+# context, so one request's budget can never stomp another's. In the subprocess/CLI (one process, one
+# thread) it behaves exactly as a module global would.
+_timeout_override: ContextVar[int | None] = ContextVar("_timeout_override", default=None)
+
+
+def _resolve_timeout_s() -> int:
+    """Effective per-statement timeout, in whole seconds. `AGAMI_SQL_TIMEOUT_S` is the
+    operator-configurable DEPLOYMENT budget (default 30 when unset) — an operator owns their
+    availability tradeoff and may set it higher OR lower than 30. A missing or non-positive value
+    falls back to the default.
+
+    Unlike `_resolve_row_cap`, a value that is PRESENT but unparseable is logged at warning before
+    the fallback. An operator who wrote `45.5` or `30s` asked for something specific and silently
+    running 30 instead is how a misconfiguration survives a whole deployment unnoticed. The warning
+    goes to the module logger and never to stderr, because the subprocess transport parses stderr and
+    an extra line there would break that contract."""
+    raw = os.environ.get("AGAMI_SQL_TIMEOUT_S", "").strip()
+    digits = raw[1:] if raw.startswith("-") else raw  # a leading minus is a value, not a typo
+    if raw and not digits.isdigit():
+        _LOG.warning(
+            "AGAMI_SQL_TIMEOUT_S=%r is not a whole number of seconds; falling back to %ds.",
+            raw,
+            _DEFAULT_TIMEOUT_S,
+        )
+    timeout_s = int(raw) if digits.isdigit() else _DEFAULT_TIMEOUT_S
+    if timeout_s <= 0:
+        timeout_s = _DEFAULT_TIMEOUT_S  # "0" / "-5" → the default, never an instantly-expired budget
+    override = _timeout_override.get()
+    if override is not None and override > 0:
+        timeout_s = override  # a caller that resolved its own budget outranks the deployment default
+    return timeout_s
+
+
+class _ResourceLimit(Exception):
+    """Raised when our own watchdog fired, so a cancelled statement unwinds the engine function the
+    same way any other failure does and the surrounding transaction rolls back. It is an internal
+    marker only: it is always caught and translated inside this module and never crosses the tool
+    boundary."""
+
+
+@contextlib.contextmanager
+def _deadline(cancel: Callable[[], None], timeout_s: float) -> Iterator[threading.Event]:
+    """Arm a watchdog that calls `cancel` if the wrapped block outlives `timeout_s`, and yield the
+    `threading.Event` that says whether it fired.
+
+    The event is set BEFORE `cancel` runs. Order matters: whoever catches the driver error that the
+    cancellation provokes must be able to read an already-set flag and attribute the failure to us
+    rather than to the database. A `cancel` that raises is swallowed and logged, because some drivers
+    raise when cancelled from a thread other than the one running the statement, and an exception
+    escaping a timer thread is both unhandleable by the caller and invisible in the result."""
+    fired = threading.Event()
+
+    def fire() -> None:
+        fired.set()
+        try:
+            cancel()
+        except Exception as exc:
+            _LOG.warning("Cancelling the statement after its timeout expired failed: %s", exc)
+
+    timer = threading.Timer(timeout_s, fire)
+    timer.daemon = True  # a hung cancel must never hold the interpreter open at shutdown
+    timer.start()
+    try:
+        yield fired
+    finally:
+        timer.cancel()  # a block that finished on time disarms the watchdog before it can fire
 
 
 def _flag_truncated(cap: int) -> None:
