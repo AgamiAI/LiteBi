@@ -89,14 +89,40 @@ OLDEST_SUPPORTED = (3, 9)
 _TOO_NEW_DATACLASS_KWARGS = {"kw_only", "slots", "match_args", "weakref_slot"}
 
 
+def _dataclass_names(tree: ast.AST) -> set[str]:
+    """Every local name bound to `dataclasses.dataclass` in this module.
+
+    Seeded with the unaliased spelling so this can only ever match MORE than a plain `== "dataclass"`
+    comparison: `from dataclasses import *` binds the name with no alias node to read, and a bare
+    `@dataclass(...)` that resolves to something else is a NameError the import check would not save.
+    """
+    names = {"dataclass"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+            names |= {a.asname or a.name for a in node.names if a.name == "dataclass"}
+    return names
+
+
 def _dataclass_decorators(tree: ast.AST):
-    """Every `@dataclass(...)` decorator call in the module, however the name was imported."""
+    """Every `@dataclass(...)` decorator call in the module, however the name was imported —
+    `dataclass(...)`, `dataclasses.dataclass(...)`, and either rebound by an `as` alias.
+
+    The alias arm matters because the miss would be SILENT: an aliased import with a too-new keyword
+    leaves this check green and breaks the vendored slice at import time on the user's machine, which
+    is the exact failure this test exists to catch. No vendored module aliases the import today.
+    """
+    names = _dataclass_names(tree)
     for node in ast.walk(tree):
         for deco in getattr(node, "decorator_list", []):
             if isinstance(deco, ast.Call):
                 fn = deco.func
-                name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
-                if name == "dataclass":
+                if isinstance(fn, ast.Attribute):
+                    # Any `<anything>.dataclass(...)` still counts, aliased module or not — left as
+                    # it was, so the attribute arm never matches less than it did before.
+                    matched = fn.attr == "dataclass"
+                else:
+                    matched = getattr(fn, "id", "") in names
+                if matched:
                     yield deco
 
 
@@ -150,3 +176,22 @@ def test_the_39_check_can_go_red():
     assert [kw.arg for deco in _dataclass_decorators(tree) for kw in deco.keywords] == [
         "frozen", "kw_only",
     ]
+
+
+@pytest.mark.parametrize(("label", "source"), [
+    ("bare", "from dataclasses import dataclass\n@dataclass(kw_only=True)\nclass C:\n    x: int\n"),
+    ("aliased name", "from dataclasses import dataclass as dc\n@dc(kw_only=True)\nclass C:\n    x: int\n"),
+    ("module", "import dataclasses\n@dataclasses.dataclass(kw_only=True)\nclass C:\n    x: int\n"),
+    ("aliased module", "import dataclasses as d\n@d.dataclass(kw_only=True)\nclass C:\n    x: int\n"),
+    ("star import", "from dataclasses import *\n@dataclass(kw_only=True)\nclass C:\n    x: int\n"),
+], ids=["bare", "aliased-name", "module", "aliased-module", "star-import"])
+def test_the_decorator_matcher_sees_every_spelling_of_the_import(label, source):
+    """The matcher's claim is "however the name was imported", so every spelling must be caught.
+
+    The aliased-name arm is the one that regressed the claim: matching the literal name `dataclass`
+    misses `import dataclass as dc`, and the miss is silent — the parametrized check above stays
+    green while the vendored slice fails to import on 3.9 for the user. Cheap to pin, and the cost
+    of being wrong is paid on someone else's machine.
+    """
+    tree = ast.parse(source)
+    assert [kw.arg for deco in _dataclass_decorators(tree) for kw in deco.keywords] == ["kw_only"], label
