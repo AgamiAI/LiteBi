@@ -407,7 +407,8 @@ class DbActivitySink:
         # which made the id unreferenceable the moment it existed.
         self._store.execute(
             "INSERT INTO query_executions (id, ts, org_id, datasource, question, sql, row_count, "
-            "source, status, reason, rule) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source, status, reason, rule, sql_truncated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record.id,
                 record.ts,
@@ -420,6 +421,9 @@ class DbActivitySink:
                 record.status,
                 record.reason,
                 record.rule,
+                # A portable 0/1 rather than a boolean literal — the same reason `record_tool_call`
+                # below writes `success` that way (SQLite has no boolean type).
+                1 if getattr(record, "sql_truncated", False) else 0,
             ),
         )
         self._store.commit()

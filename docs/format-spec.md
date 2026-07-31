@@ -288,6 +288,7 @@ The MCP server writes to this same file when no database is configured, and its 
 | `status`   | enum         | `ok`, `refused` (agami declined the statement) or `failed` (the database rejected it). Absent on entries written before this field existed — read those as `ok`. |
 | `reason`   | enum or null | Refusals only: `unsafe`, `out_of_scope` or `undetermined`                                                                                                |
 | `rule`     | string or null | Refusals only: which gate fired (`read_only`, `table_scope`, `column_scope`, …)                                                                        |
+| `sql_truncated` | boolean | The `sql` above was cut to the audit bound (8,000 characters) and is not the whole statement            |
 | `org_id`   | string       | The tenant the query ran for (`local` on a single-tenant install)                                                                                        |
 
 **Read the log filtered.** Anything treating "the last entry" as "the query you just ran" — the save-correction and reopen-chart flows both do — must skip entries whose `status` is not `ok`: a refused or failed statement never returned a result to correct or a chart to reopen.

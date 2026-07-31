@@ -568,8 +568,10 @@ def test_an_executor_error_becomes_the_failed_envelope_main_renders(tmp_path, mo
 @pytest.mark.parametrize("code", sorted(execute_sql.EXIT_TO_FAILURE_KIND))
 def test_every_produced_exit_code_round_trips_through_the_failure_kind(code):
     # `main` reconstructs the exit code from `Failure.kind`, which is lossy in general (nine kinds,
-    # four codes). It must be LOSSLESS for every code the executor actually produces, or a rewrite
-    # that only looks byte-identical would still change what a caller's `$?` sees.
+    # five codes). It must be LOSSLESS for every code the executor actually produces, or a rewrite
+    # that only looks byte-identical would still change what a caller's `$?` sees. `other` is in this
+    # set because it has its own code (6): while it fell to the generic 2, the round trip was lossy
+    # for the catch-all and the parent read an internal break back as `dsn`.
     kind = execute_sql.EXIT_TO_FAILURE_KIND[code]
     assert execute_sql.FAILURE_KIND_TO_EXIT[kind] == code
 

@@ -148,12 +148,23 @@ def test_parent_leaves_a_non_refusal_exit_alone() -> None:
 def test_parent_rejects_a_malformed_refusal() -> None:
     """Rebuilding through `Refusal` re-checks the contract on this side of the boundary, so a child
     that emitted an unknown reason or an empty remediation falls back to the generic error path
-    rather than being relayed as a valid refusal."""
+    rather than being relayed as a valid refusal.
+
+    `non_string_detail` is the case that used to escape rather than fall back: `__post_init__`
+    validates every field by calling `.strip()`, so a non-string raises `AttributeError`, which was
+    outside the caught set. The fallback this parser documents therefore did not exist for a third
+    of the ways the payload can be wrong — unreachable today, since only our own child writes that
+    stream, but the promise is the reason the parser rebuilds at all.
+    """
     bad_reason = '{"refusal": {"reason": "nope", "rule": "read_only", "detail": "d", "remediation": "r"}}'
     empty_fix = '{"refusal": {"reason": "unsafe", "rule": "read_only", "detail": "d", "remediation": " "}}'
     extra_field = ('{"refusal": {"reason": "unsafe", "rule": "read_only", "detail": "d", '
                    '"remediation": "r", "surprise": 1}}')
-    for line in (bad_reason, empty_fix, extra_field):
+    non_string_detail = ('{"refusal": {"reason": "unsafe", "rule": "read_only", "detail": 3, '
+                         '"remediation": "r"}}')
+    non_string_rule = ('{"refusal": {"reason": "unsafe", "rule": null, "detail": "d", '
+                       '"remediation": "r"}}')
+    for line in (bad_reason, empty_fix, extra_field, non_string_detail, non_string_rule):
         assert tools._stderr_refusal(1, line) is None, line
 
 

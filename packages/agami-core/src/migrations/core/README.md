@@ -15,10 +15,10 @@ Ordered `NNN_*.sql` files, each one forward-only:
 
 - **`001_serving.sql`** — the semantic model served from the DB instead of local YAML (org → datasource
   → subject-area → tables/metrics/entities/relationships).
-- **`002_runtime.sql`** … **`014_query_executions_guardrail.sql`** — runtime tables: users, OAuth/OIDC
-  identity, per-user access, the organization record, and the query-execution / tool-call audit log
-  (including each execution's guardrail verdict — `ok` / `refused` / `failed`, plus the rule when we
-  refused).
+- **`002_runtime.sql`** … **`015_query_executions_sql_truncated.sql`** — runtime tables: users,
+  OAuth/OIDC identity, per-user access, the organization record, and the query-execution / tool-call
+  audit log (including each execution's guardrail verdict — `ok` / `refused` / `failed`, plus the rule
+  when we refused, and whether the recorded statement had to be cut to the audit bound).
 
 The DDL is deliberately **portable** — `TEXT`/`INTEGER` only, app-minted keys (no `SERIAL`/`JSONB`) — so
 the same files run on **SQLite** (tests and small self-hosts) and **Postgres** (production).

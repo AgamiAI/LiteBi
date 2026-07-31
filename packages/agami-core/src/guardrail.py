@@ -50,6 +50,11 @@ RULE_TABLE_SCOPE = "table_scope"
 RULE_COLUMN_SCOPE = "column_scope"
 RULE_SELECT_STAR = "select_star"
 RULE_MODEL_UNAVAILABLE = "model_unavailable"
+# Declared and pinned below, with NO producer today. The contract reserves it for a **per-statement**
+# timeout the guard imposes — a bound whose subject is the statement, so "narrow the query" is a fix
+# we can honestly name. The subprocess supervisor's kill is NOT that bound and must not borrow this
+# rule: it stops a child that never returned, without knowing what the child was doing when it
+# stopped, so it is a `failed`/`timeout` (see `FailureKind` below and contract §3).
 RULE_RESOURCE_LIMIT = "resource_limit"
 RULE_UNPARSEABLE = "unparseable"
 
@@ -85,7 +90,8 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     RULE_SELECT_STAR: "out_of_scope",
     RULE_MODEL_UNAVAILABLE: "undetermined",
     # A bound we imposed, not a property of the statement: neither unsafe nor out of scope — we
-    # simply did not determine the answer within the bound.
+    # simply did not determine the answer within the bound. Pinned here while unproduced so the gate
+    # that eventually imposes a per-statement timeout fills a constant rather than inventing one.
     RULE_RESOURCE_LIMIT: "undetermined",
     RULE_UNPARSEABLE: "undetermined",
     RULE_MODEL_SAFETY: "undetermined",
@@ -147,18 +153,24 @@ FailureKind = Literal[
     "timeout",
     "other",
 ]
-"""The nine classified operational errors. Five are produced today — `dsn`, `driver_missing`, `auth`,
-`syntax` and `other` — all from the executor's exit codes. `column_not_found`, `table_not_found` and
-`network` are DECLARED BUT UNREACHABLE: producing them means parsing driver text, and sanitizing
-driver text belongs to the error-hardening slice.
+"""Nine classified operational errors declared, six produced.
 
-`timeout` has NO producer at all, on purpose. A timeout is classified by who decided it: the
-supervisor bound the tool edge imposes is a `resource_limit` REFUSAL, because stopping there was our
-call and it has a fix we can name; and the driver-level connect/login timeouts fold into the connect
-failure the executor already reports as `auth` (exit 4), because that is what the driver raises. A
-real per-statement database timeout — the database itself reporting that IT gave up — is the case
-this member is reserved for, and nothing raises it yet. Declared now so those slices fill a member
-rather than widen the type."""
+Produced today: `dsn`, `driver_missing`, `auth` and `syntax` from the executor's classified exit
+codes, `other` from its catch-all, and `timeout` from the subprocess supervisor at the tool edge —
+the bound that kills a forked executor which never returned.
+
+**`timeout` is a failure, not a refusal, and whose decision it was is not the test on its own.** The
+supervisor bound is ours, but it cannot attribute the kill to the STATEMENT: the child may have hung
+in connect, credential resolution or model load, where "narrow the query" is the wrong fix. So an
+unresponsive executor is `failed` / `timeout`, and its message says only that we stopped waiting
+(guardrail contract §3). A **per-statement** timeout is the other case — its subject IS the
+statement, so it is a refusal carrying `RULE_RESOURCE_LIMIT` — and nothing imposes one yet, which is
+why that rule is pinned with no producer. Driver-level connect/login timeouts fold into the connect
+failure the executor already reports as `auth` (exit 4), because that is what the driver raises.
+
+`column_not_found`, `table_not_found` and `network` are DECLARED BUT UNREACHABLE: producing them
+means parsing driver text, and sanitizing driver text belongs to the error-hardening slice. Declared
+now so those slices fill a member rather than widen the type."""
 
 _FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
 

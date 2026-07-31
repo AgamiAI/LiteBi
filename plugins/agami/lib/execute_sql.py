@@ -39,6 +39,10 @@ Exit codes:
     3  — driver missing for the configured db type
     4  — connection / authentication failed
     5  — SQL execution error (syntax, unknown column, etc.)
+    6  — an unanticipated error inside the guarded path (`Failure.kind == "other"`). It has a code of
+         its own precisely so it does not borrow one: with `other` falling to the generic 2, a parent
+         reading the exit code back reported an internal break as a datasource-configuration problem
+         (`dsn`), and only on the fork transport, while the identical break in-process said `other`.
 
 `EXIT_TO_FAILURE_KIND` / `FAILURE_KIND_TO_EXIT` below are that table in code — this module owns the
 exit-code contract because it documents it here and is the only place that produces it.
@@ -167,15 +171,24 @@ EXIT_TO_FAILURE_KIND: dict[int, FailureKind] = {
     3: "driver_missing",  # no driver installed for the configured db type
     4: "auth",            # connect / authentication failed
     5: "syntax",          # SQL execution error
+    # The catch-all needs a code of its OWN, not the generic 2. ``execute_guarded``'s catch-all
+    # produces ``other`` for anything nobody anticipated (a malformed credentials file raising
+    # ``configparser.MissingSectionHeaderError``, an adapter's own exception type), and while that
+    # mapped to 2 the parent read it back as ``dsn`` — so an internal break was reported to the
+    # caller as a datasource-configuration problem, and only on the fork transport.
+    6: "other",
 }
 
 # The inverse, for ``main`` turning a ``Failure`` back into today's exit code. Every failure
-# ``execute_guarded`` can produce comes from an ``ExecutorError`` whose code is one of the four
-# above, so the round-trip is exact for every reachable case. The default covers the kinds that have
-# no exit code of their own — ``other`` and the six declared-but-unproduced kinds — and is 2, the
-# CLI's generic config/usage code and ``_err``'s own default.
+# ``execute_guarded`` can produce is either an ``ExecutorError`` whose code is one of the four
+# classified ones above or the catch-all ``other``, and all five have their own code — so the
+# round-trip is exact for every case this module can reach, in both directions. The default covers
+# only the kinds nothing produces yet (``column_not_found``, ``table_not_found``, ``network``) plus
+# ``timeout``, which is minted at the tool edge by the subprocess supervisor and so never reaches
+# ``main``. It is 6 rather than 2 for the same reason ``other`` has its own code: an unmapped kind is
+# something we could not classify, which is what 6 says, and never a config error.
 FAILURE_KIND_TO_EXIT: dict[str, int] = {kind: code for code, kind in EXIT_TO_FAILURE_KIND.items()}
-_DEFAULT_FAILURE_EXIT = 2
+_DEFAULT_FAILURE_EXIT = 6
 
 
 def _env_token(profile: str) -> str:

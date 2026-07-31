@@ -54,6 +54,11 @@ from store import Store  # noqa: E402
 BASE_URL = "https://your-host.example.com"
 SIGNING_SECRET = "x" * 40
 PROFILE = "acme"
+# The caller's own framing of the question, passed on every tool call this file makes. The audit
+# row's `question` and `datasource` columns are the two a reviewer of a refusal reaches for first —
+# "who asked what, against which datasource" — so every assertion here names a concrete value rather
+# than accepting whatever the writer happened to pass.
+QUESTION = "how many orders"
 
 
 @pytest.fixture(autouse=True)
@@ -130,8 +135,8 @@ def _rows(url: str) -> list[dict]:
     store = Store.connect(url)
     try:
         return store.query(
-            "SELECT id, datasource, question, sql, row_count, source, status, reason, rule "
-            "FROM query_executions"
+            "SELECT id, datasource, question, sql, sql_truncated, row_count, source, status, "
+            "reason, rule FROM query_executions"
         )
     finally:
         store.close()
@@ -157,7 +162,8 @@ def _stdio_execute_sql(sql: str) -> dict:
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-         "params": {"name": "execute_sql", "arguments": {"sql": sql, "datasource": PROFILE}}},
+         "params": {"name": "execute_sql", "arguments": {
+             "sql": sql, "datasource": PROFILE, "raw_query": QUESTION}}},
     ]
     proc = subprocess.run(
         [sys.executable, "-m", "mcp_harness"],
@@ -209,25 +215,40 @@ def _http_execute_sql(sql: str) -> dict:
                     json={"jsonrpc": "2.0", "method": "notifications/initialized"})
         resp = client.post("/mcp", headers=headers2, json={
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "execute_sql", "arguments": {"sql": sql, "datasource": PROFILE}}})
+            "params": {"name": "execute_sql", "arguments": {
+                "sql": sql, "datasource": PROFILE, "raw_query": QUESTION}}})
     assert resp.status_code == 200, resp.text
     return json.loads(resp.json()["result"]["content"][0]["text"])
 
 
 # Each vector is one status, produced by a real statement against the fixture's model + warehouse:
-#   ok       — a declared column that exists in the warehouse
-#   refused  — an undeclared column, which the column-scope gate stops
-#   failed   — a column the MODEL declares but the warehouse does not have, so the database rejects it
+#   ok             — a declared column that exists in the warehouse
+#   refused (deep) — an undeclared column, which the column-scope gate stops after the model loads
+#   refused (fast) — a mutation, stopped by the read-only gate at the tool edge before anything else
+#   failed         — a column the MODEL declares but the warehouse does not have, so the database
+#                    rejects it
+# The two refusals are both here because they leave the tool edge from different places: the deep one
+# comes back from `execute_guarded` (or, on the fork, from the child's stderr), the fast one never
+# gets that far. They are the pair that used to disagree about what landed in the audit row.
 _STATUSES = [
-    ("SELECT id FROM orders", "ok", None),
-    ("SELECT nope FROM orders", "refused", guardrail.RULE_COLUMN_SCOPE),
-    ("SELECT amount FROM orders", "failed", None),
+    ("ok", "SELECT id FROM orders", "ok", None),
+    ("refused-column-scope", "SELECT nope FROM orders", "refused", guardrail.RULE_COLUMN_SCOPE),
+    ("refused-read-only", "DELETE FROM orders", "refused", guardrail.RULE_READ_ONLY),
+    ("failed", "SELECT amount FROM orders", "failed", None),
 ]
-_STATUS_IDS = [status for _, status, _ in _STATUSES]
+_STATUS_IDS = [label for label, _, _, _ in _STATUSES]
 
 
 def _assert_recorded(url: str, body: dict, status: str, rule: str | None) -> None:
-    """One row, whose primary key IS the `audit_id` the caller was handed, carrying the verdict."""
+    """One row, whose primary key IS the `audit_id` the caller was handed, carrying the verdict —
+    and carrying WHO asked WHAT against WHICH datasource.
+
+    `datasource` and `question` are asserted here because `_rows` has always selected them and
+    nothing ever checked them: the fork path (the stdio default) was passing neither on its refused
+    and failed branches, so those rows landed with `datasource=''` and `question=NULL` while the
+    identical outcome in-process recorded both. A refusal whose row cannot say which datasource it
+    was aimed at is the one row shape a reviewer cannot use.
+    """
     rows = _rows(url)
     assert len(rows) == 1, rows
     (row,) = rows
@@ -235,6 +256,8 @@ def _assert_recorded(url: str, body: dict, status: str, rule: str | None) -> Non
     # The criterion's actual verb: the id on the answer EQUALS the id of the row recording it.
     assert row["id"] == body["audit_id"]
     assert row["status"] == status
+    assert row["datasource"] == PROFILE
+    assert row["question"] == QUESTION
     if rule is None:
         # Only a refusal is a decision of ours, so only a refusal has a rule to record. An `ok` or a
         # `failed` row leaving these set would mean the columns had drifted into free text.
@@ -246,13 +269,13 @@ def _assert_recorded(url: str, body: dict, status: str, rule: str | None) -> Non
         assert row["reason"] == guardrail.REASON_FOR_RULE[rule] == body["refusal"]["reason"]
 
 
-@pytest.mark.parametrize(("sql", "status", "rule"), _STATUSES, ids=_STATUS_IDS)
-def test_the_stdio_surface_records_a_row_for_every_status(env, sql, status, rule):
+@pytest.mark.parametrize(("label", "sql", "status", "rule"), _STATUSES, ids=_STATUS_IDS)
+def test_the_stdio_surface_records_a_row_for_every_status(env, label, sql, status, rule):
     _assert_recorded(env.app_db, _stdio_execute_sql(sql), status, rule)
 
 
-@pytest.mark.parametrize(("sql", "status", "rule"), _STATUSES, ids=_STATUS_IDS)
-def test_the_http_surface_records_a_row_for_every_status(env, sql, status, rule):
+@pytest.mark.parametrize(("label", "sql", "status", "rule"), _STATUSES, ids=_STATUS_IDS)
+def test_the_http_surface_records_a_row_for_every_status(env, label, sql, status, rule):
     pytest.importorskip("starlette")
     pytest.importorskip("mcp")
     pytest.importorskip("jwt")
@@ -360,8 +383,17 @@ def _break_credentials_file(monkeypatch, env):
     `MissingSectionHeaderError` is raised by `cfg.read(...)` inside `_load_credentials`, which is
     inside the try but was not an `ExecutorError`, so it escaped. Its message embeds the absolute
     path of the file, and the traceback embeds several more.
+
+    Arranged on DISK and in the ENVIRONMENT rather than by monkeypatching a module attribute, which
+    is what makes it the one vector that also reaches a forked child: the child re-resolves
+    `CREDENTIALS_PATH` from `AGAMI_ARTIFACTS_DIR` and inherits the deleted DSN vars, so it hits the
+    same unreadable file. (`execute_sql.CREDENTIALS_PATH` is still patched for the in-process route,
+    because that module global was resolved at import time, before the fixture set the artifacts dir.)
     """
-    creds = env.artifacts / "credentials"
+    import agami_paths
+
+    creds = agami_paths.credentials_path()
+    creds.parent.mkdir(parents=True, exist_ok=True)
     creds.write_text("this line has no [section] header\nuser = someone\n")
     creds.chmod(0o600)  # `_load_credentials` refuses a world-readable file before parsing it
     monkeypatch.setattr(execute_sql, "CREDENTIALS_PATH", creds)
@@ -378,18 +410,55 @@ def _executor_raises_foreign(monkeypatch, _env):
     return _RaisesForeign()
 
 
+# Each vector: a label, how to arrange the break, and the execution routes it can reach.
+#
+# `fork` is not an optional extra. `Failure.kind` crosses that boundary as an EXIT CODE and is
+# rebuilt from it, and while the catch-all `other` had no code of its own it fell to the generic 2 —
+# which the parent read back as `dsn`. So an internal break was reported to the caller as a
+# datasource-configuration problem, on the default transport only, while the identical break
+# in-process said `other`. Driving the vectors in-process alone is precisely why that survived.
+#
+# Two vectors are in-process ONLY, and not by omission: they inject a `ports.Executor`, and the fork
+# path never consults one — it runs `python -m execute_sql`, whose executor is the built-in. There is
+# no fork analog of "the adapter a consumer supplied misbehaved". `model_safety raises` is
+# in-process only for a duller reason: it is a monkeypatch of a module attribute, which a child
+# process does not inherit, and adding a production hook to reach it would be a worse trade than the
+# coverage is worth. `unreadable credentials file` is arranged on disk, so it crosses — and it is the
+# vector that actually produced the drift.
 _ESCAPING = [
-    ("model_safety raises", _break_model_safety),
-    ("unreadable credentials file", _break_credentials_file),
-    ("executor returns None", _executor_returns_none),
-    ("executor raises a foreign type", _executor_raises_foreign),
+    ("model_safety raises", _break_model_safety, ("in_process",)),
+    ("unreadable credentials file", _break_credentials_file, ("in_process", "fork")),
+    ("executor returns None", _executor_returns_none, ("in_process",)),
+    ("executor raises a foreign type", _executor_raises_foreign, ("in_process",)),
 ]
-_ESCAPING_IDS = [label for label, _ in _ESCAPING]
+_ESCAPING_MATRIX = [
+    (label, arrange, route) for label, arrange, routes in _ESCAPING for route in routes
+]
+_ESCAPING_IDS = [f"{label} / {route}" for label, _, route in _ESCAPING_MATRIX]
 
 
-@pytest.mark.parametrize(("label", "arrange"), _ESCAPING, ids=_ESCAPING_IDS)
+def _arrange_for_route(monkeypatch, env, arrange, route: str):
+    """Apply a vector's break and put the tool edge on `route`.
+
+    Every vector's `arrange` returns the executor its in-process form needs; the fork route drops it
+    and clears the injection, which is what makes `tool_execute_sql` fork `python -m execute_sql`.
+    """
+    executor = arrange(monkeypatch, env)
+    tools.set_injected_executor(executor if route == "in_process" else None)
+
+
+def test_the_escaping_matrix_drives_both_routes(env):
+    """The matrix is the claim. An `_ESCAPING` table that quietly lost its only `fork` row would run
+    green while re-opening the exact hole above, so the route coverage is asserted, not assumed."""
+    routes = {route for _, _, route in _ESCAPING_MATRIX}
+    assert routes == {"in_process", "fork"}
+    # Every vector must at least run in-process; `fork` is the one that can be legitimately absent.
+    assert all("in_process" in routes_for for _, _, routes_for in _ESCAPING)
+
+
+@pytest.mark.parametrize(("label", "arrange", "route"), _ESCAPING_MATRIX, ids=_ESCAPING_IDS)
 def test_an_unanticipated_break_is_a_failed_envelope_with_an_audit_row(env, monkeypatch, label,
-                                                                      arrange):
+                                                                      arrange, route):
     """Four ways `execute_guarded` used to raise instead of returning, and what each cost.
 
     All four propagated out of the chokepoint: `_model_safety` sat outside the try entirely, the
@@ -403,11 +472,15 @@ def test_an_unanticipated_break_is_a_failed_envelope_with_an_audit_row(env, monk
     pooled / per-user-RBAC / SSH-tunnel executor, and nothing in its contract said it may only raise
     `ExecutorError` — so a pooled executor's `PoolError` walked straight past the chokepoint.
 
+    `kind == "other"` is asserted on BOTH routes, which is the newer half. The fork rebuilds the kind
+    from the child's exit code, and until `other` had a code of its own it was read back as `dsn`:
+    the same break, reported as a datasource-configuration problem on one transport and as an
+    internal error on the other.
+
     Asserted together, because they are one property: the caller gets a `failed` Envelope, and
     exactly one row lands, keyed by the id that Envelope carried.
     """
-    executor = arrange(monkeypatch, env)
-    tools.set_injected_executor(executor)
+    _arrange_for_route(monkeypatch, env, arrange, route)
 
     before = _ids(env.app_db)
     body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
@@ -420,29 +493,46 @@ def test_an_unanticipated_break_is_a_failed_envelope_with_an_audit_row(env, monk
     assert row["status"] == "failed" and row["reason"] is None and row["rule"] is None
 
 
-@pytest.mark.parametrize(("label", "arrange"), _ESCAPING, ids=_ESCAPING_IDS)
-def test_an_unanticipated_break_tells_the_caller_nothing_and_the_log_everything(
-    env, monkeypatch, caplog, label, arrange
-):
+@pytest.mark.parametrize(("label", "arrange", "route"), _ESCAPING_MATRIX, ids=_ESCAPING_IDS)
+def test_an_unanticipated_break_tells_the_caller_nothing(env, monkeypatch, label, arrange, route):
     """The generic message is not politeness, it is the containment.
 
     Nobody has read the text of an exception nobody anticipated. `MissingSectionHeaderError` alone
     carries the absolute path of the credentials file, and the traceback carries the path of every
     frame — which is what used to be relayed verbatim into `failure.message`, a field the caller is
-    shown. So: the caller gets the one fixed string, and the raw exception plus its stack go to the
-    server log, where an operator can actually act on them.
+    shown. So the caller gets the one fixed string, whichever route produced the break: in-process
+    the chokepoint authors it, and across the fork the parent relays the child's copy of the same
+    string (and would substitute its own for anything carrying a traceback).
     """
-    executor = arrange(monkeypatch, env)
-    tools.set_injected_executor(executor)
+    _arrange_for_route(monkeypatch, env, arrange, route)
 
-    with caplog.at_level(logging.ERROR):
-        body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
-                                                  "datasource": PROFILE}))
+    body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                              "datasource": PROFILE}))
 
     assert body["failure"]["message"] == execute_sql.UNEXPECTED_FAILURE_MESSAGE
     serialized = json.dumps(body)
     assert "Traceback" not in serialized
     assert str(env.artifacts) not in serialized  # no absolute path from any frame or message
+
+
+@pytest.mark.parametrize(
+    ("label", "arrange"),
+    [(label, arrange) for label, arrange, _ in _ESCAPING],
+    ids=[label for label, _, _ in _ESCAPING],
+)
+def test_an_unanticipated_break_tells_the_log_everything(env, monkeypatch, caplog, label, arrange):
+    """The other half of the containment: what the caller is not told, an operator must be.
+
+    In-process only, and that is the whole scope of the claim rather than a gap — `caplog` observes
+    THIS process's logger, and on the fork route the break happens in the child, whose log is its own
+    stderr. What the parent does with that stderr is a different property, pinned by
+    `_child_failure_message`'s tests and by the sibling test above.
+    """
+    tools.set_injected_executor(arrange(monkeypatch, env))
+
+    with caplog.at_level(logging.ERROR):
+        json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                           "datasource": PROFILE}))
 
     logged = [r for r in caplog.records if r.name == "execute_sql" and r.levelname == "ERROR"]
     assert len(logged) == 1, [r.getMessage() for r in logged]
@@ -542,12 +632,24 @@ def test_a_store_that_cannot_even_be_opened_changes_nothing_and_says_so(env, cap
 # ---------------------------------------------------------------------------
 
 
-def test_our_own_240s_bound_is_a_refusal_that_names_the_fix(env, monkeypatch):
-    """The supervisor bound is OURS: nothing was reported by the database, we stopped waiting.
+def test_killing_an_unresponsive_executor_is_a_failure_we_cannot_attribute(env, monkeypatch):
+    """The supervisor bound produces `failed` / `timeout`, and the contract is what settles it.
 
-    So it is `refused` / `resource_limit`, and — like every refusal — it carries a remediation the
-    caller can act on. As a `failed`/`timeout` it read as something that happened TO us, with
-    nothing to do about it.
+    Guardrail contract §3, verbatim: *"The rule is about a per-statement timeout. The subprocess
+    supervisor that kills an executor which never returned is also ours, but it cannot attribute the
+    kill to the statement — the child may have hung in connect, credential resolution or model load,
+    where 'narrow the query' is the wrong fix — so an unresponsive executor is `failed`."*
+
+    So "whose decision was it?" is not the test on its own. Ours, yes — but a refusal must name a
+    fix, and the only fix this branch could name ("narrow the time range, add a filter, aggregate")
+    asserts something we did not observe: that the STATEMENT is what ran long. Point it at a child
+    that hung resolving credentials and it is advice about the wrong subject, delivered with the
+    authority of a guardrail decision. `failed` / `timeout` claims exactly what we know — we stopped
+    waiting — and the value-free message says only that.
+
+    `RULE_RESOURCE_LIMIT` stays declared and pinned in `REASON_FOR_RULE` for the per-statement bound
+    a later gate imposes, which IS a refusal because its subject is the statement. It has no producer
+    today, and this branch must not become one.
     """
     def _timed_out(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 240))
@@ -555,21 +657,51 @@ def test_our_own_240s_bound_is_a_refusal_that_names_the_fix(env, monkeypatch):
     monkeypatch.setattr(tools.subprocess, "run", _timed_out)
 
     body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
-                                              "datasource": PROFILE}))
+                                              "datasource": PROFILE, "raw_query": QUESTION}))
 
-    assert body["status"] == "refused"
-    assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
-    assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
-    assert body["refusal"]["remediation"].strip()
+    assert body["status"] == "failed"
+    assert body["failure"]["kind"] == "timeout"
+    assert "refusal" not in body
+    # Value-free: it names no table, no column and no bound of the caller's statement, and it does
+    # not pretend to know what the child was doing.
+    message = body["failure"]["message"]
+    assert "orders" not in message and "SELECT" not in message
     (row,) = _rows(env.app_db)
     assert row["id"] == body["audit_id"]
-    assert row["status"] == "refused" and row["rule"] == guardrail.RULE_RESOURCE_LIMIT
+    assert row["status"] == "failed" and row["reason"] is None and row["rule"] is None
+    # The row still says which datasource and which question — the branch used to pass neither.
+    assert row["datasource"] == PROFILE and row["question"] == QUESTION
+
+
+def test_no_gate_produces_the_resource_limit_refusal(env, monkeypatch):
+    """`RULE_RESOURCE_LIMIT` is declared with NO producer, and the supervisor kill is where it would
+    creep back in — so drive that branch and assert the rule is absent from what the caller gets.
+
+    The pin is on `REASON_FOR_RULE`, not on the absence: the rule stays in the contract's table so
+    the gate that eventually imposes a per-statement timeout fills a constant instead of inventing a
+    string. What must not happen is a branch borrowing it because the word "timeout" fits.
+    """
+    assert guardrail.RULE_RESOURCE_LIMIT in guardrail.REASON_FOR_RULE
+
+    def _timed_out(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 240))
+
+    monkeypatch.setattr(tools.subprocess, "run", _timed_out)
+    body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                              "datasource": PROFILE}))
+
+    assert guardrail.RULE_RESOURCE_LIMIT not in json.dumps(body)
+    (row,) = _rows(env.app_db)
+    assert row["rule"] is None
 
 
 def test_a_driver_timeout_is_the_databases_and_stays_a_failure(env):
-    """The other side of the split. A connect/network timeout is the database's outcome, not our
-    decision, so it stays `failed` — and it arrives as the connect failure the executor already
-    classifies (`auth`, exit 4), which is why `FailureKind.timeout` currently has no producer at all.
+    """The other side of the split, and it lands on a DIFFERENT kind.
+
+    A connect/network timeout is the database's outcome rather than ours, and it arrives as the
+    connect failure the executor already classifies — `auth`, exit 4 — because that is what the
+    driver raises. So the two timeouts a deployment actually sees are distinguishable in the audit
+    trail: `timeout` means we stopped waiting on our own child, `auth` means the connection did.
     """
     class _TimedOutDriver:
         def execute(self, vetted_sql, creds, *, profile):
@@ -587,21 +719,74 @@ def test_a_driver_timeout_is_the_databases_and_stays_a_failure(env):
 
 
 # ---------------------------------------------------------------------------
+# The stored statement is bounded — a refusal must not be a way to grow the store
+# ---------------------------------------------------------------------------
+
+
+def test_an_oversized_statement_is_refused_and_stored_bounded(env):
+    """The cost of recording refusals, paid down.
+
+    Before refusals were audited they wrote no row at all, so the size of the statement a caller
+    sent did not matter. Now the read-only fast-fail records it — and the guard refuses a statement
+    for BEING oversized, which means the one statement guaranteed to be enormous is also guaranteed
+    to be written. An authenticated caller could grow the audit store without ever reaching the
+    warehouse.
+
+    The verdict columns are what make the row worth keeping, so those are unchanged; the blob is
+    bounded, and `sql_truncated` says so, because a cut statement that does not admit it reads as the
+    whole one.
+    """
+    oversized = "SELECT id FROM orders WHERE id IN (" + ",".join(["1"] * 250_000) + ")"
+    assert len(oversized) > 500_000
+
+    body = json.loads(tools.tool_execute_sql({"sql": oversized, "datasource": PROFILE,
+                                              "raw_query": QUESTION}))
+
+    assert body["status"] == "refused"
+    assert body["refusal"]["rule"] == guardrail.RULE_READ_ONLY
+    (row,) = _rows(env.app_db)
+    assert row["id"] == body["audit_id"]
+    assert len(row["sql"]) == tools.AUDIT_SQL_MAX_CHARS
+    assert row["sql"] == oversized[:tools.AUDIT_SQL_MAX_CHARS]  # a prefix, not a summary
+    assert row["sql_truncated"]
+    assert row["rule"] == guardrail.RULE_READ_ONLY and row["datasource"] == PROFILE
+
+
+def test_a_normal_statement_is_stored_whole_and_says_it_was_not_cut(env):
+    """The bound must not be silently rewriting ordinary rows: a statement under it is stored
+    verbatim and flagged as untruncated, so `sql_truncated` distinguishes something rather than
+    being true of everything."""
+    sql = "SELECT id FROM orders"
+    body = json.loads(tools.tool_execute_sql({"sql": sql, "datasource": PROFILE,
+                                              "raw_query": QUESTION}))
+
+    assert body["status"] == "ok"
+    (row,) = _rows(env.app_db)
+    assert row["sql"] == sql
+    assert not row["sql_truncated"]
+
+
+# ---------------------------------------------------------------------------
 # The migration itself
 # ---------------------------------------------------------------------------
 
 
-def test_the_verdict_columns_apply_to_a_fresh_store_and_re_running_is_a_no_op(tmp_path):
+def test_the_audit_columns_apply_to_a_fresh_store_and_re_running_is_a_no_op(tmp_path):
     """`ALTER TABLE ADD COLUMN` is not idempotent on either backend, so re-run safety has to come
     from the runner's `schema_migrations` ledger. A second `run_migrations()` returning nothing is
-    what proves the ledger — not the DDL — is carrying it."""
+    what proves the ledger — not the DDL — is carrying it.
+
+    Both audit migrations are asserted together: 014 added the verdict columns, 015 added
+    `sql_truncated`, and they share the property and the failure mode.
+    """
     url = "sqlite://" + str(tmp_path / "fresh.db")
     store = Store.connect(url)
     try:
         applied = store.run_migrations()
         assert "014_query_executions_guardrail.sql" in applied
+        assert "015_query_executions_sql_truncated.sql" in applied
         columns = {r["name"] for r in store.query("PRAGMA table_info(query_executions)")}
-        assert {"status", "reason", "rule"} <= columns
+        assert {"status", "reason", "rule", "sql_truncated"} <= columns
         assert store.run_migrations() == []  # a reboot is a no-op, not a duplicate-column error
     finally:
         store.close()

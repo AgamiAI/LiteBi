@@ -47,7 +47,7 @@ import agami_paths
 # nothing — unlike `sql_guard`, which is still imported lazily inside `check_read_only`. `Envelope`,
 # `Failure` and `Refusal` are CONSTRUCTED at this layer (the tool edge owns the outcomes that never
 # reach the execution chokepoint), so they cannot be TYPE_CHECKING-only the way `Refusal` was.
-from guardrail import RULE_RESOURCE_LIMIT, Envelope, Failure, Refusal, refuse
+from guardrail import Envelope, Failure, Refusal
 
 # The tool edge's logger. The audit write is best-effort — it must never break an answer — but
 # "best-effort" is not "silent": a permanently broken sink has to be distinguishable from a working
@@ -993,7 +993,11 @@ def _stderr_refusal(returncode: int, stderr: str | None) -> dict | None:
     The payload is rebuilt through `Refusal` rather than passed along as a raw dict, so the
     contract's invariants (a known reason, a non-empty detail and remediation) are re-checked on
     THIS side of the process boundary. A child that somehow emitted a malformed refusal therefore
-    falls back to the generic error path instead of being relayed as a valid one."""
+    falls back to the generic error path instead of being relayed as a valid one.
+
+    `AttributeError` is in the caught set alongside `TypeError`/`ValueError` because a non-string
+    field (`{"detail": 3}`) reaches `__post_init__`'s `.strip()` and raises it — a third way the same
+    malformed payload can fail, and the one that would escape a fallback this docstring promises."""
     if returncode != 1:
         return None
     from guardrail import Refusal
@@ -1010,7 +1014,7 @@ def _stderr_refusal(returncode: int, stderr: str | None) -> dict | None:
             continue
         try:
             return asdict(Refusal(**payload["refusal"]))
-        except (TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError):
             return None
     return None
 
@@ -1022,7 +1026,7 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     Relayed only when BOTH hold:
 
       * the exit code is one the child's CLI contract produces from a `Failure`
-        (`execute_sql.EXIT_TO_FAILURE_KIND` — 2/3/4/5). Those are the codes `main` reaches by
+        (`execute_sql.EXIT_TO_FAILURE_KIND` — 2/3/4/5/6). Those are the codes `main` reaches by
         writing `env.failure.message`, so the text is something the child classified and chose. Any
         other code — a Python-level crash exiting 1, a signal, a code we do not know — means the
         child never got that far, so its stderr is whatever happened to be on the way out.
@@ -1233,6 +1237,27 @@ def _emit(
     return json.dumps(body, indent=2, default=str)
 
 
+# The most of a caller's statement that reaches the audit store. Deliberately far below the guard's
+# own 50,000-character cap (`sql_guard._MAX_SQL_CHARS`), because the two bounds answer different
+# questions: the guard's decides what may RUN, this one decides what is worth KEEPING. Since a
+# refusal now writes a row, an oversized statement is refused *for being oversized* and its whole
+# body was still persisted — so an authenticated caller could grow the store without ever reaching
+# the warehouse. 8,000 characters holds any statement a person or a model actually writes (a long
+# generated SELECT is a few KB), and the verdict columns, not the blob, are what make the row useful.
+AUDIT_SQL_MAX_CHARS = 8_000
+
+
+def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
+    """The statement as it will be stored, plus whether it had to be cut.
+
+    The flag matters as much as the cut: a truncated statement that does not say so is a statement a
+    reviewer would read as the whole thing, and re-running it would not reproduce the decision.
+    """
+    if len(sql) <= AUDIT_SQL_MAX_CHARS:
+        return sql, False
+    return sql[:AUDIT_SQL_MAX_CHARS], True
+
+
 def _record_execution(
     env: Envelope,
     *,
@@ -1253,15 +1278,19 @@ def _record_execution(
     `reason` and `rule` are read off `env.refusal` — the contract object — rather than re-parsed out
     of the serialized body: the typed fields are already here, and a later change to the wire shape
     then cannot quietly empty the audit columns.
+
+    `sql` is BOUNDED before it is stored — see `AUDIT_SQL_MAX_CHARS`.
     """
     refusal = env.refusal
+    stored_sql, sql_truncated = _bounded_audit_sql(sql or "")
     _record_query(
         {
             "id": env.audit_id,
             "ts": _now_iso(),
             "profile": profile or "",
             "question": (args or {}).get("raw_query"),
-            "sql": sql or "",
+            "sql": stored_sql,
+            "sql_truncated": sql_truncated,
             "row_count": row_count,
             # Same provenance the tool-call row carries, so the two logs can't disagree about what
             # drove one execution. Unset, this is the value it has always been.
@@ -1335,13 +1364,22 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             execution_ms=None,
         )
 
+    # Resolved BEFORE the read-only gate so the refusal it may produce is audited against the
+    # datasource it was aimed at. `resolve_profile` reads an argument, an env var and a local config
+    # file — it opens no connection and touches no credential, so a mutation still never reaches the
+    # warehouse; what it no longer does is land in the audit trail with an empty `datasource`.
+    profile = resolve_profile(args.get("datasource"))
+
     refusal = check_read_only(sql)
     if refusal is not None:
         # The read-only fast-fail: the same gate `execute_guarded` runs, applied here so a mutation
-        # never even resolves a profile. Same rule, same remediation as the deeper call would give.
-        return _emit(_envelope("refused", refusal=refusal), sql=sql, execution_ms=None)
+        # never even resolves credentials or forks. Same rule, same remediation as the deeper call
+        # would give — and now the same audit row, too.
+        return _emit(
+            _envelope("refused", refusal=refusal),
+            sql=sql, execution_ms=None, profile=profile, args=args,
+        )
 
-    profile = resolve_profile(args.get("datasource"))
     max_rows = args.get("max_rows")
     try:
         max_rows = int(max_rows) if max_rows is not None else None
@@ -1385,20 +1423,22 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             timeout=240,
         )
     except subprocess.TimeoutExpired:
-        # A timeout splits by WHO decided it. This 240s bound is one WE impose: the database reported
-        # nothing, the supervisor simply stopped waiting — so it is a `refused`/`resource_limit`
-        # decision of ours, carrying a fix the caller can act on, not a `failed` we could only relay.
-        # A connect / network / driver timeout is the opposite case and stays a `failed`, because
-        # there it is the database (or the path to it) that ran out.
+        # A `failed`/`timeout`, NOT a `refused`/`resource_limit` — and the reason is what we can
+        # OBSERVE, not who acted. The bound is ours, but all it tells us is that the child never came
+        # back; it does not say the STATEMENT ran long. The child may have hung in connect, in
+        # credential resolution or in loading the model, and on any of those "narrow the query" is
+        # advice pointing at the wrong thing. A refusal must name a fix, so a kill we cannot attribute
+        # is not one. (Guardrail contract §3: an unresponsive executor is `failed`. The per-statement
+        # timeout a later gate imposes IS a refusal, and `RULE_RESOURCE_LIMIT` is reserved for it.)
         return _emit(
-            _envelope("refused", refusal=refuse(
-                RULE_RESOURCE_LIMIT,
-                detail="the statement ran past the 240s execution bound and was stopped",
-                remediation="Narrow the time range, add a filter, or aggregate instead of listing "
-                            "rows, then run it again.",
+            _envelope("failed", failure=Failure(
+                kind="timeout",
+                message="The executor did not respond within the supervisor's bound and was stopped.",
             )),
             sql=sql,
             execution_ms=None,
+            profile=profile,
+            args=args,
         )
     execution_ms = int((time.monotonic() - started) * 1000)
 
@@ -1418,7 +1458,13 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
                 kind=_classify_exit(proc.returncode),
                 message=_child_failure_message(proc.returncode, proc.stderr),
             ))
-        return _emit(env, sql=sql, execution_ms=execution_ms)
+        # `profile` and `args` travel with the non-ok outcomes too. Omitting them wrote the audit row
+        # with `datasource=''` and `question=NULL` on exactly the rows a reviewer of a refusal most
+        # needs them on — and only on the fork path, which is the default, so the two paths disagreed
+        # about the record of the same decision.
+        return _emit(
+            env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
+        )
 
     # Parse the RFC-4180 CSV emitted on stdout. The executor caps at the source (ACE-038/044) and
     # flags it on stderr; carry that flag so a truncated result is never presented as complete. The
@@ -1476,6 +1522,11 @@ def _record_query(rec: dict[str, Any]) -> None:
     try:
         from store import Store
 
+        # Stamped ABOVE the branch, so the field is on the record whichever sink takes it. It used to
+        # be set inside the DB branch only, which left the jsonl rows without the `org_id` the format
+        # spec documents for them — the field was declared for both sinks and written by one.
+        rec.setdefault("org_id", _current_org_id())  # the calling tenant
+
         store = Store.from_env()
         if store is None:
             # The local (no-database) path. `_append_jsonl` swallows its own OSError and reports it
@@ -1488,7 +1539,6 @@ def _record_query(rec: dict[str, Any]) -> None:
             from contracts import QueryExecutionRecord
             from model_store import DbActivitySink
 
-            rec.setdefault("org_id", _current_org_id())  # stamp the calling tenant onto the log row
             DbActivitySink(store).record_query_execution(QueryExecutionRecord(**rec))
         finally:
             store.close()

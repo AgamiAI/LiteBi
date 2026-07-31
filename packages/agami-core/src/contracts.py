@@ -203,7 +203,11 @@ class QueryExecutionRecord(_Contract):
 
     `status` / `reason` / `rule` are server-observed like the fields above them, but nullable:
     `status` because rows written before the guardrail contract have no verdict, `reason` and `rule`
-    because only a refusal has them (an `ok` or a `failed` row leaves both NULL)."""
+    because only a refusal has them (an `ok` or a `failed` row leaves both NULL).
+
+    `sql` is BOUNDED by the writer (`tools.AUDIT_SQL_MAX_CHARS`), and `sql_truncated` says whether it
+    had to be. Without the flag a cut statement reads as the whole one, and a reviewer re-running it
+    would not reproduce the decision the row records."""
 
     id: str
     ts: str
@@ -215,6 +219,7 @@ class QueryExecutionRecord(_Contract):
     status: str | None = None  # the Envelope's status: "ok" | "refused" | "failed"
     reason: str | None = None  # guardrail.RefusalReason — refusals only
     rule: str | None = None  # guardrail.RULE_* — refusals only
+    sql_truncated: bool = False  # `sql` was cut to the audit bound
     org_id: str = "local"  # the tenant this ran for; defaults to the single-tenant org
 
 
