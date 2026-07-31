@@ -1414,13 +1414,24 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # materializes the whole result — not a client-side trim after the fact.
         cmd += ["--max-rows", str(max_rows)]
 
+    # The supervisor's bound is the OUTERMOST of the four time bounds, and it is DERIVED from the
+    # same resolver every inner layer reads rather than being a number of its own. A fixed 240s
+    # inverted that order for any statement budget approaching it: the supervisor fired FIRST, so a
+    # statement we could have cancelled and refused precisely came back instead as a
+    # `failed`/`timeout` naming nothing the caller can act on. Imported lazily for the same
+    # reason `_run_in_process` does it. The child inherits `os.environ` (no `env=` below), so it
+    # resolves the identical `AGAMI_SQL_TIMEOUT_S` this call just read.
+    import execute_sql
+
+    supervisor_timeout_s = execute_sql._resolve_timeout_s() + execute_sql._SUPERVISOR_SKEW_S
+
     started = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=240,
+            timeout=supervisor_timeout_s,
         )
     except subprocess.TimeoutExpired:
         # A `failed`/`timeout`, NOT a `refused`/`resource_limit` — and the reason is what we can

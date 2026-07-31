@@ -19,6 +19,13 @@ both are properties an ordinary database error can have by coincidence, and read
 mean an unlucky query gets told to narrow itself when nothing timed out. `_deadline` sets its Event
 *before* the cancel lands, so "did WE stop this?" is answerable without inference — and it is
 asserted here in both directions.
+
+The last section is the OUTER bound, which is what makes the limit apply to every executor rather
+than to the built-in one alone. An injected executor (the hosted connection-reuse path) carries none
+of the engine watchdogs, and even the built-in BigQuery path has no cancel to arm — so
+`execute_guarded` bounds `executor.execute` itself, on a worker thread it can stop waiting for. The
+four bounds are one ordered family (watchdog < native < outer < supervisor) resolved from one budget,
+and the order is asserted as a single fact so no future change can let them drift apart.
 """
 
 from __future__ import annotations
@@ -26,7 +33,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -51,16 +60,35 @@ _TINY = 0.05
 
 @pytest.fixture(autouse=True)
 def _reset_override():
-    # _timeout_override is a request-scoped ContextVar; isolate every test from it.
+    # Both overrides are request-scoped ContextVars; isolate every test from them. The row cap is
+    # reset here too because the outer bound copies the caller's whole context into its worker, so a
+    # cap left set by one test is now visible to the next test's executor as well.
     execute_sql._timeout_override.set(None)
+    execute_sql._max_rows_override.set(None)
     yield
     execute_sql._timeout_override.set(None)
+    execute_sql._max_rows_override.set(None)
 
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
     # The suite must not inherit an operator's real budget from the ambient environment.
     monkeypatch.delenv("AGAMI_SQL_TIMEOUT_S", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_injected_executor():
+    """`_INJECTED_EXECUTOR` is a process global, and the tests below install one both directly and
+    (via `create_app`) as a side effect of building the HTTP app. Reset it around every test so
+    neither leaks into the next one and quietly moves it onto the other execution path."""
+    try:
+        import tools
+    except Exception:
+        yield
+        return
+    tools.set_injected_executor(None)
+    yield
+    tools.set_injected_executor(None)
 
 
 # --------------------------------------------------------------------------------------------
@@ -563,6 +591,10 @@ def test_an_error_that_merely_arrives_late_is_still_a_failure(warehouse, fake_sq
 # The refusal is recorded
 # --------------------------------------------------------------------------------------------
 
+# A neutral hostname and a throwaway secret, only so the HTTP surface below can mint a token.
+_BASE_URL = "https://your-host.example.com"
+_SIGNING_SECRET = "x" * 40
+
 
 @pytest.fixture
 def audited(tmp_path, monkeypatch):
@@ -607,6 +639,10 @@ def audited(tmp_path, monkeypatch):
     monkeypatch.delenv("AGAMI_ORG_ID", raising=False)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
     monkeypatch.setenv(f"DATASOURCE_URL__{PROFILE.upper()}", f"sqlite:///{path}")
+    # The HTTP surface needs both to mint and verify its bearer token; the stdio surface ignores
+    # them. Set here so one install serves both transports.
+    monkeypatch.setenv("PUBLIC_BASE_URL", _BASE_URL)
+    monkeypatch.setenv("AGAMI_SIGNING_SECRET", _SIGNING_SECRET)
     return SimpleNamespace(app_db=app_db)
 
 
@@ -643,6 +679,374 @@ def test_the_refusal_is_written_to_the_audit_trail(audited):
     assert row["status"] == "refused"
     assert row["rule"] == guardrail.RULE_RESOURCE_LIMIT
     assert row["reason"] == guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
+
+
+# --------------------------------------------------------------------------------------------
+# The outer bound — the limit reaches every executor, not only the built-in one
+# --------------------------------------------------------------------------------------------
+#
+# The engine watchdogs live INSIDE the built-in executor, so an injected one — which is what the
+# hosted connection-reuse path supplies — ran with no per-statement bound at all, and BigQuery has no
+# watchdog even on the built-in path. `execute_guarded` therefore bounds `executor.execute` itself.
+# That layer holds no connection and can cancel nothing; it runs the call on a daemon worker and
+# stops WAITING, which is why it must be the outer one and the watchdog must always win.
+
+
+class _BlockingExecutor:
+    """A `ports.Executor` whose `execute` never returns on its own — the shape the outer bound
+    exists for. Nothing about it is cancellable from outside, which is exactly the point: an
+    arbitrary injected executor exposes one method and no handle on the work behind it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> execute_sql.ExecResult:
+        self.calls += 1
+        self.entered.set()
+        # Released by the test, so the worker this deliberately leaks does not outlive the test that
+        # made it. A real one would sit here until its driver call returned on its own.
+        self.release.wait(10)
+        return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
+
+
+def test_an_injected_executor_that_never_returns_is_still_bounded(warehouse, monkeypatch):
+    """The headline for this layer: an executor with no watchdog of its own, no cancel and no
+    intention of returning still yields a `resource_limit` refusal at a bound we set.
+
+    Without the outer layer this call blocks in the executor and comes back `ok` with its rows, so
+    the assertion is on the WHOLE outcome — that it returned at all, in time, and as a refusal.
+
+    The skew is patched to zero so the bound under test is the 1s budget rather than 11s of wall
+    clock. The +10 value it normally carries is not skipped: it is pinned by the ordering test below,
+    which needs no clock at all.
+    """
+    monkeypatch.setattr(execute_sql, "_OUTER_BOUND_SKEW_S", 0)
+    execute_sql._timeout_override.set(_BUDGET_S)
+    executor = _BlockingExecutor()
+
+    started = time.monotonic()
+    try:
+        env = execute_sql.execute_guarded(
+            "SELECT id FROM orders", PROFILE, None, executor=executor, no_safety=True,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        executor.release.set()
+
+    assert executor.entered.is_set()  # the executor really ran; this is not a gate refusing early
+    assert elapsed < 10, f"the call waited {elapsed:.1f}s on a {_BUDGET_S}s bound"
+    assert env.status == "refused"
+    assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
+    # A bound WE imposed is a refusal, not a failure — and it carries no data, like every refusal.
+    assert env.data is None and env.failure is None
+
+
+def test_the_outer_refusal_says_what_actually_happened(warehouse, monkeypatch):
+    """It must not claim the statement was cancelled. Nothing was: the worker is still inside the
+    driver call, may still hold a connection, and the statement may still be running on the server.
+    The sentence the caller reads names what we observed — the executor did not come back — and
+    quotes the bound that actually elapsed rather than the inner budget."""
+    monkeypatch.setattr(execute_sql, "_OUTER_BOUND_SKEW_S", 0)
+    execute_sql._timeout_override.set(_BUDGET_S)
+    executor = _BlockingExecutor()
+
+    try:
+        env = execute_sql.execute_guarded(
+            "SELECT id FROM orders", PROFILE, None, executor=executor, no_safety=True,
+        )
+    finally:
+        executor.release.set()
+
+    assert "cancelled" not in env.refusal.detail, env.refusal.detail
+    assert "did not return" in env.refusal.detail, env.refusal.detail
+    # The remediation is the same one the inner bound gives: the fix that makes THIS statement
+    # runnable, addressed to a caller with no shell and no deployment.
+    authored = f"{env.refusal.detail} {env.refusal.remediation}"
+    assert "AGAMI_" not in authored, authored
+
+
+def test_the_inner_refusal_is_the_one_the_caller_gets(warehouse):
+    """When both layers are armed the INNER one wins, and the outer neither overwrites its refusal
+    nor mints a second.
+
+    That ordering is what buys the caller a precise answer: only the watchdog holds the connection
+    it cancelled, so only it can say the STATEMENT was stopped. A real cancel is driven here (no
+    stub, no patched skew) with the outer bound left at its real +10, so the outer layer is genuinely
+    armed and genuinely loses the race. The detail is the assertion, because it is the one part of
+    the envelope the two layers word differently.
+    """
+    execute_sql._timeout_override.set(_BUDGET_S)
+
+    started = time.monotonic()
+    env = _guarded(_RUNAWAY_SQL)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20, f"the statement ran {elapsed:.1f}s against a {_BUDGET_S}s budget"
+    assert env.status == "refused"
+    assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
+    assert f"{_BUDGET_S}s" in env.refusal.detail, env.refusal.detail  # the inner budget
+    assert "cancelled" in env.refusal.detail, env.refusal.detail  # the inner sentence
+    assert "did not return" not in env.refusal.detail, env.refusal.detail  # not the outer one
+
+
+def test_the_four_bounds_are_ordered_from_one_resolved_budget(monkeypatch):
+    """One fact, asserted once: the four time bounds are derived from a single resolved budget and
+    stand in a fixed order — watchdog < native (+5) < outer (+10) < supervisor (+60).
+
+    Asserted together rather than one skew per test because the ORDER is the property, and four
+    separate assertions would each stay green while the family drifted apart. Each layer behind the
+    watchdog is a backstop for something the layer in front cannot see, and every inversion trades a
+    precise refusal for a vaguer answer to the same event: a native kill reads as a database error,
+    an outer expiry cannot say the statement stopped, and a supervisor kill cannot say what hung.
+    """
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "45")  # distinctive: a hard-coded 30 cannot pass
+    timeout_s = execute_sql._resolve_timeout_s()
+
+    watchdog = timeout_s
+    native = timeout_s + execute_sql._NATIVE_BOUND_SKEW_S
+    outer = timeout_s + execute_sql._OUTER_BOUND_SKEW_S
+    supervisor = timeout_s + execute_sql._SUPERVISOR_SKEW_S
+
+    assert watchdog < native < outer < supervisor
+    assert (watchdog, native, outer, supervisor) == (45, 50, 55, 105)
+
+
+class _RaisingExecutor:
+    """A `ports.Executor` that raises a given exception from inside the worker thread."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> execute_sql.ExecResult:
+        raise self._exc
+
+
+def test_an_executor_error_keeps_its_type_across_the_worker(warehouse):
+    """The subtle half of running the call off-thread: an exception raised in the worker has to reach
+    the caller with its ORIGINAL type, or every handler in `execute_guarded` stops matching.
+
+    `ExecutorError` is the one that would fail loudest — its handler is what turns a driver error
+    into a classified `failed` envelope carrying the message this module authored. Caught as anything
+    else it would land in the catch-all and the caller would get the generic string instead, so the
+    relayed message is asserted rather than just the status.
+    """
+    env = execute_sql.execute_guarded(
+        "SELECT id FROM orders", PROFILE, None,
+        executor=_RaisingExecutor(execute_sql.ExecutorError("no such column: nope", code=5)),
+        no_safety=True,
+    )
+
+    assert env.status == "failed"
+    assert env.failure.kind == "syntax"  # the classified branch, i.e. `except ExecutorError` matched
+    assert env.failure.message == "no such column: nope"
+    assert env.failure.message != execute_sql.UNEXPECTED_FAILURE_MESSAGE
+
+
+def test_a_plain_exception_still_reaches_the_catch_all_across_the_worker(warehouse):
+    """And the other direction: an exception nobody classified is still an unanticipated break, told
+    to the caller as the one fixed string. A worker that swallowed it would leave the call looking
+    like it produced nothing at all."""
+    env = execute_sql.execute_guarded(
+        "SELECT id FROM orders", PROFILE, None,
+        executor=_RaisingExecutor(RuntimeError("a driver detail nobody has vetted")),
+        no_safety=True,
+    )
+
+    assert env.status == "failed"
+    assert env.failure.kind == "other"
+    assert env.failure.message == execute_sql.UNEXPECTED_FAILURE_MESSAGE
+    assert "driver detail" not in env.failure.message  # the raw text goes to the log, not the caller
+
+
+class _ContextProbeExecutor:
+    """Records the thread it ran on and what the two request-scoped ContextVars read there."""
+
+    def __init__(self) -> None:
+        self.thread: threading.Thread | None = None
+        self.seen_timeout: object = "not read"
+        self.seen_rows: object = "not read"
+
+    def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> execute_sql.ExecResult:
+        self.thread = threading.current_thread()
+        self.seen_timeout = execute_sql._timeout_override.get()
+        self.seen_rows = execute_sql._max_rows_override.get()
+        return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
+
+
+def test_the_request_scoped_overrides_are_visible_inside_the_worker(warehouse):
+    """A new thread starts with an EMPTY context, so without an explicit copy the caller's per-call
+    budget and row cap would read as unset inside the worker and every in-process call would quietly
+    fall back to the deployment defaults — a bug with no symptom other than the wrong numbers.
+
+    The thread identity is asserted first, because it is what makes the rest of this test mean
+    anything: if the call ever stopped running off-thread, the ContextVar assertions would pass
+    trivially and the copy could be deleted with the suite still green.
+    """
+    execute_sql._timeout_override.set(7)
+    execute_sql._max_rows_override.set(5)
+    probe = _ContextProbeExecutor()
+
+    env = execute_sql.execute_guarded(
+        "SELECT id FROM orders", PROFILE, None, executor=probe, no_safety=True,
+    )
+
+    assert env.status == "ok"
+    assert probe.thread is not threading.current_thread()  # it really ran on a worker
+    assert probe.seen_timeout == 7
+    assert probe.seen_rows == 5
+
+
+# --------------------------------------------------------------------------------------------
+# The supervisor's bound, derived rather than fixed
+# --------------------------------------------------------------------------------------------
+
+
+def test_the_supervisor_bound_is_derived_from_the_statement_budget(warehouse, monkeypatch):
+    """The fork path's supervisor was a hardcoded 240s, which quietly became the FIRST bound to fire
+    on any deployment configuring a larger statement budget — turning a refusal that could name the
+    statement into a `failed`/`timeout` that names nothing. It is now `budget + 60`, from the same
+    resolver every inner layer reads.
+
+    Asserted at a RAISED budget, which is the case the fixed number got wrong: at 300s the supervisor
+    must be 360, and 240 would have killed the child a full minute before its own statement bound.
+    The computed value is read off the `subprocess.run` call rather than waited out, for the obvious
+    reason.
+    """
+    import tools
+
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "300")
+    monkeypatch.setattr(tools, "resolve_profile", lambda ds: PROFILE)
+
+    class _Proc:
+        returncode = 0
+        stdout = "id\r\n1\r\n"
+        stderr = ""
+
+    captured: dict = {}
+
+    def _fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return _Proc()
+
+    monkeypatch.setattr(tools.subprocess, "run", _fake_run)
+    tools.set_injected_executor(None)  # the fork path, which is the one with a supervisor
+
+    tools.tool_execute_sql({"sql": "SELECT id FROM orders", "datasource": PROFILE})
+
+    assert captured["timeout"] == 300 + execute_sql._SUPERVISOR_SKEW_S == 360
+    assert captured["timeout"] > 300, "the supervisor must fire AFTER the statement bound, not before"
+    assert captured["timeout"] != 240, "the fixed bound this replaces"
+    # And nothing was passed that would stop the child inheriting the same configuration.
+    assert "env" not in captured
+
+
+def test_the_supervisors_verdict_is_unchanged(warehouse, monkeypatch):
+    """Only the DURATION moved. A child that never came back is still a `failed`/`timeout` and never
+    a `resource_limit`: the bound is ours, but all it tells us is that the child stopped responding —
+    it may have hung in connect, in credential resolution or in loading the model, and on any of
+    those "narrow the query" points at the wrong thing."""
+    import tools
+
+    monkeypatch.setattr(tools, "resolve_profile", lambda ds: PROFILE)
+
+    def _timed_out(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(tools.subprocess, "run", _timed_out)
+    tools.set_injected_executor(None)
+
+    body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                              "datasource": PROFILE}))
+
+    assert body["status"] == "failed"
+    assert body["failure"]["kind"] == "timeout"
+
+
+# --------------------------------------------------------------------------------------------
+# Both surfaces refuse identically
+# --------------------------------------------------------------------------------------------
+
+
+def _stdio_refusal(sql: str) -> dict:
+    """`python -m mcp_harness` over JSON-RPC on stdin — the transport a desktop client launches, and
+    the one that forks `python -m execute_sql`. The child inherits this process's environment, so it
+    resolves the same budget, model and warehouse; nothing on this path is stubbed."""
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "execute_sql", "arguments": {"sql": sql, "datasource": PROFILE,
+                                                         "raw_query": "how many"}}},
+    ]
+    proc = subprocess.run(
+        [sys.executable, "-m", "mcp_harness"],
+        input="".join(json.dumps(m) + "\n" for m in messages),
+        capture_output=True, text=True, timeout=180, env={**os.environ},
+    )
+    replies = {
+        m.get("id"): m
+        for m in (json.loads(line) for line in proc.stdout.splitlines() if line.strip())
+    }
+    assert 2 in replies, proc.stderr
+    return json.loads(replies[2]["result"]["content"][0]["text"])
+
+
+def _http_refusal(sql: str) -> dict:
+    """The authenticated HTTP transport, which runs execution IN-PROCESS through `create_app()`'s
+    default adapters — the other of the two execution paths."""
+    import mcp_http
+    import tools
+    from oauth_server import issue_jwt
+    from starlette.testclient import TestClient
+
+    headers = {
+        "Authorization": f"Bearer {issue_jwt('jordan@example.com')}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(mcp_http.create_app()) as client:
+        assert tools._INJECTED_EXECUTOR is not None, (
+            "create_app() no longer injects an executor, so this surface is now the fork path and "
+            "the in-process path this test believes it covers is uncovered"
+        )
+        init = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        session = init.headers.get("mcp-session-id")
+        headers2 = {**headers, **({"mcp-session-id": session} if session else {})}
+        client.post("/mcp", headers=headers2,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp = client.post("/mcp", headers=headers2, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "execute_sql", "arguments": {"sql": sql, "datasource": PROFILE,
+                                                            "raw_query": "how many"}}})
+    assert resp.status_code == 200, resp.text
+    return json.loads(resp.json()["result"]["content"][0]["text"])
+
+
+def test_both_surfaces_refuse_a_runaway_statement_identically(audited, monkeypatch):
+    """The criterion in one test: the limit applies the same on stdio and on HTTP, and no executor
+    escapes it.
+
+    The two transports run DIFFERENT execution paths — stdio forks a child and reads its stderr back,
+    HTTP runs the built-in executor in-process behind the outer bound — so "identically" is asserted
+    on the whole refusal, not merely on the status. A difference in any field would mean the caller's
+    answer depends on which door it came through.
+    """
+    pytest.importorskip("starlette")
+    pytest.importorskip("mcp")
+    pytest.importorskip("jwt")
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
+
+    stdio = _stdio_refusal(_RUNAWAY_SQL)
+    http = _http_refusal(_RUNAWAY_SQL)
+
+    assert stdio["status"] == http["status"] == "refused", (stdio, http)
+    assert stdio["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
+    assert stdio["refusal"] == http["refusal"]
 
 
 # --------------------------------------------------------------------------------------------
