@@ -324,6 +324,53 @@ def test_exactly_one_row_per_call_on_every_branch(env, monkeypatch):
         assert _ids(env.app_db) - before == {body["audit_id"]}, label
 
 
+@pytest.mark.parametrize(("label", "sql", "status"), [
+    ("ok", "SELECT id FROM orders", "ok"),
+    ("refused", "SELECT nope FROM orders", "refused"),
+    ("failed", "SELECT amount FROM orders", "failed"),
+], ids=["ok", "refused", "failed"])
+def test_the_audit_row_carries_the_scoped_call_source(env, label, sql, status):
+    """The recorded `source` is the one scoped for the call, on every outcome.
+
+    AH-022 gave this row its provenance: it reads `current_call_source()`, so an embedder that
+    dispatches handlers itself is distinguishable from transport traffic. That read lived in
+    `_finalize_execution`; this spec moved the write to `_emit`, and a move is exactly where a
+    hard-coded default creeps back in — the new writer only has to *say* `"mcp_server"` to look right.
+
+    Scoped via the ContextVar is the only route this row has. `record_tool_call` also accepts an
+    explicit `source=` that outranks the ContextVar, and this writer has no such parameter — so an
+    embedder that passes the argument instead of scoping gets two rows that disagree. That asymmetry
+    is AH-022's and predates this spec (it is on `main` verbatim); it is named here so the parity this
+    test does pin is not mistaken for the stronger guarantee.
+
+    Nothing else catches that. AH-022's own provenance test builds the record inline and stubs
+    `_record_query`, so it pins the ContextVar's behaviour rather than the production write, and it
+    passes whether or not the writer consults it. Verified: restoring the literal here leaves the
+    whole suite green.
+
+    Asserted on all three statuses because `_record_execution` runs on all three, and a refusal is
+    the row a reviewer most needs to attribute to a caller.
+    """
+    scoped = "embedded"
+    assert scoped != tools.DEFAULT_CALL_SOURCE  # or the assertion below proves nothing
+    token = tools.set_call_source(scoped)
+    try:
+        body = json.loads(tools.tool_execute_sql({"sql": sql, "datasource": PROFILE,
+                                                  "raw_query": QUESTION}))
+    finally:
+        tools.reset_call_source(token)
+    assert body["status"] == status
+    (row,) = [r for r in _rows(env.app_db) if r["id"] == body["audit_id"]]
+    assert row["source"] == scoped
+
+    # ...and unscoped it is the value it has always been, so the seam is opt-in rather than a
+    # rename of the default.
+    plain = json.loads(tools.tool_execute_sql({"sql": sql, "datasource": PROFILE,
+                                               "raw_query": QUESTION}))
+    (row,) = [r for r in _rows(env.app_db) if r["id"] == plain["audit_id"]]
+    assert row["source"] == tools.DEFAULT_CALL_SOURCE
+
+
 def test_the_forked_child_writes_no_row_of_its_own(env):
     """One query, one row — the child's id is neither published nor recorded.
 
