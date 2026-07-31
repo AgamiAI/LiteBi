@@ -368,6 +368,10 @@ def test_no_combination_of_outcome_overrides_writes_an_incoherent_row(
         ({"success": True, "error_kind": None}, "exception"),
         ({"error_kind": "timeout"}, "timeout"),  # a MORE specific kind is still welcome
         ({"success": False, "error_kind": "timeout"}, "timeout"),
+        # A caller contradicting themselves loses the success claim but keeps the diagnosis: there is
+        # no reason for `raised` to also discard the specific kind and fall back to the generic one.
+        ({"success": True, "error_kind": "timeout"}, "timeout"),
+        ({"success": True, "error_kind": "timeout", "row_count": 5}, "timeout"),
     ],
 )
 def test_a_call_that_raised_stays_a_failure_whatever_the_caller_passes(

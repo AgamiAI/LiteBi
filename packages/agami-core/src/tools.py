@@ -1345,9 +1345,12 @@ def record_tool_call(
         # it is a fact this function was told about what the tool actually did, and no argument can
         # make a call that threw into a successful one. Without this, passing something as innocuous
         # as `row_count` alongside `raised=True` erased the exception and logged a success.
-        # A more specific kind than the generic "exception" is still welcome, so a stated one stands.
+        # A more specific kind than the generic "exception" is still welcome, so a stated one stands
+        # — read from the parameter rather than the derived value, because a caller who contradicts
+        # themselves (`raised=True` with `success=True`) has already had the derived kind cleared by
+        # the success rule above. Their success claim loses; their diagnosis has no reason to.
         derived_success = False
-        derived_error_kind = derived_error_kind or "exception"
+        derived_error_kind = error_kind or derived_error_kind or "exception"
     rec: dict[str, Any] = {
         "ts": _now_iso(),
         "tool_name": name,

@@ -466,3 +466,31 @@ def test_a_row_written_before_the_source_column_counts_as_self_reported(env):
     (session,) = model_store.list_sessions(s)
     s.close()
     assert session["turns"][0]["question_self_reported"] is True
+
+
+def test_a_turn_mixing_two_non_default_sources_still_counts_as_self_reported(env):
+    """"Disagree" means the calls do not all carry the SAME source — not merely that one of them is
+    the transport's. A turn mixing two different non-default sources is just as ambiguous about who
+    captured the question, and dropping the marker there would OVERSTATE the trust, which is the one
+    direction this must never fail in."""
+    s = Store.connect(env)
+    _observed(s, ts="2026-06-28T13:00:00Z", actor="a", sql="Q1", success=True,
+              thread_id="t", correlation_id="c", user_question="mixed non-default sources")
+    _call(s, ts="2026-06-28T13:00:01Z", actor="a", sql="Q2", success=True, source="another-embedder",
+          thread_id="t", correlation_id="c")
+    (session,) = model_store.list_sessions(s)
+    s.close()
+    (turn,) = session["turns"]
+    assert turn["question_self_reported"] is True
+
+
+def test_a_turn_with_one_agreed_non_default_source_drops_the_marker(env):
+    """The only case that drops it: every call agreeing on a single non-default source."""
+    s = Store.connect(env)
+    _observed(s, ts="2026-06-28T14:00:00Z", actor="a", sql="Q1", success=True,
+              thread_id="t2", correlation_id="c2", user_question="all observed")
+    _observed(s, ts="2026-06-28T14:00:01Z", actor="a", sql="Q2", success=True,
+              thread_id="t2", correlation_id="c2")
+    (session,) = model_store.list_sessions(s)
+    s.close()
+    assert session["turns"][0]["question_self_reported"] is False

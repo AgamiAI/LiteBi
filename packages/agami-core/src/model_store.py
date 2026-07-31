@@ -497,10 +497,17 @@ def _question_is_self_reported(calls: list[dict[str, Any]]) -> bool:
     self-report; a caller that dispatches handlers itself can state it authoritatively instead, and says
     so by recording a different `source`. **Fails toward self-reported:** an unset source (rows written
     before the column existed) and a turn whose calls disagree both count as self-reported, because the
-    marker signals *lower* trust and the honest thing under uncertainty is to keep showing it."""
+    marker signals *lower* trust and the honest thing under uncertainty is to keep showing it.
+
+    "Disagree" means the calls do not all carry the SAME source — not merely that one of them is the
+    default. A turn mixing two different non-default sources is just as ambiguous about who captured
+    the question, and dropping the marker there would overstate the trust rather than understate it.
+    An empty turn has no evidence at all, so it keeps the marker too."""
     from tools import DEFAULT_CALL_SOURCE  # lazy: keeps the stdlib-lean base install importable
 
-    return any((c.get("source") or DEFAULT_CALL_SOURCE) == DEFAULT_CALL_SOURCE for c in calls)
+    sources = {(c.get("source") or DEFAULT_CALL_SOURCE) for c in calls}
+    # Only one case drops the marker: every call agreeing on a single, non-default source.
+    return len(sources) != 1 or DEFAULT_CALL_SOURCE in sources
 
 
 def list_sessions(
