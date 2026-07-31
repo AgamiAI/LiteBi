@@ -597,31 +597,69 @@ def test_red_team_stacked_keywords(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Stacked attack not blocked: {sql!r}"
 
 
+def _every_reject_list(namespace: dict[str, Any]) -> list[Any]:
+    """Every `REJECT_*` list in `namespace`, flattened, in declaration order.
+
+    Built by scanning rather than hand-unioned. The union was 19 `*REJECT_…` lines a contributor had
+    to remember to extend, and it is what makes the exhaustive-remediation claim in
+    `test_ace035_read_only_refusal.py` true — so a new `REJECT_FOO` list left out of it did not fail
+    anything, it silently shrank the corpus that file believes it is proving the contract over. The
+    only existing guard was a `len > 120` floor, which a single dropped list of four vectors clears
+    comfortably.
+
+    `dict.fromkeys` de-duplicates while preserving order: a vector that legitimately appears in two
+    categories should be parametrized once, and pytest ids must stay unique.
+    """
+    return list(
+        dict.fromkeys(
+            sql
+            for name, value in namespace.items()
+            if name.startswith("REJECT_") and name != "REJECT_CORPUS" and isinstance(value, list)
+            for sql in value
+        )
+    )
+
+
 # Every rejected statement in this file, in one list. `test_ace035_read_only_refusal.py` imports it
 # to assert the refusal contract holds for the whole corpus rather than for a sampled few — so a new
 # vector added to any list above is automatically held to the contract too. The over-length payload
 # is appended there (it is generated, not a literal).
-REJECT_CORPUS: list[Any] = [
-    *REJECT_NON_SELECT,
-    *REJECT_MULTI_STATEMENT,
-    *REJECT_EMPTY,
-    *REJECT_COMMENT_IN_STRING,
-    *REJECT_DATA_MODIFYING_CTES,
-    *REJECT_TRANSACTION_CONTROL,
-    *REJECT_SESSION_STATE,
-    *REJECT_PUBSUB_LOCK_PREPARED,
-    *REJECT_ROW_LEVEL_LOCKS,
-    *REJECT_NAMED_ROW_LOCK,
-    *REJECT_SELECT_INTO,
-    *REJECT_DANGEROUS_FUNCTIONS,
-    *REJECT_QUOTED_DANGEROUS_FN,
-    *REJECT_WELDED_QUOTED_DANGEROUS_FN,
-    *REJECT_COMMENT_BREAKS_GATE,
-    *REJECT_UNICODE_WHITESPACE_DENY,
-    *REJECT_DOLLAR_QUOTED_STACKING,
-    *REJECT_MYSQL_COMMENT_LEXING,
-    *REJECT_STACKED_KEYWORDS,
-]
+#
+# Assembled here, at the bottom of the reject section, so it sees every list declared above it.
+# `test_the_corpus_is_every_reject_list_in_this_module` re-runs the scan after the WHOLE module has
+# loaded, which is what catches the remaining hole: a `REJECT_FOO` declared *below* this line.
+REJECT_CORPUS: list[Any] = _every_reject_list(globals())
+
+
+def test_the_corpus_is_every_reject_list_in_this_module() -> None:
+    """The corpus, re-derived after the whole module has loaded, must equal the one assembled above.
+
+    That is the only way to see a `REJECT_*` list declared BELOW the assembly line — the scan cannot
+    include what does not exist yet, and a contributor appending a new category at the end of the
+    file is the likeliest version of this mistake. A test rather than a lazy property because the
+    corpus is consumed at import time by `@pytest.mark.parametrize`.
+    """
+    missing = [sql for sql in _every_reject_list(globals()) if sql not in REJECT_CORPUS]
+    assert missing == [], (
+        "a REJECT_* list is declared below REJECT_CORPUS and is not in it; move it above the "
+        f"assembly line. Vectors dropped: {missing!r}"
+    )
+
+
+def test_the_corpus_scanner_finds_the_lists_and_only_the_lists() -> None:
+    """The scanner is what makes the corpus self-maintaining, so it has to be shown working.
+
+    Three shapes at once: a new `REJECT_*` list is picked up, a non-`REJECT_` list is not, and a
+    duplicated vector appears once (pytest ids must stay unique).
+    """
+    scanned = _every_reject_list({
+        "REJECT_ONE": ["a", "b"],
+        "REJECT_TWO": ["b", "c"],  # 'b' is also in REJECT_ONE
+        "ACCEPT_ONE": ["SELECT 1"],
+        "REJECT_CORPUS": ["never"],  # the assembly itself is excluded by name
+        "REJECT_NOT_A_LIST": "a",
+    })
+    assert scanned == ["a", "b", "c"]
 
 
 # ---------------------------------------------------------------------------

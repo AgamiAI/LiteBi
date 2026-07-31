@@ -116,25 +116,70 @@ def test_the_error_names_the_rule_so_a_failure_is_locatable():
         _refusal(rule=guardrail.RULE_TABLE_SCOPE, remediation="")
 
 
+# --- the rule vocabulary, against the contract ------------------------------
+
+# The ten rules §1 of the guardrail contract names, transcribed as a literal. Deriving this set from
+# `guardrail` — which is what the reason-for-rule test below does, legitimately, for a different
+# question — cannot answer THIS one: a set compared against itself agrees with any drift. It agreed
+# with `unscopable` being absent from the module entirely (zero hits repo-wide) while the contract
+# spends a paragraph on why it is not the same rule as `unparseable`, and it would have agreed just
+# as readily with an invented rule appearing. Transcribing the contract is the only version of this
+# test that can fail.
+CONTRACT_RULES = frozenset({
+    "read_only",
+    "recon",
+    "resource_limit",
+    "table_scope",
+    "column_scope",
+    "select_star",
+    "unparseable",
+    "unscopable",
+    "model_unavailable",
+    "engine_mismatch",
+})
+
+# Rules this module declares that the contract does NOT name. Exactly one, and it is interim:
+# `model_safety` is what the four unconverted `_model_safety` branches carry so that every path out
+# of `execute_guarded` can still return an Envelope. It is deleted with those branches. Anything
+# else appearing here is a rule someone invented, which is the drift this test exists to catch.
+LOCAL_ADDITIONS = frozenset({"model_safety"})
+
+
+def _declared_rules() -> set[str]:
+    return {v for k, v in vars(guardrail).items() if k.startswith("RULE_") and isinstance(v, str)}
+
+
+def test_the_declared_rules_are_exactly_the_contract_plus_the_named_interim_one():
+    declared = _declared_rules()
+    # Split into the two directions so a failure says which one happened rather than printing two
+    # sets and leaving the reader to diff them.
+    assert CONTRACT_RULES - declared == frozenset(), "contract rule(s) not declared in guardrail.py"
+    assert declared - CONTRACT_RULES - LOCAL_ADDITIONS == frozenset(), "undeclared rule invented"
+    assert declared == CONTRACT_RULES | LOCAL_ADDITIONS
+
+
 # --- the pinned reason-for-rule table ---------------------------------------
 
 
 def test_every_rule_this_slice_can_emit_has_a_pinned_reason():
     """`refuse()` raises KeyError on an unpinned rule, so `REASON_FOR_RULE` is the list a new gate
     must extend. Everything emittable today is pinned."""
-    declared = {
-        v for k, v in vars(guardrail).items() if k.startswith("RULE_") and isinstance(v, str)
+    assert _declared_rules() - set(REASON_FOR_RULE) == {
+        guardrail.RULE_RECON,
+        guardrail.RULE_ENGINE_MISMATCH,
+        guardrail.RULE_UNSCOPABLE,
     }
-    assert declared - set(REASON_FOR_RULE) == {guardrail.RULE_RECON, guardrail.RULE_ENGINE_MISMATCH}
 
 
-@pytest.mark.parametrize("rule", ["recon", "engine_mismatch"])
+@pytest.mark.parametrize("rule", ["recon", "engine_mismatch", "unscopable"])
 def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
-    """`recon` and `engine_mismatch` are named by the contract but produced by later slices, and
-    their reason is genuinely those slices' call — `recon` could be `unsafe` or `out_of_scope`
-    depending on how it is framed. So they are declared as constants (a later slice fills a symbol
-    rather than inventing a string) but left out of `REASON_FOR_RULE`, which makes `refuse()` fail
-    loudly rather than let that slice pick a reason without pinning it here first."""
+    """`recon`, `engine_mismatch` and `unscopable` are named by the contract but produced by later
+    slices. For the first two the reason is genuinely those slices' call — `recon` could be `unsafe`
+    or `out_of_scope` depending on how it is framed. `unscopable` is a different case: the contract
+    already says `undetermined`, so leaving it out of `REASON_FOR_RULE` is not deferring a decision,
+    it is making the owning gate write the one line the contract dictates in a diff a reviewer sees,
+    alongside the gate that first emits it. Either way `refuse()` fails loudly rather than letting a
+    slice pick a reason without pinning it here."""
     assert rule not in REASON_FOR_RULE
     with pytest.raises(KeyError):
         refuse(rule, detail="d", remediation="r")

@@ -21,13 +21,29 @@ speaks `{"error": {kind, remediation}}` rather than the Envelope — so the base
 two shape assertions, `status == "refused"` and `refusal.rule == …`, and keeps the scanner
 verbatim.) A future failure here is therefore a live disclosure bug, not a conversion regression.
 
-**What this does NOT guarantee.** The table- and column-scope details confirm "this identifier is
-not in the model", which is a one-bit membership oracle per probed identifier: a caller willing to
-send N statements learns N bits about the declared surface. That is inherent to the existing
-design, is carried across verbatim by this work, and is deliberately unchanged here. It is prior
-art for the recon slice (`guardrail.RULE_RECON` is already declared and unassigned for it). A
-reader who takes "no enumeration" to mean "no inference" has read this file too generously: it
-bounds what a refusal *states*, not what a persistent caller can *infer*.
+**What this file covers.** Every field of the serialized tool-edge body, for the five refusal rules
+and for a `failed` — across both surfaces and both execution paths. `failure.message` is in scope
+because it is part of that body: it was the one field the scanner never saw, and it is where a
+PostgreSQL `HINT: Perhaps you meant to reference the column "orders.internal_ref".` arrives, which
+is enumeration reaching the caller through the operational channel rather than the guardrail one.
+
+**What it does NOT cover, in two different senses.**
+
+*Not yet fixed.* Driver text is relayed to `failure.message` unsanitized, so a driver that
+volunteers a declared name puts it in front of the caller. That is measured here rather than
+assumed: `test_a_driver_hint_enumerates_the_model_until_ace039_lands` drives exactly that shape and
+is `xfail(strict=True)`. Sanitizing driver text is the error-hardening slice's job (ACE-039), not
+this one's — and the strict marker means the day it lands, that test flips green and says so.
+Everything this slice *does* author into `failure.message` is value-free: the guarded path's
+catch-all message is a fixed string, and the forked path no longer relays unstructured child stderr.
+
+*Not fixable here.* The table- and column-scope details confirm "this identifier is not in the
+model", which is a one-bit membership oracle per probed identifier: a caller willing to send N
+statements learns N bits about the declared surface. That is inherent to the existing design, is
+carried across verbatim by this work, and is deliberately unchanged here. It is prior art for the
+recon slice (`guardrail.RULE_RECON` is already declared and unassigned for it). A reader who takes
+"no enumeration" to mean "no inference" has read this file too generously: it bounds what a refusal
+*states*, not what a persistent caller can *infer*.
 
 The model is defined in this file rather than imported, for the same reason
 `test_ace035_gate_verdict_parity.py` copies its fixtures: a sentinel whose canary can be
@@ -39,6 +55,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -96,9 +113,9 @@ def _write_model(root: Path) -> None:
     declared and never queried. They are what a "helpful" refusal would reach for — "did you mean
     one of these?" — and they are exactly what must never appear.
 
-    No warehouse is created alongside it, unlike S5's fixture: every statement here is refused
-    before execution, so a test that needed a live database would be reporting that a gate had
-    let something through.
+    `orders.amount` is declared here and deliberately absent from the warehouse the fixture builds,
+    which is how the `failed` vector reaches a real database and is rejected by it. Every other
+    statement in this file is refused before execution, so for those the warehouse is never touched.
     """
     import yaml
 
@@ -137,10 +154,25 @@ def _write_model(root: Path) -> None:
 
 @pytest.fixture
 def declared(tmp_path, monkeypatch):
-    """A resolvable model under profile `acme` — the four scope/safety rules run against this."""
+    """A resolvable model under profile `acme`, plus a real warehouse behind it.
+
+    The four scope/safety rules run against the model. The warehouse exists for the `failed` vector
+    alone: it has `orders`, but only the `id` column, so a statement the gates all pass is rejected
+    by the database itself — the operational channel, reached for real rather than by stubbing an
+    executor. Its table carries none of the canaries, so anything a canary-scan finds in a failure
+    body came from the model rather than from the database.
+    """
     artifacts = tmp_path / "artifacts"
     _write_model(artifacts / PROFILE)
+
+    warehouse = tmp_path / "warehouse.db"
+    con = sqlite3.connect(warehouse)
+    con.execute("CREATE TABLE orders (id INTEGER)")
+    con.commit()
+    con.close()
+
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
+    monkeypatch.setenv("DATASOURCE_URL__ACME", f"sqlite:///{warehouse}")
     # Local, not hosted: the disk model is the one the gates use. (`model_unavailable` needs the
     # hosted signal and gets its own fixture.)
     monkeypatch.delenv("AGAMI_DB_URL", raising=False)
@@ -148,7 +180,7 @@ def declared(tmp_path, monkeypatch):
     monkeypatch.delenv("AGAMI_ORG_ID", raising=False)
     monkeypatch.setenv("PUBLIC_BASE_URL", BASE_URL)
     monkeypatch.setenv("AGAMI_SIGNING_SECRET", SIGNING_SECRET)
-    return SimpleNamespace(artifacts=artifacts)
+    return SimpleNamespace(artifacts=artifacts, warehouse=warehouse)
 
 
 @pytest.fixture
@@ -276,6 +308,12 @@ VECTORS = (
 
 UNAVAILABLE_SQL = "SELECT id FROM orders"
 
+# The `failed` vector: `amount` is declared, so every gate passes it, and it is absent from the
+# warehouse, so the database rejects it. This is the operational channel — `failure.message` rather
+# than `refusal.detail` — and it was outside the sentinel's scope entirely until now, which mattered
+# because `failure.message` is the field nothing in this repo sanitizes.
+FAILED_SQL = "SELECT amount FROM orders"
+
 _MATRIX = [(rule, sql, route) for rule, sql in VECTORS for route in ROUTES]
 _MATRIX_IDS = [f"{rule}-{route}" for rule, _, route in _MATRIX]
 
@@ -345,6 +383,67 @@ def test_the_model_unavailable_refusal_lists_no_datasource_and_names_no_infrastr
     _assert_no_infrastructure(body["refusal"], whole_body=json.dumps(body), env=unavailable)
 
 
+@pytest.mark.parametrize("route", list(ROUTES), ids=list(ROUTES))
+def test_a_failed_envelope_enumerates_nothing_either(declared, route):
+    """A refusal is not the only body that reaches the caller, and `failure.message` is not scanned
+    by anything else.
+
+    A statement the gates all pass and the database then rejects produces the other channel — and
+    that channel is the one this repo does not sanitize, so leaving it out of the sentinel meant the
+    property was asserted where it was already true and unasserted where it was not. sqlite names
+    only the column the caller sent, so this is green; the shape that is not is pinned below.
+    """
+    body = ROUTES[route](FAILED_SQL)
+
+    assert body["status"] == "failed", body
+    _assert_echo_only(body, FAILED_SQL)
+
+
+# The PostgreSQL text a real deployment gets for the same statement, verbatim in shape. `amount` is
+# declared and missing from the table; PG reports that and then volunteers the nearest column it
+# does have, which here is a canary — a name the caller never sent and could not otherwise learn.
+_PG_HINT_ERROR = (
+    'Postgres execution error: column "amount" does not exist\n'
+    "LINE 1: SELECT amount FROM orders\n"
+    "               ^\n"
+    'HINT:  Perhaps you meant to reference the column "orders.internal_ref".'
+)
+
+
+class _PostgresLikeExecutor:
+    def execute(self, vetted_sql, creds, *, profile):
+        raise execute_sql.ExecutorError(_PG_HINT_ERROR, code=5)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="ACE-039 owns sanitizing driver text; until it lands, a driver HINT reaches the caller "
+           "through failure.message. Measured rather than assumed — this flips green when it lands.",
+)
+def test_a_driver_hint_enumerates_the_model_until_ace039_lands(declared):
+    """The known gap, driven rather than described.
+
+    PostgreSQL routinely appends `HINT: Perhaps you meant to reference the column "…"` to an
+    undefined-column error, and that hint names a column of the table — a declared name the caller
+    did not send. It arrives on `failure.message`, which is relayed from the driver verbatim: the
+    guardrail refuses to enumerate, and then the operational channel does it anyway.
+
+    Deliberately NOT fixed here. Classifying and sanitizing driver text across ten engines is the
+    error-hardening slice's whole job, and a partial regex in this slice would look like coverage
+    while missing the engines nobody thought of. So the vector stays, marked `strict` so it cannot
+    rot in either direction: if it starts passing, ACE-039 has landed and this marker must go; if
+    the assertion changes shape, it fails loudly.
+
+    One route is enough. The fork path relays the same child-classified text for the same exit code,
+    so this pins the field, not the transport.
+    """
+    tools.set_injected_executor(_PostgresLikeExecutor())
+    body = json.loads(tools.tool_execute_sql({"sql": FAILED_SQL, "datasource": PROFILE}))
+
+    assert body["status"] == "failed", body
+    _assert_echo_only(body, FAILED_SQL)
+
+
 def _assert_no_infrastructure(refusal: dict, *, whole_body: str, env) -> None:
     """No filesystem path, no DSN, no hostname — asserted on the two authored fields.
 
@@ -409,11 +508,11 @@ def test_the_canaries_are_real(tmp_path):
     for name in DECLARED_NAMES:
         assert _mentions(model_text, name), f"{name!r} is not actually declared by the fixture"
 
+    sent = [sql for _, sql in VECTORS] + [UNAVAILABLE_SQL, FAILED_SQL]
     for canary in CANARIES:
         assert canary in DECLARED_NAMES, canary
-        for _, sql in VECTORS:
+        for sql in sent:
             assert not _mentions(sql, canary), (canary, sql)
-        assert not _mentions(UNAVAILABLE_SQL, canary), canary
 
 
 def test_the_scanner_can_go_red():
@@ -479,3 +578,8 @@ def test_every_rule_and_every_route_is_covered():
     }
     assert set(ROUTES) == {"in_process", "fork", "stdio", "http"}
     assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 16
+    # The `failed` channel is covered by its own matrix rather than this one, because it has no
+    # rule. Its vector must not be one of these: a statement that a gate refuses would report on the
+    # refusal channel a second time and leave `failure.message` unscanned again, which is exactly
+    # the hole being closed.
+    assert FAILED_SQL not in {sql for _, sql in VECTORS} and FAILED_SQL != UNAVAILABLE_SQL

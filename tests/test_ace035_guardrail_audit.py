@@ -177,6 +177,13 @@ def _http_execute_sql(sql: str) -> dict:
 
     `create_app()`'s default adapters carry the built-in executor, so this surface runs execution
     IN-PROCESS — the other of the two execution paths. Same tool, same serializer, same audit write.
+
+    That in-process coverage is a CONSEQUENCE of a default, not a property of this test, so the
+    default is asserted rather than assumed: if `default_adapters` ever stopped carrying an
+    executor, every test in this file would quietly start exercising the fork path a second time and
+    all of them would still pass, leaving the in-process serializer unaudited with nothing to say
+    so. (`tests/test_ace035_no_enumeration.py` gets the same coverage by driving the two routes
+    explicitly; here the transports are the subject, so the assertion is the cheaper version.)
     """
     import mcp_http
     from oauth_server import issue_jwt
@@ -188,6 +195,10 @@ def _http_execute_sql(sql: str) -> dict:
         "Accept": "application/json, text/event-stream",
     }
     with TestClient(mcp_http.create_app()) as client:
+        assert tools._INJECTED_EXECUTOR is not None, (
+            "create_app() no longer injects an executor, so this surface is now the fork path — "
+            "the in-process path this file believes it covers is uncovered"
+        )
         init = client.post("/mcp", headers=headers, json={
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
@@ -310,6 +321,151 @@ def test_the_forked_child_writes_no_row_of_its_own(env):
     )
     assert proc.returncode == 0, proc.stderr
     assert _ids(env.app_db) == {body["audit_id"]}  # unchanged: the executor audits nothing
+
+
+# ---------------------------------------------------------------------------
+# `execute_guarded` is TOTAL — an escaping exception skips the chokepoint AND the audit row
+# ---------------------------------------------------------------------------
+
+
+class _ReturnsNothing:
+    """A broken adapter: satisfies `ports.Executor` by shape, returns the wrong type."""
+
+    def execute(self, vetted_sql, creds, *, profile):
+        return None
+
+
+class _RaisesItsOwnError(Exception):
+    """Stand-in for a consumer's own exception type — a pooled executor's `PoolError`, an RBAC
+    denial, a tunnel failure. `ports.Executor` never said an adapter may only raise
+    `ExecutorError`, so this is a shape a hosted consumer is entitled to produce."""
+
+
+class _RaisesForeign:
+    def execute(self, vetted_sql, creds, *, profile):
+        raise _RaisesItsOwnError("pool exhausted after 30s waiting for a connection")
+
+
+def _break_model_safety(monkeypatch, _env):
+    def _boom(sql, profile, area):
+        raise AttributeError("'NoneType' object has no attribute 'tables'")
+
+    monkeypatch.setattr(execute_sql, "_model_safety", _boom)
+    return execute_sql.BUILTIN_EXECUTOR
+
+
+def _break_credentials_file(monkeypatch, env):
+    """A credentials file `configparser` cannot read — the empirically-confirmed traceback source.
+
+    `MissingSectionHeaderError` is raised by `cfg.read(...)` inside `_load_credentials`, which is
+    inside the try but was not an `ExecutorError`, so it escaped. Its message embeds the absolute
+    path of the file, and the traceback embeds several more.
+    """
+    creds = env.artifacts / "credentials"
+    creds.write_text("this line has no [section] header\nuser = someone\n")
+    creds.chmod(0o600)  # `_load_credentials` refuses a world-readable file before parsing it
+    monkeypatch.setattr(execute_sql, "CREDENTIALS_PATH", creds)
+    monkeypatch.delenv("DATASOURCE_URL__ACME", raising=False)  # force the file path
+    monkeypatch.delenv("DATASOURCE_URL", raising=False)
+    return execute_sql.BUILTIN_EXECUTOR
+
+
+def _executor_returns_none(monkeypatch, _env):
+    return _ReturnsNothing()
+
+
+def _executor_raises_foreign(monkeypatch, _env):
+    return _RaisesForeign()
+
+
+_ESCAPING = [
+    ("model_safety raises", _break_model_safety),
+    ("unreadable credentials file", _break_credentials_file),
+    ("executor returns None", _executor_returns_none),
+    ("executor raises a foreign type", _executor_raises_foreign),
+]
+_ESCAPING_IDS = [label for label, _ in _ESCAPING]
+
+
+@pytest.mark.parametrize(("label", "arrange"), _ESCAPING, ids=_ESCAPING_IDS)
+def test_an_unanticipated_break_is_a_failed_envelope_with_an_audit_row(env, monkeypatch, label,
+                                                                      arrange):
+    """Four ways `execute_guarded` used to raise instead of returning, and what each cost.
+
+    All four propagated out of the chokepoint: `_model_safety` sat outside the try entirely, the
+    credentials file raises `configparser.Error` where only `ExecutorError` was caught, an injected
+    executor's own exception type was never anticipated, and an executor returning `None` made
+    `Envelope.__post_init__` raise on the way out. `tools._run_in_process` catches only `SystemExit`,
+    so each escaped `tool_execute_sql` — and because the audit row is written by the serializer the
+    exception skipped, the trail recorded nothing at all (verified: rows before and after, 0 and 0).
+
+    The hosted path is where this matters most. `ports.Executor` exists so a consumer can inject a
+    pooled / per-user-RBAC / SSH-tunnel executor, and nothing in its contract said it may only raise
+    `ExecutorError` — so a pooled executor's `PoolError` walked straight past the chokepoint.
+
+    Asserted together, because they are one property: the caller gets a `failed` Envelope, and
+    exactly one row lands, keyed by the id that Envelope carried.
+    """
+    executor = arrange(monkeypatch, env)
+    tools.set_injected_executor(executor)
+
+    before = _ids(env.app_db)
+    body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                              "datasource": PROFILE}))
+
+    assert body["status"] == "failed", body
+    assert body["failure"]["kind"] == "other", body
+    assert _ids(env.app_db) - before == {body["audit_id"]}, label
+    (row,) = [r for r in _rows(env.app_db) if r["id"] == body["audit_id"]]
+    assert row["status"] == "failed" and row["reason"] is None and row["rule"] is None
+
+
+@pytest.mark.parametrize(("label", "arrange"), _ESCAPING, ids=_ESCAPING_IDS)
+def test_an_unanticipated_break_tells_the_caller_nothing_and_the_log_everything(
+    env, monkeypatch, caplog, label, arrange
+):
+    """The generic message is not politeness, it is the containment.
+
+    Nobody has read the text of an exception nobody anticipated. `MissingSectionHeaderError` alone
+    carries the absolute path of the credentials file, and the traceback carries the path of every
+    frame — which is what used to be relayed verbatim into `failure.message`, a field the caller is
+    shown. So: the caller gets the one fixed string, and the raw exception plus its stack go to the
+    server log, where an operator can actually act on them.
+    """
+    executor = arrange(monkeypatch, env)
+    tools.set_injected_executor(executor)
+
+    with caplog.at_level(logging.ERROR):
+        body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                                  "datasource": PROFILE}))
+
+    assert body["failure"]["message"] == execute_sql.UNEXPECTED_FAILURE_MESSAGE
+    serialized = json.dumps(body)
+    assert "Traceback" not in serialized
+    assert str(env.artifacts) not in serialized  # no absolute path from any frame or message
+
+    logged = [r for r in caplog.records if r.name == "execute_sql" and r.levelname == "ERROR"]
+    assert len(logged) == 1, [r.getMessage() for r in logged]
+    assert logged[0].exc_info is not None  # the cause, not merely the fact
+
+
+def test_a_process_teardown_still_escapes(env, monkeypatch):
+    """`SystemExit` and `KeyboardInterrupt` are not `Exception` and must stay that way.
+
+    A process being torn down is not a query outcome to report, and swallowing it into a `failed`
+    Envelope would make Ctrl-C and a supervisor's shutdown look like a database problem. The
+    catch-all above therefore has to be `except Exception`, never a bare `except`. (The narrower
+    `SystemExit` net one layer up in `tools._run_in_process` is a different case — it is scoped to a
+    driver's own deep `sys.exit` and is pinned by
+    `tests/test_ah012_executor_seam.py::test_injected_executor_systemexit_is_caught_not_fatal`.)
+    """
+    class _Interrupted:
+        def execute(self, vetted_sql, creds, *, profile):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        execute_sql.execute_guarded("SELECT id FROM orders", PROFILE, None,
+                                    executor=_Interrupted())
 
 
 # ---------------------------------------------------------------------------

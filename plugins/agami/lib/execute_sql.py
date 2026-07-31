@@ -50,6 +50,7 @@ import argparse
 import configparser
 import csv
 import json
+import logging
 import os
 import stat
 import sys
@@ -85,6 +86,18 @@ if TYPE_CHECKING:
 CREDENTIALS_PATH = agami_paths.credentials_path()
 CONFIG_PATH = agami_paths.config_path()
 ALLOWED_PERMS = (0o600, 0o400)
+
+_LOG = logging.getLogger(__name__)
+
+# What a caller is told when something we did not anticipate broke. Deliberately generic and
+# value-free: the raw text of an unanticipated exception is the one string in this module nobody has
+# read, so it may carry a traceback, an absolute path, a DSN or a row value. It goes to the server
+# log; the caller gets this. `other` is the failure kind, because an unclassified break is exactly
+# what that member is for.
+UNEXPECTED_FAILURE_MESSAGE = (
+    "The statement could not be run because of an unexpected error on the server. "
+    "The details are in the server log."
+)
 
 
 def _resolve_default_profile() -> str:
@@ -1241,49 +1254,84 @@ def execute_guarded(
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
     SQL both guards have passed.
 
-    **Every path returns exactly one ``Envelope``** — nothing is raised out of here for a caller to
-    interpret, so the subprocess ``main`` and the in-process MCP handler cannot disagree about what
-    happened. The five outcomes:
+    **Every path returns exactly one ``Envelope``, and this function is TOTAL** — nothing is raised
+    out of here for a caller to interpret, so the subprocess ``main`` and the in-process MCP handler
+    cannot disagree about what happened. The six outcomes:
 
       * the read-only gate refuses            -> ``refused`` carrying that gate's ``Refusal``
       * ``_model_safety`` returns a Refusal   -> ``refused`` carrying it verbatim
       * ``_model_safety`` returns an int      -> ``refused`` carrying the interim ``model_safety``
       * ``executor.execute`` raises           -> ``failed`` carrying a classified ``Failure``
+      * anything else raises                  -> ``failed``/``other``, generic message, raw to the log
       * the statement ran                     -> ``ok`` carrying the ``ExecResult``
+
+    The whole body is inside the try, and the catch-all is what makes "exactly one Envelope" a
+    property rather than a claim. It was neither before: ``_model_safety`` sat outside the try
+    entirely, ``_load_credentials`` was inside it but only ``ExecutorError`` was caught (a malformed
+    or duplicate-section credentials file raises ``configparser.Error``), an injected executor
+    raising anything else escaped, and an executor returning ``None`` made ``_envelope("ok", …)``
+    raise out of ``Envelope.__post_init__``. Each of those propagated past the chokepoint to
+    ``tools._run_in_process``, which catches only ``SystemExit`` — so the caller got an exception
+    instead of an Envelope AND no audit row was written, because the row is written by the
+    serializer the exception skipped. That matters most for the hosted path: ``ports.Executor``
+    exists so a consumer can inject a pooled / per-user-RBAC / SSH-tunnel executor, and a pooled
+    executor raising its own ``PoolError`` must not be able to leave the chokepoint silently.
+
+    ``SystemExit`` and ``KeyboardInterrupt`` are not ``Exception`` and deliberately still escape: a
+    process being torn down is not a query outcome to report.
 
     ``_load_credentials`` sits INSIDE the try deliberately, so a bad profile / missing DSN becomes a
     ``failed``/``dsn`` Envelope carrying its detailed message rather than escaping as an exception
     the two callers would each have to translate. The row cap rides the request-scoped
     ``_max_rows_override`` ContextVar the caller sets."""
-    import sql_guard
-
-    refusal = sql_guard.check_read_only(sql)
-    if refusal is not None:
-        return _envelope("refused", refusal=refusal)
-    if not no_safety:
-        sql, verdict = _model_safety(sql, profile, area)
-        if isinstance(verdict, Refusal):
-            return _envelope("refused", refusal=verdict)
-        if verdict is not None:
-            # One of the four unconverted branches: it wrote its own diagnostic to the server log
-            # and handed back only an exit code, so this is the most we can say without inventing a
-            # rule for it. The interim RULE_MODEL_SAFETY exists precisely so this path still returns
-            # an Envelope — without it the signature would have to be `Envelope | int` and the
-            # "exactly one Envelope per path" property would be literally false. Both this constant
-            # and this branch go away when those branches are subtracted.
-            return _envelope("refused", refusal=refuse(
-                RULE_MODEL_SAFETY,
-                detail="the semantic-model safety pass refused this statement",
-                remediation="Check the server log for the rule that fired, then adjust the query.",
-            ))
     try:
+        import sql_guard
+
+        refusal = sql_guard.check_read_only(sql)
+        if refusal is not None:
+            return _envelope("refused", refusal=refusal)
+        if not no_safety:
+            sql, verdict = _model_safety(sql, profile, area)
+            if isinstance(verdict, Refusal):
+                return _envelope("refused", refusal=verdict)
+            if verdict is not None:
+                # One of the four unconverted branches: it wrote its own diagnostic to the server
+                # log and handed back only an exit code, so this is the most we can say without
+                # inventing a rule for it. The interim RULE_MODEL_SAFETY exists precisely so this
+                # path still returns an Envelope — without it the signature would have to be
+                # `Envelope | int` and the "exactly one Envelope per path" property would be
+                # literally false. Both this constant and this branch go away when those branches
+                # are subtracted.
+                return _envelope("refused", refusal=refuse(
+                    RULE_MODEL_SAFETY,
+                    detail="the semantic-model safety pass refused this statement",
+                    remediation="Check the server log for the rule that fired, then adjust the "
+                                "query.",
+                ))
         creds = _load_credentials(profile, org_id or "local")
         result = executor.execute(sql, creds, profile=profile)
+        # Inside the try on purpose: an executor that returns `None` (or anything else the contract
+        # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
+        # broken adapter, not a reason for the chokepoint to raise at its caller.
+        return _envelope("ok", data=result)
     except ExecutorError as exc:
+        # The classified branch: `msg` is authored by this module (a missing driver, a connect
+        # failure, the credential-resolution remediation naming DATASOURCE_URL) or relayed from the
+        # driver, and both callers already surface it. Sanitizing DRIVER text is a separate, larger
+        # job (ACE-039) and is deliberately not attempted here.
         return _envelope("failed", failure=Failure(
             kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
         ))
-    return _envelope("ok", data=result)
+    except Exception:
+        # Unanticipated, so unreadable: nobody has vetted what this exception's text contains, and
+        # `configparser.MissingSectionHeaderError` alone carries the absolute path of the
+        # credentials file. The raw text and its stack go to the server log; the caller gets the
+        # generic message. Logged at ERROR rather than WARNING because reaching here means a bug or
+        # a broken adapter, not a user mistake.
+        _LOG.error("unhandled error in the guarded execution path", exc_info=True)
+        return _envelope("failed", failure=Failure(
+            kind="other", message=UNEXPECTED_FAILURE_MESSAGE,
+        ))
 
 
 def main() -> int:

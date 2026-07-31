@@ -4,10 +4,16 @@ Every SQL safety gate returns `Refusal | None`; every path through `execute_sql.
 returns an `Envelope`. So a caller never has to know WHICH gate fired to understand what happened,
 and a decision we made is never confused with a failure the database reported.
 
-**Stdlib only, dataclasses only.** Imported at runtime by `sql_guard`, `execute_sql` and
-`semantic_model.runtime`, and vendored byte-identical into `plugins/agami/lib/guardrail.py` for the
-marketplace layout (no pip, no package, no deps). It therefore may not import pydantic, `contracts`,
-or anything outside the stdlib — pinned by the clean-subprocess check in `tests/test_ports.py`.
+**Stdlib only, dataclasses only, and 3.9-compatible.** Imported at runtime by `sql_guard`,
+`execute_sql` and `semantic_model.runtime`, and vendored byte-identical into
+`plugins/agami/lib/guardrail.py` for the marketplace layout (no pip, no package, no deps). It
+therefore may not import pydantic, `contracts`, or anything outside the stdlib — pinned by the
+clean-subprocess check in `tests/test_ports.py`. The 3.9 floor is separate and applies to this
+module and the rest of the vendored slice only: the *package* requires 3.10+, but the plugin mirror
+runs on whatever `python3` the user already has, which on stock macOS is 3.9.6. So no `match`, no
+3.10-only dataclass keyword (`kw_only`, `slots`), and `X | None` only inside annotations, which
+`from __future__ import annotations` keeps as lazy strings. Pinned by
+`tests/test_plugin_lib_resolution.py::test_the_vendored_slice_stays_python_39_compatible`.
 `Envelope.data` is an `ExecResult`, referenced under TYPE_CHECKING only: the same device
 `ports.Executor` uses, for the same two reasons — dependency-freedom, and no runtime import cycle
 (`execute_sql` imports THIS module).
@@ -53,6 +59,16 @@ RULE_UNPARSEABLE = "unparseable"
 # leaving them unpinned makes `refuse()` fail loudly rather than let that gate choose one silently.
 RULE_RECON = "recon"
 RULE_ENGINE_MISMATCH = "engine_mismatch"
+# `unscopable` is the third of these, and it is NOT a synonym for `unparseable`: an unparseable
+# statement is one sqlglot cannot read at all, while an unscopable one parses perfectly and still
+# cannot be checked — a table function, `ROWS FROM`, `VALUES`, `UNNEST`, or any source that is not an
+# `exp.Table`, so the scope walk finds nothing to reject and would otherwise silently allow. It was
+# missing from this module entirely, which is how a contract-named rule went zero-hit repo-wide
+# without a test noticing; `test_ace035_guardrail_contract.py` now pins the vocabulary against the
+# contract's list so neither direction of drift can recur. Left unpinned with the two above so the
+# gate that produces it fills `REASON_FOR_RULE` in a reviewed diff (the contract already says that
+# entry is `undetermined`, so that is a one-line change, not a decision to re-litigate).
+RULE_UNSCOPABLE = "unscopable"
 
 # Interim. `_model_safety`'s fan/chasm pre-flight and sensitive-column branches are not converted in
 # this slice (they become receipt facts when the mutation branches are subtracted), but every path
@@ -76,7 +92,7 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
 }
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class Refusal:
     """What a gate returns when it stops a statement.
 
@@ -147,7 +163,7 @@ rather than widen the type."""
 _FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class Failure:
     """The database rejecting a statement we let through, or the connection breaking — not a third
     thing we chose.
@@ -193,7 +209,7 @@ Status = Literal["ok", "refused", "failed"]
 _STATUSES: frozenset[str] = frozenset(get_args(Status))
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class Envelope:
     """What the caller gets — one shape, every surface.
 
@@ -206,9 +222,16 @@ class Envelope:
     `audit_id` is the `query_executions.id` of the row recording this execution — the same id, not a
     parallel one, so the answer and its audit trail are joined by construction.
 
-    Field order is the contract's, verbatim. `kw_only=True` is what allows that: without it the two
-    fields carrying no default would have to be adjacent, and the declared order would drift from
-    the contract for a reason no reader could see.
+    Field order is the contract's, verbatim, and `audit_id` carries a default only so that order
+    survives: a field with no default may not follow one that has any. The empty string is not a
+    valid id — `__post_init__` rejects it — so the mandatory-audit-id invariant is unchanged and the
+    declared order still reads as the contract does.
+
+    `kw_only=True` would express that more directly and was how this was first written, but the
+    marketplace plugin mirror vendors this module for whatever `python3` the user already has (no
+    pip, no package, no deps), and `dataclass(kw_only=…)` is 3.10+. It made the whole vendored slice
+    unimportable on macOS-stock 3.9 — `sql_guard` and `execute_sql` both import this at module load —
+    so the field order is kept the way that costs 3.9 nothing.
     """
 
     status: Status
@@ -216,7 +239,7 @@ class Envelope:
     refusal: Refusal | None = None
     failure: Failure | None = None
     receipt: Receipt = field(default_factory=Receipt)
-    audit_id: str
+    audit_id: str = ""
 
     def __post_init__(self) -> None:
         if self.status not in _STATUSES:

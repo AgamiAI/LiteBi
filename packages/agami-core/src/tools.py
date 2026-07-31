@@ -1015,6 +1015,49 @@ def _stderr_refusal(returncode: int, stderr: str | None) -> dict | None:
     return None
 
 
+def _child_failure_message(returncode: int, stderr: str | None) -> str:
+    """The `Failure.message` for a forked executor that exited non-zero and did **not** write a
+    structured refusal — either the child's own classified diagnostic, or a generic stand-in.
+
+    Relayed only when BOTH hold:
+
+      * the exit code is one the child's CLI contract produces from a `Failure`
+        (`execute_sql.EXIT_TO_FAILURE_KIND` — 2/3/4/5). Those are the codes `main` reaches by
+        writing `env.failure.message`, so the text is something the child classified and chose. Any
+        other code — a Python-level crash exiting 1, a signal, a code we do not know — means the
+        child never got that far, so its stderr is whatever happened to be on the way out.
+      * the text carries no Python traceback. Belt and braces on the rule above, and the concrete
+        thing that used to land here: before `execute_guarded` was made total, a malformed
+        credentials file raised `configparser.MissingSectionHeaderError` out of the child, and the
+        parent put the whole traceback — absolute filesystem paths included — into `failure.message`,
+        which is a field the caller is shown.
+
+    What is deliberately still relayed is the child's *authored* config-error text ("No warehouse
+    credentials for profile […]. Set DATASOURCE_URL…", "Postgres connect failed: …"). That is the
+    remediation a misconfigured user needs, and it is the same text the in-process path surfaces
+    from `ExecutorError.msg` — the two paths agreeing on it is a property this slice exists to keep.
+    Sanitizing *driver* text is a separate job and belongs to the error-hardening slice; see the
+    coverage note in `tests/test_ace035_no_enumeration.py`.
+    """
+    from execute_sql import EXIT_TO_FAILURE_KIND, UNEXPECTED_FAILURE_MESSAGE
+
+    text = (stderr or "").strip()
+    classified = returncode in EXIT_TO_FAILURE_KIND
+    # `Traceback (most recent call last):` is the stable header of every Python traceback, and a
+    # `  File "…", line N` frame is the line that carries the absolute path. Either one is enough.
+    has_traceback = "Traceback (most recent call last):" in text or '\n  File "' in f"\n{text}"
+    if text and classified and not has_traceback:
+        return text
+    if text:
+        # Not for the caller, but not lost either: the raw stream is exactly what an operator needs
+        # to debug a child that died in a way it could not classify.
+        _LOG.error(
+            "forked executor exited %s with no relayable diagnostic; raw stderr: %s",
+            returncode, text,
+        )
+    return UNEXPECTED_FAILURE_MESSAGE
+
+
 def _executor_truncated(stderr: str | None) -> bool:
     """True if execute_sql flagged a bounded-fetch truncation (ACE-038/044). The executor emits a
     non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
@@ -1369,9 +1412,11 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         if refusal is not None:
             env = _envelope("refused", refusal=Refusal(**refusal))
         else:
+            # Not raw stderr: see `_child_failure_message` for which of the two the caller gets and
+            # why. This field is shown to the caller, so a traceback must never reach it.
             env = _envelope("failed", failure=Failure(
                 kind=_classify_exit(proc.returncode),
-                message=(proc.stderr or "").strip() or "execute_sql.py failed",
+                message=_child_failure_message(proc.returncode, proc.stderr),
             ))
         return _emit(env, sql=sql, execution_ms=execution_ms)
 
@@ -1472,8 +1517,9 @@ def record_tool_call(
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
     audit-grade fields are server-observed; `success`/`row_count`/`error_kind` are derived from the
-    result (a tool returns a failure body on a bad query without raising). The self-report
-    fields (`user_question`/`agent_query`/`thread_id`) are whatever Claude supplied — may be None.
+    result (a tool returns a refusal or failure body without raising, so `raised` alone would see
+    almost nothing). The self-report fields (`user_question`/`agent_query`/`thread_id`) are whatever
+    Claude supplied — may be None.
     **Best-effort and never raises** — a logging failure must not break the tool.
 
     The trailing parameters are an **override seam for an embedder that dispatches tool handlers
@@ -1511,13 +1557,27 @@ def record_tool_call(
             parsed = json.loads(result_text) if result_text else None
             if isinstance(parsed, dict):
                 # Two body shapes reach this sink. `execute_sql` speaks the guardrail Envelope
-                # (`status` + `failure`); the model-backed tools still return the older
-                # `{"error": {kind, remediation}}`. Both must mark the call unsuccessful — reading
-                # only one of them would silently log every failed query as a success.
-                failure = parsed.get("failure")
+                # (`status` + `refusal`/`failure`); the model-backed tools still return the older
+                # `{"error": {kind, remediation}}`. All three must mark the call unsuccessful —
+                # reading only one of them would silently log blocked or failed queries as
+                # successes.
+                failure, refusal = parsed.get("failure"), parsed.get("refusal")
                 if parsed.get("status") == "failed" and isinstance(failure, dict):
                     derived_success = False
                     derived_error_kind = failure.get("kind") or "error"
+                elif parsed.get("status") == "refused" and isinstance(refusal, dict):
+                    # A refusal is `success=0`, which is what it was before the Envelope: the body
+                    # then was `{"error": {"kind": "permission", …}}` and this sink read the `error`
+                    # key. The Envelope moved the verdict into `refusal`, and reading only `failure`
+                    # would have flipped every blocked query to `success=1` — so any dashboard
+                    # counting blocked queries off `tool_calls.success` would silently go to zero on
+                    # deploy. `error_kind` is the rule the gate chose (`table_scope`,
+                    # `column_scope`, …), strictly more informative than the single `permission`
+                    # the old body could say. "Successful" here means the caller's request was
+                    # carried out, not that the server behaved correctly; a refusal is the server
+                    # behaving correctly AND the request not being carried out.
+                    derived_success = False
+                    derived_error_kind = refusal.get("rule") or "refused"
                 elif isinstance(parsed.get("error"), dict):
                     derived_success = False
                     derived_error_kind = parsed["error"].get("kind") or "error"

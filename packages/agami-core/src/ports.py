@@ -134,7 +134,22 @@ class Executor(Protocol):
 
     ``profile`` is the datasource identity a pooling executor keys its reused connection on. The
     built-in OSS default (subprocess/direct connect-per-query) implements this same shape, so a
-    plain deploy is unchanged."""
+    plain deploy is unchanged.
+
+    Returns:
+        An ``ExecResult``. Returning ``None`` (or anything else) is a contract violation and is
+        reported to the caller as ``failed`` / ``other`` — never as a successful empty result.
+
+    Raises:
+        ``execute_sql.ExecutorError`` for a connect / credential / driver / run failure. That is the
+        classified channel: its ``code`` picks the ``Failure.kind`` the caller sees and its ``msg``
+        is relayed, so an adapter that wants a specific kind and a useful message raises this.
+
+        Any **other** exception is caught by ``execute_guarded`` and becomes ``failed`` / ``other``
+        with a generic, value-free message; the raw text and stack go to the server log only. So a
+        pooled executor's own ``PoolError`` is safe to raise — it will not escape the chokepoint and
+        it will not skip the audit row — but it will not reach the caller either. Prefer
+        ``ExecutorError``."""
 
     def execute(self, vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult: ...
 

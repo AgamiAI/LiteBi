@@ -23,6 +23,7 @@ what IS allowed would enumerate the declared surface, and no static string can.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -154,3 +155,75 @@ def test_parent_rejects_a_malformed_refusal() -> None:
                    '"remediation": "r", "surprise": 1}}')
     for line in (bad_reason, empty_fix, extra_field):
         assert tools._stderr_refusal(1, line) is None, line
+
+
+# ---------------------------------------------------------------------------
+# The other half of the wire: what a NON-refusal exit puts in `failure.message`
+# ---------------------------------------------------------------------------
+
+
+def test_the_childs_own_config_diagnostic_is_relayed() -> None:
+    """A classified exit carries text the child authored and the caller needs.
+
+    Exit 2/3/4/5 are the codes `execute_sql.main` reaches by writing `env.failure.message`, so the
+    text is something the child classified and chose — a missing driver, a connect failure, or the
+    credential remediation naming the env var to set. Relaying it is also what keeps the two
+    execution paths saying the same thing: the in-process path surfaces the same string from
+    `ExecutorError.msg` (pinned in tests/test_ah012_executor_seam.py).
+    """
+    detailed = ("No warehouse credentials for profile [acme]. Set DATASOURCE_URL "
+                "(or DATASOURCE_URL__ACME) in the environment.")
+    assert tools._child_failure_message(2, detailed) == detailed
+    assert tools._child_failure_message(4, "Postgres connect failed: refused") == (
+        "Postgres connect failed: refused"
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "stderr"),
+    [
+        # A Python-level crash in the child: exit 1 with no refusal object on the stream. The
+        # concrete case — a credentials file with no section header — used to put this whole thing,
+        # absolute paths and all, into a field the caller is shown.
+        (1, 'Traceback (most recent call last):\n'
+            '  File "/Users/someone/agami/execute_sql.py", line 266, in _load_credentials\n'
+            '    cfg.read(CREDENTIALS_PATH)\n'
+            'configparser.MissingSectionHeaderError: File contains no section headers.\n'
+            "file: '/Users/someone/agami-artifacts/local/credentials', line: 1"),
+        # A signal, or any code outside the CLI's table: the child never classified anything.
+        (-11, "Segmentation fault"),
+        (70, "something upstream decided this"),
+        # Belt and braces: a traceback on a classified code is still not relayed.
+        (2, 'Traceback (most recent call last):\n  File "/private/x.py", line 1, in <module>\n'
+            "ValueError: boom"),
+    ],
+    ids=["python crash", "signal", "unknown code", "traceback on a classified code"],
+)
+def test_an_unstructured_child_stream_never_reaches_the_caller(code, stderr, caplog) -> None:
+    """Anything the child did not classify is replaced, and logged instead.
+
+    `failure.message` is shown to the caller, and a traceback in it discloses the absolute path of
+    every frame — which is a real disclosure, not a formatting complaint. The rule is structural
+    (was this an exit code the child produces from a `Failure`?) with a traceback check behind it,
+    rather than a scrub of the text, because scrubbing text you did not author is a guess.
+    """
+    from execute_sql import UNEXPECTED_FAILURE_MESSAGE
+
+    with caplog.at_level(logging.ERROR):
+        message = tools._child_failure_message(code, stderr)
+
+    assert message == UNEXPECTED_FAILURE_MESSAGE
+    assert "Traceback" not in message and "/" not in message
+    # Suppressed for the caller, kept for the operator — the raw stream is what makes a child that
+    # died unclassifiably debuggable at all.
+    logged = [r for r in caplog.records if r.name == "tools" and r.levelname == "ERROR"]
+    assert len(logged) == 1 and stderr in logged[0].getMessage()
+
+
+def test_a_silent_child_still_gets_a_message() -> None:
+    """`Failure.message` has no meaningful empty value, and an empty stream is exactly the case
+    where there is nothing to relay. Nothing is logged either — there is no raw text to keep."""
+    from execute_sql import UNEXPECTED_FAILURE_MESSAGE
+
+    assert tools._child_failure_message(2, "") == UNEXPECTED_FAILURE_MESSAGE
+    assert tools._child_failure_message(1, None) == UNEXPECTED_FAILURE_MESSAGE
