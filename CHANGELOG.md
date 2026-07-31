@@ -19,9 +19,10 @@ below corresponds to one such version.
 - **Override seam on the tool-call audit log (`record_tool_call`).** An embedder that dispatches the
   tool handlers itself can now supply the values the log would otherwise infer from the model's own
   tool arguments and result body — `source`, `thread_id`, `correlation_id`, `user_question`,
-  `org_id`, plus the outcome (`success`, `row_count`, `error_kind`, `raised`). Every parameter
-  defaults to `None` = "derive it the way you always have", so the in-repo transport path is
-  regression-pinned identical to before the seam existed. `_record_query`'s source is likewise
+  `org_id`, and the outcome (`success`, `row_count`, `error_kind`). Each of these override
+  parameters defaults to `None` = "derive it the way you always have" (the recorded fact `raised` is
+  a separate boolean, default `False`), so a caller that passes none of them gets byte-identical
+  rows — the in-repo transport path is regression-pinned identical to before the seam existed. `_record_query`'s source is likewise
   readable from a context var, so the query log and the tool-call log can't disagree about what drove
   one execution.
 
