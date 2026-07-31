@@ -131,13 +131,18 @@ FailureKind = Literal[
     "timeout",
     "other",
 ]
-"""The nine classified operational errors. This slice produces `dsn`, `driver_missing`, `auth`,
-`syntax` and `other`, from the executor's exit codes. `column_not_found`, `table_not_found` and
+"""The nine classified operational errors. Five are produced today — `dsn`, `driver_missing`, `auth`,
+`syntax` and `other` — all from the executor's exit codes. `column_not_found`, `table_not_found` and
 `network` are DECLARED BUT UNREACHABLE: producing them means parsing driver text, and sanitizing
-driver text belongs to the error-hardening slice. `timeout` is likewise unproduced today — the
-supervisor bound we impose is a `resource_limit` REFUSAL, because the decision was ours; a real
-per-statement database timeout arrives with the timeout slice. Declared now so those slices fill a
-member rather than widen the type."""
+driver text belongs to the error-hardening slice.
+
+`timeout` has NO producer at all, on purpose. A timeout is classified by who decided it: the
+supervisor bound the tool edge imposes is a `resource_limit` REFUSAL, because stopping there was our
+call and it has a fix we can name; and the driver-level connect/login timeouts fold into the connect
+failure the executor already reports as `auth` (exit 4), because that is what the driver raises. A
+real per-statement database timeout — the database itself reporting that IT gave up — is the case
+this member is reserved for, and nothing raises it yet. Declared now so those slices fill a member
+rather than widen the type."""
 
 _FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
 

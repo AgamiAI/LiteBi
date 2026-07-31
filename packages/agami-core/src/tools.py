@@ -24,6 +24,7 @@ import csv
 import functools
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -46,7 +47,13 @@ import agami_paths
 # nothing — unlike `sql_guard`, which is still imported lazily inside `check_read_only`. `Envelope`,
 # `Failure` and `Refusal` are CONSTRUCTED at this layer (the tool edge owns the outcomes that never
 # reach the execution chokepoint), so they cannot be TYPE_CHECKING-only the way `Refusal` was.
-from guardrail import Envelope, Failure, Refusal
+from guardrail import RULE_RESOURCE_LIMIT, Envelope, Failure, Refusal, refuse
+
+# The tool edge's logger. The audit write is best-effort — it must never break an answer — but
+# "best-effort" is not "silent": a permanently broken sink has to be distinguishable from a working
+# one, or the audit trail can be absent for weeks with nothing to notice it by. Everything that is
+# swallowed here is logged at WARNING with its exception instead.
+_LOG = logging.getLogger(__name__)
 
 # Secrets + per-user state live under <artifacts_dir>/local/. Re-resolved after bootstrap() in main().
 AGAMI_LOCAL = agami_paths.local_dir()
@@ -1048,18 +1055,22 @@ def set_injected_executor(executor: Any | None) -> None:
 
 def _finalize_execution(
     columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
-    execution_ms: int, args: dict[str, Any],
+    execution_ms: int,
 ) -> str:
-    """Shape a successful result (units + exact-render markdown + trust receipt), log the execution
-    through the single sink, and return the result JSON. Shared by both execution paths — the
-    subprocess fork and the in-process executor — so a successful query returns the identical
-    payload whichever ran it.
+    """Shape a successful result (units + exact-render markdown + trust receipt) and return the
+    result JSON. Shared by both execution paths — the subprocess fork and the in-process executor —
+    so a successful query returns the identical payload whichever ran it.
 
     This is the **`ok` payload only**, and it is frozen: `_emit` merges `status` and `audit_id` onto
     what this returns and is the only thing that serializes a tool response. The nested
     `"receipt": _resolve_receipt(...)` here is the populated `contracts.Receipt` (tables_used /
     metrics / warnings), NOT the stdlib `Envelope.receipt` stub — the two are different types and
-    neither is wired from the other."""
+    neither is wired from the other.
+
+    It no longer writes the audit row. This function only ever runs on success, so hanging the write
+    here is precisely why a refusal left no trace; the write moved to `_emit`, which every outcome
+    passes through. Shaping a payload and recording an execution were two jobs in one place — and the
+    `args` parameter went with the write, since the tool arguments were only ever read for the log."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
@@ -1086,21 +1097,6 @@ def _finalize_execution(
         # (offer to approve/correct via the save_correction tool).
         "receipt": _resolve_receipt(profile, sql),
     }
-
-    # Log the execution through the single chokepoint: the DB sink when AGAMI_DB_URL is set (one
-    # query_executions row), else the local jsonl the skills use. Best-effort either way.
-    _record_query(
-        {
-            "ts": _now_iso(),
-            "profile": profile,
-            "question": args.get("raw_query"),
-            "sql": sql,
-            "row_count": len(data_rows),
-            # Same provenance the tool-call row carries, so the two logs can't disagree about what
-            # drove one execution. Unset, this is the value it has always been.
-            "source": current_call_source(),
-        }
-    )
     return json.dumps(result, indent=2, default=str)
 
 
@@ -1117,8 +1113,9 @@ def _envelope(
     The execution chokepoint (`execute_sql.execute_guarded`) mints its own for everything that
     reaches it; this covers the outcomes that never do — a malformed argument, the read-only
     fast-fail, the subprocess supervisor timeout, and the fork path, whose child's id is
-    deliberately not on the wire. When the audit row lands (a later slice) it hangs off `_emit`,
-    which is the single consumer of what this returns."""
+    deliberately not on the wire. The id minted here is the one that gets RECORDED: `_emit` — the
+    single consumer of what this returns — writes it as `query_executions.id`, so the id a caller
+    reads back off the answer is the primary key of its own audit row."""
     return Envelope(
         status=status,
         data=data,
@@ -1152,7 +1149,11 @@ def _emit(
       * `failed`  — `{status, failure, sql?, execution_ms?, audit_id}`.
 
     `None` fields are omitted rather than emitted as explicit `null`, so a response never carries a
-    key that says nothing (the argument-validation path, for instance, has no `sql` to report)."""
+    key that says nothing (the argument-validation path, for instance, has no `sql` to report).
+
+    This is also where the audit row is written — see `_record_execution`. Both branches below fall
+    through to ONE record call and ONE `json.dumps`, so "exactly one row per tool call, on every
+    outcome" is a property of the control flow rather than of six call sites staying in step."""
     if env.status == "ok":
         columns = list(env.data.columns)
         rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
@@ -1166,24 +1167,67 @@ def _emit(
             _finalize_execution(
                 columns, rows, truncated,
                 profile=profile or "", sql=sql or "", execution_ms=execution_ms or 0,
-                args=args or {},
             )
         )
-        return json.dumps(
-            {"status": "ok", **payload, "audit_id": env.audit_id}, indent=2, default=str
-        )
+        body: dict[str, Any] = {"status": "ok", **payload, "audit_id": env.audit_id}
+        row_count = payload["row_count"]
+    else:
+        body = {"status": env.status}
+        if env.refusal is not None:
+            body["refusal"] = asdict(env.refusal)
+        if env.failure is not None:
+            body["failure"] = asdict(env.failure)
+        if sql is not None:
+            body["sql"] = sql
+        if execution_ms is not None:
+            body["execution_ms"] = execution_ms
+        body["audit_id"] = env.audit_id
+        # A refused or failed call returned no rows at all — which is not the same fact as a query
+        # that ran and matched nothing, but the row's `status` is what carries that distinction.
+        row_count = 0
 
-    body: dict[str, Any] = {"status": env.status}
-    if env.refusal is not None:
-        body["refusal"] = asdict(env.refusal)
-    if env.failure is not None:
-        body["failure"] = asdict(env.failure)
-    if sql is not None:
-        body["sql"] = sql
-    if execution_ms is not None:
-        body["execution_ms"] = execution_ms
-    body["audit_id"] = env.audit_id
+    _record_execution(env, sql=sql, profile=profile, args=args, row_count=row_count)
     return json.dumps(body, indent=2, default=str)
+
+
+def _record_execution(
+    env: Envelope,
+    *,
+    sql: str | None,
+    profile: str | None,
+    args: dict[str, Any] | None,
+    row_count: int,
+) -> None:
+    """Write the ONE audit row for this call, from the ONE Envelope about to be serialized.
+
+    Called from `_emit`, the single tool-edge serializer, so a row lands for `ok`, `refused` **and**
+    `failed`. It used to hang off `_finalize_execution`, which runs only on success — so the audit
+    trail recorded the queries that worked and silently dropped every decision we made against one.
+
+    `id=env.audit_id` makes the row's primary key the same id the answer carried back, so a caller
+    can find the record of its own execution with no join and no second uuid to reconcile.
+
+    `reason` and `rule` are read off `env.refusal` — the contract object — rather than re-parsed out
+    of the serialized body: the typed fields are already here, and a later change to the wire shape
+    then cannot quietly empty the audit columns.
+    """
+    refusal = env.refusal
+    _record_query(
+        {
+            "id": env.audit_id,
+            "ts": _now_iso(),
+            "profile": profile or "",
+            "question": (args or {}).get("raw_query"),
+            "sql": sql or "",
+            "row_count": row_count,
+            # Same provenance the tool-call row carries, so the two logs can't disagree about what
+            # drove one execution. Unset, this is the value it has always been.
+            "source": current_call_source(),
+            "status": env.status,
+            "reason": refusal.reason if refusal is not None else None,
+            "rule": refusal.rule if refusal is not None else None,
+        }
+    )
 
 
 def _run_in_process(
@@ -1298,12 +1342,17 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             timeout=240,
         )
     except subprocess.TimeoutExpired:
-        # The supervisor bound, kept exactly as it reads today (kind + message). Whether a bound WE
-        # impose is really a `resource_limit` refusal rather than a `timeout` failure is the timeout
-        # slice's call; reclassifying it here would pre-empt that.
+        # A timeout splits by WHO decided it. This 240s bound is one WE impose: the database reported
+        # nothing, the supervisor simply stopped waiting — so it is a `refused`/`resource_limit`
+        # decision of ours, carrying a fix the caller can act on, not a `failed` we could only relay.
+        # A connect / network / driver timeout is the opposite case and stays a `failed`, because
+        # there it is the database (or the path to it) that ran out.
         return _emit(
-            _envelope("failed", failure=Failure(
-                kind="timeout", message="Query exceeded 240s.",
+            _envelope("refused", refusal=refuse(
+                RULE_RESOURCE_LIMIT,
+                detail="the statement ran past the 240s execution bound and was stopped",
+                remediation="Narrow the time range, add a filter, or aggregate instead of listing "
+                            "rows, then run it again.",
             )),
             sql=sql,
             execution_ms=None,
@@ -1367,24 +1416,41 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> bool:
 
 def _record_query(rec: dict[str, Any]) -> None:
     """Log a query execution through the DB sink (AGAMI_DB_URL) or the local jsonl. **Best-effort:**
-    a logging failure must never break an otherwise-successful query — so the DB path swallows
-    errors exactly like the jsonl path, and always closes its connection."""
-    from store import Store
+    a logging failure must never break an otherwise-successful query, and must never turn a refusal
+    into an exception.
 
-    store = Store.from_env()
-    if store is None:
-        _append_jsonl(QUERY_LOG, rec)
-        return
+    The WHOLE body sits inside the try, `Store.from_env()` included. Constructing the store can
+    itself raise — a malformed DSN, an uninstalled driver — and with that call outside the try the
+    exception escaped onto the success path: a deployment with a bad `AGAMI_DB_URL` broke every query
+    it logged, rather than every log it wrote. `_record_tool_call` has this shape already; this is
+    the same fix for the same reason.
+
+    A swallowed failure is LOGGED at WARNING with its traceback, not passed silently. The audit trail
+    is the point of the write, so a sink that has been broken for a month must not look identical to
+    one that is working."""
     try:
-        from contracts import QueryExecutionRecord
-        from model_store import DbActivitySink
+        from store import Store
 
-        rec.setdefault("org_id", _current_org_id())  # stamp the calling tenant onto the log row
-        DbActivitySink(store).record_query_execution(QueryExecutionRecord(**rec))
+        store = Store.from_env()
+        if store is None:
+            # The local (no-database) path. `_append_jsonl` swallows its own OSError and reports it
+            # as a False return, which was being discarded — the same invisibility as the bare
+            # `except: pass` below, so it gets the same treatment.
+            if not _append_jsonl(QUERY_LOG, rec):
+                _LOG.warning("query-execution audit write to %s failed", QUERY_LOG)
+            return
+        try:
+            from contracts import QueryExecutionRecord
+            from model_store import DbActivitySink
+
+            rec.setdefault("org_id", _current_org_id())  # stamp the calling tenant onto the log row
+            DbActivitySink(store).record_query_execution(QueryExecutionRecord(**rec))
+        finally:
+            store.close()
     except Exception:
-        pass  # best-effort: never fail the query because logging failed
-    finally:
-        store.close()
+        # No SQL, no question, no org — the record's own fields are the caller's data, and this line
+        # goes to the server log. The exception and the stack say where the write broke.
+        _LOG.warning("query-execution audit write failed; the answer is unaffected", exc_info=True)
 
 
 def record_tool_call(

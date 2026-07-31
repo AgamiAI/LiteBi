@@ -8,14 +8,16 @@ subject-area-primary shape. Samples here are copied from the dicts in `mcp_harne
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 pytest.importorskip("pydantic")
 
+import contracts  # noqa: E402
 from contracts import (  # noqa: E402
     CrossAreaRelationship,
     DatasourceSchemaResult,
-    ErrorResult,
     ExecuteSqlResult,
     ListDatasourcesResult,
     PromptExamplesResult,
@@ -110,23 +112,79 @@ def test_execute_sql_result_with_receipt_roundtrip():
     assert _roundtrip(ExecuteSqlResult, sample) == sample
 
 
-def test_execute_sql_error_roundtrip():
-    sample = {
-        "error": {"kind": "permission", "remediation": "DML/DDL rejected."},
-        "sql": "DELETE FROM orders",
-        "execution_ms": 0,
-    }
-    assert _roundtrip(ErrorResult, sample) == sample
+def test_a_rejected_execute_sql_is_an_envelope_body_not_an_error_contract():
+    """`ErrorResult` / `ToolError` are gone — the guardrail Envelope replaced both.
+
+    `execute_sql` no longer returns `{"error": {kind, remediation}}` for anything. A decision of
+    ours arrives as `{"status": "refused", "refusal": {reason, rule, detail, remediation}}` and the
+    database's as `{"status": "failed", "failure": {kind, message}}`, both carrying the `audit_id`
+    of the recorded execution. Asserted against the real tool-edge serializer rather than a
+    hand-written sample, so this pins the shape a client actually receives.
+
+    The absence is asserted too: `contracts` is where a reader looks for a tool's error shape, and
+    finding nothing has to be a deliberate removal rather than something that fell out by accident.
+    """
+    import guardrail
+    import tools
+
+    refused = json.loads(tools._emit(
+        guardrail.Envelope(
+            status="refused",
+            refusal=guardrail.refuse(
+                guardrail.RULE_READ_ONLY,
+                detail="only a single read statement is allowed",
+                remediation="Rewrite it as a SELECT.",
+            ),
+            audit_id="0" * 32,
+        ),
+        sql="DELETE FROM orders", execution_ms=None,
+    ))
+    assert set(refused) == {"status", "refusal", "sql", "audit_id"}
+    assert set(refused["refusal"]) == {"reason", "rule", "detail", "remediation"}
+
+    failed = json.loads(tools._emit(
+        guardrail.Envelope(
+            status="failed",
+            failure=guardrail.Failure(kind="syntax", message="no such column"),
+            audit_id="1" * 32,
+        ),
+        sql="SELECT nope FROM orders", execution_ms=0,
+    ))
+    assert set(failed) == {"status", "failure", "sql", "execution_ms", "audit_id"}
+    assert set(failed["failure"]) == {"kind", "message"}
+
+    assert not hasattr(contracts, "ErrorResult") and not hasattr(contracts, "ToolError")
 
 
 def test_activity_sink_records_roundtrip():
+    # `id` is the Envelope's `audit_id` — supplied by the caller, never minted by the sink — so the
+    # answer and the row recording it share one key. `status`/`reason`/`rule` are the verdict.
     q = {
+        "id": "9f2c1e4a7b6d4c0f8e3a5b7c9d1e2f30",
         "ts": "2026-06-25T00:00:00Z",
         "profile": "acme",
         "question": "how many orders?",
         "sql": "SELECT count(*) FROM orders",
         "row_count": 1,
         "source": "mcp_server",
+        "status": "ok",
+    }
+    assert _roundtrip(QueryExecutionRecord, q) == q
+
+
+def test_a_refusal_record_carries_its_reason_and_rule():
+    # The audit row for a refusal is the one a reviewer most needs, and it is the reason + rule that
+    # make it reviewable: without them a refused row is indistinguishable from a query that ran.
+    q = {
+        "id": "3d5f7a91c2b84e6d90f1a2b3c4d5e6f7",
+        "ts": "2026-06-25T00:00:00Z",
+        "profile": "acme",
+        "sql": "DELETE FROM orders",
+        "row_count": 0,
+        "source": "mcp_server",
+        "status": "refused",
+        "reason": "unsafe",
+        "rule": "read_only",
     }
     assert _roundtrip(QueryExecutionRecord, q) == q
 
