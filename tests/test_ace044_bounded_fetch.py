@@ -175,12 +175,18 @@ def test_postgres_uses_a_server_side_named_cursor(monkeypatch, capsys):
         def __exit__(self, *a):
             return False
 
-        def execute(self, sql):
+        def execute(self, sql, params=None):
+            # `params` accepts the native server-side bound the engine now sets first
+            # (`SET LOCAL statement_timeout = %s`, on its own client-side cursor). The caller's
+            # statement runs last, so `seen["sql"]` still ends up holding it.
             seen["sql"] = sql
 
         def fetchmany(self, n):
             seen["fetchmany"] = n
             return self._rows[:n]
+
+        def close(self):
+            seen["closed"] = True
 
     class FakeConn:
         def cursor(self, name=None):
@@ -191,6 +197,10 @@ def test_postgres_uses_a_server_side_named_cursor(monkeypatch, capsys):
 
         def __exit__(self, *a):
             return False
+
+        def cancel(self):
+            # The per-statement watchdog arms `connection.cancel` on this engine; never fired here.
+            seen["cancelled"] = True
 
         def close(self):
             pass
