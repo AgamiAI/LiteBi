@@ -13,6 +13,11 @@ internal `_ResourceLimit` marker, and leaves `execute_guarded` as a `refused` En
 `resource_limit` — with no partial data, a detail that quotes the configured budget, and a
 remediation addressed to whoever can actually act on it.
 
+What no test here can show is that the cancel reached a SERVER: SQLite is in-process, and on a
+client/server engine an abandoned statement produces the identical Envelope while the backend keeps
+running. That assertion needs a live database and a second connection, and lives in
+`test_postgres_timeout_integration.py`, which skips unless one is configured.
+
 **The classification is the FLAG, and only the flag.** A cancelled SQLite statement raises
 `OperationalError("interrupted")`, so neither the error text nor the elapsed clock can be the test:
 both are properties an ordinary database error can have by coincidence, and reading either one would

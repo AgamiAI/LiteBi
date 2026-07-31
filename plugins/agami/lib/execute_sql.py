@@ -508,7 +508,7 @@ def _run_postgres(creds: dict[str, str], sql: str) -> ExecResult:
             # A server-side (named) cursor so the row cap bounds TRANSFER, not just what we write:
             # psycopg2's default client-side cursor buffers the ENTIRE result before we can fetchmany,
             # so a runaway result would still be pulled whole. The named cursor streams from the
-            # server in bounded batches (ACE-038). Read-only SELECTs (the only thing the guard admits)
+            # server in bounded batches. Read-only SELECTs (the only thing the guard admits)
             # are exactly what a server-side cursor supports.
             cur = conn.cursor(name="agami_bounded")
             cur.itersize = _resolve_row_cap() + 1  # server fetch batch = the bounded window
@@ -1049,7 +1049,7 @@ def _run_duckdb(creds: dict[str, str], sql: str) -> ExecResult:
     return result
 
 
-_DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation (ACE-038)
+_DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation
 # Per-call cap from --max-rows (ACE-044). A ContextVar, not a plain global, so it is REQUEST-SCOPED
 # once the HTTP server runs execution in-process (ACE-028): concurrent handlers run in worker threads
 # (`run_blocking` copies the context per call, like `_current_org_ctx`), so each request's cap is
@@ -1195,7 +1195,7 @@ def _deadline(cancel: Callable[[], None], timeout_s: float) -> Iterator[threadin
 def _flag_truncated(cap: int) -> None:
     """Signal a bounded-fetch truncation to the caller — a non-error `{"truncated": …}` marker on
     stderr (distinct from the guards' `{"error": …}`), so a truncated result is never mistaken for a
-    complete one (ACE-038/044). Shared by every engine's materialization path. One write so the
+    complete one (ACE-044). Shared by every engine's materialization path. One write so the
     marker is always a single line, even if other notices surround it."""
     sys.stderr.write(json.dumps({"truncated": {"row_cap": cap}}) + "\n")
 
@@ -1208,7 +1208,7 @@ def _collect_cursor(cur: Any) -> ExecResult:
     executor path share, so the row cap is enforced once, identically, for every caller.
 
     Fetch FIRST, then read ``cur.description``: a psycopg2 **server-side (named) cursor** — which the
-    Postgres/Redshift path uses to bound transfer (ACE-038) — reports ``description is None`` until the
+    Postgres/Redshift path uses to bound transfer — reports ``description is None`` until the
     first fetch, so reading it beforehand would drop EVERY row of a real Postgres result. Client-side
     cursors (sqlite/mysql/…) set ``description`` at execute, so fetch-first is equally correct there."""
     cap = _resolve_row_cap()

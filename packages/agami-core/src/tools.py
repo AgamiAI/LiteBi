@@ -1063,7 +1063,7 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
 
 
 def _executor_truncated(stderr: str | None) -> bool:
-    """True if execute_sql flagged a bounded-fetch truncation (ACE-038/044). The executor emits a
+    """True if execute_sql flagged a bounded-fetch truncation (ACE-044). The executor emits a
     non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
     for line in (stderr or "").splitlines():
         line = line.strip()
@@ -1205,7 +1205,7 @@ def _emit(
         columns = list(env.data.columns)
         rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
         truncated = env.data.truncated
-        # Backstop only: the executor already caps at the source (ACE-038/044) and flags it. This
+        # Backstop only: the executor already caps at the source (ACE-044) and flags it. This
         # catches a result that slipped past that bound, and marks it truncated rather than
         # presenting a trimmed result as complete.
         if max_rows is not None and len(rows) > max_rows:
@@ -1479,7 +1479,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
         )
 
-    # Parse the RFC-4180 CSV emitted on stdout. The executor caps at the source (ACE-038/044) and
+    # Parse the RFC-4180 CSV emitted on stdout. The executor caps at the source (ACE-044) and
     # flags it on stderr; carry that flag so a truncated result is never presented as complete. The
     # `max_rows` backstop is applied by `_emit`, the same one the in-process path gets.
     reader = csv.reader(io.StringIO(proc.stdout))
