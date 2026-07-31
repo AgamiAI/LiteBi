@@ -1303,9 +1303,11 @@ def record_tool_call(
       `result_text`**. A caller that already classified the outcome passes it rather than handing over a
       result body to be re-parsed — and, more importantly, one that has *no* body to hand over can still
       record a failure. Without these, an outcome this function cannot see defaults to success, which is
-      the one direction an audit log must never fail in. They are applied **as a group**: state any one
-      and the derived trio is replaced wholesale, so a stated success cannot leave a derived
-      `error_kind` stranded beside it on the row.
+      the one direction an audit log must never fail in. They are applied **as a group, and forced to
+      be coherent**: state any one and the derived trio is replaced wholesale; an `error_kind` with no
+      explicit `success` reads as a failure rather than defaulting to success; and a success never
+      carries an error kind. So no combination of these arguments can write a row that says
+      "succeeded" beside an error.
     - `org_id` replaces the tenant otherwise stamped downstream from this process's context. A caller
       that read the tenant at the point which actually scoped the work states it, rather than leaving it
       to be re-read later from a context that may no longer be the same one. The fallback when that
@@ -1327,8 +1329,15 @@ def record_tool_call(
         except (ValueError, TypeError):
             pass
     if success is not None or row_count is not None or error_kind is not None:
-        derived_success = True if success is None else success
-        derived_row_count, derived_error_kind = row_count, error_kind
+        # Stating any one of the three replaces all three — and the result is forced to be coherent,
+        # because an audit row that says "succeeded" beside an error kind is worse than either fact
+        # alone. Two rules do that: naming an `error_kind` IS a statement of failure even with no
+        # explicit flag (otherwise the outcome would default to success and reintroduce exactly the
+        # row this seam exists to prevent), and a success cannot carry an error kind, so a caller that
+        # states both loses the kind rather than writing the contradiction.
+        derived_success = success if success is not None else error_kind is None
+        derived_error_kind = None if derived_success else error_kind
+        derived_row_count = row_count
     rec: dict[str, Any] = {
         "ts": _now_iso(),
         "tool_name": name,

@@ -328,6 +328,37 @@ def test_a_stated_outcome_replaces_the_derived_one_wholesale(db):
     assert r["success"] == 1 and r["error_kind"] is None
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected_success", "expected_error_kind"),
+    [
+        # An error_kind with no explicit flag IS a statement of failure. Defaulting it to success is
+        # how the "succeeded, syntax error" row came back the first time this was fixed.
+        ({"error_kind": "syntax"}, 0, "syntax"),
+        # ...and a success can never carry one, however the caller phrases it.
+        ({"success": True, "error_kind": "syntax"}, 1, None),
+        ({"success": False, "error_kind": "syntax"}, 0, "syntax"),
+        ({"success": False}, 0, None),
+        ({"success": True}, 1, None),
+        ({"row_count": 5}, 1, None),
+        ({"row_count": 0}, 1, None),  # a falsy value still counts as stated
+    ],
+)
+def test_no_combination_of_outcome_overrides_writes_an_incoherent_row(
+    db, overrides, expected_success, expected_error_kind
+):
+    """Every way a caller can state the outcome, checked for coherence rather than field by field.
+
+    The failure this guards is not hypothetical: the grouped-override logic shipped once with
+    `error_kind` alone defaulting the row to success, which is precisely the contradiction the group
+    was introduced to remove."""
+    tools.record_tool_call(
+        name="a_tool", arguments={}, result_text=None, execution_ms=1, actor="a", **overrides
+    )
+    (r,) = _rows(db)
+    assert (r["success"], r["error_kind"]) == (expected_success, expected_error_kind)
+    assert not (r["success"] == 1 and r["error_kind"]), "a successful row must carry no error kind"
+
+
 def test_a_stated_tenant_is_not_re_read_from_the_process_context(db, monkeypatch):
     """The tenant is otherwise stamped downstream by re-reading this process's context, whose fallback
     is the deployment-wide org. A caller that read it where the work was actually scoped states it."""
