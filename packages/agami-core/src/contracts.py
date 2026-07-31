@@ -57,19 +57,17 @@ class ExecuteSqlRequest(_Contract):
 
 
 # ---------------------------------------------------------------------------
-# Errors (every tool may return {"error": {"kind", "remediation"}, ...})
+# Errors — deliberately absent.
+#
+# `execute_sql` speaks the guardrail Envelope on every path: a decision of ours is
+# `{"status": "refused", "refusal": {reason, rule, detail, remediation}}` and the database's is
+# `{"status": "failed", "failure": {kind, message}}`. Both are stdlib dataclasses in `guardrail`,
+# which is vendored into the plugin slice and therefore may not import pydantic — so re-declaring
+# them here as contract models would be a second, drifting copy of a shape that already has one
+# owner. The `{"error": {kind, remediation}}` models this section used to hold (`ToolError` /
+# `ErrorResult`) are gone for that reason; the model-backed tools that still emit that older shape
+# are the ones to convert next, not a reason to keep a contract for it.
 # ---------------------------------------------------------------------------
-
-
-class ToolError(_Contract):
-    kind: str
-    remediation: str
-
-
-class ErrorResult(_Contract):
-    error: ToolError
-    sql: str | None = None
-    execution_ms: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +165,19 @@ class Receipt(_Contract):
 
 
 class ExecuteSqlResult(_Contract):
+    """The `ok` half of the enveloped `execute_sql` JSON — **documentation, not a construction site**.
+
+    What the tool actually returns is one guardrail Envelope, serialized by `tools._emit`. On the
+    `ok` path that body is these fields plus two the Envelope owns: `"status": "ok"` and `audit_id`,
+    the `query_executions.id` of the row recording the execution. On the other two paths the body is
+    a `refusal` or a `failure` instead, and none of the fields below appear — so this model describes
+    one branch of the wire, never the whole of it.
+
+    Nothing in the shipped code constructs or validates against this; it is `extra="allow"` and it is
+    here so a reader (or a downstream consumer building against the surface) can see the successful
+    shape in one place. `guardrail` deliberately does not import it — that module is stdlib-only.
+    """
+
     columns: list[str] = Field(default_factory=list)
     rows: list[list[Any]] = Field(default_factory=list)
     row_count: int = 0
@@ -184,12 +195,31 @@ class ExecuteSqlResult(_Contract):
 
 
 class QueryExecutionRecord(_Contract):
+    """One execute_sql execution — written for **every** outcome, not only the successful ones.
+
+    `id` is supplied by the caller rather than minted by the sink: it is the `audit_id` the guardrail
+    Envelope handed back with the answer, and it becomes `query_executions.id`. One id, so a caller
+    can find the row recording its own query without a join and without two ids to reconcile.
+
+    `status` / `reason` / `rule` are server-observed like the fields above them, but nullable:
+    `status` because rows written before the guardrail contract have no verdict, `reason` and `rule`
+    because only a refusal has them (an `ok` or a `failed` row leaves both NULL).
+
+    `sql` is BOUNDED by the writer (`tools.AUDIT_SQL_MAX_CHARS`), and `sql_truncated` says whether it
+    had to be. Without the flag a cut statement reads as the whole one, and a reviewer re-running it
+    would not reproduce the decision the row records."""
+
+    id: str
     ts: str
     profile: str
     sql: str
     row_count: int
     source: str
     question: str | None = None  # the user's NL question (may be absent)
+    status: str | None = None  # the Envelope's status: "ok" | "refused" | "failed"
+    reason: str | None = None  # guardrail.RefusalReason — refusals only
+    rule: str | None = None  # guardrail.RULE_* — refusals only
+    sql_truncated: bool = False  # `sql` was cut to the audit bound
     org_id: str = "local"  # the tenant this ran for; defaults to the single-tenant org
 
 

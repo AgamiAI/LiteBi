@@ -39,6 +39,19 @@ def test_ports_module_imports_without_model_deps():
     assert subprocess.run([sys.executable, "-c", code]).returncode == 0
 
 
+def test_guardrail_module_imports_without_model_deps():
+    """`guardrail` is held to the same bar as `ports`, and one notch tighter: it is vendored into
+    the plugin mirror, where there is no pip and no package — so it must import on a bare python3.
+    `execute_sql` is in the assertion because `Envelope.data`'s annotation is TYPE_CHECKING-only;
+    if that import ever escapes to runtime it would also create a cycle (`execute_sql` imports
+    this module)."""
+    code = (
+        "import sys, guardrail; "
+        "assert not {'pydantic', 'contracts', 'execute_sql'} & set(sys.modules)"
+    )
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
 # --- default adapters satisfy their Protocol (runtime_checkable) -------------
 
 
@@ -97,14 +110,19 @@ def test_file_activity_sink_writes_jsonl(tmp_path):
 
     sink.record_query_execution(
         QueryExecutionRecord(
+            id="4b1d9c0e5f3a47829d6e8f0a1b2c3d4e",
             ts="2026-06-25T00:00:00Z",
             profile="acme",
             question="how many?",
             sql="SELECT count(*) FROM orders",
             row_count=1,
             source="mcp_server",
+            status="ok",
         )
     )
 
     qrec = json.loads(ql.read_text().splitlines()[0])
     assert qrec["profile"] == "acme" and qrec["row_count"] == 1 and qrec["source"] == "mcp_server"
+    # The jsonl sink carries the audit fields too, so the file-mode install records the same verdict
+    # the DB-backed one does — `id` is the `audit_id` the answer returned, not a second identifier.
+    assert qrec["id"] == "4b1d9c0e5f3a47829d6e8f0a1b2c3d4e" and qrec["status"] == "ok"

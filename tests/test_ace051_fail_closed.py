@@ -1,11 +1,25 @@
 """ACE-051 — the hosted safety guard resolves the model from the DB and FAILS CLOSED when no model
 can be found: a served query never runs with the fan/chasm/scope/PII guards silently off. Locally
 (no DB configured) a not-yet-built model is still a no-op.
+
+The branches these tests reach speak the shared guardrail contract, and now **return** it rather
+than writing it: `_model_safety` hands back `Refusal | int | None`, and `execute_guarded` puts the
+`Refusal` in the Envelope. So the assertions read the returned verdict where they used to read an
+exit code plus a stderr line.
+
+What is being pinned is unchanged and strictly stronger. The old rule was "stderr must parse WHOLE
+as a single JSON object" — a stray diagnostic line would make the refusal unreadable to the parent,
+and could carry DB connection details. These branches now write **nothing at all**, which is that
+rule's limit case, so `_silent` asserts an empty stream. The wire itself is still exercised
+end-to-end, one process boundary out, by `test_hosted_refusal_stderr_is_a_single_clean_json_object`
+below: it runs the real CLI and parses its whole stderr, which is where a caller actually reads it.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,7 +35,27 @@ if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
 import execute_sql  # noqa: E402
+import guardrail  # noqa: E402
 from semantic_model import models as m  # noqa: E402
+
+
+def _silent(capsys) -> None:
+    """Assert a converted branch wrote nothing.
+
+    A converted gate returns its `Refusal`; the ONE writer is `main`. Anything on stderr from here
+    would be a diagnostic that precedes the refusal on the wire — exactly what would make the
+    stream unparseable to the parent, and exactly where a DB connection string would leak.
+    """
+    captured = capsys.readouterr()
+    assert captured.err == "", captured.err
+    assert captured.out == "", captured.out
+
+
+def _refusal(verdict) -> guardrail.Refusal:
+    """The verdict, asserted to be a real contract `Refusal` rather than the interim bare int the
+    four unconverted branches still return."""
+    assert isinstance(verdict, guardrail.Refusal), verdict
+    return verdict
 
 
 def _org() -> m.Datasource:
@@ -77,9 +111,9 @@ def test_hosted_fail_closed_refuses_when_no_model(tmp_path, monkeypatch, capsys)
     monkeypatch.setenv("AGAMI_DB_URL", url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_artifacts"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code == 1  # refused, not run
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "model_unavailable"
+    _, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert _refusal(verdict).rule == guardrail.RULE_MODEL_UNAVAILABLE  # refused, not run
+    _silent(capsys)
 
 
 def test_local_missing_model_is_noop(tmp_path, monkeypatch):
@@ -88,8 +122,8 @@ def test_local_missing_model_is_noop(tmp_path, monkeypatch):
     monkeypatch.delenv("APP_DATABASE_URL", raising=False)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "empty"))
 
-    sql, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code is None and sql == "SELECT id FROM orders"  # unchanged, guards inert
+    sql, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert verdict is None and sql == "SELECT id FROM orders"  # unchanged, guards inert
 
 
 def test_db_sourced_model_enforces_guards(tmp_path, monkeypatch, capsys):
@@ -99,12 +133,13 @@ def test_db_sourced_model_enforces_guards(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AGAMI_DB_URL", url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
-    assert code == 1  # undeclared table refused by the table-scope guard, sourced from the DB model
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "table_out_of_scope"
+    _, verdict = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
+    # Undeclared table refused by the table-scope guard, sourced from the DB model.
+    assert _refusal(verdict).rule == guardrail.RULE_TABLE_SCOPE
+    _silent(capsys)
 
-    sql, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code is None  # a declared table with a named projection passes
+    sql, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert verdict is None  # a declared table with a named projection passes
 
 
 def test_disk_db_verdict_parity(tmp_path, monkeypatch, capsys):
@@ -120,9 +155,12 @@ def test_disk_db_verdict_parity(tmp_path, monkeypatch, capsys):
         else:
             monkeypatch.delenv("AGAMI_DB_URL", raising=False)
             monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "art"))  # disk is the only source
-        _, code = execute_sql._model_safety(sql, "acme", None)
+        _, out = execute_sql._model_safety(sql, "acme", None)
         capsys.readouterr()
-        return code
+        # Compare the whole verdict, not just refuse-vs-allow: with the contract object returned
+        # rather than serialized away, a DB round-trip that changed WHICH rule fired (or the
+        # identifiers echoed in its detail) is now visible here too.
+        return out
 
     # Query BOTH declared tables + an undeclared table + a bad column, so a lossy DB round-trip that
     # drops a table (customers) or mangles a column can't hide behind identical verdicts.
@@ -147,9 +185,10 @@ def test_hosted_falls_back_to_disk_when_db_has_no_model(tmp_path, monkeypatch, c
     monkeypatch.setenv("AGAMI_DB_URL", url)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "art"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
-    assert code == 1  # refused by the disk-sourced model, NOT model_unavailable
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "table_out_of_scope"
+    _, verdict = execute_sql._model_safety("SELECT id FROM sqlite_master", "acme", None)
+    # Refused by the disk-sourced model, NOT model_unavailable.
+    assert _refusal(verdict).rule == guardrail.RULE_TABLE_SCOPE
+    _silent(capsys)
 
 
 def test_hosted_db_load_error_falls_back_to_disk(tmp_path, monkeypatch):
@@ -158,22 +197,58 @@ def test_hosted_db_load_error_falls_back_to_disk(tmp_path, monkeypatch):
     monkeypatch.setenv("AGAMI_DB_URL", "postgres://user:pw@127.0.0.1:1/nope")  # unreachable
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "art"))
 
-    sql, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code is None  # disk model resolved + guards passed the declared query
+    sql, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert verdict is None  # disk model resolved + guards passed the declared query
 
 
-def test_refusal_stderr_is_a_single_clean_json_object(tmp_path, monkeypatch, capsys):
+def test_a_db_load_failure_leaks_nothing_into_the_refusal(tmp_path, monkeypatch, capsys):
     # A DB that ERRORS on load + no disk model, on hosted → fail closed. The load failure must NOT
-    # write freeform diagnostics (which would precede the JSON refusal → mixed/unparseable stderr,
-    # and could leak DB connection details). stderr must be exactly one JSON refusal object.
+    # produce freeform diagnostics (which on the wire would precede the JSON refusal → mixed,
+    # unparseable stderr) and must not carry DB connection details into the refusal it returns.
     monkeypatch.setenv("AGAMI_DB_URL", "postgres://user:pw@127.0.0.1:1/nope")  # unreachable → raises
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))  # no disk model either
 
-    _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code == 1
-    err = capsys.readouterr().err.strip()
-    assert json.loads(err)["error"]["kind"] == "model_unavailable"  # parses whole → single object
-    assert "127.0.0.1" not in err and "pw" not in err  # no connection details leaked
+    _, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+
+    refusal = _refusal(verdict)
+    assert refusal.rule == guardrail.RULE_MODEL_UNAVAILABLE
+    _silent(capsys)  # nothing written at all — the limit case of "one clean object"
+    # No connection details leaked — checked against the whole serialized refusal, so it covers the
+    # authored remediation this branch gained as well as the detail it already had.
+    text = json.dumps({"refusal": {"reason": refusal.reason, "rule": refusal.rule,
+                                   "detail": refusal.detail, "remediation": refusal.remediation}})
+    assert "127.0.0.1" not in text and "pw" not in text
+    assert str(tmp_path) not in text  # nor the resolved artifacts path we just probed
+
+
+def test_hosted_refusal_stderr_is_a_single_clean_json_object(tmp_path):
+    """The wire, one process boundary out: the fail-closed refusal reaches a real caller as exactly
+    one JSON object on stderr.
+
+    `_model_safety` no longer writes, so the single-clean-object property is now `main`'s to keep —
+    and this is where it must be pinned, because this is where a caller actually reads it. The
+    child is given an unreachable DB and no disk model, which is the same fail-closed condition the
+    in-process test above exercises.
+    """
+    env = {
+        **os.environ,
+        "AGAMI_DB_URL": "postgres://user:pw@127.0.0.1:1/nope",
+        "AGAMI_ARTIFACTS_DIR": str(tmp_path / "no_disk"),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "execute_sql", "--profile", "acme", "--sql", "SELECT id FROM orders"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert proc.stderr.count("\n") == 1  # one line, so no diagnostic rode alongside it
+    payload = json.loads(proc.stderr)  # parses WHOLE → a single object
+    assert set(payload) == {"refusal"}
+    refusal = guardrail.Refusal(**payload["refusal"])  # and it satisfies the contract
+    assert refusal.rule == guardrail.RULE_MODEL_UNAVAILABLE
+    assert "127.0.0.1" not in proc.stderr and "pw" not in proc.stderr
+    assert str(tmp_path) not in proc.stderr
 
 
 def test_hosted_fail_closed_when_model_package_unimportable(tmp_path, monkeypatch, capsys):
@@ -192,9 +267,10 @@ def test_hosted_fail_closed_when_model_package_unimportable(tmp_path, monkeypatc
     monkeypatch.setattr(builtins, "__import__", boom)
     monkeypatch.setenv("AGAMI_DB_URL", "sqlite://" + str(tmp_path / "x.db"))
 
-    _, code = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
-    assert code == 1  # fail closed — no DB load is even attempted (we never resolve a model)
-    assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "model_unavailable"
+    _, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    # Fail closed — no DB load is even attempted (we never resolve a model).
+    assert _refusal(verdict).rule == guardrail.RULE_MODEL_UNAVAILABLE
+    _silent(capsys)
 
 
 def test_db_model_resolves_under_the_requests_org(tmp_path, monkeypatch, capsys):
@@ -226,13 +302,13 @@ def test_db_model_resolves_under_the_requests_org(tmp_path, monkeypatch, capsys)
     tools.resolved_org_id.cache_clear()
     token = tools._current_org_ctx.set("contoso")  # what the multi-tenant resolver set for this request
     try:
-        _, code = execute_sql._model_safety("SELECT id FROM orders", "shop", None)
-        assert code is None  # resolved under 'contoso': a declared table passes
+        _, verdict = execute_sql._model_safety("SELECT id FROM orders", "shop", None)
+        assert verdict is None  # resolved under 'contoso': a declared table passes
 
         # ...and the guards genuinely ran off that model, rather than being inert.
-        _, code = execute_sql._model_safety("SELECT id FROM sqlite_master", "shop", None)
-        assert code == 1
-        assert json.loads(capsys.readouterr().err.strip())["error"]["kind"] == "table_out_of_scope"
+        _, verdict = execute_sql._model_safety("SELECT id FROM sqlite_master", "shop", None)
+        assert _refusal(verdict).rule == guardrail.RULE_TABLE_SCOPE
+        _silent(capsys)
     finally:
         tools._current_org_ctx.reset(token)
         tools.resolved_org_id.cache_clear()

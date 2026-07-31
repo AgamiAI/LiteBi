@@ -1,0 +1,25 @@
+-- Say when the stored statement is not the whole statement (ACE-035).
+--
+-- Since 014 a refusal writes a `query_executions` row, and the read-only fast-fail records the
+-- caller's SQL verbatim. That closed one hole and opened another: a statement refused *for being
+-- oversized* still had its whole body persisted, so an authenticated caller could grow the audit
+-- store without the statement ever reaching a warehouse. The tool edge now bounds what it stores
+-- (`tools.AUDIT_SQL_MAX_CHARS`), and this column is how the row admits it.
+--
+-- A FLAG, NOT A CONVENTION. Without it a truncated statement is indistinguishable from a short one:
+-- a reviewer reads the column as the statement that was judged, and re-running it would not
+-- reproduce the decision. The verdict columns are what make the row worth keeping; the blob is not,
+-- and this says which of the two the reader is looking at.
+--
+-- NULLABLE, no default backfill. Every row written before this migration ran stored whatever the
+-- caller sent, unbounded — NULL reads as "written before the bound existed", which is not the same
+-- claim as `0`.
+--
+-- INTEGER 0/1, not BOOLEAN — the same choice `tool_calls.success` made in 008, for the same reason:
+-- there is no boolean literal that is portable across SQLite and Postgres.
+--
+-- Forward-only and portable (runs on SQLite + Postgres unchanged) — same shape as
+-- 014_query_executions_guardrail.sql. No `IF NOT EXISTS`: SQLite's ALTER TABLE does not accept it,
+-- and re-run safety comes from the runner's `schema_migrations` ledger, which skips an applied file.
+
+ALTER TABLE query_executions ADD COLUMN sql_truncated INTEGER;

@@ -192,7 +192,7 @@ Check intents in this order. The first match wins; only that branch runs.
 
 If the user's intent is to re-display the most recent chart:
 
-1. Read the last entry of `<artifacts_dir>/local/query_log.jsonl` (each line is a JSON object — take the last non-empty line).
+1. Read `<artifacts_dir>/local/query_log.jsonl` (each line is a JSON object) and take the last non-empty line **whose `status` is `"ok"` or absent** — the log also records refused and failed executions, and neither of those rendered a chart. Entries written before the log carried a `status` field have none; treat those as `ok`.
 2. Look at the `chart_path` field. Possible cases:
    - **`chart_path` set AND the file exists on disk** → run `open <path>` (macOS), `xdg-open <path>` (Linux), or `start <path>` (Windows). Surface a one-liner in chat:
      ```

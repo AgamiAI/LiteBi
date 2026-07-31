@@ -30,6 +30,25 @@ def _reset_org_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_query_log(tmp_path_factory, monkeypatch):
+    """Keep the suite's audit writes out of the developer's own artifacts directory.
+
+    `tools._emit` records one query-execution row for EVERY outcome now, and with no database
+    configured that record is appended to `tools.QUERY_LOG` — a module-level constant resolved at
+    import time from the real artifacts dir, so a test setting `AGAMI_ARTIFACTS_DIR` afterwards does
+    not move it. Left alone, running the tests would append to the developer's own
+    `query_log.jsonl`. Redirect it per test; a test that asserts on the jsonl points it at a path of
+    its own and this fixture is then simply overwritten."""
+    try:
+        import tools
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(tools, "QUERY_LOG", tmp_path_factory.mktemp("qlog") / "query_log.jsonl")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_validation_cache():
     """The incremental-curation-validation cache (ACE-046) is module-global too; clear it around
     each test so one test's cached per-area findings can't bleed into the next."""

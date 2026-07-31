@@ -97,12 +97,19 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
 ])
 def test_verdict_parity_with_and_without_ctx(sql):
     """Every guard returns byte-identical results whether it builds its own work or is
-    handed a shared ctx — the behaviour-preserving guarantee."""
+    handed a shared ctx — the behaviour-preserving guarantee.
+
+    The three scope gates now return `guardrail.Refusal | None`, so their parity is a plain `==`
+    on a frozen dataclass instead of a dict round-trip. That is strictly stronger: `as_dict()`
+    compared only the four keys it chose to project, while `==` compares the whole object and
+    would also catch a differing `reason` or `rule`. The two gates still on result objects
+    (pre_flight, sensitive) keep `as_dict()` until their own slice converts them.
+    """
     org = _org()
     ctx = rt.build_guard_context(sql, org)
-    assert rt.check_table_scope(sql, org).as_dict() == rt.check_table_scope(sql, org, ctx=ctx).as_dict()
-    assert rt.check_no_select_star(sql).as_dict() == rt.check_no_select_star(sql, ctx=ctx).as_dict()
-    assert rt.check_column_scope(sql, org).as_dict() == rt.check_column_scope(sql, org, ctx=ctx).as_dict()
+    assert rt.check_table_scope(sql, org) == rt.check_table_scope(sql, org, ctx=ctx)
+    assert rt.check_no_select_star(sql) == rt.check_no_select_star(sql, ctx=ctx)
+    assert rt.check_column_scope(sql, org) == rt.check_column_scope(sql, org, ctx=ctx)
     assert rt.pre_flight_check(sql, org).as_dict() == rt.pre_flight_check(sql, org, ctx=ctx).as_dict()
     assert (rt.check_sensitive_projection(sql, org).as_dict()
             == rt.check_sensitive_projection(sql, org, ctx=ctx).as_dict())
@@ -115,5 +122,5 @@ def test_unparseable_sql_ctx_tree_is_none_and_guards_allow():
     org = _org()
     bad = "NOT SQL AT ALL ;;;"
     ctx = rt.build_guard_context(bad, org)
-    assert rt.check_table_scope(bad, org, ctx=ctx).action == "allow"
-    assert rt.check_no_select_star(bad, ctx=ctx).action == "allow"
+    assert rt.check_table_scope(bad, org, ctx=ctx) is None
+    assert rt.check_no_select_star(bad, ctx=ctx) is None

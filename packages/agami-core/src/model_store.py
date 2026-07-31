@@ -401,11 +401,16 @@ class DbActivitySink:
         self._store = store
 
     def record_query_execution(self, record: Any) -> None:
+        # The row's key is the caller's `record.id`, NOT a uuid minted here. It is the `audit_id` the
+        # guardrail Envelope already handed back with the answer, so the caller can look up the row
+        # recording its own query. Minting one here (as this did) discarded it inside the INSERT,
+        # which made the id unreferenceable the moment it existed.
         self._store.execute(
             "INSERT INTO query_executions (id, ts, org_id, datasource, question, sql, row_count, "
-            "source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "source, status, reason, rule, sql_truncated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                uuid4().hex,
+                record.id,
                 record.ts,
                 _record_org(record),
                 record.profile,
@@ -413,6 +418,12 @@ class DbActivitySink:
                 record.sql,
                 record.row_count,
                 record.source,
+                record.status,
+                record.reason,
+                record.rule,
+                # A portable 0/1 rather than a boolean literal — the same reason `record_tool_call`
+                # below writes `success` that way (SQLite has no boolean type).
+                1 if getattr(record, "sql_truncated", False) else 0,
             ),
         )
         self._store.commit()

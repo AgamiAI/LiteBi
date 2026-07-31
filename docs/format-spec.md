@@ -278,6 +278,21 @@ Fields per line:
 
 **Local-only** — never sent. Records every query. Grep / aggregate it in your own tooling if you want personal analytics.
 
+The MCP server writes to this same file when no database is configured, and its records carry the audit fields instead of the skill's rendering fields:
+
+| Field    | Type           | Description                                                                                                                                              |
+| -------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`     | string         | The execution's id — the same value the tool response returned as `audit_id`. When a database *is* configured this is `query_executions.id`.              |
+| `profile`  | string       | The datasource the statement ran against                                                                                                                 |
+| `source`   | string       | What wrote the record (`mcp_server`)                                                                                                                     |
+| `status`   | enum         | `ok`, `refused` (agami declined the statement) or `failed` (the database rejected it). Absent on entries written before this field existed — read those as `ok`. |
+| `reason`   | enum or null | Refusals only: `unsafe`, `out_of_scope` or `undetermined`                                                                                                |
+| `rule`     | string or null | Refusals only: which gate fired (`read_only`, `table_scope`, `column_scope`, …)                                                                        |
+| `sql_truncated` | boolean | The `sql` above was cut to the audit bound (8,000 characters) and is not the whole statement            |
+| `org_id`   | string       | The tenant the query ran for (`local` on a single-tenant install)                                                                                        |
+
+**Read the log filtered.** Anything treating "the last entry" as "the query you just ran" — the save-correction and reopen-chart flows both do — must skip entries whose `status` is not `ok`: a refused or failed statement never returned a result to correct or a chart to reopen.
+
 ---
 
 ## 6. Chart artifacts (`<artifacts_dir>/local/charts/<ts>.html`)
