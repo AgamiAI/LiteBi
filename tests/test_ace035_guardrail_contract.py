@@ -212,7 +212,11 @@ def test_refuse_rejects_a_rule_with_no_pinned_reason():
 # --- failure kinds ----------------------------------------------------------
 
 
-def test_failure_kinds_are_exactly_the_contract_nine():
+def test_failure_kinds_are_exactly_the_contract_ten():
+    """Contract §3's list, verbatim. `permission` is in it and is NOT the `read_only` rule: §1's
+    `read_only` is our verdict that we blocked a write, `permission` is the database refusing a read
+    to the connection's role. Declared here though nothing produces it yet, so ACE-039 fills a member
+    rather than widening the type — which is the whole reason the unreachable kinds are declared."""
     assert sorted(guardrail._FAILURE_KINDS) == [
         "auth",
         "column_not_found",
@@ -220,6 +224,7 @@ def test_failure_kinds_are_exactly_the_contract_nine():
         "dsn",
         "network",
         "other",
+        "permission",
         "syntax",
         "table_not_found",
         "timeout",
@@ -227,8 +232,26 @@ def test_failure_kinds_are_exactly_the_contract_nine():
 
 
 def test_an_unknown_failure_kind_is_rejected():
+    """The vector used to be `permission`, which the contract declares as a real kind (§3) — it read
+    as invalid only because the type had dropped it. Using a member as the not-a-member example is
+    how that omission stayed invisible, so this asks for a string the contract will never name."""
     with pytest.raises(ValueError, match="kind must be one of"):
-        Failure(kind="permission", message="m")
+        Failure(kind="not_a_declared_kind", message="m")
+
+
+def test_permission_is_a_failure_kind_and_read_only_is_a_rule():
+    """Contract §3's distinction, pinned as a type-level fact because it was collapsed once already.
+
+    `read_only` is §1's RULE — our verdict that we blocked a write. `permission` is a failure KIND —
+    the database refusing a read to the connection's role, which is also not `auth`, because the
+    credentials were accepted and the fix is a grant. Nothing produces `permission` yet (ACE-039
+    does), so without this the member could be dropped again and every test would stay green.
+    """
+    assert "permission" in guardrail._FAILURE_KINDS
+    assert "permission" not in guardrail.REASON_FOR_RULE
+    assert guardrail.RULE_READ_ONLY in guardrail.REASON_FOR_RULE
+    assert guardrail.RULE_READ_ONLY not in guardrail._FAILURE_KINDS
+    assert Failure(kind="permission", message="m").kind == "permission"
 
 
 # --- the Envelope's present-iff invariant -----------------------------------

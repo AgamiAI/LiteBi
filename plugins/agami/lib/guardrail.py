@@ -146,6 +146,7 @@ FailureKind = Literal[
     "syntax",
     "column_not_found",
     "table_not_found",
+    "permission",
     "auth",
     "network",
     "dsn",
@@ -153,7 +154,7 @@ FailureKind = Literal[
     "timeout",
     "other",
 ]
-"""Nine classified operational errors declared, six produced.
+"""Ten classified operational errors declared, six produced.
 
 Produced today: `dsn`, `driver_missing`, `auth` and `syntax` from the executor's classified exit
 codes, `other` from its catch-all, and `timeout` from the subprocess supervisor at the tool edge —
@@ -168,9 +169,15 @@ statement, so it is a refusal carrying `RULE_RESOURCE_LIMIT` — and nothing imp
 why that rule is pinned with no producer. Driver-level connect/login timeouts fold into the connect
 failure the executor already reports as `auth` (exit 4), because that is what the driver raises.
 
-`column_not_found`, `table_not_found` and `network` are DECLARED BUT UNREACHABLE: producing them
-means parsing driver text, and sanitizing driver text belongs to the error-hardening slice. Declared
-now so those slices fill a member rather than widen the type."""
+`column_not_found`, `table_not_found`, `permission` and `network` are DECLARED BUT UNREACHABLE:
+producing them means parsing driver text, and sanitizing driver text belongs to the error-hardening
+slice. Declared now so those slices fill a member rather than widen the type.
+
+**`permission` is a failure kind, not the `read_only` rule** (contract §3). `read_only` is §1's
+verdict that we blocked a write; `permission` is the database refusing a READ to the connection's
+role, and it stays distinct from `auth` because the credentials were accepted — the operator action
+is a grant, not a re-credential. The two were one word until 2026-07-30, which left an audit row
+unable to say which had happened. ACE-039 produces it."""
 
 _FAILURE_KINDS: frozenset[str] = frozenset(get_args(FailureKind))
 
