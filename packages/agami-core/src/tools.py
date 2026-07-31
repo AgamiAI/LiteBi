@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
 
@@ -278,6 +278,33 @@ def _model_version(profile: str) -> str | None:
 # The org id for the current request's tool calls (ACE-045). The HTTP server sets this per request from
 # the OrgResolver-resolved org; unset (stdio / single-tenant) it falls back to AGAMI_ORG_ID / "local".
 _current_org_ctx: ContextVar[str | None] = ContextVar("agami_current_org_id", default=None)
+
+# What drove the current tool call, recorded on every activity-log row. The MCP transport is the only
+# caller in this package, so the default is the value this log has always carried; an embedder that
+# dispatches tool handlers itself sets this for the duration of a call so its rows are distinguishable
+# from transport traffic. Unset, every row reads exactly as it did before this seam existed.
+#
+# It lives in this module rather than `contracts` because the base install is stdlib-lean
+# (`dependencies = []`) and `contracts` needs pydantic — which is why every import of it here is
+# function-level. The read path imports this constant the same lazy way.
+DEFAULT_CALL_SOURCE = "mcp_server"
+_source_ctx: ContextVar[str] = ContextVar("agami_call_source", default=DEFAULT_CALL_SOURCE)
+
+
+def current_call_source() -> str:
+    """What drove this tool call — `DEFAULT_CALL_SOURCE` unless an embedder scoped it to something else."""
+    return _source_ctx.get()
+
+
+def set_call_source(source: str) -> Token[str]:
+    """Scope the recorded source for the calls made under it. Reset with the returned token in a
+    `finally`, so a caller that dispatches handlers directly cannot leak its label into later work."""
+    return _source_ctx.set(source)
+
+
+def reset_call_source(token: Token[str]) -> None:
+    """Undo `set_call_source`. Separate from the setter so the pairing is visible at the call site."""
+    _source_ctx.reset(token)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1025,7 +1052,9 @@ def _finalize_execution(
             "question": args.get("raw_query"),
             "sql": sql,
             "row_count": len(data_rows),
-            "source": "mcp_server",
+            # Same provenance the tool-call row carries, so the two logs can't disagree about what
+            # drove one execution. Unset, this is the value it has always been.
+            "source": current_call_source(),
         }
     )
     return json.dumps(result, indent=2, default=str)
@@ -1246,46 +1275,105 @@ def record_tool_call(
     execution_ms: int | None,
     actor: str | None,
     raised: bool = False,
+    source: str | None = None,
+    thread_id: str | None = None,
+    correlation_id: str | None = None,
+    user_question: str | None = None,
+    success: bool | None = None,
+    row_count: int | None = None,
+    error_kind: str | None = None,
+    org_id: str | None = None,
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
     audit-grade fields are server-observed; `success`/`row_count`/`error_kind` are derived from the
     result (execute_sql returns an `{"error": ...}` body on a bad query without raising). The self-report
     fields (`user_question`/`agent_query`/`thread_id`) are whatever Claude supplied — may be None.
-    **Best-effort and never raises** — a logging failure must not break the tool."""
+    **Best-effort and never raises** — a logging failure must not break the tool.
+
+    The trailing parameters are an **override seam for an embedder that dispatches tool handlers
+    itself** rather than through this package's transport. Each defaults to `None`, meaning *derive it
+    the way this function always has* — so a caller that passes none of them gets byte-identical rows.
+
+    Two groups, for two different reasons:
+
+    - `source` / `thread_id` / `correlation_id` / `user_question` replace values that are otherwise read
+      out of `arguments`, i.e. **self-reported by the model**. A caller that observed them directly can
+      state them authoritatively, and the model can no longer influence how its own calls are grouped.
+    - `success` / `row_count` / `error_kind` replace values otherwise **derived here by parsing
+      `result_text`**. A caller that already classified the outcome passes it rather than handing over a
+      result body to be re-parsed — and, more importantly, one that has *no* body to hand over can still
+      record a failure. Without these, an outcome this function cannot see defaults to success, which is
+      the one direction an audit log must never fail in. They are applied **as a group, and forced to
+      be coherent**: state any one and the derived trio is replaced wholesale; an `error_kind` with no
+      explicit `success` reads as a failure rather than defaulting to success; and a success never
+      carries an error kind. So no combination of these arguments can write a row that says
+      "succeeded" beside an error. **`raised=True` outranks all of them** — a call that threw is a
+      failure whatever the caller passes, though it may still be given a more specific kind than the
+      generic `"exception"`.
+    - `org_id` replaces the tenant otherwise stamped downstream from this process's context. A caller
+      that read the tenant at the point which actually scoped the work states it, rather than leaving it
+      to be re-read later from a context that may no longer be the same one. The fallback when that
+      read finds nothing is the deployment-wide org, and for an audit row that is the wrong direction
+      to fail in.
+    """
     args = arguments or {}
-    success, row_count, error_kind = True, None, None
+    derived_success, derived_row_count, derived_error_kind = True, None, None
     if raised:
-        success, error_kind = False, "exception"
+        derived_success, derived_error_kind = False, "exception"
     else:
         try:
             parsed = json.loads(result_text) if result_text else None
             if isinstance(parsed, dict):
                 if isinstance(parsed.get("error"), dict):
-                    success = False
-                    error_kind = parsed["error"].get("kind") or "error"
-                row_count = parsed.get("row_count")
+                    derived_success = False
+                    derived_error_kind = parsed["error"].get("kind") or "error"
+                derived_row_count = parsed.get("row_count")
         except (ValueError, TypeError):
             pass
-    _record_tool_call(
-        {
-            "ts": _now_iso(),
-            "tool_name": name,
-            "source": "mcp_server",
-            "actor": actor,
-            "datasource": args.get("datasource"),
-            "sql": args.get("sql"),
-            "row_count": row_count if isinstance(row_count, int) else None,
-            "execution_ms": execution_ms,
-            "success": success,
-            "error_kind": error_kind,
-            "user_question": args.get("user_question"),
-            "agent_query": args.get(
-                "raw_query"
-            ),  # the existing arg is the agent's framing of the query
-            "thread_id": args.get("thread_id"),
-            "correlation_id": args.get("correlation_id"),  # the turn (one user question)
-        }
-    )
+    if success is not None or row_count is not None or error_kind is not None:
+        # Stating any one of the three replaces all three — and the result is forced to be coherent,
+        # because an audit row that says "succeeded" beside an error kind is worse than either fact
+        # alone. Two rules do that: naming an `error_kind` IS a statement of failure even with no
+        # explicit flag (otherwise the outcome would default to success and reintroduce exactly the
+        # row this seam exists to prevent), and a success cannot carry an error kind, so a caller that
+        # states both loses the kind rather than writing the contradiction.
+        derived_success = success if success is not None else error_kind is None
+        derived_error_kind = None if derived_success else error_kind
+        derived_row_count = row_count
+    if raised:
+        # A raise outranks every override. `raised` is not a classification the caller is offering —
+        # it is a fact this function was told about what the tool actually did, and no argument can
+        # make a call that threw into a successful one. Without this, passing something as innocuous
+        # as `row_count` alongside `raised=True` erased the exception and logged a success.
+        # A more specific kind than the generic "exception" is still welcome, so a stated one stands
+        # — read from the parameter rather than the derived value, because a caller who contradicts
+        # themselves (`raised=True` with `success=True`) has already had the derived kind cleared by
+        # the success rule above. Their success claim loses; their diagnosis has no reason to.
+        derived_success = False
+        derived_error_kind = error_kind or derived_error_kind or "exception"
+    rec: dict[str, Any] = {
+        "ts": _now_iso(),
+        "tool_name": name,
+        "source": current_call_source() if source is None else source,
+        "actor": actor,
+        "datasource": args.get("datasource"),
+        "sql": args.get("sql"),
+        "row_count": derived_row_count if isinstance(derived_row_count, int) else None,
+        "execution_ms": execution_ms,
+        "success": derived_success,
+        "error_kind": derived_error_kind,
+        "user_question": user_question if user_question is not None else args.get("user_question"),
+        "agent_query": args.get("raw_query"),  # the existing arg is the agent's framing of the query
+        "thread_id": thread_id if thread_id is not None else args.get("thread_id"),
+        "correlation_id": (  # the turn (one user question)
+            correlation_id if correlation_id is not None else args.get("correlation_id")
+        ),
+    }
+    if org_id is not None:
+        # Set rather than left absent, so `_record_tool_call`'s `setdefault` keeps it instead of
+        # re-reading the tenant from this process's context later.
+        rec["org_id"] = org_id
+    _record_tool_call(rec)
 
 
 def _record_tool_call(rec: dict[str, Any]) -> None:

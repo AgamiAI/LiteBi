@@ -256,11 +256,17 @@ def _session_drawer(s: dict[str, Any], idx: int) -> str:
         question = t.get("question") or "(no question reported)"
         n = len(t["calls"])
         call_cards = "".join(_call_card(c) for c in t["calls"])
-        # The question is Claude-self-reported (best-effort, attacker-influenceable) — mark it so, like
-        # the rest of the activity log; "User asked" is the framing, "· self-reported" the provenance.
+        # Provenance on the question. Where it was copied out of the tool arguments the model wrote it is
+        # a self-report (best-effort, attacker-influenceable) and is marked so, like the rest of the
+        # activity log; where the caller observed the question directly the marker would *understate* the
+        # trust, so it is omitted. `_group_turns` decides, and errs toward keeping the marker.
+        marker = (
+            ' <span class="muted" style="font-size:13px">· self-reported</span>'
+            if t.get("question_self_reported", True)
+            else ""
+        )
         asked = (
-            f'<span class="muted">User asked</span> <strong>{ui.esc(question)}</strong> '
-            '<span class="muted" style="font-size:13px">· self-reported</span>'
+            f'<span class="muted">User asked</span> <strong>{ui.esc(question)}</strong>{marker}'
             if t.get("question")
             else f'<strong class="muted">{ui.esc(question)}</strong>'
         )
