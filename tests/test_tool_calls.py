@@ -7,6 +7,7 @@ tool dispatch and lands in the log — the one piece of new wiring (a contextvar
 
 from __future__ import annotations
 
+import itertools
 import sys
 from pathlib import Path
 
@@ -448,3 +449,60 @@ def test_the_query_log_carries_the_same_source_as_the_tool_call_log(db, monkeypa
     _log_a_query()
     assert [r["source"] for r in seen] == [tools.DEFAULT_CALL_SOURCE, "embedded",
                                            tools.DEFAULT_CALL_SOURCE]
+
+
+def test_no_combination_of_outcome_arguments_can_write_a_dishonest_row(db):
+    """The whole override space, checked for invariants rather than for expected values.
+
+    Three separate review rounds found defects in this block, every one a combination the in-repo
+    caller never produces: an `error_kind` alone defaulting to success, `raised` flipped by an
+    unrelated `row_count`, a stated kind discarded by a contradictory success. Each was fixed with a
+    test for that case, and the next case slipped through the same way — because the matrix was
+    written from the cases already thought of.
+
+    So this asserts the three properties that must hold for EVERY input instead:
+      1. a successful row never carries an error kind;
+      2. a call that raised is never logged as a success;
+      3. an explicitly stated error kind is never silently replaced on a failed row;
+      4. naming an error kind, without also claiming success, produces a FAILED row.
+
+    Property 4 is the one that matters most and was the last to be written down. The other three are
+    all satisfied by turning a stated error into `success=1, error_kind=NULL` — which is perfectly
+    coherent, and is exactly the first bug found here. Coherence alone is not honesty: a row can
+    contradict itself, or it can quietly agree with itself about the wrong thing.
+    """
+    cases = list(
+        itertools.product(
+            [False, True],                     # raised
+            [None, True, False],               # success
+            [None, "timeout"],                 # error_kind
+            [None, 0, 5],                      # row_count
+            [None, "{}", '{"error": {"kind": "syntax"}}', "not json", '{"row_count": 3}'],
+        )
+    )
+    store = Store.connect(db)
+    try:
+        for raised, success, kind, rows, body in cases:
+            overrides: dict[str, object] = {}
+            if success is not None:
+                overrides["success"] = success
+            if kind is not None:
+                overrides["error_kind"] = kind
+            if rows is not None:
+                overrides["row_count"] = rows
+            tools.record_tool_call(
+                name="a_tool", arguments={}, result_text=body, execution_ms=1, actor="a",
+                raised=raised, **overrides,
+            )
+            r = store.query(
+                "SELECT success, error_kind FROM tool_calls ORDER BY rowid DESC LIMIT 1"
+            )[0]
+            case = f"raised={raised} success={success} kind={kind!r} rows={rows} body={body!r}"
+            assert not (r["success"] == 1 and r["error_kind"]), f"succeeded WITH an error: {case}"
+            assert not (raised and r["success"] == 1), f"a raise logged as success: {case}"
+            if kind is not None and r["success"] == 0:
+                assert r["error_kind"] == kind, f"stated kind dropped: {case}"
+            if kind is not None and success is not True:
+                assert r["success"] == 0, f"a stated error kind logged as a success: {case}"
+    finally:
+        store.close()
