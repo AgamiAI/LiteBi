@@ -1307,7 +1307,9 @@ def record_tool_call(
       be coherent**: state any one and the derived trio is replaced wholesale; an `error_kind` with no
       explicit `success` reads as a failure rather than defaulting to success; and a success never
       carries an error kind. So no combination of these arguments can write a row that says
-      "succeeded" beside an error.
+      "succeeded" beside an error. **`raised=True` outranks all of them** — a call that threw is a
+      failure whatever the caller passes, though it may still be given a more specific kind than the
+      generic `"exception"`.
     - `org_id` replaces the tenant otherwise stamped downstream from this process's context. A caller
       that read the tenant at the point which actually scoped the work states it, rather than leaving it
       to be re-read later from a context that may no longer be the same one. The fallback when that
@@ -1338,6 +1340,14 @@ def record_tool_call(
         derived_success = success if success is not None else error_kind is None
         derived_error_kind = None if derived_success else error_kind
         derived_row_count = row_count
+    if raised:
+        # A raise outranks every override. `raised` is not a classification the caller is offering —
+        # it is a fact this function was told about what the tool actually did, and no argument can
+        # make a call that threw into a successful one. Without this, passing something as innocuous
+        # as `row_count` alongside `raised=True` erased the exception and logged a success.
+        # A more specific kind than the generic "exception" is still welcome, so a stated one stands.
+        derived_success = False
+        derived_error_kind = derived_error_kind or "exception"
     rec: dict[str, Any] = {
         "ts": _now_iso(),
         "tool_name": name,

@@ -359,6 +359,32 @@ def test_no_combination_of_outcome_overrides_writes_an_incoherent_row(
     assert not (r["success"] == 1 and r["error_kind"]), "a successful row must carry no error kind"
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected_error_kind"),
+    [
+        ({}, "exception"),
+        ({"row_count": 5}, "exception"),  # an innocuous argument must not erase the exception
+        ({"success": True}, "exception"),
+        ({"success": True, "error_kind": None}, "exception"),
+        ({"error_kind": "timeout"}, "timeout"),  # a MORE specific kind is still welcome
+        ({"success": False, "error_kind": "timeout"}, "timeout"),
+    ],
+)
+def test_a_call_that_raised_stays_a_failure_whatever_the_caller_passes(
+    db, overrides, expected_error_kind
+):
+    """`raised` is not a classification on offer — it is a fact this function was told about what the
+    tool actually did. No override may turn a call that threw into a successful one, or an exception
+    could be logged as a success and vanish from every error view."""
+    tools.record_tool_call(
+        name="a_tool", arguments={}, result_text=None, execution_ms=1, actor="a",
+        raised=True, **overrides,
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 0, f"a raised call logged as a success: {overrides}"
+    assert r["error_kind"] == expected_error_kind
+
+
 def test_a_stated_tenant_is_not_re_read_from_the_process_context(db, monkeypatch):
     """The tenant is otherwise stamped downstream by re-reading this process's context, whose fallback
     is the deployment-wide org. A caller that read it where the work was actually scoped states it."""
