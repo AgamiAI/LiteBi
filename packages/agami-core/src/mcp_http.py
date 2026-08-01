@@ -428,9 +428,10 @@ def build_server(
         raised = False
         try:
             # Run the tool handler OFF the event loop. The heavy handlers block for the whole query —
-            # execute_sql shells out to a subprocess (up to 240 s) and hits the warehouse — so on the
-            # loop a single slow query would freeze every other in-flight request. This completes
-            # ACE-048 (which off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
+            # execute_sql runs it under the executor's own bounds (the per-statement budget, plus the
+            # supervisor's slack on the fork path) and hits the warehouse — so on the loop a single
+            # slow query would freeze every other in-flight request. This completes ACE-048 (which
+            # off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
             # `run_blocking` (anyio.to_thread) copies the request context into the worker thread, so
             # the org-scoped model cache (ACE-045, read via `_current_org_ctx`) stays tenant-correct.
             result_text = await run_blocking(meta["handler"], arguments or {})

@@ -1419,8 +1419,16 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     # inverted that order for any statement budget approaching it: the supervisor fired FIRST, so a
     # statement we could have cancelled and refused precisely came back instead as a
     # `failed`/`timeout` naming nothing the caller can act on. Imported lazily for the same
-    # reason `_run_in_process` does it. The child inherits `os.environ` (no `env=` below), so it
-    # resolves the identical `AGAMI_SQL_TIMEOUT_S` this call just read.
+    # reason `_run_in_process` does it.
+    #
+    # Resolved HERE and enforced on a child that re-resolves for itself, which only works because the
+    # resolver reads the environment and nothing else: the child inherits `os.environ` (no `env=`
+    # below) and therefore reaches the identical number. A request-scoped override would be the one
+    # thing that could break that — it would outrank the environment on this side of the fork and be
+    # invisible on the other, so a parent bound of 65s could sit against a child budget of 300s and
+    # fire first, inverting the order this whole family exists to hold. There is deliberately no such
+    # override; `_resolve_timeout_s` documents why, and a test pins that the budget keeps exactly one
+    # configuration surface.
     import execute_sql
 
     supervisor_timeout_s = execute_sql._resolve_timeout_s() + execute_sql._SUPERVISOR_SKEW_S

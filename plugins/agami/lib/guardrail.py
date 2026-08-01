@@ -55,8 +55,10 @@ RULE_MODEL_UNAVAILABLE = "model_unavailable"
 # subject is the statement, which is what earns it a rule at all — "narrow the query" is a fix we can
 # honestly name. The subprocess supervisor's kill is NOT that bound and must not borrow this rule: it
 # stops a child that never returned, without knowing what the child was doing when it stopped, so it
-# is a `failed`/`timeout` (see `FailureKind` below and contract §3). Wired into SQLite first; the
-# other engines follow, and until they do a statement on them is bounded only by that supervisor.
+# is a `failed`/`timeout` (see `FailureKind` below and contract §3). Every engine the executor speaks
+# to is wired, with one recorded residual: BigQuery has no connection to cancel, so there the bound is
+# server-side only and a client-side stall comes back as the executor never returning rather than as a
+# statement we stopped.
 RULE_RESOURCE_LIMIT = "resource_limit"
 RULE_UNPARSEABLE = "unparseable"
 

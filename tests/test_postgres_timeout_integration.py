@@ -118,13 +118,11 @@ def pg_observer():
 
 @pytest.fixture(autouse=True)
 def _reset_overrides():
-    # Both overrides are request-scoped ContextVars; isolate this file from whatever set them. The
-    # budget below travels by env var rather than by ContextVar on purpose: the executor runs on a
-    # thread this test starts, and a new thread begins with an empty context.
-    execute_sql._timeout_override.set(None)
+    # The row cap is a request-scoped ContextVar; isolate this file from whatever set it. The budget
+    # has no such surface at all — it travels by env var only, which is what lets a forked child and
+    # a thread this test starts both resolve the same number.
     execute_sql._max_rows_override.set(None)
     yield
-    execute_sql._timeout_override.set(None)
     execute_sql._max_rows_override.set(None)
 
 

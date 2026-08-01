@@ -1,10 +1,12 @@
 """Per-statement timeout — config resolution, the deadline primitive, and the refusal it produces.
 
-`_resolve_timeout_s` answers "how long may one statement run", from `AGAMI_SQL_TIMEOUT_S`, the
-`_timeout_override` ContextVar, and a 30s default; unlike the row cap it complains out loud when the
-env value is present but unparseable. `_deadline` is the watchdog those seconds feed: it fires an
-Event and calls a cancel callable when a block outlives its budget, and disarms cleanly when it does
-not.
+`_resolve_timeout_s` answers "how long may one statement run", from `AGAMI_SQL_TIMEOUT_S` and a 30s
+default and from nothing else — one configuration surface, so the parent and the forked child reach
+the same number. Unlike the row cap it complains out loud whenever the budget it returns is not the
+one the operator wrote, whether the text was unreadable or merely declined. `_deadline` is the
+watchdog those seconds feed: it fires an Event and calls a cancel callable when a block outlives its
+budget, and disarms cleanly when it does not — where "cleanly" means the disarm is a JOIN, so a
+watchdog that loses the race lands nowhere at all.
 
 The second half of this file proves the whole contract end to end on ONE engine — SQLite, chosen
 because it is in-process, needs no network, and `sqlite3.Connection.interrupt()` is a genuine cancel
@@ -45,6 +47,7 @@ import sys
 import threading
 import time
 import types
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,15 +67,28 @@ _TINY = 0.05
 
 
 @pytest.fixture(autouse=True)
-def _reset_override():
-    # Both overrides are request-scoped ContextVars; isolate every test from them. The row cap is
-    # reset here too because the outer bound copies the caller's whole context into its worker, so a
-    # cap left set by one test is now visible to the next test's executor as well.
-    execute_sql._timeout_override.set(None)
+def _reset_row_cap():
+    # The row cap is a request-scoped ContextVar; isolate every test from it. It matters more than it
+    # used to because the outer bound copies the caller's whole context into its worker, so a cap
+    # left set by one test is now visible to the next test's executor as well.
     execute_sql._max_rows_override.set(None)
     yield
-    execute_sql._timeout_override.set(None)
     execute_sql._max_rows_override.set(None)
+
+
+@pytest.fixture(autouse=True)
+def _drain_abandoned_workers():
+    """Wait for any worker a test abandoned to finish, so its slot is back before the next test runs.
+
+    The counter is process-wide and released by the abandoned worker itself, which returns shortly
+    after the test releases it. Draining here rather than zeroing the counter keeps the accounting
+    honest: setting it to 0 while a worker was still running would let that worker decrement past
+    zero and hand a later test a cap it has not actually got.
+    """
+    yield
+    deadline = time.monotonic() + 5
+    while execute_sql._abandoned_workers and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 @pytest.fixture(autouse=True)
@@ -123,8 +139,11 @@ def test_a_non_positive_value_falls_back_to_the_default(monkeypatch, raw):
     assert execute_sql._resolve_timeout_s() == 30
 
 
-@pytest.mark.parametrize("raw", ["6O", "30s", "45.5", "thirty", "1e3"])
-def test_an_unparseable_value_falls_back_and_says_so(monkeypatch, caplog, raw):
+# `²` and `①` are the cases `str.isdigit()` waves through and `int()` then refuses. They are not a
+# curiosity: the resolver is called at the fork path's supervisor bound, outside any handler, so a
+# ValueError raised out of it escapes the tool edge as a traceback rather than as a budget.
+@pytest.mark.parametrize("raw", ["6O", "30s", "45.5", "thirty", "1e3", "²", "①"])
+def test_an_unreadable_value_falls_back_and_says_so(monkeypatch, caplog, raw):
     """The row cap falls back silently; this one must not. An operator who typed a capital O for a
     zero has to be able to find out why their budget is not what they configured."""
     monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", raw)
@@ -138,39 +157,79 @@ def test_an_unparseable_value_falls_back_and_says_so(monkeypatch, caplog, raw):
     )
 
 
-@pytest.mark.parametrize("raw", ["", "45", "0", "-5"])
-def test_a_parseable_or_absent_value_stays_quiet(monkeypatch, caplog, raw):
-    """Only genuinely unparseable text warrants the warning. A deliberate `0` or `-5` is a value we
-    understood and declined, not a typo, and warning on it would train operators to ignore the log."""
+@pytest.mark.parametrize("raw", ["0", "00", "-5", "-0"])
+def test_a_value_we_read_and_declined_says_so_too(monkeypatch, caplog, raw):
+    """The warning is about the OUTCOME, not about the parse.
+
+    `-5` reads perfectly and is then declined, so it used to slip past silently while `6O` warned —
+    and a deployment quietly running 30s when its operator wrote something else is precisely the
+    invisible degradation the warning exists against. Whether we could read the text is not the
+    question the operator has; whether they got what they asked for is.
+    """
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", raw)
+    with caplog.at_level(logging.WARNING, logger=execute_sql._LOG.name):
+        assert execute_sql._resolve_timeout_s() == 30
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, f"no warning emitted for the declined value {raw!r}"
+    assert any(raw in r.getMessage() for r in warnings), (
+        f"the warning must name the declined text {raw!r}; got {[r.getMessage() for r in warnings]}"
+    )
+
+
+@pytest.mark.parametrize("raw", ["", "45", "045", "  45  ", "600"])
+def test_a_value_the_operator_actually_got_stays_quiet(monkeypatch, caplog, raw):
+    """The other direction, so the warning cannot become noise. A leading zero or surrounding
+    whitespace still yields exactly the number that was written, and warning on it would train
+    operators to ignore the log."""
     monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", raw)
     with caplog.at_level(logging.WARNING, logger=execute_sql._LOG.name):
         execute_sql._resolve_timeout_s()
     assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
-def test_the_context_var_takes_precedence_over_the_env(monkeypatch):
-    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "45")
-    execute_sql._timeout_override.set(7)
-    assert execute_sql._resolve_timeout_s() == 7
+def test_the_budget_has_exactly_one_configuration_surface():
+    """The environment is the only source, and that is load-bearing rather than tidy.
+
+    A request-scoped override outranks the environment in THIS process and cannot cross a fork: the
+    child re-resolves from `os.environ` alone. So a parent that derived the supervisor's bound from
+    an override would compute a bound BELOW the budget the child actually enforces, the supervisor
+    would fire first, and the ordered family the whole design rests on would invert — turning a
+    precise refusal into a `failed`/`timeout` that names nothing. Asserted structurally, because the
+    hazard is the existence of a second surface, not any particular value in one.
+    """
+    context_vars = {
+        name for name, value in vars(execute_sql).items() if isinstance(value, ContextVar)
+    }
+    assert context_vars == {"_max_rows_override"}, (
+        "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
+        f"found {sorted(context_vars)}"
+    )
 
 
-def test_the_context_var_takes_precedence_over_the_default():
-    execute_sql._timeout_override.set(12)
-    assert execute_sql._resolve_timeout_s() == 12
+def test_the_supervisor_bound_exceeds_the_budget_a_real_child_resolves(monkeypatch):
+    """The inversion, driven across the actual process boundary rather than reasoned about.
 
+    The parent computes the supervisor's bound; a real forked interpreter, inheriting this
+    environment exactly as `subprocess.run` gives it one, resolves its own budget. The first must
+    exceed the second, or the outermost bound fires before the innermost.
+    """
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "300")
+    parent_bound = execute_sql._resolve_timeout_s() + execute_sql._SUPERVISOR_SKEW_S
 
-def test_the_context_var_may_raise_the_budget_as_well_as_lower_it(monkeypatch):
-    """Unlike the row cap, which can only be tightened per call, the override wins outright."""
-    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "5")
-    execute_sql._timeout_override.set(90)
-    assert execute_sql._resolve_timeout_s() == 90
+    child = subprocess.run(
+        [sys.executable, "-c", "import execute_sql; print(execute_sql._resolve_timeout_s())"],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PYTHONPATH": str(PKG_SRC)},
+    )
+    assert child.returncode == 0, child.stderr
+    child_budget = int(child.stdout.strip())
 
-
-@pytest.mark.parametrize("override", [0, -1])
-def test_a_non_positive_override_is_ignored(monkeypatch, override):
-    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "45")
-    execute_sql._timeout_override.set(override)
-    assert execute_sql._resolve_timeout_s() == 45
+    assert child_budget == 300, child.stdout
+    assert parent_bound > child_budget, (
+        f"the supervisor stops waiting at {parent_bound}s while the child is still inside a "
+        f"{child_budget}s budget"
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -233,22 +292,115 @@ def test_the_timer_is_disarmed_even_when_the_block_raises():
     assert cancel.calls == 0
 
 
+class _ManualTimer:
+    """A `threading.Timer` stand-in whose `cancel()` does nothing and whose callback the test fires.
+
+    Not a caricature of the real one — a faithful model of its worst case. `Timer.cancel()` only sets
+    the timer's internal `finished` Event, so a timer thread that has ALREADY passed its own
+    `if not self.finished.is_set()` check runs the callback regardless. This makes that interleaving
+    — disarm first, `fire` second — happen on every run rather than once in a thousand.
+    """
+
+    def __init__(self, interval, function):
+        self.interval = interval
+        self.function = function
+        self.started = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        pass
+
+
+def test_a_watchdog_that_loses_the_race_to_the_disarm_lands_nowhere(monkeypatch):
+    """The disarm has to be a JOIN, not a request, and `Timer.cancel()` is only ever a request.
+
+    Two things go wrong when a `fire` that lost the race still runs. Every engine re-reads the flag
+    once the block has exited — "checked after the watchdog is disarmed, so the flag is final" — and
+    a flag set afterwards makes a completed statement look like a refusal. And the cancel itself
+    lands on a connection the engine has moved on from; on a pooled one that is somebody else's
+    statement being killed by our watchdog.
+    """
+    timers: list = []
+
+    def _timer(interval, function):
+        timers.append(_ManualTimer(interval, function))
+        return timers[-1]
+
+    monkeypatch.setattr(execute_sql.threading, "Timer", _timer)
+    cancel = _RecordingCancel()
+
+    with execute_sql._deadline(cancel, _TINY) as fired:
+        pass
+
+    assert timers and timers[0].started, "no watchdog was armed"
+    timers[0].function()  # the timer thread had already committed; `fire` runs anyway
+
+    assert cancel.calls == 0, "a cancel landed after the block the deadline was bounding had exited"
+    assert not fired.is_set(), "the flag every engine re-reads after the block was not final"
+
+
+def test_the_disarm_waits_for_a_cancel_already_in_flight():
+    """The other half of the same guarantee: a `fire` that WON the race is finished with before the
+    block is allowed to return.
+
+    Otherwise "no late cancel arrives" is only true of the cancels that had not started yet, and a
+    driver cancel that takes a moment still reaches into whatever the connection does next.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+
+    def cancel() -> None:
+        entered.set()
+        release.wait(5)
+
+    def run() -> None:
+        with execute_sql._deadline(cancel, _TINY):
+            assert entered.wait(5), "the watchdog never ran"
+        exited.set()
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    assert entered.wait(5), "the watchdog never ran"
+
+    assert not exited.wait(0.3), "the block returned while its own cancel was still running"
+    release.set()
+    runner.join(5)
+    assert exited.is_set()
+
+
+def _wait_for_warning(caplog, needle: str, timeout_s: float = 5.0) -> bool:
+    """Poll the captured records for a warning containing `needle`, up to a deadline."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if any(needle in r.getMessage()
+               for r in caplog.records if r.levelno == logging.WARNING):
+            return True
+        time.sleep(0.005)
+    return False
+
+
 def test_a_cancel_that_raises_does_not_escape_the_timer_thread(caplog):
     """Some drivers raise when cancelled from a thread other than the one running the statement. That
     must be logged and swallowed: an exception escaping a timer thread is unhandleable by the caller
-    and would be lost to threading's excepthook."""
+    and would be lost to threading's excepthook.
+
+    Polled rather than slept on. `cancel.done` is set in a `finally` that runs BEFORE the raise
+    reaches `fire`'s handler, so nothing this test can wait on is synchronized with the log write,
+    and a fixed sleep is a wager on how the runner happened to schedule two threads.
+    """
     cancel = _RecordingCancel(fails=True)
     with caplog.at_level(logging.WARNING, logger=execute_sql._LOG.name):
         with execute_sql._deadline(cancel, _TINY) as fired:
             assert cancel.done.wait(2.0), "the watchdog never ran"
-            time.sleep(_TINY)  # let `fire` finish handling the raised cancel before we leave
+        assert _wait_for_warning(caplog, "driver refused to cancel"), (
+            f"the failed cancel was not logged; got {[r.getMessage() for r in caplog.records]}"
+        )
 
     assert fired.is_set()  # the timeout still counts as fired even though the cancel failed
     assert cancel.calls == 1
-    assert any(
-        r.levelno == logging.WARNING and "driver refused to cancel" in r.getMessage()
-        for r in caplog.records
-    ), f"the failed cancel was not logged; got {[r.getMessage() for r in caplog.records]}"
 
 
 def test_the_watchdog_thread_is_a_daemon_and_does_not_hold_the_process_open():
@@ -325,14 +477,14 @@ def _guarded(sql: str) -> object:
     )
 
 
-def test_a_runaway_statement_is_cancelled_rather_than_left_to_run(warehouse):
+def test_a_runaway_statement_is_cancelled_rather_than_left_to_run(warehouse, monkeypatch):
     """The headline: a statement that would run for minutes is stopped at its budget and comes back
     as a refusal naming the rule the contract reserves for a bound we imposed.
 
     The elapsed assertion is the one that would still fail if the deadline were never armed — without
     it a test that merely waited out the query would look identical and pass in several minutes.
     """
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
 
     started = time.monotonic()
     env = _guarded(_RUNAWAY_SQL)
@@ -346,14 +498,14 @@ def test_a_runaway_statement_is_cancelled_rather_than_left_to_run(warehouse):
     assert env.refusal.reason == guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
 
 
-def test_a_cancelled_statement_yields_no_partial_data(warehouse):
+def test_a_cancelled_statement_yields_no_partial_data(warehouse, monkeypatch):
     """Whatever rows the engine had gathered when the watchdog fired are not an answer.
 
     A truncated result presented as a result is the failure mode the bounded-fetch work already
     guards against on the row axis; on the time axis the answer is stronger — there is no data at
     all, and `Envelope.__post_init__` enforces that a refusal cannot carry any.
     """
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
 
     env = _guarded(_RUNAWAY_SQL)
 
@@ -371,14 +523,14 @@ class _ResourceLimitExecutor:
         raise execute_sql._ResourceLimit("the statement outlived its per-statement budget")
 
 
-def test_the_detail_quotes_the_configured_budget(warehouse):
+def test_the_detail_quotes_the_configured_budget(warehouse, monkeypatch):
     """A bound the caller cannot see is one it cannot plan around, so the number is in the detail.
 
     The configured value is not a data value: it is a deployment setting, and stating it discloses
     nothing about the database or its contents. Asserted against a distinctive budget rather than the
     default, so a hard-coded `30s` in the message cannot pass.
     """
-    execute_sql._timeout_override.set(7)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(7))
 
     env = execute_sql.execute_guarded(
         "SELECT id FROM orders", PROFILE, None,
@@ -390,7 +542,7 @@ def test_the_detail_quotes_the_configured_budget(warehouse):
     assert "7s" in env.refusal.detail, env.refusal.detail
 
 
-def test_the_remediation_names_no_deployment_environment_variable(warehouse):
+def test_the_remediation_names_no_deployment_environment_variable(warehouse, monkeypatch):
     """The remediation has to be addressed to whoever is reading it.
 
     On the served path that is an assistant holding a statement, with no shell, no deployment and no
@@ -398,7 +550,7 @@ def test_the_remediation_names_no_deployment_environment_variable(warehouse):
     caller at an operator who is not in the conversation, and it reads as a fix while being
     unfollowable. What is left has to be something that would make THIS statement executable.
     """
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
 
     env = execute_sql.execute_guarded(
         "SELECT id FROM orders", PROFILE, None,
@@ -482,14 +634,16 @@ def fake_sqlite(monkeypatch):
     return _install
 
 
-def test_a_slow_fetch_is_bounded_even_when_the_execute_returned_at_once(warehouse, fake_sqlite):
+def test_a_slow_fetch_is_bounded_even_when_the_execute_returned_at_once(
+    warehouse, fake_sqlite, monkeypatch
+):
     """The clock covers the whole statement, fetch included — an explicit criterion, not a bonus.
 
     Bounding only `execute` would leave the common streaming shape unbounded: the driver returns
     immediately and the engine scans while the caller pulls. The cancel has to land on the fetch, and
     the refusal has to be the same one a slow execute produces.
     """
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
     conn = fake_sqlite(_SlowFetchCursor)
 
     started = time.monotonic()
@@ -528,14 +682,16 @@ class _ImmediateErrorCursor:
         raise AssertionError("unreachable")
 
 
-def test_a_database_error_with_the_flag_unset_is_a_failure_not_a_refusal(warehouse, fake_sqlite):
+def test_a_database_error_with_the_flag_unset_is_a_failure_not_a_refusal(
+    warehouse, fake_sqlite, monkeypatch
+):
     """Direction (a): the watchdog never fired, so this is the database's outcome, not ours.
 
     A generous budget means the flag stays clear while the identical error text arrives. It must
     unwind as an `ExecutorError` and leave the chokepoint as `failed`/`syntax` — a refusal here would
     tell a caller to narrow a statement that never ran long at all.
     """
-    execute_sql._timeout_override.set(300)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(300))
     fake_sqlite(_ImmediateErrorCursor)
 
     env = _guarded("SELECT c FROM orders")
@@ -579,7 +735,7 @@ def test_an_error_that_merely_arrives_late_is_still_a_failure(warehouse, fake_sq
     `failed`, because we did not stop this statement; it stopped on its own, late.
     """
     monkeypatch.setattr(execute_sql, "_deadline", _deadline_that_never_fires)
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
     fake_sqlite(_LateErrorCursor)
 
     started = time.monotonic()
@@ -651,7 +807,7 @@ def audited(tmp_path, monkeypatch):
     return SimpleNamespace(app_db=app_db)
 
 
-def test_the_refusal_is_written_to_the_audit_trail(audited):
+def test_the_refusal_is_written_to_the_audit_trail(audited, monkeypatch):
     """A decision we made against a caller's statement is exactly the row a reviewer comes looking
     for, so this outcome is audited like every other — and keyed by the id the caller was handed.
 
@@ -662,7 +818,7 @@ def test_the_refusal_is_written_to_the_audit_trail(audited):
     from store import Store
 
     tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
     try:
         body = json.loads(tools.tool_execute_sql({"sql": _RUNAWAY_SQL, "datasource": PROFILE,
                                                   "raw_query": "how many"}))
@@ -728,7 +884,7 @@ def test_an_injected_executor_that_never_returns_is_still_bounded(warehouse, mon
     which needs no clock at all.
     """
     monkeypatch.setattr(execute_sql, "_OUTER_BOUND_SKEW_S", 0)
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
     executor = _BlockingExecutor()
 
     started = time.monotonic()
@@ -754,7 +910,7 @@ def test_the_outer_refusal_says_what_actually_happened(warehouse, monkeypatch):
     The sentence the caller reads names what we observed — the executor did not come back — and
     quotes the bound that actually elapsed rather than the inner budget."""
     monkeypatch.setattr(execute_sql, "_OUTER_BOUND_SKEW_S", 0)
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
     executor = _BlockingExecutor()
 
     try:
@@ -772,7 +928,65 @@ def test_the_outer_refusal_says_what_actually_happened(warehouse, monkeypatch):
     assert "AGAMI_" not in authored, authored
 
 
-def test_the_inner_refusal_is_the_one_the_caller_gets(warehouse):
+def _guarded_with(executor) -> object:
+    return execute_sql.execute_guarded(
+        "SELECT id FROM orders", PROFILE, None, executor=executor, no_safety=True,
+    )
+
+
+def _drain(deadline_s: float = 5.0) -> None:
+    """Wait for the abandoned workers to return and give their slots back."""
+    deadline = time.monotonic() + deadline_s
+    while execute_sql._abandoned_workers and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_the_abandoned_workers_are_capped_and_the_cap_releases(warehouse, monkeypatch):
+    """The cost of the outer bound is an abandoned worker, and it has to have a ceiling.
+
+    Before this layer existed, a call this slow blocked the host's own worker thread — so the thread
+    limiter capped how much abandoned work could exist and pushed back on everything behind it.
+    Returning at the bound frees that slot, and on the injected path (no inner watchdog, so EVERY
+    slow statement abandons one) the abandonments would accumulate at the rate callers arrive, each
+    still holding a pooled connection and a running statement, until the datasource belonged to work
+    nobody is waiting for.
+
+    So at the cap the chokepoint refuses BEFORE starting one more — fast, fail-closed, and saying the
+    executor is saturated rather than blaming a statement that never ran. And the slot comes back
+    when the abandoned worker finally returns, which is the moment the leak actually ends.
+    """
+    monkeypatch.setattr(execute_sql, "_OUTER_BOUND_SKEW_S", 0)
+    monkeypatch.setattr(execute_sql, "_MAX_ABANDONED_WORKERS", 2)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
+    executor = _BlockingExecutor()
+
+    try:
+        for n in range(2):
+            env = _guarded_with(executor)
+            assert env.status == "refused", (n, env)
+            assert "did not return" in env.refusal.detail, (n, env.refusal.detail)
+        assert execute_sql._abandoned_workers == 2
+
+        started = time.monotonic()
+        env = _guarded_with(executor)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < _BUDGET_S, f"the capped call still waited out a bound ({elapsed:.2f}s)"
+        assert env.status == "refused"
+        assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
+        assert "saturated" in env.refusal.detail, env.refusal.detail
+        # It must not blame a statement that never ran, and it must not claim a cancel.
+        assert "cancelled" not in env.refusal.detail, env.refusal.detail
+        assert executor.calls == 2, "the refused call started leak N+1 anyway"
+    finally:
+        executor.release.set()
+
+    _drain()
+    assert execute_sql._abandoned_workers == 0, "the slots never came back"
+    assert _guarded_with(executor).status == "ok"  # and the executor is usable again
+
+
+def test_the_inner_refusal_is_the_one_the_caller_gets(warehouse, monkeypatch):
     """When both layers are armed the INNER one wins, and the outer neither overwrites its refusal
     nor mints a second.
 
@@ -782,7 +996,7 @@ def test_the_inner_refusal_is_the_one_the_caller_gets(warehouse):
     armed and genuinely loses the race. The detail is the assertion, because it is the one part of
     the envelope the two layers word differently.
     """
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
 
     started = time.monotonic()
     env = _guarded(_RUNAWAY_SQL)
@@ -866,7 +1080,7 @@ def test_a_plain_exception_still_reaches_the_catch_all_across_the_worker(warehou
 
 
 class _ContextProbeExecutor:
-    """Records the thread it ran on and what the two request-scoped ContextVars read there."""
+    """Records the thread it ran on, the request-scoped row cap it read there, and the budget."""
 
     def __init__(self) -> None:
         self.thread: threading.Thread | None = None
@@ -875,21 +1089,24 @@ class _ContextProbeExecutor:
 
     def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> execute_sql.ExecResult:
         self.thread = threading.current_thread()
-        self.seen_timeout = execute_sql._timeout_override.get()
+        self.seen_timeout = execute_sql._resolve_timeout_s()
         self.seen_rows = execute_sql._max_rows_override.get()
         return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
 
 
-def test_the_request_scoped_overrides_are_visible_inside_the_worker(warehouse):
+def test_the_request_scoped_row_cap_is_visible_inside_the_worker(warehouse, monkeypatch):
     """A new thread starts with an EMPTY context, so without an explicit copy the caller's per-call
-    budget and row cap would read as unset inside the worker and every in-process call would quietly
-    fall back to the deployment defaults — a bug with no symptom other than the wrong numbers.
+    row cap would read as unset inside the worker and every in-process call would quietly fall back
+    to the deployment default — a bug with no symptom other than the wrong numbers.
+
+    The budget is asserted alongside it for the opposite reason: it rides the environment, which a
+    new thread inherits for free, and the two must agree inside the worker as well as outside it.
 
     The thread identity is asserted first, because it is what makes the rest of this test mean
-    anything: if the call ever stopped running off-thread, the ContextVar assertions would pass
+    anything: if the call ever stopped running off-thread, the ContextVar assertion would pass
     trivially and the copy could be deleted with the suite still green.
     """
-    execute_sql._timeout_override.set(7)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "7")
     execute_sql._max_rows_override.set(5)
     probe = _ContextProbeExecutor()
 
@@ -1032,14 +1249,29 @@ def _http_refusal(sql: str) -> dict:
     return json.loads(resp.json()["result"]["content"][0]["text"])
 
 
+def _audit_rows(app_db: str) -> list:
+    from store import Store
+
+    store = Store.connect(app_db)
+    try:
+        return store.query("SELECT id, status, reason, rule FROM query_executions")
+    finally:
+        store.close()
+
+
 def test_both_surfaces_refuse_a_runaway_statement_identically(audited, monkeypatch):
-    """The criterion in one test: the limit applies the same on stdio and on HTTP, and no executor
-    escapes it.
+    """The criterion in one test: the limit applies the same on stdio and on HTTP, no executor
+    escapes it, and BOTH leave an audit row.
 
     The two transports run DIFFERENT execution paths — stdio forks a child and reads its stderr back,
     HTTP runs the built-in executor in-process behind the outer bound — so "identically" is asserted
     on the whole refusal, not merely on the status. A difference in any field would mean the caller's
     answer depends on which door it came through.
+
+    The audit half is asserted here rather than only at the in-process tool edge for the same reason:
+    the row is written by the serializer, and the fork path reaches it having reconstructed the
+    refusal from a child's stderr. "A timeout refusal is recorded on both surfaces" is a claim about
+    both, and one surface's row does not evidence the other's.
     """
     pytest.importorskip("starlette")
     pytest.importorskip("mcp")
@@ -1047,11 +1279,24 @@ def test_both_surfaces_refuse_a_runaway_statement_identically(audited, monkeypat
     monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
 
     stdio = _stdio_refusal(_RUNAWAY_SQL)
+    after_stdio = _audit_rows(audited.app_db)
     http = _http_refusal(_RUNAWAY_SQL)
+    after_http = _audit_rows(audited.app_db)
 
     assert stdio["status"] == http["status"] == "refused", (stdio, http)
     assert stdio["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
     assert stdio["refusal"] == http["refusal"]
+
+    # One row per call, keyed by the id that call handed back — counted after each transport so a
+    # single row could not stand in for both.
+    assert len(after_stdio) == 1, after_stdio
+    assert len(after_http) == 2, after_http
+    assert {r["id"] for r in after_http} == {stdio["audit_id"], http["audit_id"]}
+    assert {r["status"] for r in after_http} == {"refused"}
+    assert {r["rule"] for r in after_http} == {guardrail.RULE_RESOURCE_LIMIT}
+    assert {r["reason"] for r in after_http} == {
+        guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
+    }
 
 
 # --------------------------------------------------------------------------------------------
@@ -1415,6 +1660,27 @@ def test_a_cancel_that_lands_without_raising_is_still_a_refusal(engine, monkeypa
         case.run()
 
 
+def test_the_cli_adapter_renders_the_marker_as_a_refusal_not_a_traceback(monkeypatch, capsys):
+    """The per-engine CSV wrappers are the SECOND entry into the engine functions, and the engines
+    raise the internal marker.
+
+    That adapter caught only `ExecutorError`, so a per-statement timeout reached through it escaped
+    as a traceback rather than as the exit code its contract documents. It renders what `main`
+    renders for any refusal — the one JSON object on stderr and exit 1 — so the two entries cannot
+    disagree about what a bound we imposed looks like.
+    """
+    monkeypatch.setattr(execute_sql, "_deadline", _deadline_already_fired)
+    case = ENGINE_CASES["sqlite"]
+    case.install(monkeypatch, on_execute=lambda: RuntimeError("interrupted"))
+
+    code = execute_sql._execute_sqlite(case.creds, "SELECT c FROM orders")
+
+    assert code == 1
+    body = json.loads(capsys.readouterr().err)  # one JSON object, on one line, and nothing else
+    assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
+    assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
+
+
 # --------------------------------------------------------------------------------------------
 # The named cancel is the one that actually runs
 # --------------------------------------------------------------------------------------------
@@ -1462,6 +1728,36 @@ def test_each_engine_arms_its_own_named_cancel(engine, monkeypatch):
     recorder.cancels[0]()
     landed = [entry[0] for entry in conn.log[before:]]
     assert landed == [case.cancel], f"{engine} cancelled via {landed}, expected {[case.cancel]}"
+
+
+@pytest.mark.parametrize("engine", _WATCHDOG_ENGINES)
+def test_the_deadline_covers_the_fetch_and_not_only_the_execute(engine, monkeypatch):
+    """An explicit criterion, and until now pinned on two engines out of nine.
+
+    `_collect_cursor` pulls `cap + 1` rows in a single `fetchmany`, and on a cursor that streams its
+    result THAT is where the scan happens — a clock stopping at `execute` would bound the cheap half
+    of the work and leave the expensive half unbounded. Only SQLite (through a fake slow-fetch
+    cursor) and DuckDB (through this ordering assertion) actually held the line; on the other seven,
+    moving the fetch out of the deadline's block left the whole suite green. The ordering IS the
+    criterion, so it is asserted the same way on every engine that arms a watchdog.
+    """
+    case = ENGINE_CASES[engine]
+    conn = case.install(monkeypatch)
+    recorder = _CancelRecorder(conn.log)
+    monkeypatch.setattr(execute_sql, "_deadline", recorder)
+
+    case.run()
+
+    kinds = [entry[0] for entry in conn.log]
+    # By value, not by first occurrence: Postgres runs `SET LOCAL statement_timeout` on its own
+    # cursor before the deadline is armed, and that is an `execute` too.
+    statement = next(
+        i for i, e in enumerate(conn.log) if e[0] == "execute" and e[1] == "SELECT c FROM orders"
+    )
+    assert (
+        kinds.index("deadline.arm") < statement < kinds.index("fetchmany")
+        < kinds.index("deadline.disarm")
+    ), conn.log
 
 
 def test_the_mysql_cancel_forces_the_socket_shut_and_never_sends_quit(monkeypatch):
@@ -1520,7 +1816,7 @@ def test_the_snowflake_cancel_does_nothing_before_a_query_id_exists(monkeypatch)
 def test_each_engine_arms_the_deadline_with_the_resolved_budget(engine, monkeypatch):
     """One resolution per call, so the budget the watchdog enforces and the number the refusal quotes
     cannot be two different values."""
-    execute_sql._timeout_override.set(11)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(11))
     case = ENGINE_CASES[engine]
     case.install(monkeypatch)
     recorder = _CancelRecorder()
@@ -1555,8 +1851,54 @@ def test_duckdb_cancels_through_the_connection_even_though_the_cursor_is_the_con
 
 
 # --------------------------------------------------------------------------------------------
-# Postgres: the named cursor must not eat the marker
+# Nothing in a `finally` may eat the marker
 # --------------------------------------------------------------------------------------------
+
+
+class _EngineExecutor:
+    """Runs one engine's real `_run_<db>` against its fake driver, so the assertion is about the
+    Envelope the chokepoint produces rather than about the exception the engine raises."""
+
+    def __init__(self, case: "_EngineCase"):
+        self._case = case
+
+    def execute(self, vetted_sql: str, creds: dict, *, profile: str):
+        return self._case.fn(self._case.creds, vetted_sql)
+
+
+# The three engines whose `finally` closed the connection unguarded. The other seven already wrapped
+# it; these were the ones a refusal could still die in.
+@pytest.mark.parametrize("engine", ["mysql", "postgres", "sqlite"])
+def test_a_connection_close_that_raises_does_not_eat_the_refusal(engine, warehouse, monkeypatch):
+    """The same structural bug as the named cursor above, one line further down.
+
+    An exception raised inside a `finally` REPLACES the one propagating through it, and by the time
+    the `finally` runs the engine's `except _ResourceLimit: raise` has already re-raised the marker.
+    So a `close()` that throws destroys it, the catch-all one layer out wraps the replacement, and a
+    bound WE imposed reaches the caller as an unclassified server break telling them nothing.
+
+    MySQL is the most exposed and the reason this is not theoretical: its cancel is `_force_close()`,
+    which deliberately destroys the socket — so on exactly the timeout path, `close()` is being asked
+    to write COM_QUIT to a socket that is already gone.
+    """
+    monkeypatch.setattr(execute_sql, "_deadline", _deadline_already_fired)
+    case = ENGINE_CASES[engine]
+    conn = case.install(monkeypatch, on_execute=lambda: RuntimeError("connection reset by peer"))
+
+    def _close_raises() -> None:
+        conn.log.append(("conn.close",))
+        raise RuntimeError("the socket the cancel destroyed is not there to close")
+
+    monkeypatch.setattr(conn, "close", _close_raises)
+
+    env = execute_sql.execute_guarded(
+        "SELECT c FROM orders", PROFILE, None, executor=_EngineExecutor(case), no_safety=True,
+    )
+
+    assert ("conn.close",) in conn.log, "the connection was never closed"
+    assert env.status == "refused", getattr(env, "failure", None)
+    assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
+    assert env.failure is None
 
 
 class _PostgresExecutor:
@@ -1628,7 +1970,7 @@ def test_the_skew_puts_the_native_bound_behind_the_watchdog():
 def test_postgres_sets_the_native_bound_on_the_same_transaction_before_the_named_cursor(monkeypatch):
     """`SET LOCAL` is transaction-scoped, so it is worthless unless it runs on the transaction the
     statement will run in, and before it. Ordering is the assertion; the value is the other half."""
-    execute_sql._timeout_override.set(_BUDGET_FOR_NATIVE)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_FOR_NATIVE))
     case = ENGINE_CASES["postgres"]
     conn = case.install(monkeypatch)
 
@@ -1655,7 +1997,7 @@ def test_postgres_does_not_set_the_native_bound_through_the_connect_options(monk
     """The libpq `options` startup parameter is the other way to set `statement_timeout`, and it is
     the wrong one here: a transaction-mode connection pooler can reject an unknown startup parameter,
     which breaks the connect outright rather than bounding the statement."""
-    execute_sql._timeout_override.set(_BUDGET_FOR_NATIVE)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_FOR_NATIVE))
     case = ENGINE_CASES["postgres"]
     conn = case.install(monkeypatch)
 
@@ -1665,7 +2007,7 @@ def test_postgres_does_not_set_the_native_bound_through_the_connect_options(monk
 
 
 def test_snowflake_sets_its_statement_timeout_as_a_session_parameter(monkeypatch):
-    execute_sql._timeout_override.set(_BUDGET_FOR_NATIVE)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_FOR_NATIVE))
     case = ENGINE_CASES["snowflake"]
     conn = case.install(monkeypatch)
 
@@ -1682,7 +2024,7 @@ def test_bigquery_sets_a_job_timeout_and_is_the_one_engine_with_no_cancel(monkey
     an oversight: there is no connection to cancel, and the call that blocks is `job.result()`, which
     is reached only after `client.query()` returns — so at the instant a watchdog would fire there is
     nothing in hand to stop. A client-side stall here comes back `failed`, not `resource_limit`."""
-    execute_sql._timeout_override.set(_BUDGET_FOR_NATIVE)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_FOR_NATIVE))
     case = ENGINE_CASES["bigquery"]
     conn = case.install(monkeypatch)
     recorder = _CancelRecorder()
@@ -1727,7 +2069,7 @@ def test_no_other_engine_grows_a_native_bound(engine, monkeypatch):
 # --------------------------------------------------------------------------------------------
 
 
-def test_a_cartesian_bomb_is_bounded_on_a_real_duckdb(tmp_path):
+def test_a_cartesian_bomb_is_bounded_on_a_real_duckdb(tmp_path, monkeypatch):
     """The fakes above prove the wiring; this proves the cancel. DuckDB is in-process like SQLite, so
     a genuine `interrupt()` can be driven end to end with no network and no fixture warehouse — and a
     cross join of two ten-million-row ranges is 10^14 rows, far beyond what the budget allows, so a
@@ -1739,7 +2081,7 @@ def test_a_cartesian_bomb_is_bounded_on_a_real_duckdb(tmp_path):
     con.execute("CREATE TABLE orders (id INTEGER)")
     con.close()
 
-    execute_sql._timeout_override.set(_BUDGET_S)
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", str(_BUDGET_S))
     started = time.monotonic()
     with pytest.raises(execute_sql._ResourceLimit):
         execute_sql._run_duckdb(

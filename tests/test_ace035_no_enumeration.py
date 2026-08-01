@@ -180,11 +180,11 @@ def declared(tmp_path, monkeypatch):
 
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
     monkeypatch.setenv("DATASOURCE_URL__ACME", f"sqlite:///{warehouse}")
-    # The smallest per-statement budget the resolver accepts, for the `resource_limit` vector: it is
-    # the one statement here that reaches the executor and has to be stopped there. Every other
-    # statement in this file is refused before execution or rejected instantly by the database, so a
-    # short budget costs them nothing.
-    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "1")
+    # Deliberately NOT a one-second budget for every test that takes this fixture. Only the
+    # `resource_limit` vector wants one, and it sets it for itself; the `failed` vector reaches the
+    # same warehouse under it, so a stall on a loaded runner would turn an expected database
+    # rejection into a timeout refusal and fail a test that has nothing to do with the clock.
+    monkeypatch.delenv("AGAMI_SQL_TIMEOUT_S", raising=False)
     # Local, not hosted: the disk model is the one the gates use. (`model_unavailable` needs the
     # hosted signal and gets its own fixture.)
     monkeypatch.delenv("AGAMI_DB_URL", raising=False)
@@ -370,7 +370,9 @@ def _assert_echo_only(body: dict, sql: str) -> None:
 
 
 @pytest.mark.parametrize(("rule", "sql", "route"), _MATRIX, ids=_MATRIX_IDS)
-def test_no_declared_name_the_caller_did_not_send_reaches_a_refusal(declared, rule, sql, route):
+def test_no_declared_name_the_caller_did_not_send_reaches_a_refusal(
+    declared, rule, sql, route, monkeypatch
+):
     """Six rules — five here, `model_unavailable` below — across both surfaces and both execution
     paths.
 
@@ -380,6 +382,13 @@ def test_no_declared_name_the_caller_did_not_send_reaches_a_refusal(declared, ru
     by construction; the child's own read-only refusal crossing the wire is covered by
     `tests/test_ace035_read_only_refusal.py::test_parent_reconstructs_the_child_refusal`.)
     """
+    if rule == guardrail.RULE_RESOURCE_LIMIT:
+        # The smallest per-statement budget the resolver accepts, scoped to the one vector that needs
+        # it: this is the only statement here that passes every gate, reaches the executor, and has
+        # to be stopped there. The forked and stdio routes inherit `os.environ`, so setting it here
+        # reaches them too.
+        monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "1")
+
     body = ROUTES[route](sql)
 
     assert body["status"] == "refused", body
