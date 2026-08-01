@@ -43,6 +43,16 @@ Exit codes:
          its own precisely so it does not borrow one: with `other` falling to the generic 2, a parent
          reading the exit code back reported an internal break as a datasource-configuration problem
          (`dsn`), and only on the fork transport, while the identical break in-process said `other`.
+    7  — the statement referenced a column the database does not have
+    8  — the statement referenced a table the database does not have
+    9  — the connection's role lacks SELECT on a referenced object
+    10 — the database was unreachable mid-statement (connection refused / reset)
+
+Codes 7-10 exist for the same reason 6 does. The child classifies a driver error at the chokepoint
+and then `main` collapses that classification to an exit code, so a kind without a code of its own is
+a kind the fork silently loses: all four landed on the `other` default and a parent read them back as
+`other`, while the identical error in-process reported the real kind. The in-process tests passed and
+the DEFAULT surface was wrong (ACE-039).
 
 `EXIT_TO_FAILURE_KIND` / `FAILURE_KIND_TO_EXIT` below are that table in code — this module owns the
 exit-code contract because it documents it here and is the only place that produces it.
@@ -180,16 +190,33 @@ EXIT_TO_FAILURE_KIND: dict[int, FailureKind] = {
     # mapped to 2 the parent read it back as ``dsn`` — so an internal break was reported to the
     # caller as a datasource-configuration problem, and only on the fork transport.
     6: "other",
+    # The four kinds the error-hardening slice makes reachable (ACE-039). Each needs a code of its
+    # own for exactly the reason 6 does, and the failure mode is worse because it is silent: the
+    # child classifies the driver error correctly at the chokepoint, `main` collapses the kind to an
+    # exit code, and a kind with no code falls to the `other` default. In-process the caller saw
+    # `column_not_found`; through the fork — the DEFAULT transport — it saw `other`, and no test that
+    # exercised only the in-process path could tell. `_child_failure_message` compounds it: it
+    # relays the child's sanitized text only for a code in this table, so an unmapped code also
+    # replaced the message with the generic unexpected-failure text.
+    7: "column_not_found",
+    8: "table_not_found",
+    9: "permission",  # the ROLE lacks SELECT; distinct from `auth`, where the credentials failed
+    10: "network",
 }
 
 # The inverse, for ``main`` turning a ``Failure`` back into today's exit code. Every failure
-# ``execute_guarded`` can produce is either an ``ExecutorError`` whose code is one of the four
-# classified ones above or the catch-all ``other``, and all five have their own code — so the
-# round-trip is exact for every case this module can reach, in both directions. The default covers
-# only the kinds nothing produces yet (``column_not_found``, ``table_not_found``, ``network``) plus
-# ``timeout``, which is minted at the tool edge by the subprocess supervisor and so never reaches
-# ``main``. It is 6 rather than 2 for the same reason ``other`` has its own code: an unmapped kind is
-# something we could not classify, which is what 6 says, and never a config error.
+# ``execute_guarded`` can produce is either an ``ExecutorError`` whose code is one of the classified
+# ones above or the catch-all ``other``, and all of them have their own code — so the round-trip is
+# exact for every case this module can reach, in both directions.
+#
+# The default now covers exactly ONE kind: ``timeout``, which is minted at the tool edge by the
+# subprocess supervisor when a child never returns, and so never reaches ``main`` to be encoded.
+# That is the whole remaining gap, and it is a gap by construction rather than by omission — a
+# supervisor that stops an unresponsive child cannot attribute the kill to the statement, which is
+# why it is a failure rather than a ``resource_limit`` refusal (guardrail contract §3).
+#
+# It is 6 rather than 2 for the same reason ``other`` has its own code: an unmapped kind is something
+# we could not classify, which is what 6 says, and never a config error.
 FAILURE_KIND_TO_EXIT: dict[str, int] = {kind: code for code, kind in EXIT_TO_FAILURE_KIND.items()}
 _DEFAULT_FAILURE_EXIT = 6
 
