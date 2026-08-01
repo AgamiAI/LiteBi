@@ -21,6 +21,7 @@ whole object rather than re-deriving a shape of their own.
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 from guardrail import RULE_READ_ONLY, Refusal, refuse
 
@@ -89,7 +90,33 @@ class _GuardReject(Exception):
         super().__init__(detail)
 
 
-def _neutralize(sql: str) -> str:
+class _Neutralized(NamedTuple):
+    """The analysis copy of a statement, plus where its quoted identifiers ended up.
+
+    `text` is the neutralized statement, **already stripped**. `quoted` holds one
+    `[start, end)` per double-quoted identifier, naming that identifier's CONTENT in
+    `text`'s own coordinates — never the re-supplied separators around it.
+
+    **One coordinate frame, deliberately.** The scan re-supplies separator spaces and
+    drops delimiters, so input offsets are not output offsets, and stripping afterwards
+    would shift them a third time. Doing the strip *inside* this function and reporting
+    spans against the stripped result is what makes a span usable without any caller
+    reconciling frames. A span in the wrong frame does not fail loudly; it mis-identifies
+    a token, so the frame is collapsed to one rather than documented.
+
+    **Only the niladic recon matcher reads `quoted`.** Every other consumer — the
+    read-only gate above all — matches `text` with the quotes already dropped, because
+    that unwrapping is what keeps `SELECT*FROM"pg_read_file"(...)` visible to a
+    `\\b`-anchored pattern. A quoted bare word is unambiguously an identifier; a quoted
+    name with a trailing `(` is still a call. That distinction is the consumer's to make,
+    which is why this type reports provenance and decides nothing.
+    """
+
+    text: str
+    quoted: tuple[tuple[int, int], ...]
+
+
+def _neutralize(sql: str) -> _Neutralized:
     """Blank out comments and string / dollar-quoted literals, and drop the quote
     delimiters of double-quoted identifiers (keeping their content), in a SINGLE
     left-to-right pass so the FIRST-opened construct wins — exactly how the database
@@ -111,6 +138,9 @@ def _neutralize(sql: str) -> str:
     identifier are treated as doubled-delimiter escapes (standard SQL). Backslash is
     deliberately NOT an escape here — engines disagree (MySQL yes, standard PG no),
     and not honoring it can only stop a literal *early* (fail safe), never late.
+
+    Returns a `_Neutralized` — the stripped text plus the quoted-identifier spans. See
+    that type for why the strip happens here rather than at the call site.
     """
     def _last_emitted(chunks: list[str]) -> str:
         """The last character actually emitted, skipping empty chunks.
@@ -125,6 +155,14 @@ def _neutralize(sql: str) -> str:
         return ""
 
     out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    width = 0  # running len("".join(out)), so a span can be recorded as it is emitted
+
+    def emit(chunk: str) -> None:
+        nonlocal width
+        out.append(chunk)
+        width += len(chunk)
+
     i, n = 0, len(sql)
     while i < n:
         two = sql[i : i + 2]
@@ -143,7 +181,7 @@ def _neutralize(sql: str) -> str:
             j = i + 2
             while j < n and sql[j] not in "\r\n":
                 j += 1
-            out.append(" ")
+            emit(" ")
             i = j
         elif two == "/*":  # block comment
             # `/*! ... */` (and versioned `/*!NNNNN ... */`) is a MySQL *executable*
@@ -156,7 +194,7 @@ def _neutralize(sql: str) -> str:
                 )
             end = sql.find("*/", i + 2)
             i = n if end == -1 else end + 2
-            out.append(" ")
+            emit(" ")
         elif sql[i] == "'":  # single-quoted string literal
             j = i + 1
             while j < n:
@@ -167,7 +205,7 @@ def _neutralize(sql: str) -> str:
                     j += 1
                     break
                 j += 1
-            out.append(" ")
+            emit(" ")
             i = j
         elif sql[i] == '"':  # double-quoted identifier — keep content, drop quotes
             j, buf = i + 1, []
@@ -201,11 +239,15 @@ def _neutralize(sql: str) -> str:
             # pinned by an explicit output test, since no current rule distinguishes the
             # two spellings on its own.
             if _last_emitted(out).isalnum() or _last_emitted(out) == "_":
-                out.append(" ")
-            out.append("".join(buf))
+                emit(" ")
+            # Record the span AROUND the content only, between the two separator emits, so
+            # `quoted` names the identifier and never the boundary this branch re-supplied.
+            start = width
+            emit("".join(buf))
+            spans.append((start, width))
             nxt = sql[j] if j < n else ""
             if nxt.isalnum() or nxt == "_":
-                out.append(" ")
+                emit(" ")
             i = j
         elif sql[i] == "$":  # dollar-quoted string literal ($$...$$ or $tag$...$tag$)
             # Only a `$tag$` with a MATCHING close delimiter is a literal we can blank.
@@ -217,14 +259,25 @@ def _neutralize(sql: str) -> str:
             close = sql.find(m.group(0), m.end()) if m else -1
             if m and close != -1:
                 i = close + len(m.group(0))
-                out.append(" ")
+                emit(" ")
             else:
-                out.append("$")
+                emit("$")
                 i += 1
         else:
-            out.append(sql[i])
+            emit(sql[i])
             i += 1
-    return "".join(out)
+    raw = "".join(out)
+    text = raw.strip()
+    lead = len(raw) - len(raw.lstrip())
+    limit = len(text)
+    # Shift every span into the stripped frame, and DROP any the strip disturbed rather
+    # than clamping it. Dropping is the safe direction: a missing span means the niladic
+    # matcher does not skip that token, so the gate over-refuses. Clamping a span that ran
+    # off either end would instead widen the skipped region and could hide a live keyword.
+    kept = tuple(
+        (s - lead, e - lead) for s, e in spans if 0 <= s - lead < e - lead <= limit
+    )
+    return _Neutralized(text, kept)
 
 
 # Allowed opening keyword. `WITH` covers CTEs whose final clause is a SELECT.
@@ -343,7 +396,7 @@ def check_read_only(sql: str | None) -> Refusal | None:
     # nothing hidden inside a literal or comment can reach the checks below. See
     # `_neutralize` for why a single scan is required rather than layered regexes.
     try:
-        stripped = _neutralize(sql).strip()
+        stripped = _neutralize(sql).text
     except _GuardReject as reject:
         return refuse(RULE_READ_ONLY, detail=reject.detail, remediation=reject.remediation)
 

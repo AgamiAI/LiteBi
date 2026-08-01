@@ -475,8 +475,14 @@ def test_neutralize_preserves_token_structure(sql: str, expected: str) -> None:
     tokens where the statement meant one. Any rule that reasons about qualification (a
     pattern anchored on a preceding `.`, say) would then read a qualified column as a bare
     identifier. Asserting the neutralized string keeps that decision checkable.
+
+    The assertion compares `.text` rather than the bare return value: ACE-039 gave
+    `_neutralize` a second output (the quoted-identifier spans the recon gate's niladic
+    matcher consults) and folded the caller's `.strip()` inside, so one coordinate frame
+    exists instead of three. A deliberate contract change, not a weakening — the six cases
+    and the property they pin are untouched.
     """
-    assert _neutralize(sql) == expected
+    assert _neutralize(sql).text == expected
 
 
 REJECT_COMMENT_BREAKS_GATE = [
