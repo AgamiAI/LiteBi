@@ -36,13 +36,13 @@ is enumeration reaching the caller through the operational channel rather than t
 
 **What it does NOT cover, in two different senses.**
 
-*Not yet fixed.* Driver text is relayed to `failure.message` unsanitized, so a driver that
-volunteers a declared name puts it in front of the caller. That is measured here rather than
-assumed: `test_a_driver_hint_enumerates_the_model_until_ace039_lands` drives exactly that shape and
-is `xfail(strict=True)`. Sanitizing driver text is the error-hardening slice's job (ACE-039), not
-this one's — and the strict marker means the day it lands, that test flips green and says so.
-Everything this slice *does* author into `failure.message` is value-free: the guarded path's
-catch-all message is a fixed string, and the forked path no longer relays unstructured child stderr.
+*Fixed by ACE-039.* Driver text used to be relayed to `failure.message` unsanitized, so a driver
+that volunteered a declared name put it in front of the caller. That was measured here rather than
+assumed, as an `xfail(strict=True)`; the error-hardening slice now classifies FROM the driver text
+and returns a fixed value-free sentence INSTEAD of it, the marker is gone, and
+`test_a_driver_hint_never_reaches_the_caller` asserts the closed shape. Everything reaching
+`failure.message` is now value-free on every path: the classified sentences, the guarded path's
+catch-all fixed string, and the forked path, which no longer relays unstructured child stderr.
 
 *Not fixable here.* The table- and column-scope details confirm "this identifier is not in the
 model", which is a one-bit membership oracle per probed identifier: a caller willing to send N
@@ -457,24 +457,22 @@ class _PostgresLikeExecutor:
         raise execute_sql.ExecutorError(_PG_HINT_ERROR, code=5)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ACE-039 owns sanitizing driver text; until it lands, a driver HINT reaches the caller "
-           "through failure.message. Measured rather than assumed — this flips green when it lands.",
-)
-def test_a_driver_hint_enumerates_the_model_until_ace039_lands(declared):
-    """The known gap, driven rather than described.
+def test_a_driver_hint_never_reaches_the_caller(declared):
+    """The gap this file measured as an `xfail(strict=True)`, now closed.
 
     PostgreSQL routinely appends `HINT: Perhaps you meant to reference the column "…"` to an
     undefined-column error, and that hint names a column of the table — a declared name the caller
-    did not send. It arrives on `failure.message`, which is relayed from the driver verbatim: the
-    guardrail refuses to enumerate, and then the operational channel does it anyway.
+    did not send. It arrived on `failure.message`, relayed from the driver verbatim: the guardrail
+    refused to enumerate, and then the operational channel did it anyway.
 
-    Deliberately NOT fixed here. Classifying and sanitizing driver text across ten engines is the
-    error-hardening slice's whole job, and a partial regex in this slice would look like coverage
-    while missing the engines nobody thought of. So the vector stays, marked `strict` so it cannot
-    rot in either direction: if it starts passing, ACE-039 has landed and this marker must go; if
-    the assertion changes shape, it fails loudly.
+    ACE-039 classifies FROM that text and returns a fixed value-free sentence INSTEAD of it, so the
+    channel closes without the caller losing the ability to tell a missing column from a syntax
+    error. The `strict` marker is gone with the gap — a strict xfail that passes is a CI error, and
+    that is exactly the alarm it was there to raise.
+
+    The executor here raises with `code=5` and no special flag, which is why the discriminator is
+    the exit code rather than something the adapter opts into: an adapter that does nothing unusual
+    is still sanitized.
 
     One route is enough. The fork path relays the same child-classified text for the same exit code,
     so this pins the field, not the transport.

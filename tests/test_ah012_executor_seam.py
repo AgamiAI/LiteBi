@@ -329,7 +329,11 @@ def test_injected_executor_error_maps_to_the_same_envelope(monkeypatch):
 
     assert out["status"] == "failed"
     assert out["failure"]["kind"] == tools._classify_exit(4)
-    assert "connect failed" in out["failure"]["message"]
+    # The message is now the fixed value-free sentence for the kind, not the driver's text
+    # (ACE-039). Code 4 carries the driver's own exception, so relaying it was the enumeration
+    # channel; the KIND still round-trips, which is what this test is actually about.
+    assert out["failure"]["message"] == execute_sql._ERROR_MESSAGES["auth"]
+    assert "connect failed" not in out["failure"]["message"]
 
 
 def test_set_injected_executor_rejects_a_bad_shape():
@@ -562,7 +566,11 @@ def test_an_executor_error_becomes_the_failed_envelope_main_renders(tmp_path, mo
     rc = execute_sql.main()
 
     assert rc == 4
-    assert capsys.readouterr().err == "Postgres connect failed: refused\n"
+    # `main` still writes the bare message and returns the classified code — the CLI contract is
+    # unchanged, and that matters because the parent relays this stream to the caller. What changed
+    # is WHICH message reaches it: code 4 carries the driver's own exception, so it is classified
+    # and replaced with the fixed sentence rather than relayed (ACE-039).
+    assert capsys.readouterr().err == execute_sql._ERROR_MESSAGES["auth"] + "\n"
 
 
 @pytest.mark.parametrize("code", sorted(execute_sql.EXIT_TO_FAILURE_KIND))

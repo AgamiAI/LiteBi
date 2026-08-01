@@ -220,6 +220,131 @@ EXIT_TO_FAILURE_KIND: dict[int, FailureKind] = {
 FAILURE_KIND_TO_EXIT: dict[str, int] = {kind: code for code, kind in EXIT_TO_FAILURE_KIND.items()}
 _DEFAULT_FAILURE_EXIT = 6
 
+# --- Error sanitization (ACE-039) -------------------------------------------
+#
+# A raw driver error is an enumeration channel. PostgreSQL's `HINT: Perhaps you meant to reference
+# the column "orders.internal_ref"` names a DECLARED column the caller never sent, which is the
+# model leaking through the operational channel rather than the refusal channel. Measured before
+# this landed, by a `strict=True` xfail in tests/test_ace035_no_enumeration.py.
+#
+# WHOSE TEXT IS IT. Codes 2 and 3 are authored by this module — the credential remediation naming
+# DATASOURCE_URL, the chmod-600 fix, the `pip install` lines — and are relayed deliberately, because
+# they tell an operator what to do and contain nothing the database said. Codes 4 and 5 are the
+# twenty f-string sites that interpolate the driver's own exception. The module's docstring table
+# already draws exactly this line, so the discriminator is documented rather than invented.
+_AUTHORED_EXIT_CODES = frozenset({2, 3})
+
+# One value-free sentence per kind. NO REMEDIATION: `Failure` has no such field, and that absence is
+# what lets a caller tell a decision of ours from the database's outcome. Where the reference
+# implementation's remediation carried real information it is folded into the message, which is
+# already value-free.
+#
+# There is deliberately no `timeout` entry. A per-statement deadline is a `resource_limit` REFUSAL
+# (ACE-038 owns it, classified from a watchdog flag rather than a driver string), and the only
+# `timeout` failure is the subprocess supervisor's kill at the tool edge, which never reaches here.
+_ERROR_MESSAGES: dict[str, str] = {
+    "syntax": "The generated SQL was not valid for this database. Re-run the query.",
+    "column_not_found": (
+        "The statement referenced a column this database does not have. If the model was built "
+        "against an older schema, re-introspect the datasource."
+    ),
+    "table_not_found": (
+        "The statement referenced a table this database does not have. If the model was built "
+        "against an older schema, re-introspect the datasource."
+    ),
+    "permission": (
+        "The database refused to read an object this statement referenced. The connection's role "
+        "needs SELECT on it."
+    ),
+    "auth": "The database rejected the connection's credentials.",
+    "network": "The database was unreachable.",
+    "dsn": "The datasource host or path could not be resolved.",
+    "driver_missing": "The database driver is not installed on the server.",
+}
+
+
+def _classify_db_error(text: str, code: int) -> FailureKind:
+    """Classify a driver error into a `FailureKind`, from text that is never relayed.
+
+    Classifying FROM driver text is not the same as returning it: the output is one of a fixed set
+    of labels, and the caller receives `_ERROR_MESSAGES[kind]` rather than anything the database
+    said. The raw text is captured server-side only.
+
+    Order matters and two positions are load-bearing:
+
+    * **Cancellation is checked early and lands on `other`.** Every cancellation signature was ceded
+      to ACE-038, whose rule is that a deadline is classified from a signal rather than a string.
+      But simply DELETING the arm does not leave these statements unclassified — it leaves them
+      mis-classified: "canceling statement due to statement timeout" contains "timed out" and would
+      fall to `network`, or, failing that, to the exit-5 prior and out as `syntax`. An
+      unattributable server-side cancellation is honestly `other`.
+    * **`table_not_found` precedes `syntax`**, because Snowflake prefixes an unknown object with
+      "SQL compilation error" and would otherwise be read as a syntax error.
+
+    `"timed out"` is deliberately NOT a `network` needle. A driver-level connect or login timeout is
+    what the executor already reports as `auth` (exit 4) and stays there; adding the needle would
+    silently move it and contradict the contract's account of what `timeout` means.
+    """
+    lowered = (text or "").lower()
+
+    def has(*needles: str) -> bool:
+        return any(needle in lowered for needle in needles)
+
+    if code == 3 or has("no module named", "modulenotfounderror", "command not found"):
+        return "driver_missing"
+    if has(
+        "permission denied",
+        "insufficient_privileges",
+        "command denied",
+        "insufficient_access_or_readonly",
+    ):
+        return "permission"
+    if has(
+        "canceling statement",
+        "statement_timeout",
+        "query was canceled",
+        "querycanceled",
+        # MySQL 2013, whose actual text is "Lost connection to MySQL server DURING QUERY". The
+        # reference's needle read "lost connection during query" and so never matched it. Kept
+        # specific on purpose: a bare "lost connection" also covers "…at 'reading initial
+        # communication packet'", which is a genuine network failure and not a cancellation.
+        "lost connection to mysql server during query",
+    ):
+        return "other"
+    if has(
+        "no such column",
+        "unknown column",
+        "undefinedcolumn",
+        "invalid identifier",
+        "invalid_field",
+    ) or ("column" in lowered and has("does not exist", "not found")):
+        return "column_not_found"
+    if has("no such table", "undefinedtable") or (
+        has("relation", "table", "object") and has("does not exist", "doesn't exist", "not found")
+    ):
+        return "table_not_found"
+    if has("syntax error", "syntaxerror", "compilation error", "error in your sql syntax"):
+        return "syntax"
+    if has(
+        "could not translate host",
+        "name or service not known",
+        "getaddrinfo",
+        "unknown mysql server host",
+        "can't connect",
+        "no such file or directory",
+    ):
+        return "dsn"
+    if has("connection refused", "connection reset", "could not connect", "wrong_version_number"):
+        return "network"
+    if has(
+        "password authentication failed",
+        "no pg_hba",
+        "incorrect username or password",
+        "access denied",
+    ):
+        return "auth"
+    return EXIT_TO_FAILURE_KIND.get(code, "other")
+
 
 def _env_token(profile: str) -> str:
     """The env-var suffix for a datasource: the profile id upper-cased with every non-alphanumeric char
@@ -762,8 +887,19 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
                 sa_path_expanded
             )
             client_kwargs["credentials"] = creds_obj
-        except Exception as e:
-            raise ExecutorError(f"BigQuery credentials load failed: {e}", code=2)
+        except Exception:
+            # The ONE code-2 site that interpolated a third-party exception. google-auth's text can
+            # carry the absolute path of the service-account key, and code 2 is the band this module
+            # relays verbatim on the strength of having authored it — so an interpolated exception
+            # here made "codes 2 and 3 are ours" true only approximately (ACE-039). Authored prose
+            # out, the original to the server log.
+            _LOG.error("BigQuery service-account credentials failed to load", exc_info=True)
+            raise ExecutorError(
+                "BigQuery credentials could not be loaded. Check `service_account_path` for this "
+                "profile in <artifacts_dir>/local/credentials — the file must exist and be a valid "
+                "service-account key.",
+                code=2,
+            )
 
     try:
         client = bigquery.Client(**client_kwargs)
@@ -1936,12 +2072,21 @@ def execute_guarded(
         # refusal is the answer and cannot be overwritten by a later one.
         return _envelope("refused", refusal=_resource_limit_refusal(exc))
     except ExecutorError as exc:
-        # The classified branch: `msg` is authored by this module (a missing driver, a connect
-        # failure, the credential-resolution remediation naming DATASOURCE_URL) or relayed from the
-        # driver, and both callers already surface it. Sanitizing DRIVER text is a separate, larger
-        # job (ACE-039) and is deliberately not attempted here.
+        # Two kinds of text arrive here and only one of them is ours (ACE-039).
+        #
+        # Codes 2 and 3 are AUTHORED by this module — "No warehouse credentials for profile […]",
+        # the chmod-600 fix, the `pip install` line. They name an operator action and contain
+        # nothing the database said, so they are relayed verbatim exactly as before.
+        if exc.code in _AUTHORED_EXIT_CODES:
+            return _envelope("failed", failure=Failure(
+                kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
+            ))
+        # Codes 4 and 5 carry the driver's own exception, interpolated at one of the twenty
+        # per-engine sites. That text is an enumeration channel: a PostgreSQL HINT names declared
+        # columns the caller never sent. Classify FROM it, return a fixed sentence INSTEAD of it.
+        kind = _classify_db_error(exc.msg, exc.code)
         return _envelope("failed", failure=Failure(
-            kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
+            kind=kind, message=_ERROR_MESSAGES.get(kind, UNEXPECTED_FAILURE_MESSAGE),
         ))
     except Exception:
         # Unanticipated, so unreadable: nobody has vetted what this exception's text contains, and
