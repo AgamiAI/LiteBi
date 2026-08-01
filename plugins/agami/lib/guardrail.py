@@ -50,11 +50,15 @@ RULE_TABLE_SCOPE = "table_scope"
 RULE_COLUMN_SCOPE = "column_scope"
 RULE_SELECT_STAR = "select_star"
 RULE_MODEL_UNAVAILABLE = "model_unavailable"
-# Declared and pinned below, with NO producer today. The contract reserves it for a **per-statement**
-# timeout the guard imposes — a bound whose subject is the statement, so "narrow the query" is a fix
-# we can honestly name. The subprocess supervisor's kill is NOT that bound and must not borrow this
-# rule: it stops a child that never returned, without knowing what the child was doing when it
-# stopped, so it is a `failed`/`timeout` (see `FailureKind` below and contract §3).
+# Produced by the **per-statement** timeout the executor imposes: a watchdog cancels a statement that
+# outlives the configured budget, and `execute_sql.execute_guarded` turns that into this refusal. Its
+# subject is the statement, which is what earns it a rule at all — "narrow the query" is a fix we can
+# honestly name. The subprocess supervisor's kill is NOT that bound and must not borrow this rule: it
+# stops a child that never returned, without knowing what the child was doing when it stopped, so it
+# is a `failed`/`timeout` (see `FailureKind` below and contract §3). Every engine the executor speaks
+# to is wired, with one recorded residual: BigQuery has no connection to cancel, so there the bound is
+# server-side only and a client-side stall comes back as the executor never returning rather than as a
+# statement we stopped.
 RULE_RESOURCE_LIMIT = "resource_limit"
 RULE_UNPARSEABLE = "unparseable"
 
@@ -90,8 +94,8 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     RULE_SELECT_STAR: "out_of_scope",
     RULE_MODEL_UNAVAILABLE: "undetermined",
     # A bound we imposed, not a property of the statement: neither unsafe nor out of scope — we
-    # simply did not determine the answer within the bound. Pinned here while unproduced so the gate
-    # that eventually imposes a per-statement timeout fills a constant rather than inventing one.
+    # simply did not determine the answer within the bound. Pinned before it had a producer, so the
+    # gate that imposes the per-statement timeout filled a constant rather than inventing one.
     RULE_RESOURCE_LIMIT: "undetermined",
     RULE_UNPARSEABLE: "undetermined",
     RULE_MODEL_SAFETY: "undetermined",
@@ -165,9 +169,12 @@ supervisor bound is ours, but it cannot attribute the kill to the STATEMENT: the
 in connect, credential resolution or model load, where "narrow the query" is the wrong fix. So an
 unresponsive executor is `failed` / `timeout`, and its message says only that we stopped waiting
 (guardrail contract §3). A **per-statement** timeout is the other case — its subject IS the
-statement, so it is a refusal carrying `RULE_RESOURCE_LIMIT` — and nothing imposes one yet, which is
-why that rule is pinned with no producer. Driver-level connect/login timeouts fold into the connect
-failure the executor already reports as `auth` (exit 4), because that is what the driver raises.
+statement, so it is a refusal carrying `RULE_RESOURCE_LIMIT`, and the executor now imposes one: a
+watchdog cancels the statement through the driver and the outcome leaves the chokepoint on the
+refusal channel rather than this one. The two therefore coexist and stay distinguishable in the audit
+trail, which is the whole point of splitting them. Driver-level connect/login timeouts fold into the
+connect failure the executor already reports as `auth` (exit 4), because that is what the driver
+raises.
 
 `column_not_found`, `table_not_found`, `permission` and `network` are DECLARED BUT UNREACHABLE:
 producing them means parsing driver text, and sanitizing driver text belongs to the error-hardening

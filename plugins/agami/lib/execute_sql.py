@@ -52,16 +52,18 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import contextlib
 import csv
 import json
 import logging
 import os
 import stat
 import sys
+import threading
 import urllib.parse
 import uuid
-from collections.abc import Callable
-from contextvars import ContextVar
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -70,6 +72,7 @@ import agami_paths
 from guardrail import (
     RULE_MODEL_SAFETY,
     RULE_MODEL_UNAVAILABLE,
+    RULE_RESOURCE_LIMIT,
     Envelope,
     Failure,
     FailureKind,
@@ -483,21 +486,70 @@ def _run_postgres(creds: dict[str, str], sql: str) -> ExecResult:
         )
     except Exception as e:
         raise ExecutorError(f"Postgres connect failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
+    # Bound outside the try so the `finally` can close it whether or not the declare got that far.
+    cur = None
     try:
+        # `with conn` is the TRANSACTION, not the connection: leaving it by an exception rolls back,
+        # which is why it stays even though the cursor no longer lives inside a `with` of its own.
         with conn:
+            # `SET LOCAL statement_timeout` is the native server-side backstop. It is
+            # TRANSACTION-scoped, so it has to run on THIS transaction and before the named cursor
+            # declares — a regular client-side cursor, because a named cursor may only ever run the
+            # one query it was declared for. The libpq `options` startup parameter would be the
+            # other way to set it and is deliberately not used: a transaction-mode connection pooler
+            # can reject an unknown startup parameter, which would break the connect outright rather
+            # than bound the statement.
+            with conn.cursor() as bound_cur:
+                bound_cur.execute(
+                    "SET LOCAL statement_timeout = %s",
+                    ((timeout_s + _NATIVE_BOUND_SKEW_S) * 1000,),  # the setting is in milliseconds
+                )
             # A server-side (named) cursor so the row cap bounds TRANSFER, not just what we write:
             # psycopg2's default client-side cursor buffers the ENTIRE result before we can fetchmany,
             # so a runaway result would still be pulled whole. The named cursor streams from the
-            # server in bounded batches (ACE-038). Read-only SELECTs (the only thing the guard admits)
+            # server in bounded batches. Read-only SELECTs (the only thing the guard admits)
             # are exactly what a server-side cursor supports.
-            with conn.cursor(name="agami_bounded") as cur:
-                cur.itersize = _resolve_row_cap() + 1  # server fetch batch = the bounded window
-                cur.execute(sql)
-                result = _collect_cursor(cur)
+            cur = conn.cursor(name="agami_bounded")
+            cur.itersize = _resolve_row_cap() + 1  # server fetch batch = the bounded window
+            # `connection.cancel()` is psycopg2's cancel: it opens a second connection and sends the
+            # libpq cancel request, so it is safe to call from the watchdog thread while this one is
+            # blocked in the driver.
+            with _deadline(conn.cancel, timeout_s) as expired:
+                try:
+                    cur.execute(sql)
+                    result = _collect_cursor(cur)
+                except Exception:
+                    if expired.is_set():
+                        raise _ResourceLimit(_OUTLIVED_BUDGET)
+                    raise
+            if expired.is_set():
+                raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Postgres execution error: {e}", code=5)
     finally:
-        conn.close()
+        # The named cursor is closed HERE, by hand, rather than by a `with` around it. Closing one
+        # sends `CLOSE agami_bounded` to the server, and when we are unwinding on the timeout marker
+        # the transaction is already aborted, so that statement raises in turn — from inside
+        # `__exit__`, where a raised exception REPLACES the one being propagated. The refusal would
+        # reach the chokepoint as an ordinary driver error and be reported as a failure. Swallowing
+        # it costs nothing: by this point the transaction has ended and the server-side portal is
+        # gone with it, so the close is a courtesy rather than the thing that frees the resource.
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        # And the connection close is guarded for the same reason, one line down: an exception raised
+        # inside a `finally` REPLACES the one propagating through it, so an unguarded close here would
+        # destroy the marker the `except _ResourceLimit: raise` above just re-raised — and the caller
+        # would read a bound we imposed as an unclassified server break.
+        try:
+            conn.close()
+        except Exception:
+            pass
     return result
 
 
@@ -520,14 +572,38 @@ def _run_mysql(creds: dict[str, str], sql: str) -> ExecResult:
         )
     except Exception as e:
         raise ExecutorError(f"MySQL connect failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
     try:
         with conn.cursor() as cur:
-            cur.execute(sql)
-            result = _collect_cursor(cur)
+            # pymysql's connection has NO `cancel()`. Its two cancel-shaped methods are `close()`,
+            # which sends COM_QUIT down the very socket the blocked statement owns — and so can
+            # itself block on a connection that is already stuck — and `_force_close()`, which
+            # closes the socket outright. Only the second one actually unblocks a statement in
+            # flight, so it is named here explicitly rather than reached for by shape.
+            with _deadline(conn._force_close, timeout_s) as expired:
+                try:
+                    cur.execute(sql)
+                    result = _collect_cursor(cur)
+                except Exception:
+                    if expired.is_set():
+                        raise _ResourceLimit(_OUTLIVED_BUDGET)
+                    raise
+            if expired.is_set():
+                raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"MySQL execution error: {e}", code=5)
     finally:
-        conn.close()
+        # Guarded because an exception raised inside a `finally` REPLACES the one propagating through
+        # it, which would destroy the marker re-raised just above. MySQL is the most exposed of the
+        # ten: its cancel is `_force_close()`, which deliberately destroys the socket that this
+        # `close()` then tries to write COM_QUIT to — so on exactly the timeout path this is the close
+        # most likely to raise.
+        try:
+            conn.close()
+        except Exception:
+            pass
     return result
 
 
@@ -548,11 +624,20 @@ def _run_snowflake(creds: dict[str, str], sql: str) -> ExecResult:
             "Add one to <artifacts_dir>/local/credentials.",
             code=2,
         )
+    # Resolved before the connect, because the native backstop is a SESSION parameter and so has to
+    # be handed to the connect call itself.
+    timeout_s = _resolve_timeout_s()
     conn_kwargs: dict[str, Any] = {
         "account": creds["account"],
         "user": creds["user"],
         "client_session_keep_alive": False,
         "login_timeout": 15,
+        # Snowflake's native server-side bound, set behind our watchdog by the usual skew so the
+        # watchdog wins and the flag stays the only classification. On a warehouse the backstop is
+        # worth more than elsewhere: a statement nobody is waiting for still bills credits.
+        "session_parameters": {
+            "STATEMENT_TIMEOUT_IN_SECONDS": timeout_s + _NATIVE_BOUND_SKEW_S,
+        },
     }
     for k in ("password", "warehouse", "database", "schema", "role", "authenticator"):
         if creds.get(k):
@@ -563,8 +648,32 @@ def _run_snowflake(creds: dict[str, str], sql: str) -> ExecResult:
         raise ExecutorError(f"Snowflake connect failed: {e}", code=4)
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+
+        def cancel_snowflake_statement() -> None:
+            """Ask Snowflake to abort the statement this cursor is running.
+
+            Neither the connection nor the cursor has a `cancel()` — verified against the connector's
+            own source, where the only public abort is `SnowflakeCursor.abort_query(qid)` and the
+            connection's cancel helpers are private. The query id is what identifies the statement to
+            abort, and it exists only once the statement has been submitted; before that there is
+            nothing to abort and the session parameter above is what bounds the call.
+            """
+            qid = cur.sfqid
+            if qid:
+                cur.abort_query(qid)
+
+        with _deadline(cancel_snowflake_statement, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Snowflake execution error: {e}", code=5)
     finally:
@@ -634,9 +743,20 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
     except Exception as e:
         raise ExecutorError(f"BigQuery client init failed: {e}", code=4)
 
+    timeout_s = _resolve_timeout_s()
+    # `job_timeout_ms` is BigQuery's native server-side bound, and on this engine it is the ONLY
+    # bound: there is no watchdog cancel here, deliberately. BigQuery hands out no connection or
+    # cursor to cancel, and the call that blocks is `job.result()`, which is reached only AFTER
+    # `client.query()` has returned — so at the instant a watchdog would fire there is nothing in
+    # hand to stop. Stated plainly, and accepted rather than papered over: on BigQuery a client-side
+    # stall comes back as a `failed` envelope, not a `resource_limit` refusal. The query itself is
+    # still stopped by the bound below, which is what keeps a runaway from scanning on unattended.
+    # The usual skew is kept so this engine's number matches every other engine's.
+    job_config_kwargs: dict[str, Any] = {
+        "job_timeout_ms": (timeout_s + _NATIVE_BOUND_SKEW_S) * 1000,
+    }
     # If `dataset` was set, prefix unqualified table references via the
     # default_dataset job config so the SQL can omit `<project>.<dataset>.`
-    job_config_kwargs: dict[str, Any] = {}
     if creds.get("dataset"):
         try:
             job_config_kwargs["default_dataset"] = f"{project}.{creds['dataset']}"
@@ -645,15 +765,17 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
 
     cap = _resolve_row_cap()
     try:
-        if job_config_kwargs:
-            job_config = bigquery.QueryJobConfig(**job_config_kwargs)
-            job = client.query(sql, job_config=job_config)
-        else:
-            job = client.query(sql)
+        job_config = bigquery.QueryJobConfig(**job_config_kwargs)
+        job = client.query(sql, job_config=job_config)
         # BigQuery has no DB-API cursor, so it can't funnel through `_collect_cursor`; apply the
         # same bounded-fetch cap here. `max_results=cap+1` bounds what the API returns (transfer),
         # and the (cap+1)th row flags truncation — the never-silent guarantee holds for BigQuery too.
         results = job.result(max_results=cap + 1)  # waits for completion; raises on error
+    except _ResourceLimit:
+        # Nothing in this engine raises the marker today, and this clause is still not optional: the
+        # rule is that NO engine may relabel it as a driver error, and the clause below would. It is
+        # what makes the rule checkable across all ten engines rather than nine.
+        raise
     except Exception as e:
         raise ExecutorError(f"BigQuery execution error: {e}", code=5)
 
@@ -672,6 +794,12 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
 
 
 def _run_sqlite(creds: dict[str, str], sql: str) -> ExecResult:
+    """Tier-3 path for SQLite using the stdlib `sqlite3` module.
+
+    The first engine to run under the per-statement deadline. `sqlite3.Connection.interrupt()` is a
+    genuine cancel — it stops the statement mid-scan from another thread — so this engine can prove
+    the whole refusal contract in-process, with no network and no fixture warehouse.
+    """
     import sqlite3  # always available in stdlib
     _require(creds, "path")
     path = os.path.expanduser(creds["path"])
@@ -679,14 +807,48 @@ def _run_sqlite(creds: dict[str, str], sql: str) -> ExecResult:
         conn = sqlite3.connect(path)
     except Exception as e:
         raise ExecutorError(f"SQLite connect failed: {e}", code=4)
+    # Resolved ONCE for the call, so the budget the watchdog enforces and the number the refusal
+    # quotes cannot be two different values.
+    timeout_s = _resolve_timeout_s()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # The deadline covers the FETCH as well as the execute. `_collect_cursor` pulls `cap + 1`
+        # rows in a single `fetchmany`, and on a cursor that streams its result that pull is where
+        # the scan actually happens — a clock that stopped at `execute` would bound the cheap half
+        # of the work and leave the expensive half unbounded.
+        with _deadline(conn.interrupt, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                # A cancelled statement raises `sqlite3.OperationalError("interrupted")`, whose text
+                # is not a classification we would want to key on. The FLAG is the classification,
+                # and it is the ONLY one: `_deadline` sets it before the cancel lands, so an error
+                # raised while it is unset is the database's own — however late it arrives.
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        # Checked after the watchdog is disarmed, so the flag is final. A cancel can also land
+        # between the two calls above, or just as the second returns, and leave nothing to raise:
+        # the budget still elapsed, so the outcome is still a refusal rather than a result gathered
+        # past it.
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        # Ahead of the catch-all below on purpose: our own marker must reach `execute_guarded`
+        # intact. Wrapped in an `ExecutorError` it would become a `failed`/`syntax` envelope, which
+        # is the database's outcome rather than the bound we imposed.
+        raise
     except Exception as e:
         raise ExecutorError(f"SQLite execution error: {e}", code=5)
     finally:
-        conn.close()
+        # Guarded like every other engine's: an exception raised inside a `finally` REPLACES the one
+        # propagating through it, so an unguarded close would silently convert the refusal above into
+        # an unclassified failure.
+        try:
+            conn.close()
+        except Exception:
+            pass
     return result
 
 
@@ -705,10 +867,26 @@ def _run_sqlserver(creds: dict[str, str], sql: str) -> ExecResult:
         )
     except Exception as e:
         raise ExecutorError(f"SQL Server connect failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # pymssql's DB-API `Connection` has no `cancel()` — verified against pymssql 2.3, whose
+        # connection exposes only close/commit/cursor/rollback/bulk_copy, and whose cursor exposes
+        # none either. The cancel lives one layer down, on the `_mssql.MSSQLConnection` that
+        # connection wraps, reachable only as the private `_conn`; that object's `cancel()` sends the
+        # TDS attention packet, which is the thing that actually stops a statement in flight.
+        with _deadline(conn._conn.cancel, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"SQL Server execution error: {e}", code=5)
     finally:
@@ -735,10 +913,23 @@ def _run_oracle(creds: dict[str, str], sql: str) -> ExecResult:
         conn = oracledb.connect(user=creds["user"], password=creds["password"], dsn=dsn)
     except Exception as e:
         raise ExecutorError(f"Oracle connect failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # `oracledb.Connection.cancel()` breaks out of the call in progress on that connection —
+        # verified against python-oracledb 3.x, where it is on the CONNECTION and not on the cursor.
+        with _deadline(conn.cancel, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Oracle execution error: {e}", code=5)
     finally:
@@ -766,10 +957,24 @@ def _run_databricks(creds: dict[str, str], sql: str) -> ExecResult:
         )
     except Exception as e:
         raise ExecutorError(f"Databricks connect failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # The cancel is on the CURSOR here, not the connection — verified against
+        # databricks-sql-connector 4.x, whose `Cursor.cancel()` posts a cancel for the operation that
+        # cursor is running while its connection has none.
+        with _deadline(cur.cancel, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Databricks execution error: {e}", code=5)
     finally:
@@ -798,10 +1003,23 @@ def _run_trino(creds: dict[str, str], sql: str) -> ExecResult:
         )
     except Exception as e:
         raise ExecutorError(f"Trino connect failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
-        result = _collect_cursor(cur)
+        # Trino's cancel is on the CURSOR — verified against the trino client, whose
+        # `Cursor.cancel()` sends the coordinator a DELETE for the query that cursor started.
+        with _deadline(cur.cancel, timeout_s) as expired:
+            try:
+                cur.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"Trino execution error: {e}", code=5)
     finally:
@@ -823,9 +1041,25 @@ def _run_duckdb(creds: dict[str, str], sql: str) -> ExecResult:
         conn = duckdb.connect(path, read_only=True)
     except Exception as e:
         raise ExecutorError(f"DuckDB open failed: {e}", code=4)
+    timeout_s = _resolve_timeout_s()
     try:
-        cur = conn.execute(sql)
-        result = _collect_cursor(cur)
+        # `conn.interrupt()` is DuckDB's cancel, and it is on the connection — which is just as well,
+        # because on this engine there is no cursor to reach for until the execute has returned:
+        # `conn.execute` HANDS BACK THE CONNECTION ITSELF, so `cur` below IS `conn`. The deadline
+        # therefore has to be armed around the execute as well as the fetch, and on an in-process
+        # engine the execute is where the scan happens.
+        with _deadline(conn.interrupt, timeout_s) as expired:
+            try:
+                cur = conn.execute(sql)
+                result = _collect_cursor(cur)
+            except Exception:
+                if expired.is_set():
+                    raise _ResourceLimit(_OUTLIVED_BUDGET)
+                raise
+        if expired.is_set():
+            raise _ResourceLimit(_OUTLIVED_BUDGET)
+    except _ResourceLimit:
+        raise
     except Exception as e:
         raise ExecutorError(f"DuckDB execution error: {e}", code=5)
     finally:
@@ -836,7 +1070,7 @@ def _run_duckdb(creds: dict[str, str], sql: str) -> ExecResult:
     return result
 
 
-_DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation (ACE-038)
+_DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation
 # Per-call cap from --max-rows (ACE-044). A ContextVar, not a plain global, so it is REQUEST-SCOPED
 # once the HTTP server runs execution in-process (ACE-028): concurrent handlers run in worker threads
 # (`run_blocking` copies the context per call, like `_current_org_ctx`), so each request's cap is
@@ -860,10 +1094,225 @@ def _resolve_row_cap() -> int:
     return cap
 
 
+_DEFAULT_TIMEOUT_S = 30  # wall-clock seconds one statement may run before the watchdog cancels it
+# How far BEHIND our own watchdog a NATIVE server-side bound is set, on the three engines that have
+# one. The skew is the whole point: our watchdog fires at the budget, the engine's own bound five
+# seconds later, so the watchdog always wins the race and its Event stays the SOLE classification
+# signal. Reverse the order and a server-side kill would beat us to the statement, the flag would be
+# clear, and the refusal would come back as an ordinary database failure. The native bound is a
+# backstop for the one case the watchdog cannot cover — our process dying with a statement in
+# flight, which would otherwise leave the engine scanning for nobody.
+_NATIVE_BOUND_SKEW_S = 5
+# How far behind the watchdog the OUTER bound sits — the one `execute_guarded` puts around
+# `executor.execute` itself, so an INJECTED executor is bounded too. The four bounds are one ordered
+# family resolved from the same budget, innermost first:
+#
+#     watchdog (timeout_s) < native (+5) < outer (+10) < supervisor (+60)
+#
+# and the order is the contract. The inner watchdog must always win, because it is the only layer
+# that can attribute the stop to the statement and hand the caller the precise refusal; every layer
+# behind it is a backstop for a failure the layer in front of it cannot see. Collapse the order and
+# a bound we imposed comes back as something else — a native server-side kill reads as an ordinary
+# database error, and a supervisor kill reads as `failed`/`timeout` naming nothing the caller can
+# act on. Both are strictly worse answers to the same event.
+_OUTER_BOUND_SKEW_S = 10
+# The OUTERMOST bound: how far behind the watchdog the subprocess supervisor in `tools` stops waiting
+# for a forked child. It lives here, next to its three siblings, so the whole family is derived from
+# one resolver and one place — the supervisor was a hardcoded 240s, which for any statement budget
+# approaching it became the FIRST bound to fire and inverted the order. Its slack is large because it
+# bounds a whole process (interpreter start, model load, credential resolution, connect) rather than
+# a statement.
+_SUPERVISOR_SKEW_S = 60
+# How many worker threads `_execute_bounded` may have given up on at once, process-wide. That layer
+# holds nothing it can cancel, so every expiry abandons a thread which still occupies a pooled
+# connection and, server-side, a running statement. On the built-in path the inner watchdog fires ten
+# seconds earlier, so reaching the outer bound means a cancel already failed — rare, and an honest
+# cost. On an INJECTED executor there is no inner watchdog at all, so every slow statement abandons
+# one, and because the caller's own thread is freed at the bound the abandonments accumulate with no
+# ceiling of their own: the anyio worker limiter used to supply that ceiling by blocking the caller,
+# and bounding the wait removed it. The cap restores one explicitly. 8 is deliberately far below both
+# that former limiter and a typical warehouse connection pool, so a saturated executor loses a
+# minority of the pool to work nobody is waiting for rather than taking the datasource away from the
+# whole organization.
+_MAX_ABANDONED_WORKERS = 8
+_abandoned_lock = threading.Lock()
+_abandoned_workers = 0
+
+
+def _resolve_timeout_s() -> int:
+    """Effective per-statement timeout, in whole seconds. `AGAMI_SQL_TIMEOUT_S` is the
+    operator-configurable DEPLOYMENT budget (default 30 when unset) — an operator owns their
+    availability tradeoff and may set it higher OR lower than 30. A missing or non-positive value
+    falls back to the default.
+
+    **The environment is the ONLY source, deliberately.** A request-scoped override would outrank it
+    in the parent and be invisible to a forked child, which re-resolves from `os.environ` alone — so
+    the supervisor bound the parent derives could sit BELOW the budget the child actually enforces
+    and fire first, inverting the ordered family the whole design rests on. One source, readable on
+    both sides of the fork, makes that inversion unrepresentable rather than merely unlikely.
+
+    Unlike `_resolve_row_cap`, a value that is PRESENT and does not survive to become the budget is
+    logged at warning before the fallback. That covers `45.5` and `30s`, which cannot be read at all,
+    and equally `-5` and `0`, which can be read and are then declined: an operator who wrote either
+    asked for something specific, and a deployment quietly running 30 instead is exactly the
+    invisible degradation the warning exists against. The warning goes to the module logger and never
+    to stderr, because the subprocess transport parses stderr and an extra line there would break
+    that contract."""
+    raw = os.environ.get("AGAMI_SQL_TIMEOUT_S", "").strip()
+    digits = raw[1:] if raw.startswith("-") else raw  # a leading minus is a value, not a typo
+    # `isdecimal`, not `isdigit`: the latter admits `²` and `①`, which `int()` then refuses — turning
+    # a misconfigured deployment into a ValueError raised out of this resolver, at a call site (the
+    # fork path's supervisor bound) that sits outside any handler.
+    written = int(raw) if digits.isdecimal() else None
+    timeout_s = written if written is not None and written > 0 else _DEFAULT_TIMEOUT_S
+    if raw and timeout_s != written:
+        _LOG.warning(
+            "AGAMI_SQL_TIMEOUT_S=%r is not a usable whole number of seconds; falling back to %ds.",
+            raw,
+            _DEFAULT_TIMEOUT_S,
+        )
+    return timeout_s
+
+
+class _ResourceLimit(Exception):
+    """Raised when our own watchdog fired, so a cancelled statement unwinds the engine function the
+    same way any other failure does and the surrounding transaction rolls back. It is an internal
+    marker only: it is always caught and translated inside this module and never crosses the tool
+    boundary."""
+
+
+class _OuterBoundExpired(_ResourceLimit):
+    """Raised when the OUTER bound expired: the executor never returned and we stopped waiting.
+
+    A subclass, so the one `except _ResourceLimit` handler in `execute_guarded` produces exactly one
+    refusal for either layer and no second one can be minted. It stays distinguishable because the
+    two events are not the same event: the watchdog CANCELLED a statement it holds a connection to,
+    while this layer only abandoned its wait — so the sentence the caller reads differs, and saying
+    "cancelled" here would be false.
+    """
+
+
+class _ExecutorSaturated(_ResourceLimit):
+    """Raised INSTEAD of starting a statement, when the abandoned-worker cap is already reached.
+
+    A sibling of `_OuterBoundExpired` under the same parent for the same reason — one handler, one
+    refusal — and distinguishable for the same reason too: this statement did not run long, it did
+    not run at all. What we observed is the executor, not the statement, so the sentence the caller
+    reads must not blame the query it just sent.
+    """
+
+
+# The marker's message, single-sourced because every engine raises it. It is diagnostic text, not
+# caller-facing: the refusal `execute_guarded` builds re-resolves the budget and writes its own
+# detail, so nothing a caller reads comes from here.
+_OUTLIVED_BUDGET = "the statement outlived its per-statement budget"
+# The outer marker's message, and diagnostic in the same way — it names the executor rather than the
+# statement, because at this layer the statement is not the thing we observed.
+_OUTLIVED_OUTER_BOUND = "the executor outlived the outer bound around it"
+# The saturation marker's message, diagnostic in the same way again.
+_EXECUTOR_SATURATED = "the executor already has its limit of abandoned calls outstanding"
+
+# The remediation names only what would make THIS statement executable: on the served path the caller
+# is an assistant with no shell and no deployment, so naming the environment variable would be advice
+# it cannot take, addressed to someone who is not reading.
+_NARROW_IT = ("Narrow the time range, reduce the grouping, or add a selective filter, "
+              "then run it again.")
+
+
+def _resource_limit_refusal(exc: _ResourceLimit) -> Refusal:
+    """The ONE `resource_limit` refusal, built from whichever of the three bounds raised.
+
+    Single-sourced because two entries into the engines lead here — the guarded chokepoint and the
+    subprocess/CLI adapter — and a caller must not be able to tell which one it came through.
+
+    The budget is re-resolved rather than carried on the marker: the marker stays a plain exception,
+    and nothing between the engine call and here can change the environment the resolver reads, so it
+    is the same number the watchdog used. The configured number belongs in the detail — it is a
+    deployment setting, not a data value, and a bound the caller cannot see is one it cannot plan
+    around.
+    """
+    timeout_s = _resolve_timeout_s()
+    if isinstance(exc, _ExecutorSaturated):
+        # Nothing ran, so nothing about THIS statement is the finding. Saying "your query was too
+        # slow" here would be false and would send the caller off simplifying a statement that is
+        # very possibly fine.
+        detail = (
+            "The executor is saturated: too many earlier calls have not returned, so this "
+            "statement was not started."
+        )
+        remediation = "Wait for the calls already in flight to finish, then run it again."
+    elif isinstance(exc, _OuterBoundExpired):
+        # The outer layer holds no connection, so it stopped WAITING rather than stopping the
+        # statement. "Cancelled" would be a claim we cannot make: the worker is still inside the
+        # driver call and the statement may still be running. The caller is told what we actually
+        # know, and the number quoted is the bound that actually elapsed.
+        detail = (
+            f"The executor did not return within the {timeout_s + _OUTER_BOUND_SKEW_S}s limit "
+            "and the query was abandoned."
+        )
+        remediation = _NARROW_IT
+    else:
+        detail = f"The statement ran longer than the {timeout_s}s limit and was cancelled."
+        remediation = _NARROW_IT
+    return refuse(RULE_RESOURCE_LIMIT, detail=detail, remediation=remediation)
+
+
+@contextlib.contextmanager
+def _deadline(cancel: Callable[[], None], timeout_s: float) -> Iterator[threading.Event]:
+    """Arm a watchdog that calls `cancel` if the wrapped block outlives `timeout_s`, and yield the
+    `threading.Event` that says whether it fired.
+
+    The event is set BEFORE `cancel` runs. Order matters: whoever catches the driver error that the
+    cancellation provokes must be able to read an already-set flag and attribute the failure to us
+    rather than to the database. A `cancel` that raises is swallowed and logged, because some drivers
+    raise when cancelled from a thread other than the one running the statement, and an exception
+    escaping a timer thread is both unhandleable by the caller and invisible in the result.
+
+    **The disarm is a JOIN, not a request.** `threading.Timer.cancel()` only sets the timer's internal
+    `finished` Event, so a `fire` that already passed its own check runs to completion regardless —
+    setting the flag and delivering a cancel AFTER this block has returned. Both consequences are
+    real: every engine re-reads the flag once the block has exited and would read a stale `False`, and
+    a cancel arriving late lands on a connection the engine has moved on from, which on a pooled one
+    is by then someone else's statement. The lock plus the flag close that: a `fire` that loses the
+    race neither sets the Event nor calls `cancel`, and a `fire` that wins holds the lock across the
+    cancel, so the disarm waits for it. The wait is bounded by the layer outside this one — a cancel
+    that hangs is what the outer bound around the whole executor call exists to survive."""
+    fired = threading.Event()
+    lock = threading.Lock()
+    # Assigned only below, in the enclosing scope, and only read inside `fire` — so the closure sees
+    # the current value with no `nonlocal` and no mutable box.
+    disarmed = False
+
+    def fire() -> None:
+        with lock:
+            if disarmed:
+                return  # the block already returned; there is nothing of ours left to stop
+            fired.set()
+            try:
+                cancel()
+            except Exception as exc:
+                _LOG.warning("Cancelling the statement after its timeout expired failed: %s", exc)
+
+    timer = threading.Timer(timeout_s, fire)
+    timer.daemon = True  # a hung cancel must never hold the interpreter open at shutdown
+    timer.start()
+    try:
+        yield fired
+    finally:
+        # Claim the race under the lock FIRST, then ask the timer to stand down. `Timer.cancel()` is
+        # not a join, so doing it the other way round leaves a window between this block returning
+        # and the flag being set, in which a `fire` that has already expired can still take the lock
+        # and mark a statement that actually completed. Taking the lock first closes that window: a
+        # `fire` already holding the lock is waited for, and every other `fire` observes `disarmed`.
+        with lock:
+            disarmed = True
+        timer.cancel()  # belt and braces, for a timer that has not started running yet
+
+
 def _flag_truncated(cap: int) -> None:
     """Signal a bounded-fetch truncation to the caller — a non-error `{"truncated": …}` marker on
     stderr (distinct from the guards' `{"error": …}`), so a truncated result is never mistaken for a
-    complete one (ACE-038/044). Shared by every engine's materialization path. One write so the
+    complete one (ACE-044). Shared by every engine's materialization path. One write so the
     marker is always a single line, even if other notices surround it."""
     sys.stderr.write(json.dumps({"truncated": {"row_cap": cap}}) + "\n")
 
@@ -876,7 +1325,7 @@ def _collect_cursor(cur: Any) -> ExecResult:
     executor path share, so the row cap is enforced once, identically, for every caller.
 
     Fetch FIRST, then read ``cur.description``: a psycopg2 **server-side (named) cursor** — which the
-    Postgres/Redshift path uses to bound transfer (ACE-038) — reports ``description is None`` until the
+    Postgres/Redshift path uses to bound transfer — reports ``description is None`` until the
     first fetch, so reading it beforehand would drop EVERY row of a real Postgres result. Client-side
     cursors (sqlite/mysql/…) set ``description`` at execute, so fetch-first is equally correct there."""
     cap = _resolve_row_cap()
@@ -969,7 +1418,8 @@ def _resolve_guard_model(profile: str):
 
 def _write_refusal(refusal: Refusal) -> None:
     """Write a guard refusal to stderr in the ONE shape every caller parses — the single wire-writer,
-    called only from ``main``.
+    called from ``main`` and from the per-engine CSV adapter, which is the other entry into the
+    engines.
 
     One JSON object, on one line: ``{"refusal": {reason, rule, detail, remediation}}`` — the wire
     shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on the parent
@@ -1115,9 +1565,18 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
 def _emit_or_err(run: Callable[[], ExecResult]) -> int:
     """Subprocess/CLI adapter over a ``_run_<db>`` function: write its result to stdout as CSV and
     return exit code 0, or translate an ``ExecutorError`` into the stderr message + exit code the CLI
-    contract documents (byte-identical to what the old ``_execute_<db>`` emitted)."""
+    contract documents (byte-identical to what the old ``_execute_<db>`` emitted).
+
+    The watchdog marker gets an arm of its own, AHEAD of the classified one, because this is the
+    second entry into the engine functions and they raise it. Without it a per-statement timeout
+    reached through here would escape as a traceback rather than as the exit code this docstring
+    promises. It renders exactly what ``main`` renders for a refusal — the one JSON object on stderr
+    and exit 1 — so the two entries cannot disagree about what a bound we imposed looks like."""
     try:
         _emit_result_csv(run())
+    except _ResourceLimit as exc:
+        _write_refusal(_resource_limit_refusal(exc))
+        return 1
     except ExecutorError as e:
         return _err(e.msg, code=e.code)
     return 0
@@ -1250,6 +1709,105 @@ def _envelope(
     )
 
 
+def _execute_bounded(
+    executor: Executor, sql: str, creds: dict[str, str], *, profile: str
+) -> ExecResult:
+    """Run ``executor.execute`` under the OUTER bound and return what it returned.
+
+    This is the layer that makes "no executor escapes the limit" true. The inner deadline lives
+    inside the BUILT-IN executor's engine functions, so before this an INJECTED executor — the
+    hosted connection-reuse path — ran with no per-statement bound at all, and even on the built-in
+    path BigQuery has no watchdog (it has no connection object to cancel), so a client-side stall
+    there was unbounded too. Both are bounded here, and deliberately by the same layer: applying
+    this only to non-built-in executors would leave the BigQuery hole open while looking closed.
+
+    **The mechanism is a worker thread, because this layer holds nothing it can cancel.** An
+    arbitrary ``Executor`` exposes one method and no connection, so the only thing this code owns is
+    its own WAIT — it starts the call on a daemon thread and joins with the budget.
+
+    **The cost is an abandoned worker, and it is real.** On expiry the thread is still inside the
+    driver call, and it stays there: nothing here cancels it, and it may hold a database connection
+    (and, on the server side, a running statement) until that call returns on its own. It is a
+    daemon so it cannot hold the interpreter open at exit. This is a bound on how long a CALLER
+    waits, not a promise that the work stopped — which is exactly why the inner watchdog, the layer
+    that really can cancel, is set to fire first.
+
+    **And the cost is CAPPED, because bounding the wait removed the ceiling that used to bound it.**
+    Before this layer existed the same slow call blocked the caller's own worker thread, so the
+    host's thread limiter capped how much abandoned work could be in flight and applied backpressure
+    to everything behind it. Returning at the bound frees that slot, so on the injected path — where
+    there is no inner watchdog and EVERY slow statement abandons one — the abandonments would
+    otherwise accumulate without limit until the pool, and with it the datasource, belonged entirely
+    to work nobody is waiting for. So the count is capped by ``_MAX_ABANDONED_WORKERS`` and checked
+    BEFORE a worker is started: at the cap this refuses immediately rather than starting abandonment
+    N+1, and says the executor is saturated rather than blaming a statement that never ran. The slot
+    is released when the abandoned worker finally returns, which is the moment the leak actually
+    ends.
+
+    Exceptions cross the thread boundary with their ORIGINAL type, re-raised here. That is what
+    keeps the handlers in ``execute_guarded`` correct: ``_ResourceLimit`` still reaches the refusal
+    branch and ``ExecutorError`` still reaches the classified one, rather than every executor
+    failure arriving as a worker that finished having produced nothing. ``BaseException`` is caught
+    rather than ``Exception`` for the same reason: a driver's deep ``sys.exit`` raises ``SystemExit``,
+    which ``tools._run_in_process`` nets one layer up, and swallowing it in a worker thread would
+    turn that fail-closed answer into a silent hang until the bound expired.
+
+    The call runs inside a copy of the CALLER's context. A new thread starts with an empty one, so
+    without this the request-scoped ``_max_rows_override`` would read as unset inside the worker and
+    every in-process call would silently fall back to the deployment default.
+    """
+    global _abandoned_workers
+
+    timeout_s = _resolve_timeout_s()
+    outcome: dict[str, Any] = {}
+    ctx = copy_context()
+
+    with _abandoned_lock:
+        if _abandoned_workers >= _MAX_ABANDONED_WORKERS:
+            # Fail closed, and before the work starts: the cheapest moment to say no, and the only
+            # one at which saying no still prevents anything.
+            raise _ExecutorSaturated(_EXECUTOR_SATURATED)
+
+    def call() -> None:
+        global _abandoned_workers
+        try:
+            outcome["result"] = ctx.run(executor.execute, sql, creds, profile=profile)
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            # `finished` and the slot release are set under the same lock the abandonment takes, so
+            # the SLOT ACCOUNTING cannot double-count: a worker that finishes in the sliver between
+            # the join timing out and the lock being taken decrements the slot the caller just took.
+            #
+            # The OUTCOME is not decided that cleanly, and the difference is a known defect — see
+            # issue #177. Whichever thread reaches this lock first decides: if the caller wins it
+            # reads `finished` unset and raises, so a call whose work had in fact completed is
+            # refused. It fails closed, and the built-in path is shielded by the per-statement
+            # watchdog firing a full skew earlier, so it is reachable only through an injected
+            # executor returning in that same instant. The repair is to signal the end of the WORK
+            # separately from this accounting, so the flag the caller reads cannot be delayed by
+            # lock contention. Do not "fix" it with `worker.is_alive()`: a worker parked here in
+            # its `finally` is still alive, and reads as abandoned in exactly the losing ordering.
+            with _abandoned_lock:
+                if outcome.get("abandoned"):
+                    _abandoned_workers -= 1
+                outcome["finished"] = True
+
+    worker = threading.Thread(target=call, name="agami-bounded-execute", daemon=True)
+    worker.start()
+    worker.join(timeout_s + _OUTER_BOUND_SKEW_S)
+    with _abandoned_lock:
+        abandoned = not outcome.get("finished")
+        if abandoned:
+            _abandoned_workers += 1
+            outcome["abandoned"] = True
+    if abandoned:
+        raise _OuterBoundExpired(_OUTLIVED_OUTER_BOUND)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
+
+
 def execute_guarded(
     sql: str,
     profile: str,
@@ -1269,11 +1827,12 @@ def execute_guarded(
 
     **Every path returns exactly one ``Envelope``, and this function is TOTAL** — nothing is raised
     out of here for a caller to interpret, so the subprocess ``main`` and the in-process MCP handler
-    cannot disagree about what happened. The six outcomes:
+    cannot disagree about what happened. The seven outcomes:
 
       * the read-only gate refuses            -> ``refused`` carrying that gate's ``Refusal``
       * ``_model_safety`` returns a Refusal   -> ``refused`` carrying it verbatim
       * ``_model_safety`` returns an int      -> ``refused`` carrying the interim ``model_safety``
+      * either time bound fired               -> ``refused`` carrying ``resource_limit``
       * ``executor.execute`` raises           -> ``failed`` carrying a classified ``Failure``
       * anything else raises                  -> ``failed``/``other``, generic message, raw to the log
       * the statement ran                     -> ``ok`` carrying the ``ExecResult``
@@ -1322,11 +1881,26 @@ def execute_guarded(
                                 "query.",
                 ))
         creds = _load_credentials(profile, org_id or "local")
-        result = executor.execute(sql, creds, profile=profile)
+        # Bounded at the CHOKEPOINT, so the limit reaches every executor rather than only the
+        # built-in one whose engines carry the inner watchdog. See `_execute_bounded` for the
+        # mechanism and for the leaked worker it costs on expiry.
+        result = _execute_bounded(executor, sql, creds, profile=profile)
         # Inside the try on purpose: an executor that returns `None` (or anything else the contract
         # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
         # broken adapter, not a reason for the chokepoint to raise at its caller.
         return _envelope("ok", data=result)
+    except _ResourceLimit as exc:
+        # AHEAD of both handlers below: `_ResourceLimit` is an `ExecutorError` sibling, not a
+        # subclass, but the catch-all would swallow it and report a bound WE imposed as an
+        # unclassified server break. This is the per-statement bound the contract reserves
+        # `resource_limit` for — its subject IS the statement, so "narrow it and run it again" is a
+        # fix we can honestly name, unlike the supervisor's kill of a child that never returned.
+        #
+        # ONE handler for all three bounds, and so exactly one refusal per call however many layers
+        # were armed. When the inner watchdog fired, its marker is what arrives here — the outer
+        # layer's join returned long before its own budget and has nothing to add, so the inner
+        # refusal is the answer and cannot be overwritten by a later one.
+        return _envelope("refused", refusal=_resource_limit_refusal(exc))
     except ExecutorError as exc:
         # The classified branch: `msg` is authored by this module (a missing driver, a connect
         # failure, the credential-resolution remediation naming DATASOURCE_URL) or relayed from the

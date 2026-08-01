@@ -694,9 +694,10 @@ def test_killing_an_unresponsive_executor_is_a_failure_we_cannot_attribute(env, 
     authority of a guardrail decision. `failed` / `timeout` claims exactly what we know — we stopped
     waiting — and the value-free message says only that.
 
-    `RULE_RESOURCE_LIMIT` stays declared and pinned in `REASON_FOR_RULE` for the per-statement bound
-    a later gate imposes, which IS a refusal because its subject is the statement. It has no producer
-    today, and this branch must not become one.
+    `RULE_RESOURCE_LIMIT` belongs to the per-statement bound the executor now imposes, which IS a
+    refusal because its subject is the statement. That the rule finally has a producer is precisely
+    why this branch is worth holding: the two bounds now coexist, and the one that cannot say what it
+    stopped must not drift into borrowing the vocabulary of the one that can.
     """
     def _timed_out(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 240))
@@ -720,13 +721,15 @@ def test_killing_an_unresponsive_executor_is_a_failure_we_cannot_attribute(env, 
     assert row["datasource"] == PROFILE and row["question"] == QUESTION
 
 
-def test_no_gate_produces_the_resource_limit_refusal(env, monkeypatch):
-    """`RULE_RESOURCE_LIMIT` is declared with NO producer, and the supervisor kill is where it would
-    creep back in — so drive that branch and assert the rule is absent from what the caller gets.
+def test_the_supervisor_kill_does_not_borrow_the_resource_limit_refusal(env, monkeypatch):
+    """The supervisor kill is where `RULE_RESOURCE_LIMIT` would creep in — so drive that branch and
+    assert the rule is absent from what the caller gets, and from the row recording it.
 
-    The pin is on `REASON_FOR_RULE`, not on the absence: the rule stays in the contract's table so
-    the gate that eventually imposes a per-statement timeout fills a constant instead of inventing a
-    string. What must not happen is a branch borrowing it because the word "timeout" fits.
+    Renamed rather than retired: the rule DOES have a producer now (the executor's per-statement
+    deadline), so "no gate produces it" is no longer the claim. The claim that survives is the sharper
+    half and always was — a branch must not borrow this rule merely because the word "timeout" fits.
+    The pin is on `REASON_FOR_RULE`, not on the absence, which is why this test needed no weakening
+    when the producer landed: it asserts what this branch says, not what the contract contains.
     """
     assert guardrail.RULE_RESOURCE_LIMIT in guardrail.REASON_FOR_RULE
 

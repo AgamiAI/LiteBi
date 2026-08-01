@@ -1063,7 +1063,7 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
 
 
 def _executor_truncated(stderr: str | None) -> bool:
-    """True if execute_sql flagged a bounded-fetch truncation (ACE-038/044). The executor emits a
+    """True if execute_sql flagged a bounded-fetch truncation (ACE-044). The executor emits a
     non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
     for line in (stderr or "").splitlines():
         line = line.strip()
@@ -1205,7 +1205,7 @@ def _emit(
         columns = list(env.data.columns)
         rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
         truncated = env.data.truncated
-        # Backstop only: the executor already caps at the source (ACE-038/044) and flags it. This
+        # Backstop only: the executor already caps at the source (ACE-044) and flags it. This
         # catches a result that slipped past that bound, and marks it truncated rather than
         # presenting a trimmed result as complete.
         if max_rows is not None and len(rows) > max_rows:
@@ -1414,13 +1414,32 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # materializes the whole result — not a client-side trim after the fact.
         cmd += ["--max-rows", str(max_rows)]
 
+    # The supervisor's bound is the OUTERMOST of the four time bounds, and it is DERIVED from the
+    # same resolver every inner layer reads rather than being a number of its own. A fixed 240s
+    # inverted that order for any statement budget approaching it: the supervisor fired FIRST, so a
+    # statement we could have cancelled and refused precisely came back instead as a
+    # `failed`/`timeout` naming nothing the caller can act on. Imported lazily for the same
+    # reason `_run_in_process` does it.
+    #
+    # Resolved HERE and enforced on a child that re-resolves for itself, which only works because the
+    # resolver reads the environment and nothing else: the child inherits `os.environ` (no `env=`
+    # below) and therefore reaches the identical number. A request-scoped override would be the one
+    # thing that could break that — it would outrank the environment on this side of the fork and be
+    # invisible on the other, so a parent bound of 65s could sit against a child budget of 300s and
+    # fire first, inverting the order this whole family exists to hold. There is deliberately no such
+    # override; `_resolve_timeout_s` documents why, and a test pins that the budget keeps exactly one
+    # configuration surface.
+    import execute_sql
+
+    supervisor_timeout_s = execute_sql._resolve_timeout_s() + execute_sql._SUPERVISOR_SKEW_S
+
     started = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=240,
+            timeout=supervisor_timeout_s,
         )
     except subprocess.TimeoutExpired:
         # A `failed`/`timeout`, NOT a `refused`/`resource_limit` — and the reason is what we can
@@ -1428,8 +1447,10 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # back; it does not say the STATEMENT ran long. The child may have hung in connect, in
         # credential resolution or in loading the model, and on any of those "narrow the query" is
         # advice pointing at the wrong thing. A refusal must name a fix, so a kill we cannot attribute
-        # is not one. (Guardrail contract §3: an unresponsive executor is `failed`. The per-statement
-        # timeout a later gate imposes IS a refusal, and `RULE_RESOURCE_LIMIT` is reserved for it.)
+        # is not one. (Guardrail contract §3: an unresponsive executor is `failed`. The executor's own
+        # per-statement deadline IS a refusal and carries `RULE_RESOURCE_LIMIT`; it can attribute the
+        # cancel to the statement because it is the thing it cancelled. The two bounds coexist, and
+        # this one must not borrow the other's rule.)
         return _emit(
             _envelope("failed", failure=Failure(
                 kind="timeout",
@@ -1466,7 +1487,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
         )
 
-    # Parse the RFC-4180 CSV emitted on stdout. The executor caps at the source (ACE-038/044) and
+    # Parse the RFC-4180 CSV emitted on stdout. The executor caps at the source (ACE-044) and
     # flags it on stderr; carry that flag so a truncated result is never presented as complete. The
     # `max_rows` backstop is applied by `_emit`, the same one the in-process path gets.
     reader = csv.reader(io.StringIO(proc.stdout))
