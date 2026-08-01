@@ -201,6 +201,11 @@ def test_the_budget_has_exactly_one_configuration_surface():
     context_vars = {
         name for name, value in vars(execute_sql).items() if isinstance(value, ContextVar)
     }
+    # `_last_error_detail` (ACE-039) is a ContextVar but not a CONFIGURATION surface: it carries the
+    # raw driver text OUT of a failed call for the audit row, is written after the budget has already
+    # been resolved and spent, and is never read to compute a bound. The hazard this test names is a
+    # second INPUT to the budget that the fork cannot carry; an output carrier is not one.
+    context_vars -= {"_last_error_detail"}
     assert context_vars == {"_max_rows_override"}, (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"
@@ -1084,8 +1089,16 @@ def test_an_executor_error_keeps_its_type_across_the_worker(warehouse):
     )
 
     assert env.status == "failed"
-    assert env.failure.kind == "syntax"  # the classified branch, i.e. `except ExecutorError` matched
-    assert env.failure.message == "no such column: nope"
+    # The classified branch, i.e. `except ExecutorError` matched. Was `syntax` before ACE-039, which
+    # was the exit-5 prior showing through rather than a read of the text; `SELECT c FROM orders`
+    # against a warehouse with no `c` is a missing column.
+    assert env.failure.kind == "column_not_found"
+    # The message is the classified sentence, not the driver's text (ACE-039). What this test is
+    # actually about survives unchanged: the exception kept its TYPE across the worker thread, which
+    # is what `except ExecutorError` matching at all proves — had it been re-wrapped, the catch-all
+    # would have produced `other` and the generic unexpected-failure message instead.
+    assert env.failure.message == execute_sql._ERROR_MESSAGES["column_not_found"]
+    assert "nope" not in env.failure.message
     assert env.failure.message != execute_sql.UNEXPECTED_FAILURE_MESSAGE
 
 
