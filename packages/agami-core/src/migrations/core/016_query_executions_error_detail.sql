@@ -1,0 +1,29 @@
+-- Keep the raw driver error where only an operator can read it (ACE-039). The caller now receives a
+-- classified, value-free `failure.message` — "the statement referenced a column this database does
+-- not have" — because the driver's own text is an enumeration channel: PostgreSQL appends
+-- `HINT: Perhaps you meant to reference the column "orders.internal_ref"`, naming a DECLARED column
+-- the caller never sent. Sanitizing it on the way out would leave the operator debugging a real
+-- customer failure with nothing to read, so the raw text is kept here instead of discarded.
+--
+-- COLUMN, NOT A SECOND TABLE — the same argument 014 makes, for the same reason. The detail is 1:1
+-- with the execution, and `Envelope.audit_id` IS `query_executions.id`, so a `query_errors` table
+-- would be a join that can only ever match a single row, keyed on an id that already lives here.
+--
+-- NULL IS A CLAIM, NOT A GAP, and it means something specific: the chokepoint that holds the raw
+-- text and the recorder that writes this row were not in the same process. On the in-process and
+-- HTTP surfaces they are, and the column is populated. On the DEFAULT stdio surface the tool edge
+-- forks: the child classifies and sanitizes, the parent writes the row, and the child deliberately
+-- writes no audit row of its own — so the raw text never crosses, by design rather than by
+-- oversight. There the child logs it server-side and this column stays NULL. Rows written before
+-- this migration ran are NULL for the older reason 014 describes, and a back-fill would be
+-- inventing history either way.
+--
+-- BOUNDED BY THE WRITER, like `sql` before it (`tools.AUDIT_ERROR_DETAIL_MAX_CHARS`). A driver error
+-- carrying a full HINT / CONTEXT / parameter dump is unbounded, and 015's argument applies verbatim:
+-- a failed statement must not become a way to grow the store.
+--
+-- Forward-only and portable (runs on SQLite + Postgres unchanged) — same shape as
+-- 014_query_executions_guardrail.sql. No `IF NOT EXISTS`: SQLite's ALTER TABLE does not accept it,
+-- and re-run safety comes from the runner's `schema_migrations` ledger, which skips an applied file.
+
+ALTER TABLE query_executions ADD COLUMN error_detail TEXT;

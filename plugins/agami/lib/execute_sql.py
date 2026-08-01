@@ -43,6 +43,16 @@ Exit codes:
          its own precisely so it does not borrow one: with `other` falling to the generic 2, a parent
          reading the exit code back reported an internal break as a datasource-configuration problem
          (`dsn`), and only on the fork transport, while the identical break in-process said `other`.
+    7  — the statement referenced a column the database does not have
+    8  — the statement referenced a table the database does not have
+    9  — the connection's role lacks SELECT on a referenced object
+    10 — the database was unreachable mid-statement (connection refused / reset)
+
+Codes 7-10 exist for the same reason 6 does. The child classifies a driver error at the chokepoint
+and then `main` collapses that classification to an exit code, so a kind without a code of its own is
+a kind the fork silently loses: all four landed on the `other` default and a parent read them back as
+`other`, while the identical error in-process reported the real kind. The in-process tests passed and
+the DEFAULT surface was wrong (ACE-039).
 
 `EXIT_TO_FAILURE_KIND` / `FAILURE_KIND_TO_EXIT` below are that table in code — this module owns the
 exit-code contract because it documents it here and is the only place that produces it.
@@ -95,6 +105,18 @@ CONFIG_PATH = agami_paths.config_path()
 ALLOWED_PERMS = (0o600, 0o400)
 
 _LOG = logging.getLogger(__name__)
+
+# A logger of its OWN for raw driver text, and the reason is a leak rather than tidiness (ACE-039).
+# This module never calls `basicConfig`, so in a forked child a record on `_LOG` falls through to
+# `logging.lastResort` and is written to STDERR — and `tools._child_failure_message` relays the
+# child's whole stderr into `failure.message` for any classified exit code. Logging the raw text on
+# `_LOG` would therefore hand it straight back to the caller on the DEFAULT surface, undoing the
+# sanitization in the same breath. (The catch-all beneath the classifier escapes this only because
+# its `exc_info=True` trips the traceback guard, at the cost of degrading its message.)
+#
+# `main` silences this logger at CLI entry, so the forked child emits nothing here and the column
+# stays NULL. In-process and hosted, it propagates to the server's root logger as intended.
+_RAW_LOG = logging.getLogger(__name__ + ".raw")
 
 # What a caller is told when something we did not anticipate broke. Deliberately generic and
 # value-free: the raw text of an unanticipated exception is the one string in this module nobody has
@@ -180,18 +202,175 @@ EXIT_TO_FAILURE_KIND: dict[int, FailureKind] = {
     # mapped to 2 the parent read it back as ``dsn`` — so an internal break was reported to the
     # caller as a datasource-configuration problem, and only on the fork transport.
     6: "other",
+    # The four kinds the error-hardening slice makes reachable (ACE-039). Each needs a code of its
+    # own for exactly the reason 6 does, and the failure mode is worse because it is silent: the
+    # child classifies the driver error correctly at the chokepoint, `main` collapses the kind to an
+    # exit code, and a kind with no code falls to the `other` default. In-process the caller saw
+    # `column_not_found`; through the fork — the DEFAULT transport — it saw `other`, and no test that
+    # exercised only the in-process path could tell. `_child_failure_message` compounds it: it
+    # relays the child's sanitized text only for a code in this table, so an unmapped code also
+    # replaced the message with the generic unexpected-failure text.
+    7: "column_not_found",
+    8: "table_not_found",
+    9: "permission",  # the ROLE lacks SELECT; distinct from `auth`, where the credentials failed
+    10: "network",
 }
 
 # The inverse, for ``main`` turning a ``Failure`` back into today's exit code. Every failure
-# ``execute_guarded`` can produce is either an ``ExecutorError`` whose code is one of the four
-# classified ones above or the catch-all ``other``, and all five have their own code — so the
-# round-trip is exact for every case this module can reach, in both directions. The default covers
-# only the kinds nothing produces yet (``column_not_found``, ``table_not_found``, ``network``) plus
-# ``timeout``, which is minted at the tool edge by the subprocess supervisor and so never reaches
-# ``main``. It is 6 rather than 2 for the same reason ``other`` has its own code: an unmapped kind is
-# something we could not classify, which is what 6 says, and never a config error.
+# ``execute_guarded`` can produce is either an ``ExecutorError`` whose code is one of the classified
+# ones above or the catch-all ``other``, and all of them have their own code — so the round-trip is
+# exact for every case this module can reach, in both directions.
+#
+# The default now covers exactly ONE kind: ``timeout``, which is minted at the tool edge by the
+# subprocess supervisor when a child never returns, and so never reaches ``main`` to be encoded.
+# That is the whole remaining gap, and it is a gap by construction rather than by omission — a
+# supervisor that stops an unresponsive child cannot attribute the kill to the statement, which is
+# why it is a failure rather than a ``resource_limit`` refusal (guardrail contract §3).
+#
+# It is 6 rather than 2 for the same reason ``other`` has its own code: an unmapped kind is something
+# we could not classify, which is what 6 says, and never a config error.
 FAILURE_KIND_TO_EXIT: dict[str, int] = {kind: code for code, kind in EXIT_TO_FAILURE_KIND.items()}
 _DEFAULT_FAILURE_EXIT = 6
+
+# --- Error sanitization (ACE-039) -------------------------------------------
+#
+# A raw driver error is an enumeration channel. PostgreSQL's `HINT: Perhaps you meant to reference
+# the column "orders.internal_ref"` names a DECLARED column the caller never sent, which is the
+# model leaking through the operational channel rather than the refusal channel. Measured before
+# this landed, by a `strict=True` xfail in tests/test_ace035_no_enumeration.py.
+#
+# WHOSE TEXT IS IT. Codes 2 and 3 are authored by this module — the credential remediation naming
+# DATASOURCE_URL, the chmod-600 fix, the `pip install` lines — and are relayed deliberately, because
+# they tell an operator what to do and contain nothing the database said. Codes 4 and 5 are the
+# twenty f-string sites that interpolate the driver's own exception. The module's docstring table
+# already draws exactly this line, so the discriminator is documented rather than invented.
+_AUTHORED_EXIT_CODES = frozenset({2, 3})
+
+# One value-free sentence per kind. NO REMEDIATION: `Failure` has no such field, and that absence is
+# what lets a caller tell a decision of ours from the database's outcome. Where the reference
+# implementation's remediation carried real information it is folded into the message, which is
+# already value-free.
+#
+# There is deliberately no `timeout` entry. A per-statement deadline is a `resource_limit` REFUSAL
+# (ACE-038 owns it, classified from a watchdog flag rather than a driver string), and the only
+# `timeout` failure is the subprocess supervisor's kill at the tool edge, which never reaches here.
+_ERROR_MESSAGES: dict[str, str] = {
+    "syntax": "The generated SQL was not valid for this database. Re-run the query.",
+    "column_not_found": (
+        "The statement referenced a column this database does not have. If the model was built "
+        "against an older schema, re-introspect the datasource."
+    ),
+    "table_not_found": (
+        "The statement referenced a table this database does not have. If the model was built "
+        "against an older schema, re-introspect the datasource."
+    ),
+    "permission": (
+        "The database refused to read an object this statement referenced. The connection's role "
+        "needs SELECT on it."
+    ),
+    "auth": "The database rejected the connection's credentials.",
+    "network": "The database was unreachable.",
+    "dsn": "The datasource host or path could not be resolved.",
+    "driver_missing": "The database driver is not installed on the server.",
+}
+
+
+def _classify_db_error(text: str, code: int) -> FailureKind:
+    """Classify a driver error into a `FailureKind`, from text that is never relayed.
+
+    Classifying FROM driver text is not the same as returning it: the output is one of a fixed set
+    of labels, and the caller receives `_ERROR_MESSAGES[kind]` rather than anything the database
+    said. The raw text is captured server-side only.
+
+    Order matters and two positions are load-bearing:
+
+    * **Cancellation is checked early and lands on `other`.** Every cancellation signature was ceded
+      to ACE-038, whose rule is that a deadline is classified from a signal rather than a string.
+      But simply DELETING the arm does not leave these statements unclassified — it leaves them
+      mis-classified: "canceling statement due to statement timeout" contains "timed out" and would
+      fall to `network`, or, failing that, to the exit-5 prior and out as `syntax`. An
+      unattributable server-side cancellation is honestly `other`.
+    * **`table_not_found` precedes `syntax`**, because Snowflake prefixes an unknown object with
+      "SQL compilation error" and would otherwise be read as a syntax error.
+
+    `"timed out"` is deliberately NOT a `network` needle. A driver-level connect or login timeout is
+    what the executor already reports as `auth` (exit 4) and stays there; adding the needle would
+    silently move it and contradict the contract's account of what `timeout` means.
+    """
+    lowered = (text or "").lower()
+
+    def has(*needles: str) -> bool:
+        return any(needle in lowered for needle in needles)
+
+    if code == 3 or has("no module named", "modulenotfounderror", "command not found"):
+        return "driver_missing"
+    # Ten engines spell an authorization failure ten ways, and getting this wrong is not cosmetic:
+    # a `permission` failure tells the operator to GRANT, while `auth` tells them to re-credential
+    # and `syntax` makes the skill auto-retry the identical statement twice.
+    if has(
+        "permission denied",
+        "insufficient_privileges",
+        "insufficient privileges",  # Oracle ORA-01031, a space rather than an underscore
+        "command denied",
+        "insufficient_access_or_readonly",
+        "permission was denied",  # SQL Server
+        "access denied for user",  # MySQL 1044/1045 — narrower than the bare needle in `auth`
+    ) or ("access denied" in lowered and has("table", "dataset", "cannot select")):
+        # BigQuery and Trino both open with "Access Denied:", which the `auth` arm's bare
+        # "access denied" would otherwise swallow into a credentials problem.
+        return "permission"
+    if has(
+        "canceling statement",
+        "statement_timeout",
+        "query was canceled",
+        "querycanceled",
+        # MySQL 2013, whose actual text is "Lost connection to MySQL server DURING QUERY". The
+        # reference's needle read "lost connection during query" and so never matched it. Kept
+        # specific on purpose: a bare "lost connection" also covers "…at 'reading initial
+        # communication packet'", which is a genuine network failure and not a cancellation.
+        "lost connection to mysql server during query",
+    ):
+        return "other"
+    if has(
+        "no such column",
+        "unknown column",
+        "undefinedcolumn",
+        "invalid identifier",
+        "invalid_field",
+        "invalid column name",  # SQL Server 207
+        "cannot be resolved",  # Trino, Databricks (UNRESOLVED_COLUMN)
+        "unrecognized name",  # BigQuery
+        "unresolved_column",
+    ) or ("column" in lowered and has("does not exist", "not found")):
+        return "column_not_found"
+    if has("no such table", "undefinedtable", "invalid object name") or (
+        has("relation", "table", "object") and has("does not exist", "doesn't exist", "not found")
+    ):
+        return "table_not_found"
+    if has("syntax error", "syntaxerror", "compilation error", "error in your sql syntax"):
+        return "syntax"
+    if has(
+        "could not translate host",
+        "name or service not known",
+        "getaddrinfo",
+        "unknown mysql server host",
+        "can't connect",
+        "no such file or directory",
+    ):
+        return "dsn"
+    if has("connection refused", "connection reset", "could not connect", "wrong_version_number"):
+        return "network"
+    if has(
+        "password authentication failed",
+        "no pg_hba",
+        "incorrect username or password",
+        # NOT a bare "access denied": BigQuery, Trino, SQL Server and MySQL 1044 all use that
+        # wording for an AUTHORIZATION failure on an object, which the arm above now claims.
+        "authentication failed",
+        "login failed",
+    ):
+        return "auth"
+    return EXIT_TO_FAILURE_KIND.get(code, "other")
 
 
 def _env_token(profile: str) -> str:
@@ -735,8 +914,19 @@ def _run_bigquery(creds: dict[str, str], sql: str) -> ExecResult:
                 sa_path_expanded
             )
             client_kwargs["credentials"] = creds_obj
-        except Exception as e:
-            raise ExecutorError(f"BigQuery credentials load failed: {e}", code=2)
+        except Exception:
+            # The ONE code-2 site that interpolated a third-party exception. google-auth's text can
+            # carry the absolute path of the service-account key, and code 2 is the band this module
+            # relays verbatim on the strength of having authored it — so an interpolated exception
+            # here made "codes 2 and 3 are ours" true only approximately (ACE-039). Authored prose
+            # out, the original to the server log.
+            _LOG.error("BigQuery service-account credentials failed to load", exc_info=True)
+            raise ExecutorError(
+                "BigQuery credentials could not be loaded. Check `service_account_path` for this "
+                "profile in <artifacts_dir>/local/credentials — the file must exist and be a valid "
+                "service-account key.",
+                code=2,
+            )
 
     try:
         client = bigquery.Client(**client_kwargs)
@@ -1077,6 +1267,17 @@ _DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation
 # isolated and can't stomp another's. In the subprocess/CLI (one process, one thread) it behaves
 # exactly as the old module global did.
 _max_rows_override: ContextVar[int | None] = ContextVar("_max_rows_override", default=None)
+
+# The raw driver text of the failure this call classified, for the audit row only (ACE-039). A
+# ContextVar for the same reason as the cap above: request-scoped, so concurrent in-process handlers
+# cannot read each other's. `execute_guarded` CLEARS it on entry, which is the load-bearing half —
+# without that, a call that succeeds after one that failed would attribute the earlier call's error
+# to itself, and the audit row would name a statement that never produced it.
+#
+# It carries the text out-of-band rather than on the Envelope on purpose: `Failure` is `{kind,
+# message}` and stays that way, because a raw field on the contract is a raw field somebody
+# eventually serializes.
+_last_error_detail: ContextVar[str | None] = ContextVar("_last_error_detail", default=None)
 
 
 def _resolve_row_cap() -> int:
@@ -1856,10 +2057,21 @@ def execute_guarded(
     ``failed``/``dsn`` Envelope carrying its detailed message rather than escaping as an exception
     the two callers would each have to translate. The row cap rides the request-scoped
     ``_max_rows_override`` ContextVar the caller sets."""
+    # Clear before anything can set it, so a detail from a PREVIOUS call in this context can never
+    # be attributed to this one. The recorder reads it unconditionally; a stale value would put the
+    # wrong error text on a row that succeeded.
+    _last_error_detail.set(None)
     try:
         import sql_guard
 
         refusal = sql_guard.check_read_only(sql)
+        if refusal is not None:
+            return _envelope("refused", refusal=refusal)
+        # Metadata / recon functions, ABOVE the `no_safety` branch on purpose. `no_safety` skips the
+        # semantic-model pass and nothing else; server fingerprinting and object-existence probing
+        # are a hard gate for the same reason write and RCE protection are. Running second is what
+        # makes the label deterministic when a name is on both lists (principle 9).
+        refusal = sql_guard.check_no_recon(sql)
         if refusal is not None:
             return _envelope("refused", refusal=refusal)
         if not no_safety:
@@ -1902,12 +2114,26 @@ def execute_guarded(
         # refusal is the answer and cannot be overwritten by a later one.
         return _envelope("refused", refusal=_resource_limit_refusal(exc))
     except ExecutorError as exc:
-        # The classified branch: `msg` is authored by this module (a missing driver, a connect
-        # failure, the credential-resolution remediation naming DATASOURCE_URL) or relayed from the
-        # driver, and both callers already surface it. Sanitizing DRIVER text is a separate, larger
-        # job (ACE-039) and is deliberately not attempted here.
+        # Two kinds of text arrive here and only one of them is ours (ACE-039).
+        #
+        # Codes 2 and 3 are AUTHORED by this module — "No warehouse credentials for profile […]",
+        # the chmod-600 fix, the `pip install` line. They name an operator action and contain
+        # nothing the database said, so they are relayed verbatim exactly as before.
+        if exc.code in _AUTHORED_EXIT_CODES:
+            return _envelope("failed", failure=Failure(
+                kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
+            ))
+        # Codes 4 and 5 carry the driver's own exception, interpolated at one of the twenty
+        # per-engine sites. That text is an enumeration channel: a PostgreSQL HINT names declared
+        # columns the caller never sent. Classify FROM it, return a fixed sentence INSTEAD of it.
+        kind = _classify_db_error(exc.msg, exc.code)
+        # Keep the raw text for the operator, on two channels that reach two different places. The
+        # ContextVar is read by `tools._record_execution` when the recorder shares this process, and
+        # `_RAW_LOG` is the server-side trail everywhere else. Neither is the caller's channel.
+        _last_error_detail.set(exc.msg)
+        _RAW_LOG.error("database error (audit detail): %s", exc.msg)
         return _envelope("failed", failure=Failure(
-            kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
+            kind=kind, message=_ERROR_MESSAGES.get(kind, UNEXPECTED_FAILURE_MESSAGE),
         ))
     except Exception:
         # Unanticipated, so unreadable: nobody has vetted what this exception's text contains, and
@@ -1952,6 +2178,15 @@ def main() -> int:
     # the one-shot subprocess/CLI entry (one process, one thread), so there's no sibling request to
     # isolate from — unlike the in-process server path, which resets the token in tools._run_in_process.
     _max_rows_override.set(args.max_rows)
+
+    # Silence the raw-detail logger for the whole CLI/child lifetime. Without this it falls through
+    # to `logging.lastResort`, which writes to stderr — and the parent relays the child's stderr into
+    # `failure.message`, so the raw driver text this module just took OUT of the caller's answer
+    # would arrive back in it (ACE-039). The child therefore records no detail at all and the audit
+    # column stays NULL, which is exactly what NULL means on that column: the chokepoint and the
+    # recorder were not in one process.
+    _RAW_LOG.addHandler(logging.NullHandler())
+    _RAW_LOG.propagate = False
 
     if args.sql_file:
         sql = Path(os.path.expanduser(args.sql_file)).read_text()

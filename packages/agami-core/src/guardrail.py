@@ -62,11 +62,18 @@ RULE_MODEL_UNAVAILABLE = "model_unavailable"
 RULE_RESOURCE_LIMIT = "resource_limit"
 RULE_UNPARSEABLE = "unparseable"
 
-# Named by the contract, produced by a later gate — declared here so that work fills a constant
-# rather than inventing a string. Deliberately absent from `REASON_FOR_RULE` below: their reason is
-# the owning gate's call (`recon` is arguably `unsafe` or `out_of_scope` depending on framing), and
-# leaving them unpinned makes `refuse()` fail loudly rather than let that gate choose one silently.
+# Metadata / recon functions: `version()`, `current_user`, `has_table_privilege(…)`, the register-type
+# casts. Pinned `unsafe` by ACE-039, the gate that produces it. The reason was genuinely arguable —
+# a recon call is a reach in one framing and a hazard in another — which is why it was left for the
+# owning gate to settle in a reviewed diff rather than guessed at here. It is `unsafe` because the
+# statement is not asking the model a question it could ask differently: a semantic model declares
+# tables and columns and never declares functions, so there is no in-scope spelling of `version()`
+# for a 4b `out_of_scope` refusal to point the caller toward.
 RULE_RECON = "recon"
+# Named by the contract, produced by a later gate — declared here so that work fills a constant
+# rather than inventing a string. Deliberately absent from `REASON_FOR_RULE` below: its reason is the
+# owning gate's call, and leaving it unpinned makes `refuse()` fail loudly rather than let that gate
+# choose one silently.
 RULE_ENGINE_MISMATCH = "engine_mismatch"
 # `unscopable` is the third of these, and it is NOT a synonym for `unparseable`: an unparseable
 # statement is one sqlglot cannot read at all, while an unscopable one parses perfectly and still
@@ -93,6 +100,7 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     # refusal in a later slice, and emitting `undetermined` now would silently pre-empt it.
     RULE_SELECT_STAR: "out_of_scope",
     RULE_MODEL_UNAVAILABLE: "undetermined",
+    RULE_RECON: "unsafe",
     # A bound we imposed, not a property of the statement: neither unsafe nor out of scope — we
     # simply did not determine the answer within the bound. Pinned before it had a producer, so the
     # gate that imposes the per-statement timeout filled a constant rather than inventing one.

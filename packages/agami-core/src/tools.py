@@ -1037,15 +1037,32 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
         which is a field the caller is shown.
 
     What is deliberately still relayed is the child's *authored* config-error text ("No warehouse
-    credentials for profile […]. Set DATASOURCE_URL…", "Postgres connect failed: …"). That is the
-    remediation a misconfigured user needs, and it is the same text the in-process path surfaces
-    from `ExecutorError.msg` — the two paths agreeing on it is a property this slice exists to keep.
-    Sanitizing *driver* text is a separate job and belongs to the error-hardening slice; see the
-    coverage note in `tests/test_ace035_no_enumeration.py`.
+    credentials for profile […]. Set DATASOURCE_URL…"). That is the remediation a misconfigured user
+    needs, and it is the same text the in-process path surfaces from `ExecutorError.msg` — the two
+    paths agreeing on it is a property this slice exists to keep.
+
+    **The sanitized band is RECONSTRUCTED, never relayed (ACE-039).** For every code whose message
+    the child derives from `_ERROR_MESSAGES`, the parent can rebuild that exact sentence from the
+    exit code alone, so relaying stderr for those codes buys nothing and carries real risk: stderr
+    is a *shared* stream, and the child writes to it before the failure line. `_model_safety`'s
+    `[agami] applied default_filters: …` notice is the concrete case — it put a declared row-level
+    predicate, which the caller never sent, into `failure.message` on the DEFAULT transport, while
+    the in-process path returned the clean sentence. Anything else a library logs to stderr had the
+    same reach; the traceback guard below only ever caught the two `exc_info=True` sites.
     """
-    from execute_sql import EXIT_TO_FAILURE_KIND, UNEXPECTED_FAILURE_MESSAGE
+    from execute_sql import (
+        _AUTHORED_EXIT_CODES,
+        _ERROR_MESSAGES,
+        EXIT_TO_FAILURE_KIND,
+        UNEXPECTED_FAILURE_MESSAGE,
+    )
 
     text = (stderr or "").strip()
+    # Rebuild rather than relay. The child produced this sentence from the kind, so the kind is all
+    # the parent needs, and the child's stream never touches the caller's answer.
+    kind = EXIT_TO_FAILURE_KIND.get(returncode)
+    if returncode not in _AUTHORED_EXIT_CODES and kind in _ERROR_MESSAGES:
+        return _ERROR_MESSAGES[kind]
     classified = returncode in EXIT_TO_FAILURE_KIND
     # `Traceback (most recent call last):` is the stable header of every Python traceback, and a
     # `  File "…", line N` frame is the line that carries the absolute path. Either one is enough.
@@ -1246,6 +1263,12 @@ def _emit(
 # generated SELECT is a few KB), and the verdict columns, not the blob, are what make the row useful.
 AUDIT_SQL_MAX_CHARS = 8_000
 
+# The raw driver error is unbounded in a way the statement is not: a PostgreSQL failure can carry a
+# HINT, a CONTEXT chain and every bound parameter. 015's argument applies verbatim — a failed
+# statement must not become a way to grow the store — and this is the operator's diagnostic, so a
+# couple of thousand characters is the whole of what is worth keeping.
+AUDIT_ERROR_DETAIL_MAX_CHARS = 2_000
+
 
 def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     """The statement as it will be stored, plus whether it had to be cut.
@@ -1283,9 +1306,20 @@ def _record_execution(
     """
     refusal = env.refusal
     stored_sql, sql_truncated = _bounded_audit_sql(sql or "")
+    # The RAW driver text, for the operator only — the caller's `failure.message` is the classified
+    # value-free sentence and stays that way. Present only when the chokepoint ran in THIS process:
+    # across the fork the child sanitizes and the parent records, so the raw text never crosses and
+    # this is None. `execute_guarded` clears the var on entry, so a stale detail cannot attach to a
+    # later call.
+    from execute_sql import _last_error_detail
+
+    raw_detail = _last_error_detail.get()
     _record_query(
         {
             "id": env.audit_id,
+            "error_detail": (
+                raw_detail[:AUDIT_ERROR_DETAIL_MAX_CHARS] if raw_detail else None
+            ),
             "ts": _now_iso(),
             "profile": profile or "",
             "question": (args or {}).get("raw_query"),
@@ -1351,6 +1385,15 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     a caller sees the same shape — and, for a refusal, the same rule and the same remediation —
     whichever path ran.
     """
+    # Clear the raw-detail carrier for THIS call, at the one point both paths pass through.
+    # `execute_guarded` also clears it on entry, but that only covers the in-process path — on the
+    # fork the parent never calls it, so without this a forked call would record the driver text
+    # left behind by an earlier IN-PROCESS failure in the same server process. Two paths, one
+    # ContextVar, so the reset belongs where the call begins rather than where one of them does.
+    from execute_sql import _last_error_detail
+
+    _last_error_detail.set(None)
+
     sql = args.get("sql")
     if not isinstance(sql, str) or not sql.strip():
         # An argument the caller got wrong, before any gate or database is involved: not a refusal

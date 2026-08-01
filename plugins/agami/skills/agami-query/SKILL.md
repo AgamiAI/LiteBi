@@ -389,8 +389,13 @@ Route any non-zero exit through [`shared/db_error_classifier.md`](../../shared/d
 | `driver_missing` | Fall through to the next available method (native CLI → DuckDB → Python driver). |
 | `permission` | Stop. DB user lacks SELECT on the touched dataset. |
 | `column_not_found`, `table_not_found`, `syntax` | Auto-retry up to **2** times. Pass the error back to the SQL generator: "The previous SQL failed with `<one-line classifier message>`. Regenerate using only table / column names from the schema context above." |
-| `timeout` | Stop. Suggest adding a filter using the `recommended_filters` from the dataset's performance hints. |
 | `other` | Stop. Surface raw error truncated to 200 chars. |
+
+A statement stopped for taking too long no longer arrives here as an error. A per-statement deadline
+is a **`resource_limit` refusal**, which carries its own remediation because it is a decision the
+server made — handle it as a refusal, not as a classified failure. The `timeout` failure kind now
+has one producer, the supervisor stopping an executor that never responded, and there is nothing
+query-specific to suggest for it.
 
 After 2 retries with no success, stop. Don't loop.
 

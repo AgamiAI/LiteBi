@@ -27,8 +27,21 @@ Credentials live in `<artifacts_dir>/local/credentials` (per-profile `[section]`
 | `column_not_found` | psycopg2 `UndefinedColumn`; mysql `1054` `Unknown column`; snowflake `Invalid identifier`; BigQuery `Name <x> not found`; sqlite `no such column`; SF `INVALID_FIELD` | If the missing column **is** in the local semantic model YAML: `"Your model references <col> but it's no longer in the live database — schema drift. Re-introspect with /agami-connect to sync."` Otherwise: `"Generated SQL referenced a column that doesn't exist. Re-run the query — it'll auto-retry with corrected SQL."` |
 | `table_not_found` | psycopg2 `UndefinedTable`; mysql `1146` `Table doesn't exist`; snowflake `Object <x> does not exist`; BigQuery `Table <x> not found`; sqlite `no such table` | If the missing table **is** in the local semantic model: `"Your model references <table> but it's no longer in the live database — schema drift. Re-introspect with /agami-connect to sync."` Otherwise: `"Generated SQL referenced a table that doesn't exist in this datasource. Re-run the query."` |
 | `syntax` | psycopg2 `SyntaxError` (DB-side); mysql `1064` `You have an error in your SQL syntax`; snowflake `compilation error`; sqlite `near "X": syntax error` | `"SQL syntax error from the generator. Re-run the query — auto-retry usually fixes generator slips."` |
-| `timeout` | psycopg2 `QueryCanceled`; mysql `2013 Lost connection during query`; snowflake `query was canceled`; explicit `statement_timeout` errors | `"Query timed out. Add a tighter filter, a LIMIT, or a date range — large unfiltered scans hit the DB's statement_timeout. If a big table keeps timing out, give it a recommended_filters entry in its semantic-model YAML."` |
 | `other` | anything else | `"<original error message>. For deeper per-datasource troubleshooting see the connection reference (plugins/agami/shared/connection-reference.md) and docs/troubleshooting.md."` |
+
+**There is no `timeout` row, deliberately.** It used to detect psycopg2 `QueryCanceled`, MySQL 2013,
+Snowflake `query was canceled` and explicit `statement_timeout` errors — every one of which is a
+*cancellation signature*, and a deadline is now classified from the watchdog signal that fired it
+rather than from whatever string the driver happened to return. `timeout` survives as a
+`FailureKind` with exactly one producer, the subprocess supervisor stopping an executor that never
+returned, which no rule in this table can see. A per-statement deadline is a `resource_limit`
+**refusal**, not a classified error: it is a decision the server made, so it carries a remediation,
+which is precisely what a failure does not.
+
+An unattributable server-side cancellation therefore classifies as `other`. That is the honest
+label — deleting the row without saying so would have let those errors fall through to `network`
+(the "timed out" wording) or to `syntax` (the exit-code prior), and both read as a diagnosis this
+table cannot actually make.
 
 ## Drift-aware column / table classification
 
@@ -64,6 +77,11 @@ The classifier returns:
 
 ```python
 {
+  # The vocabulary is owned by `guardrail.FailureKind` — this document does not declare its own.
+  # Two surfaces read the same kinds and present them differently, which is the point: locally the
+  # raw error is already in front of the user and a remediation is worth giving, while
+  # `execute_sql`'s failure crosses the LLM boundary and carries `{kind, message}` with no
+  # remediation and no value text. Detection rules are shared; presentation is per-surface.
   "kind": "auth | dsn | network | driver_missing | permission | column_not_found | table_not_found | syntax | timeout | other",
   "remediation": "<one-line user-facing remediation message>",
   "raw_message": "<original exception message, truncated to 500 chars>",

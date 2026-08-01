@@ -234,6 +234,11 @@ _STATUSES = [
     ("ok", "SELECT id FROM orders", "ok", None),
     ("refused-column-scope", "SELECT nope FROM orders", "refused", guardrail.RULE_COLUMN_SCOPE),
     ("refused-read-only", "DELETE FROM orders", "refused", guardrail.RULE_READ_ONLY),
+    # A third refusal, from a third place again: the recon gate sits at the chokepoint between the
+    # other two, after the read-only gate and before the model pass, and it is the only refusal that
+    # is NOT skippable by `--no-safety` yet is also not a write. Its row is what proves a refusal is
+    # audited on the strength of being a refusal rather than of which gate produced it.
+    ("refused-recon", "SELECT id, version() FROM orders", "refused", guardrail.RULE_RECON),
     ("failed", "SELECT amount FROM orders", "failed", None),
 ]
 _STATUS_IDS = [label for label, _, _, _ in _STATUSES]

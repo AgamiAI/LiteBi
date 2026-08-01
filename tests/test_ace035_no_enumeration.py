@@ -36,13 +36,13 @@ is enumeration reaching the caller through the operational channel rather than t
 
 **What it does NOT cover, in two different senses.**
 
-*Not yet fixed.* Driver text is relayed to `failure.message` unsanitized, so a driver that
-volunteers a declared name puts it in front of the caller. That is measured here rather than
-assumed: `test_a_driver_hint_enumerates_the_model_until_ace039_lands` drives exactly that shape and
-is `xfail(strict=True)`. Sanitizing driver text is the error-hardening slice's job (ACE-039), not
-this one's — and the strict marker means the day it lands, that test flips green and says so.
-Everything this slice *does* author into `failure.message` is value-free: the guarded path's
-catch-all message is a fixed string, and the forked path no longer relays unstructured child stderr.
+*Fixed by ACE-039.* Driver text used to be relayed to `failure.message` unsanitized, so a driver
+that volunteered a declared name put it in front of the caller. That was measured here rather than
+assumed, as an `xfail(strict=True)`; the error-hardening slice now classifies FROM the driver text
+and returns a fixed value-free sentence INSTEAD of it, the marker is gone, and
+`test_a_driver_hint_never_reaches_the_caller` asserts the closed shape. Everything reaching
+`failure.message` is now value-free on every path: the classified sentences, the guarded path's
+catch-all fixed string, and the forked path, which no longer relays unstructured child stderr.
 
 *Not fixable here.* The table- and column-scope details confirm "this identifier is not in the
 model", which is a one-bit membership oracle per probed identifier: a caller willing to send N
@@ -332,6 +332,11 @@ VECTORS = (
     (guardrail.RULE_SELECT_STAR, "SELECT * FROM orders"),
     (guardrail.RULE_COLUMN_SCOPE, "SELECT ref_no FROM orders"),
     (guardrail.RULE_RESOURCE_LIMIT, _RUNAWAY_SQL),
+    # recon — `version()` is not on the dangerous-function list, so the read-only gate passes it,
+    # and the recon gate runs before the model pass, so it fires first. `id` and `orders` are
+    # declared AND sent by the caller, so echoing them is legitimate; the token the detail actually
+    # echoes is `version`, which is the caller's own.
+    (guardrail.RULE_RECON, "SELECT id, version() FROM orders"),
 )
 
 UNAVAILABLE_SQL = "SELECT id FROM orders"
@@ -452,24 +457,22 @@ class _PostgresLikeExecutor:
         raise execute_sql.ExecutorError(_PG_HINT_ERROR, code=5)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ACE-039 owns sanitizing driver text; until it lands, a driver HINT reaches the caller "
-           "through failure.message. Measured rather than assumed — this flips green when it lands.",
-)
-def test_a_driver_hint_enumerates_the_model_until_ace039_lands(declared):
-    """The known gap, driven rather than described.
+def test_a_driver_hint_never_reaches_the_caller(declared):
+    """The gap this file measured as an `xfail(strict=True)`, now closed.
 
     PostgreSQL routinely appends `HINT: Perhaps you meant to reference the column "…"` to an
     undefined-column error, and that hint names a column of the table — a declared name the caller
-    did not send. It arrives on `failure.message`, which is relayed from the driver verbatim: the
-    guardrail refuses to enumerate, and then the operational channel does it anyway.
+    did not send. It arrived on `failure.message`, relayed from the driver verbatim: the guardrail
+    refused to enumerate, and then the operational channel did it anyway.
 
-    Deliberately NOT fixed here. Classifying and sanitizing driver text across ten engines is the
-    error-hardening slice's whole job, and a partial regex in this slice would look like coverage
-    while missing the engines nobody thought of. So the vector stays, marked `strict` so it cannot
-    rot in either direction: if it starts passing, ACE-039 has landed and this marker must go; if
-    the assertion changes shape, it fails loudly.
+    ACE-039 classifies FROM that text and returns a fixed value-free sentence INSTEAD of it, so the
+    channel closes without the caller losing the ability to tell a missing column from a syntax
+    error. The `strict` marker is gone with the gap — a strict xfail that passes is a CI error, and
+    that is exactly the alarm it was there to raise.
+
+    The executor here raises with `code=5` and no special flag, which is why the discriminator is
+    the exit code rather than something the adapter opts into: an adapter that does nothing unusual
+    is still sanitized.
 
     One route is enough. The fork path relays the same child-classified text for the same exit code,
     so this pins the field, not the transport.
@@ -734,9 +737,15 @@ def test_echoing_the_callers_own_identifier_is_allowed():
 # to the completeness assertion is the point.
 _NO_VECTOR = {
     guardrail.RULE_UNPARSEABLE: (
-        "No producer. Every gate degrades to ALLOW when sqlglot cannot read the statement rather "
-        "than refusing, so nothing constructs this rule yet; turning that fail-open into a refusal "
-        "is the unparseable-statement slice's job, and the refusal it introduces needs a vector here."
+        "One producer, unreachable on every route. `sql_guard.check_no_recon` refuses `unparseable` "
+        "when the neutralizer cannot read the statement (ACE-039) — but at the chokepoint "
+        "`check_read_only` runs the SAME neutralizer first and refuses as `read_only`, so no route "
+        "reaches it and a vector here could not drive it. Its detail is the neutralizer's own static "
+        "prose, carrying no model-derived text. Covered as a standalone call by "
+        "test_ace039_recon.py::test_an_unreadable_statement_is_undetermined_not_recon. The "
+        "sqlglot-level gates still degrade to ALLOW rather than refusing; turning that fail-open "
+        "into a refusal is the unparseable-statement slice's job, and the refusal it introduces "
+        "will be reachable and will need a vector here."
     ),
     guardrail.RULE_MODEL_SAFETY: (
         "Reachable, but its detail is authored as static prose at a single construction site in "
@@ -769,7 +778,7 @@ def test_every_rule_and_every_route_is_covered():
     assert not covered & set(_NO_VECTOR)
     assert all(reason.strip() for reason in _NO_VECTOR.values())
     assert set(ROUTES) == {"in_process", "fork", "stdio", "http"}
-    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 20
+    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 24
     # The `failed` channel is covered by its own matrix rather than this one, because it has no
     # rule. Its vector must not be one of these: a statement that a gate refuses would report on the
     # refusal channel a second time and leave `failure.message` unscanned again, which is exactly

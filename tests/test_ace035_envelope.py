@@ -236,7 +236,11 @@ def test_tool_edge_failed_shape(monkeypatch, _emitted):
     assert set(out) == {"status", "failure", "sql", "execution_ms", "audit_id"}
     assert out["status"] == "failed"
     assert set(out["failure"]) == {"kind", "message"}
-    assert out["failure"]["kind"] == "syntax"
+    # Was `syntax`, which was just the exit-5 prior showing through: nothing read the text, so
+    # every code-5 error got the same label. ACE-039 classifies it, and "no such column" is a
+    # missing column rather than a syntax error — a distinction the caller can act on.
+    assert out["failure"]["kind"] == "column_not_found"
+    assert "no such column" not in out["failure"]["message"]
     assert len(_emitted) == 1
 
 
