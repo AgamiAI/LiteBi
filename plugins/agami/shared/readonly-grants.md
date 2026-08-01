@@ -11,13 +11,13 @@ agami only ever runs **read-only SELECT** queries against your datasource: query
 
 ## What the role does and does not guarantee
 
-The read-only role is the **primary, non-bypassable** guarantee of **integrity and confinement**: SELECT-only means **no write / DDL / `COPY` / file access / server-side network call / cross-database reach** — and that holds even if the app-layer guard were bypassed. It does **not** bound a **runaway** query (a recursive CTE or cartesian join), and it does **not** stop schema/metadata **recon**. Those are the **app layer's** job, not the role's: the executor caps the **result-row count**, and query-resource limits (statement timeout) plus recon/error-text hardening are enforced above the grant, not by it. So don't read "read-only" as "time-bounded" — the role confines *what* a query can touch; bounding *how much* it consumes is handled app-side.
+The read-only role is the **primary, non-bypassable** guarantee of **integrity and confinement**: SELECT-only means **no write / DDL / `COPY` / file access / server-side network call / cross-database reach** — and that holds even if the app-layer guard were bypassed. It does **not** bound a **runaway** query (a recursive CTE or cartesian join), and it does **not** stop schema/metadata **recon**. Those are the **app layer's** job, not the role's — and only partly done today: the executor caps the **result-row count** (`AGAMI_SQL_MAX_ROWS`, default 1000) and a supervisor stops an executor that stops responding, but a **per-statement query timeout and error-text/recon hardening are not in place yet**. So don't read "read-only" as "time-bounded" — the role confines *what* a query can touch, and bounding *how much* it consumes is app-side. Until that bound ships, an operator who needs one should set a `statement_timeout` (or the engine's equivalent) on the role itself.
 
 ## Creating the role
 
 Create the user/role with one of the blocks below, then put **its** credentials where your setup reads them: the `user` / `password` (or `url = …`) in `<artifacts_dir>/local/credentials` for the single-player flow, or `DATASOURCE_URL` in `agami.env` for a deploy.
 
-Replace the `<…>` placeholders — `<password>`, `<db>`, `<schema>`, `<warehouse>`, `<catalog>`, `<project>`, `<dataset>`, and the `agami_ro` user/role name — with your values (each block uses only some of them). For **multiple schemas**, repeat the `USAGE` + `SELECT` grants once per schema.
+Replace the `<…>` placeholders — `<password>`, `<db>`, `<schema>`, `<owner>`, `<warehouse>`, `<catalog>`, `<project>`, `<dataset>`, and the `agami_ro` user/role name — with your values (each block uses only some of them). For **multiple schemas**, repeat the `USAGE` + `SELECT` grants once per schema.
 
 ## PostgreSQL / Redshift
 
@@ -26,8 +26,10 @@ CREATE USER agami_ro WITH PASSWORD '<password>';
 GRANT CONNECT ON DATABASE <db> TO agami_ro;
 GRANT USAGE ON SCHEMA <schema> TO agami_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO agami_ro;
--- keep future tables readable too (run once per schema):
-ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT SELECT ON TABLES TO agami_ro;
+-- keep future tables readable too (run once per schema). `FOR ROLE` names whoever CREATES the
+-- tables — your owner / ETL / migration role; without it the default only covers tables created
+-- by the role running this statement, so tables your ETL adds later stay invisible to agami_ro:
+ALTER DEFAULT PRIVILEGES FOR ROLE <owner> IN SCHEMA <schema> GRANT SELECT ON TABLES TO agami_ro;
 ```
 
 (Redshift uses the same statements. `<schema>` defaults to `public` if you didn't set one.)
