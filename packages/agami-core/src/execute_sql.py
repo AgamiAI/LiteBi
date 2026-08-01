@@ -106,6 +106,18 @@ ALLOWED_PERMS = (0o600, 0o400)
 
 _LOG = logging.getLogger(__name__)
 
+# A logger of its OWN for raw driver text, and the reason is a leak rather than tidiness (ACE-039).
+# This module never calls `basicConfig`, so in a forked child a record on `_LOG` falls through to
+# `logging.lastResort` and is written to STDERR — and `tools._child_failure_message` relays the
+# child's whole stderr into `failure.message` for any classified exit code. Logging the raw text on
+# `_LOG` would therefore hand it straight back to the caller on the DEFAULT surface, undoing the
+# sanitization in the same breath. (The catch-all beneath the classifier escapes this only because
+# its `exc_info=True` trips the traceback guard, at the cost of degrading its message.)
+#
+# `main` silences this logger at CLI entry, so the forked child emits nothing here and the column
+# stays NULL. In-process and hosted, it propagates to the server's root logger as intended.
+_RAW_LOG = logging.getLogger(__name__ + ".raw")
+
 # What a caller is told when something we did not anticipate broke. Deliberately generic and
 # value-free: the raw text of an unanticipated exception is the one string in this module nobody has
 # read, so it may carry a traceback, an absolute path, a DSN or a row value. It goes to the server
@@ -1241,6 +1253,17 @@ _DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation
 # exactly as the old module global did.
 _max_rows_override: ContextVar[int | None] = ContextVar("_max_rows_override", default=None)
 
+# The raw driver text of the failure this call classified, for the audit row only (ACE-039). A
+# ContextVar for the same reason as the cap above: request-scoped, so concurrent in-process handlers
+# cannot read each other's. `execute_guarded` CLEARS it on entry, which is the load-bearing half —
+# without that, a call that succeeds after one that failed would attribute the earlier call's error
+# to itself, and the audit row would name a statement that never produced it.
+#
+# It carries the text out-of-band rather than on the Envelope on purpose: `Failure` is `{kind,
+# message}` and stays that way, because a raw field on the contract is a raw field somebody
+# eventually serializes.
+_last_error_detail: ContextVar[str | None] = ContextVar("_last_error_detail", default=None)
+
 
 def _resolve_row_cap() -> int:
     """Effective result-row cap. `AGAMI_SQL_MAX_ROWS` is the operator-configurable DEPLOYMENT cap
@@ -2019,6 +2042,10 @@ def execute_guarded(
     ``failed``/``dsn`` Envelope carrying its detailed message rather than escaping as an exception
     the two callers would each have to translate. The row cap rides the request-scoped
     ``_max_rows_override`` ContextVar the caller sets."""
+    # Clear before anything can set it, so a detail from a PREVIOUS call in this context can never
+    # be attributed to this one. The recorder reads it unconditionally; a stale value would put the
+    # wrong error text on a row that succeeded.
+    _last_error_detail.set(None)
     try:
         import sql_guard
 
@@ -2085,6 +2112,11 @@ def execute_guarded(
         # per-engine sites. That text is an enumeration channel: a PostgreSQL HINT names declared
         # columns the caller never sent. Classify FROM it, return a fixed sentence INSTEAD of it.
         kind = _classify_db_error(exc.msg, exc.code)
+        # Keep the raw text for the operator, on two channels that reach two different places. The
+        # ContextVar is read by `tools._record_execution` when the recorder shares this process, and
+        # `_RAW_LOG` is the server-side trail everywhere else. Neither is the caller's channel.
+        _last_error_detail.set(exc.msg)
+        _RAW_LOG.error("database error (audit detail): %s", exc.msg)
         return _envelope("failed", failure=Failure(
             kind=kind, message=_ERROR_MESSAGES.get(kind, UNEXPECTED_FAILURE_MESSAGE),
         ))
@@ -2131,6 +2163,15 @@ def main() -> int:
     # the one-shot subprocess/CLI entry (one process, one thread), so there's no sibling request to
     # isolate from — unlike the in-process server path, which resets the token in tools._run_in_process.
     _max_rows_override.set(args.max_rows)
+
+    # Silence the raw-detail logger for the whole CLI/child lifetime. Without this it falls through
+    # to `logging.lastResort`, which writes to stderr — and the parent relays the child's stderr into
+    # `failure.message`, so the raw driver text this module just took OUT of the caller's answer
+    # would arrive back in it (ACE-039). The child therefore records no detail at all and the audit
+    # column stays NULL, which is exactly what NULL means on that column: the chokepoint and the
+    # recorder were not in one process.
+    _RAW_LOG.addHandler(logging.NullHandler())
+    _RAW_LOG.propagate = False
 
     if args.sql_file:
         sql = Path(os.path.expanduser(args.sql_file)).read_text()

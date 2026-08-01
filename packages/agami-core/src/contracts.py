@@ -220,6 +220,12 @@ class QueryExecutionRecord(_Contract):
     reason: str | None = None  # guardrail.RefusalReason — refusals only
     rule: str | None = None  # guardrail.RULE_* — refusals only
     sql_truncated: bool = False  # `sql` was cut to the audit bound
+    # The RAW driver error, operator-only — never the caller's `failure.message`, which is the
+    # classified value-free sentence. NULL is a claim rather than a gap: it means the chokepoint
+    # holding the raw text and this recorder were not in one process, which on the forked stdio
+    # surface is by design (the child sanitizes, the parent records, and the raw text never
+    # crosses). Bounded by the writer — `tools.AUDIT_ERROR_DETAIL_MAX_CHARS`.
+    error_detail: str | None = None
     org_id: str = "local"  # the tenant this ran for; defaults to the single-tenant org
 
 

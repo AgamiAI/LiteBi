@@ -1246,6 +1246,12 @@ def _emit(
 # generated SELECT is a few KB), and the verdict columns, not the blob, are what make the row useful.
 AUDIT_SQL_MAX_CHARS = 8_000
 
+# The raw driver error is unbounded in a way the statement is not: a PostgreSQL failure can carry a
+# HINT, a CONTEXT chain and every bound parameter. 015's argument applies verbatim — a failed
+# statement must not become a way to grow the store — and this is the operator's diagnostic, so a
+# couple of thousand characters is the whole of what is worth keeping.
+AUDIT_ERROR_DETAIL_MAX_CHARS = 2_000
+
 
 def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     """The statement as it will be stored, plus whether it had to be cut.
@@ -1283,9 +1289,20 @@ def _record_execution(
     """
     refusal = env.refusal
     stored_sql, sql_truncated = _bounded_audit_sql(sql or "")
+    # The RAW driver text, for the operator only — the caller's `failure.message` is the classified
+    # value-free sentence and stays that way. Present only when the chokepoint ran in THIS process:
+    # across the fork the child sanitizes and the parent records, so the raw text never crosses and
+    # this is None. `execute_guarded` clears the var on entry, so a stale detail cannot attach to a
+    # later call.
+    from execute_sql import _last_error_detail
+
+    raw_detail = _last_error_detail.get()
     _record_query(
         {
             "id": env.audit_id,
+            "error_detail": (
+                raw_detail[:AUDIT_ERROR_DETAIL_MAX_CHARS] if raw_detail else None
+            ),
             "ts": _now_iso(),
             "profile": profile or "",
             "question": (args or {}).get("raw_query"),
@@ -1351,6 +1368,15 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     a caller sees the same shape — and, for a refusal, the same rule and the same remediation —
     whichever path ran.
     """
+    # Clear the raw-detail carrier for THIS call, at the one point both paths pass through.
+    # `execute_guarded` also clears it on entry, but that only covers the in-process path — on the
+    # fork the parent never calls it, so without this a forked call would record the driver text
+    # left behind by an earlier IN-PROCESS failure in the same server process. Two paths, one
+    # ContextVar, so the reset belongs where the call begins rather than where one of them does.
+    from execute_sql import _last_error_detail
+
+    _last_error_detail.set(None)
+
     sql = args.get("sql")
     if not isinstance(sql, str) or not sql.strip():
         # An argument the caller got wrong, before any gate or database is involved: not a refusal
