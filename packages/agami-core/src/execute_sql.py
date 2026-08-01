@@ -1776,9 +1776,18 @@ def _execute_bounded(
             outcome["error"] = exc
         finally:
             # `finished` and the slot release are set under the same lock the abandonment takes, so
-            # the two cannot both claim this call: a worker that finishes in the sliver between the
-            # join timing out and the lock being taken is counted as having returned, and its result
-            # is used rather than a refusal invented over the top of it.
+            # the SLOT ACCOUNTING cannot double-count: a worker that finishes in the sliver between
+            # the join timing out and the lock being taken decrements the slot the caller just took.
+            #
+            # The OUTCOME is not decided that cleanly, and the difference is a known defect — see
+            # issue #177. Whichever thread reaches this lock first decides: if the caller wins it
+            # reads `finished` unset and raises, so a call whose work had in fact completed is
+            # refused. It fails closed, and the built-in path is shielded by the per-statement
+            # watchdog firing a full skew earlier, so it is reachable only through an injected
+            # executor returning in that same instant. The repair is to signal the end of the WORK
+            # separately from this accounting, so the flag the caller reads cannot be delayed by
+            # lock contention. Do not "fix" it with `worker.is_alive()`: a worker parked here in
+            # its `finally` is still alive, and reads as abandoned in exactly the losing ordering.
             with _abandoned_lock:
                 if outcome.get("abandoned"):
                     _abandoned_workers -= 1
