@@ -50,6 +50,24 @@ _DRIVER_ERRORS = [
     ("could not translate host name \"warehouse.internal\" to address", 4, "dsn"),
     ("connection refused", 4, "network"),
     ("password authentication failed for user \"analytics\"", 4, "auth"),
+    # One vector per remaining supported engine. Without these the not-found needles covered
+    # PG / MySQL / SQLite / Snowflake only, and SQL Server, Trino, Databricks and BigQuery fell
+    # to the exit-5 prior and were labelled `syntax` — which tells the caller to re-run the
+    # identical failing statement instead of to re-introspect a drifted model.
+    ("Invalid column name 'ssn'.", 5, "column_not_found"),                      # SQL Server 207
+    ("Invalid object name 'dbo.payroll'.", 5, "table_not_found"),               # SQL Server 208
+    ("line 1:8: Column 'ssn' cannot be resolved", 5, "column_not_found"),       # Trino
+    ("[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column with name `ssn` cannot be resolved.",
+     5, "column_not_found"),                                                   # Databricks
+    ("400 Unrecognized name: ssn at [1:8]", 5, "column_not_found"),             # BigQuery
+    # Authorization, which must not read as a credentials problem: the operator action is a
+    # GRANT, and the skill stops on `auth` but auto-retries twice on `syntax`.
+    ("Access Denied: Table p: User does not have bigquery.tables.get permission",
+     5, "permission"),                                                         # BigQuery
+    ("Access Denied: Cannot select from table payroll", 5, "permission"),       # Trino
+    ("The SELECT permission was denied on the object 'payroll'", 5, "permission"),  # SQL Server
+    ("ORA-01031: insufficient privileges", 5, "permission"),                    # Oracle
+    ("Access denied for user 'app'@'%' to database 'payroll'", 5, "permission"),  # MySQL 1044
 ]
 
 # Ceded to ACE-038: a deadline is classified from a watchdog signal, never a driver string.

@@ -1037,15 +1037,32 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
         which is a field the caller is shown.
 
     What is deliberately still relayed is the child's *authored* config-error text ("No warehouse
-    credentials for profile […]. Set DATASOURCE_URL…", "Postgres connect failed: …"). That is the
-    remediation a misconfigured user needs, and it is the same text the in-process path surfaces
-    from `ExecutorError.msg` — the two paths agreeing on it is a property this slice exists to keep.
-    Sanitizing *driver* text is a separate job and belongs to the error-hardening slice; see the
-    coverage note in `tests/test_ace035_no_enumeration.py`.
+    credentials for profile […]. Set DATASOURCE_URL…"). That is the remediation a misconfigured user
+    needs, and it is the same text the in-process path surfaces from `ExecutorError.msg` — the two
+    paths agreeing on it is a property this slice exists to keep.
+
+    **The sanitized band is RECONSTRUCTED, never relayed (ACE-039).** For every code whose message
+    the child derives from `_ERROR_MESSAGES`, the parent can rebuild that exact sentence from the
+    exit code alone, so relaying stderr for those codes buys nothing and carries real risk: stderr
+    is a *shared* stream, and the child writes to it before the failure line. `_model_safety`'s
+    `[agami] applied default_filters: …` notice is the concrete case — it put a declared row-level
+    predicate, which the caller never sent, into `failure.message` on the DEFAULT transport, while
+    the in-process path returned the clean sentence. Anything else a library logs to stderr had the
+    same reach; the traceback guard below only ever caught the two `exc_info=True` sites.
     """
-    from execute_sql import EXIT_TO_FAILURE_KIND, UNEXPECTED_FAILURE_MESSAGE
+    from execute_sql import (
+        _AUTHORED_EXIT_CODES,
+        _ERROR_MESSAGES,
+        EXIT_TO_FAILURE_KIND,
+        UNEXPECTED_FAILURE_MESSAGE,
+    )
 
     text = (stderr or "").strip()
+    # Rebuild rather than relay. The child produced this sentence from the kind, so the kind is all
+    # the parent needs, and the child's stream never touches the caller's answer.
+    kind = EXIT_TO_FAILURE_KIND.get(returncode)
+    if returncode not in _AUTHORED_EXIT_CODES and kind in _ERROR_MESSAGES:
+        return _ERROR_MESSAGES[kind]
     classified = returncode in EXIT_TO_FAILURE_KIND
     # `Traceback (most recent call last):` is the stable header of every Python traceback, and a
     # `  File "…", line N` frame is the line that carries the absolute path. Either one is enough.

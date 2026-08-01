@@ -58,6 +58,11 @@ RECON_DENY = [
     "SELECT 'x'::regproc",
     "SELECT 'x'::regnamespace",
     "SELECT CAST('secret_table' AS regclass)",
+    # SCHEMA-QUALIFIED, the spelling an arm anchored straight after `::` never sees. Valid
+    # PostgreSQL, same oracle, and it names no relation for the model gate to bite on.
+    "SELECT 'secret_table'::pg_catalog.regclass",
+    "SELECT CAST('secret_table' AS pg_catalog.regproc)",
+    'SELECT \'x\'::"pg_catalog"."regclass"',
     # A quoted CALL is still a call — quoting suppresses the niladic matcher, never a call
     # matcher. Without the paren/niladic union this one slips both.
     'SELECT "current_schema"()',
@@ -137,6 +142,31 @@ def test_a_name_on_both_lists_refuses_as_read_only(sql: str) -> None:
 def test_no_false_positives(sql: str) -> None:
     assert check_read_only(sql) is None, f"read-only gate over-refused: {sql!r}"
     assert check_no_recon(sql) is None, f"recon gate over-refused: {sql!r}"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'SELECT "current_user',                      # runs to EOF
+        'SELECT "a\\"b" , current_user FROM t',       # MySQL re-opens a runaway identifier
+        'SELECT o.id FROM orders o WHERE o.n = "x current_user',
+    ],
+    ids=["eof", "mysql_backslash", "tail"],
+)
+def test_an_unterminated_quote_does_not_suppress_the_keyword(sql: str) -> None:
+    """The under-refusal direction, which is the only one that matters here.
+
+    An unterminated `"` swallows the rest of the statement into the identifier buffer. If that
+    produced a span, the niladic matcher would treat every keyword inside it as quoted and skip
+    it. Reachable rather than theoretical: MySQL's default sql_mode treats `"` as a STRING
+    delimiter with backslash escapes, so the second vector is a statement MySQL runs and answers
+    with CURRENT_USER() while the neutralizer reads a runaway identifier.
+
+    No closing delimiter means no span, so nothing is skipped and the gate refuses.
+    """
+    refusal = check_no_recon(sql)
+    assert refusal is not None, f"an unterminated quote suppressed the keyword: {sql!r}"
+    assert refusal.rule == guardrail.RULE_RECON
 
 
 def test_a_quoted_bare_word_is_an_identifier_but_a_quoted_call_is_a_call() -> None:

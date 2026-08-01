@@ -304,12 +304,20 @@ def _classify_db_error(text: str, code: int) -> FailureKind:
 
     if code == 3 or has("no module named", "modulenotfounderror", "command not found"):
         return "driver_missing"
+    # Ten engines spell an authorization failure ten ways, and getting this wrong is not cosmetic:
+    # a `permission` failure tells the operator to GRANT, while `auth` tells them to re-credential
+    # and `syntax` makes the skill auto-retry the identical statement twice.
     if has(
         "permission denied",
         "insufficient_privileges",
+        "insufficient privileges",  # Oracle ORA-01031, a space rather than an underscore
         "command denied",
         "insufficient_access_or_readonly",
-    ):
+        "permission was denied",  # SQL Server
+        "access denied for user",  # MySQL 1044/1045 — narrower than the bare needle in `auth`
+    ) or ("access denied" in lowered and has("table", "dataset", "cannot select")):
+        # BigQuery and Trino both open with "Access Denied:", which the `auth` arm's bare
+        # "access denied" would otherwise swallow into a credentials problem.
         return "permission"
     if has(
         "canceling statement",
@@ -329,9 +337,13 @@ def _classify_db_error(text: str, code: int) -> FailureKind:
         "undefinedcolumn",
         "invalid identifier",
         "invalid_field",
+        "invalid column name",  # SQL Server 207
+        "cannot be resolved",  # Trino, Databricks (UNRESOLVED_COLUMN)
+        "unrecognized name",  # BigQuery
+        "unresolved_column",
     ) or ("column" in lowered and has("does not exist", "not found")):
         return "column_not_found"
-    if has("no such table", "undefinedtable") or (
+    if has("no such table", "undefinedtable", "invalid object name") or (
         has("relation", "table", "object") and has("does not exist", "doesn't exist", "not found")
     ):
         return "table_not_found"
@@ -352,7 +364,10 @@ def _classify_db_error(text: str, code: int) -> FailureKind:
         "password authentication failed",
         "no pg_hba",
         "incorrect username or password",
-        "access denied",
+        # NOT a bare "access denied": BigQuery, Trino, SQL Server and MySQL 1044 all use that
+        # wording for an AUTHORIZATION failure on an object, which the arm above now claims.
+        "authentication failed",
+        "login failed",
     ):
         return "auth"
     return EXIT_TO_FAILURE_KIND.get(code, "other")

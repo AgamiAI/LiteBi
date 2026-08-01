@@ -174,20 +174,40 @@ def test_parent_rejects_a_malformed_refusal() -> None:
 
 
 def test_the_childs_own_config_diagnostic_is_relayed() -> None:
-    """A classified exit carries text the child authored and the caller needs.
+    """An AUTHORED exit carries text the child wrote and the caller needs.
 
-    Exit 2/3/4/5 are the codes `execute_sql.main` reaches by writing `env.failure.message`, so the
-    text is something the child classified and chose — a missing driver, a connect failure, or the
-    credential remediation naming the env var to set. Relaying it is also what keeps the two
-    execution paths saying the same thing: the in-process path surfaces the same string from
-    `ExecutorError.msg` (pinned in tests/test_ah012_executor_seam.py).
+    Exit 2 and 3 are the codes whose message this module composed — a missing driver, or the
+    credential remediation naming the env var to set. They contain nothing the database said, so
+    relaying them is what keeps the two execution paths saying the same thing: the in-process path
+    surfaces the same string from `ExecutorError.msg` (pinned in tests/test_ah012_executor_seam.py).
+
+    Codes 4 and 5 USED to be asserted here too, on the reading that they were equally the child's
+    own. ACE-039 separated them: those carry the driver's exception, so the child replaces them with
+    a fixed sentence and the parent rebuilds that sentence from the exit code rather than relaying
+    the stream. That case now lives in `test_the_sanitized_band_is_rebuilt_not_relayed` below.
     """
     detailed = ("No warehouse credentials for profile [acme]. Set DATASOURCE_URL "
                 "(or DATASOURCE_URL__ACME) in the environment.")
     assert tools._child_failure_message(2, detailed) == detailed
-    assert tools._child_failure_message(4, "Postgres connect failed: refused") == (
-        "Postgres connect failed: refused"
-    )
+    driver_missing = "pymysql not installed. Run: pip install pymysql"
+    assert tools._child_failure_message(3, driver_missing) == driver_missing
+
+
+@pytest.mark.parametrize("code", [4, 5, 7, 8, 9, 10])
+def test_the_sanitized_band_is_rebuilt_not_relayed(code: int) -> None:
+    """For a driver-originated failure the parent reconstructs; it never reads the child's stream.
+
+    The child's stderr is SHARED — the model-safety pass writes its own notices there before the
+    failure line — so relaying it handed the caller text it never sent. Since the child derives its
+    message from the kind, the exit code alone is enough to rebuild the identical sentence, which
+    makes the stream irrelevant to the answer rather than merely filtered.
+    """
+    import execute_sql
+
+    kind = execute_sql.EXIT_TO_FAILURE_KIND[code]
+    noisy = f"[agami] applied default_filters: [\"t.tenant = 'X'\"]\n{execute_sql._ERROR_MESSAGES[kind]}"
+    assert tools._child_failure_message(code, noisy) == execute_sql._ERROR_MESSAGES[kind]
+    assert "tenant" not in tools._child_failure_message(code, noisy)
 
 
 @pytest.mark.parametrize(

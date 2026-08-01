@@ -270,3 +270,57 @@ def test_migrations_are_re_runnable(tmp_path):
     finally:
         conn.close()
     assert cols.count("error_detail") == 1
+
+
+def test_the_fork_does_not_relay_the_models_own_notices_to_the_caller(tmp_path, monkeypatch):
+    """The child's stderr is a SHARED stream, so relaying it leaked declared model surface.
+
+    `_model_safety` writes `[agami] applied default_filters: …` to stderr before execution, and
+    `main` appends the sanitized failure line after it. `_child_failure_message` relayed the
+    whole stream, so the caller received a row-level tenancy predicate it never sent — on the
+    DEFAULT transport, while the in-process path returned the clean sentence. The fork/in-process
+    parity this slice exists to establish was false exactly where it mattered.
+
+    The parent now RECONSTRUCTS the message from the exit code for the sanitized band. The child
+    derived that sentence from the kind, so the kind is all the parent needs, and nothing the
+    child writes to stderr can reach the answer.
+    """
+    import yaml
+    from store import Store
+
+    app_db = tmp_path / "app.db"
+    store = Store.connect(f"sqlite:///{app_db}")
+    store.run_migrations()
+    store.close()
+
+    artifacts = tmp_path / "artifacts"
+    _write_model(artifacts / PROFILE)
+    # A declared row filter, which is business logic the caller never sends and must never see.
+    table = artifacts / PROFILE / "subject_areas" / "sales" / "tables" / "orders.yaml"
+    model = yaml.safe_load(table.read_text())
+    model["default_filters"] = ["orders.tenant_id = 'ACME-INTERNAL-7742'"]
+    table.write_text(yaml.safe_dump(model))
+
+    warehouse = tmp_path / "warehouse.db"
+    conn = sqlite3.connect(warehouse)
+    conn.execute("CREATE TABLE orders (id INTEGER, tenant_id TEXT)")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("AGAMI_DB_URL", f"sqlite:///{app_db}")
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
+    monkeypatch.setenv(f"DATASOURCE_URL__{PROFILE.upper()}", f"sqlite:///{warehouse}")
+
+    body = json.loads(
+        tools.tool_execute_sql({"sql": "SELECT amount FROM orders", "datasource": PROFILE})
+    )
+
+    assert body["status"] == "failed"
+    message = body["failure"]["message"]
+    assert "ACME-INTERNAL-7742" not in message, "the model's row filter reached the caller"
+    assert "tenant_id" not in message
+    assert "default_filters" not in message
+    assert "[agami]" not in message
+    # And it is exactly the sentence the in-process path would have returned.
+    assert message == execute_sql._ERROR_MESSAGES[body["failure"]["kind"]]

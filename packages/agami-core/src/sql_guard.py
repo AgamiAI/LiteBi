@@ -209,6 +209,7 @@ def _neutralize(sql: str) -> _Neutralized:
             i = j
         elif sql[i] == '"':  # double-quoted identifier — keep content, drop quotes
             j, buf = i + 1, []
+            closed = False
             while j < n:
                 if sql[j] == '"':
                     if j + 1 < n and sql[j + 1] == '"':  # doubled "" escape
@@ -216,6 +217,7 @@ def _neutralize(sql: str) -> _Neutralized:
                         j += 2
                         continue
                     j += 1
+                    closed = True
                     break
                 buf.append(sql[j])
                 j += 1
@@ -244,7 +246,15 @@ def _neutralize(sql: str) -> _Neutralized:
             # `quoted` names the identifier and never the boundary this branch re-supplied.
             start = width
             emit("".join(buf))
-            spans.append((start, width))
+            # Record a span ONLY for an identifier whose closing delimiter we actually consumed.
+            # An unterminated `"` swallows the rest of the statement into `buf`, and a span over
+            # that tail would tell the niladic matcher to skip every keyword inside it — an
+            # UNDER-refusal, the one direction this design must never fail in. It is reachable:
+            # MySQL's default sql_mode treats `"` as a string delimiter with backslash escapes, so
+            # `SELECT "a\"b" , current_user FROM t` re-opens a runaway identifier here while MySQL
+            # executes it and returns CURRENT_USER(). No span means no skip, so the gate refuses.
+            if closed:
+                spans.append((start, width))
             nxt = sql[j] if j < n else ""
             if nxt.isalnum() or nxt == "_":
                 emit(" ")
@@ -583,9 +593,14 @@ _RECON_NILADIC_RE = re.compile(
 # Both cast spellings. `::reg*` anchors on the type name because `_neutralize` blanks the literal
 # before it, so `'x'::regclass` arrives as ` ::regclass`. The `CAST(x AS reg*)` arm requires the
 # closing paren so a column aliased `AS regclass` is not caught.
+# The optional `\w+\s*\.\s*` is a SCHEMA QUALIFIER, and it is load-bearing:
+# `'secret_table'::pg_catalog.regclass` is the same object-existence oracle in the spelling a
+# deny-list that anchors straight after `::` never sees. `_neutralize` has already unwrapped quotes
+# by this point, so `"pg_catalog"."regclass"` arrives here as `pg_catalog.regclass` and is covered
+# by the same branch. The call matcher tolerated qualification already; this arm did not.
 _RECON_CAST_RE = re.compile(
-    r"::\s*(" + _recon_group(_RECON_REGTYPES) + r")\b"
-    r"|\bAS\s+(" + _recon_group(_RECON_REGTYPES) + r")\s*\)",
+    r"::\s*(?:\w+\s*\.\s*)?(" + _recon_group(_RECON_REGTYPES) + r")\b"
+    r"|\bAS\s+(?:\w+\s*\.\s*)?(" + _recon_group(_RECON_REGTYPES) + r")\s*\)",
     re.IGNORECASE,
 )
 

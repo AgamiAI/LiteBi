@@ -67,17 +67,22 @@ def test_the_tool_edge_reads_the_new_codes_back(code: int, kind: str) -> None:
 
 
 @pytest.mark.parametrize("code", [7, 8, 9, 10])
-def test_a_child_exiting_a_new_code_has_its_text_relayed(code: int) -> None:
+def test_a_child_exiting_a_new_code_gets_its_message_rebuilt(code: int) -> None:
     """The second half of the bug, and the easier half to miss.
 
-    `_child_failure_message` relays the child's already-sanitized line only for a code in
-    the table. Before this slice the four new codes were not in it, so the parent discarded
-    the message and substituted the generic unexpected-failure text — losing the kind AND
-    the message in one step.
+    Before this slice the four new codes were absent from the table, so the parent could
+    neither name the kind nor keep the message: `_child_failure_message` substituted the
+    generic unexpected-failure text for any unmapped code. One missing entry lost both.
+
+    The parent REBUILDS the sentence from the code rather than relaying the child's stream.
+    Security review found the stream is shared — the model-safety pass writes notices to it
+    before the failure line — so relaying it leaked declared model surface. Rebuilding yields
+    the identical text and makes the stream irrelevant to the answer rather than filtered.
     """
-    relayed = tools._child_failure_message(code, "the child's sanitized line")
-    assert relayed == "the child's sanitized line"
-    assert relayed != execute_sql.UNEXPECTED_FAILURE_MESSAGE
+    kind = execute_sql.EXIT_TO_FAILURE_KIND[code]
+    rebuilt = tools._child_failure_message(code, "anything at all on the child's stderr")
+    assert rebuilt == execute_sql._ERROR_MESSAGES[kind]
+    assert rebuilt != execute_sql.UNEXPECTED_FAILURE_MESSAGE
 
 
 def test_an_unmapped_code_is_still_other_not_dsn() -> None:
