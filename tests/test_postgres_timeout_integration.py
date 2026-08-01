@@ -147,13 +147,16 @@ def test_the_dsn_escapes_every_reserved_character_in_userinfo_and_path():
     ends the path early, either way producing a URL that parses cleanly and connects elsewhere. This
     one needs no database, so it runs in ordinary CI alongside the opt-in tests below.
     """
+    # The values spell out the characters under test rather than looking like credentials, so a
+    # secret scanner has nothing to flag and a reader can see what each one is for.
+    reserved = "slash/colon:at@"
     dsn = _dsn(
-        {"user": "a/b", "password": "p@ss/w:rd", "host": "127.0.0.1", "port": "5432", "database": "d/b"}
+        {"user": "a/b", "password": reserved, "host": "127.0.0.1", "port": "5432", "database": "d/b"}
     )
     parsed = urllib.parse.urlparse(dsn)
 
     assert urllib.parse.unquote(parsed.username or "") == "a/b"
-    assert urllib.parse.unquote(parsed.password or "") == "p@ss/w:rd"
+    assert urllib.parse.unquote(parsed.password or "") == reserved
     assert urllib.parse.unquote(parsed.path.lstrip("/")) == "d/b"
     assert parsed.hostname == "127.0.0.1"
     assert parsed.port == 5432
