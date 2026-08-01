@@ -341,6 +341,32 @@ def test_a_watchdog_that_loses_the_race_to_the_disarm_lands_nowhere(monkeypatch)
     assert not fired.is_set(), "the flag every engine re-reads after the block was not final"
 
 
+def test_a_watchdog_that_fires_while_the_timer_is_being_disarmed_lands_nowhere(monkeypatch):
+    """The narrowest interleaving of the same race: `fire` lands DURING the disarm itself.
+
+    `Timer.cancel()` is not a join, so the disarm has two steps that are not one atomic act: stand the
+    timer down, and claim the race under the lock. Do them in that order and the gap between them is
+    a window in which an already-expired `fire` takes the lock first, sets the flag, and marks a
+    statement that in fact completed. Claiming the race first closes it. This timer fires its
+    callback from inside `cancel()`, which puts a `fire` in exactly that gap on every run.
+    """
+    cancel = _RecordingCancel()
+
+    class _FiresWhileBeingCancelled(_ManualTimer):
+        def cancel(self) -> None:
+            self.function()
+
+    monkeypatch.setattr(
+        execute_sql.threading, "Timer", lambda interval, function: _FiresWhileBeingCancelled(interval, function)
+    )
+
+    with execute_sql._deadline(cancel, _TINY) as fired:
+        pass
+
+    assert cancel.calls == 0, "a cancel landed in the gap between standing the timer down and disarming"
+    assert not fired.is_set(), "a statement that completed was flagged by a watchdog firing mid-disarm"
+
+
 def test_the_disarm_waits_for_a_cancel_already_in_flight():
     """The other half of the same guarantee: a `fire` that WON the race is finished with before the
     block is allowed to return.

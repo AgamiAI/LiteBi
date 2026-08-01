@@ -127,11 +127,36 @@ def _reset_overrides():
 
 
 def _dsn(creds: dict[str, str]) -> str:
-    quote = urllib.parse.quote
+    # `safe=""` because every reserved character has to be escaped inside userinfo and the path.
+    # `quote`'s default leaves `/` alone, which would end the userinfo or the database name early and
+    # build a DSN that silently points somewhere else.
+    def quote(value: str) -> str:
+        return urllib.parse.quote(value, safe="")
+
     return (
         f"postgresql://{quote(creds['user'])}:{quote(creds['password'])}"
         f"@{creds['host']}:{creds['port']}/{quote(creds['database'])}"
     )
+
+
+def test_the_dsn_escapes_every_reserved_character_in_userinfo_and_path():
+    """A `/` in a password must not silently truncate the DSN and point the test somewhere else.
+
+    `urllib.parse.quote` leaves `/` alone by default, which is right for a path and wrong for every
+    component this builds: a `/` in the password ends the userinfo early and one in the database name
+    ends the path early, either way producing a URL that parses cleanly and connects elsewhere. This
+    one needs no database, so it runs in ordinary CI alongside the opt-in tests below.
+    """
+    dsn = _dsn(
+        {"user": "a/b", "password": "p@ss/w:rd", "host": "127.0.0.1", "port": "5432", "database": "d/b"}
+    )
+    parsed = urllib.parse.urlparse(dsn)
+
+    assert urllib.parse.unquote(parsed.username or "") == "a/b"
+    assert urllib.parse.unquote(parsed.password or "") == "p@ss/w:rd"
+    assert urllib.parse.unquote(parsed.path.lstrip("/")) == "d/b"
+    assert parsed.hostname == "127.0.0.1"
+    assert parsed.port == 5432
 
 
 def _our_backends(conn, creds: dict[str, str]) -> list[tuple]:

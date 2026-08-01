@@ -1299,9 +1299,14 @@ def _deadline(cancel: Callable[[], None], timeout_s: float) -> Iterator[threadin
     try:
         yield fired
     finally:
-        timer.cancel()  # a block that finished on time disarms the watchdog before it can fire
+        # Claim the race under the lock FIRST, then ask the timer to stand down. `Timer.cancel()` is
+        # not a join, so doing it the other way round leaves a window between this block returning
+        # and the flag being set, in which a `fire` that has already expired can still take the lock
+        # and mark a statement that actually completed. Taking the lock first closes that window: a
+        # `fire` already holding the lock is waited for, and every other `fire` observes `disarmed`.
         with lock:
             disarmed = True
+        timer.cancel()  # belt and braces, for a timer that has not started running yet
 
 
 def _flag_truncated(cap: int) -> None:
