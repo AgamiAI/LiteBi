@@ -12,6 +12,16 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Docs
+
+- **Read-only datasource role is now a stated deploy obligation, not a suggestion (ACE-036).** The
+  self-host guide and `readonly-grants.md` now frame the SELECT-only role as the **required**
+  `DATASOURCE_URL` posture for a deploy (single-player stays *recommended*), spell out the app-role vs
+  operator/owner-role split, and clarify that the role guarantees integrity/confinement but **not**
+  availability/recon — bounding runaway work and recon is app-side, and the docs now state which of
+  those bounds exist today (the result-row cap) and which do not yet (a per-statement query timeout,
+  error-text/recon hardening). Docs only — no behaviour or config change.
+
 ## [0.5.3] — 2026-07-31
 
 ### Added
