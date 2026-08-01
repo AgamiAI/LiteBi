@@ -165,21 +165,23 @@ def test_every_rule_this_slice_can_emit_has_a_pinned_reason():
     """`refuse()` raises KeyError on an unpinned rule, so `REASON_FOR_RULE` is the list a new gate
     must extend. Everything emittable today is pinned."""
     assert _declared_rules() - set(REASON_FOR_RULE) == {
-        guardrail.RULE_RECON,
         guardrail.RULE_ENGINE_MISMATCH,
         guardrail.RULE_UNSCOPABLE,
     }
 
 
-@pytest.mark.parametrize("rule", ["recon", "engine_mismatch", "unscopable"])
+@pytest.mark.parametrize("rule", ["engine_mismatch", "unscopable"])
 def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
-    """`recon`, `engine_mismatch` and `unscopable` are named by the contract but produced by later
-    slices. For the first two the reason is genuinely those slices' call — `recon` could be `unsafe`
-    or `out_of_scope` depending on how it is framed. `unscopable` is a different case: the contract
-    already says `undetermined`, so leaving it out of `REASON_FOR_RULE` is not deferring a decision,
-    it is making the owning gate write the one line the contract dictates in a diff a reviewer sees,
-    alongside the gate that first emits it. Either way `refuse()` fails loudly rather than letting a
-    slice pick a reason without pinning it here."""
+    """`engine_mismatch` and `unscopable` are named by the contract but produced by later slices.
+    For the first the reason is genuinely that slice's call. `unscopable` is a different case: the
+    contract already says `undetermined`, so leaving it out of `REASON_FOR_RULE` is not deferring a
+    decision, it is making the owning gate write the one line the contract dictates in a diff a
+    reviewer sees, alongside the gate that first emits it. Either way `refuse()` fails loudly rather
+    than letting a slice pick a reason without pinning it here.
+
+    `recon` LEFT this list in ACE-039, which is the slice that produces it. Its reason was the one
+    genuinely arguable case — a recon call is a reach in one framing and a hazard in another — and
+    it settled as `unsafe`, pinned in the table below."""
     assert rule not in REASON_FOR_RULE
     with pytest.raises(KeyError):
         refuse(rule, detail="d", remediation="r")
@@ -197,6 +199,10 @@ def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
         ("model_unavailable", "undetermined"),
         ("resource_limit", "undetermined"),
         ("unparseable", "undetermined"),
+        # Pinned by ACE-039, the gate that produces it. `unsafe` rather than `out_of_scope`
+        # because a model declares tables and columns and never declares functions, so there is
+        # no in-scope spelling of `version()` for an out-of-scope refusal to point toward.
+        ("recon", "unsafe"),
     ],
 )
 def test_the_reason_for_each_rule_is_pinned(rule, reason):

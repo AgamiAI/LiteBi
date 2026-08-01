@@ -332,6 +332,11 @@ VECTORS = (
     (guardrail.RULE_SELECT_STAR, "SELECT * FROM orders"),
     (guardrail.RULE_COLUMN_SCOPE, "SELECT ref_no FROM orders"),
     (guardrail.RULE_RESOURCE_LIMIT, _RUNAWAY_SQL),
+    # recon — `version()` is not on the dangerous-function list, so the read-only gate passes it,
+    # and the recon gate runs before the model pass, so it fires first. `id` and `orders` are
+    # declared AND sent by the caller, so echoing them is legitimate; the token the detail actually
+    # echoes is `version`, which is the caller's own.
+    (guardrail.RULE_RECON, "SELECT id, version() FROM orders"),
 )
 
 UNAVAILABLE_SQL = "SELECT id FROM orders"
@@ -734,9 +739,15 @@ def test_echoing_the_callers_own_identifier_is_allowed():
 # to the completeness assertion is the point.
 _NO_VECTOR = {
     guardrail.RULE_UNPARSEABLE: (
-        "No producer. Every gate degrades to ALLOW when sqlglot cannot read the statement rather "
-        "than refusing, so nothing constructs this rule yet; turning that fail-open into a refusal "
-        "is the unparseable-statement slice's job, and the refusal it introduces needs a vector here."
+        "One producer, unreachable on every route. `sql_guard.check_no_recon` refuses `unparseable` "
+        "when the neutralizer cannot read the statement (ACE-039) — but at the chokepoint "
+        "`check_read_only` runs the SAME neutralizer first and refuses as `read_only`, so no route "
+        "reaches it and a vector here could not drive it. Its detail is the neutralizer's own static "
+        "prose, carrying no model-derived text. Covered as a standalone call by "
+        "test_ace039_recon.py::test_an_unreadable_statement_is_undetermined_not_recon. The "
+        "sqlglot-level gates still degrade to ALLOW rather than refusing; turning that fail-open "
+        "into a refusal is the unparseable-statement slice's job, and the refusal it introduces "
+        "will be reachable and will need a vector here."
     ),
     guardrail.RULE_MODEL_SAFETY: (
         "Reachable, but its detail is authored as static prose at a single construction site in "
@@ -769,7 +780,7 @@ def test_every_rule_and_every_route_is_covered():
     assert not covered & set(_NO_VECTOR)
     assert all(reason.strip() for reason in _NO_VECTOR.values())
     assert set(ROUTES) == {"in_process", "fork", "stdio", "http"}
-    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 20
+    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 24
     # The `failed` channel is covered by its own matrix rather than this one, because it has no
     # rule. Its vector must not be one of these: a statement that a gate refuses would report on the
     # refusal channel a second time and leave `failure.message` unscanned again, which is exactly

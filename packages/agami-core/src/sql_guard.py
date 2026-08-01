@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from guardrail import RULE_READ_ONLY, Refusal, refuse
+from guardrail import RULE_READ_ONLY, RULE_RECON, RULE_UNPARSEABLE, Refusal, refuse
 
 # Hard cap on SQL length. Prevents a compromised client from POSTing a multi-MB
 # SQL blob that takes the parser / planner / this gate down a slow path. Real
@@ -452,3 +452,209 @@ def check_read_only(sql: str | None) -> Refusal | None:
             remediation=_REMEDIATION["dangerous_function"],
         )
     return None
+
+
+# --- Recon / metadata functions (ACE-039) -----------------------------------
+#
+# FUNCTIONS ONLY. No schema names, no relation names, no relation-name prefixes, no system
+# variables. Catalog RELATIONS are the model's to refuse, not this gate's: `check_table_scope`
+# already rejects `pg_class` and `information_schema.tables` as tables the model does not declare,
+# which is the same refusal reached by the gate that owns it. The relation half was therefore
+# redundant where the model gate runs — and where it does not run, it was actively harmful: matching
+# bare schema names on every engine refused a datasource whose `sys` schema holds ordinary user
+# tables. A schema the model declares is a schema the caller may query.
+#
+# The residual is stated rather than hidden: on the vendored plugin layout `semantic_model.runtime`
+# is absent by construction (it needs sqlglot and pydantic; the mirror is stdlib-only), so catalog
+# relations have no gate there at all. Recon denial protects an operator from a caller who is not
+# them, and on that layout the user owns the machine, the credentials and the role.
+#
+# Niladic keywords and register-type casts are in scope because they are the same primitive in a
+# spelling the function matcher never sees: `current_user` is `current_user()` without the parens,
+# and `'x'::regclass` is `to_regclass('x')` without them either — the cast errors when the object is
+# absent, which is an object-existence oracle that rides inside a fully-scoped query.
+
+
+def _recon_group(names: frozenset[str]) -> str:
+    """Alternation body for a set of names, longest first.
+
+    Longest-first is load-bearing rather than tidy: regex alternation takes the first branch that
+    matches at a position, so `current_schema` listed before `current_schemas` would shadow it and
+    the longer name would never match as a whole token.
+    """
+    return "|".join(sorted(names, key=len, reverse=True))
+
+
+# Server / session / account metadata, matched only in their CALL form.
+_RECON_PAREN_FNS = frozenset(
+    {
+        "version",
+        "current_database",
+        "current_schemas",  # pg, plural, takes a bool — the niladic `current_schema` is below
+        "database",
+        "schema",
+        "user",  # MySQL user() / system_user() — the CALL form only
+        "connection_id",
+        "system_user",
+        "current_account",  # snowflake
+        "current_region",
+        "current_version",
+        "current_warehouse",
+        "inet_server_addr",  # server / client network fingerprint (pg)
+        "inet_server_port",
+        "inet_client_addr",
+        "inet_client_port",
+    }
+)
+
+# Niladic metadata keywords — the special function spelled without parens. Bare `user`, `schema` and
+# `database` are DELIBERATELY absent: they are Postgres niladic synonyms but far too common as
+# intended column names, so only their call form (above) is denied. A known, minor
+# username-fingerprint residual, taken knowingly in exchange for not refusing ordinary schemas.
+_RECON_NILADIC = frozenset(
+    {"current_user", "session_user", "current_catalog", "current_schema", "current_role"}
+)
+
+# The privilege-check family, enumerated rather than globbed. `has_\w+_privilege` also matched
+# `has_active_privilege(...)` — a plausible user-defined function, and an over-refusal is the failure
+# mode this list has already produced in real use.
+_RECON_PRIVILEGE_FNS = frozenset(
+    {
+        "has_any_column_privilege",
+        "has_column_privilege",
+        "has_database_privilege",
+        "has_foreign_data_wrapper_privilege",
+        "has_function_privilege",
+        "has_language_privilege",
+        "has_largeobject_privilege",
+        "has_parameter_privilege",
+        "has_schema_privilege",
+        "has_sequence_privilege",
+        "has_server_privilege",
+        "has_table_privilege",
+        "has_tablespace_privilege",
+        "has_type_privilege",
+    }
+)
+
+# Call FAMILIES matched by prefix, each still requiring the trailing `(`. `pg_*` is a namespace ban
+# and deliberately overlaps the dangerous-function list: `check_read_only` runs first and owns the
+# label for what it names, and this is the backstop underneath — including for builtins that ship
+# after this list is written. `to_reg*` resolves a name to an OID, the call form of the casts below.
+_RECON_CALL_FAMILIES = (r"pg_\w+", r"to_reg\w+")
+
+# Register types. `'secret'::regclass` errors when the object is absent, so it answers "does this
+# exist?" without ever naming it in a FROM clause.
+_RECON_REGTYPES = frozenset(
+    {
+        "regclass",
+        "regcollation",
+        "regconfig",
+        "regdictionary",
+        "regnamespace",
+        "regoper",
+        "regoperator",
+        "regproc",
+        "regprocedure",
+        "regrole",
+        "regtype",
+    }
+)
+
+# A quoted name with a trailing `(` is STILL A CALL, so the paren matcher covers the niladic
+# keywords too. Without that union `SELECT "current_schema"()` would be skipped by the niladic
+# matcher (it is a quoted span) and missed by the paren matcher (`current_schemas` needs its `s`) —
+# a hole the false-positive fix would otherwise open. This union is where the FP rule and the
+# deny-list interact, and it is the only place they do.
+_RECON_PAREN_RE = re.compile(
+    r"\b("
+    + _recon_group(_RECON_PAREN_FNS | _RECON_NILADIC | _RECON_PRIVILEGE_FNS)
+    + "|"
+    + "|".join(_RECON_CALL_FAMILIES)
+    + r")\s*\(",
+    re.IGNORECASE,
+)
+# `(?<!\.)` lets a qualified column through (`t.current_user`); the quoted-span check in
+# `_recon_niladic_hit` handles the bare quoted spelling (`"current_user"`), which the neutralizer
+# has by then unwrapped into something this pattern would otherwise match.
+_RECON_NILADIC_RE = re.compile(
+    r"(?<!\.)\b(" + _recon_group(_RECON_NILADIC) + r")\b", re.IGNORECASE
+)
+# Both cast spellings. `::reg*` anchors on the type name because `_neutralize` blanks the literal
+# before it, so `'x'::regclass` arrives as ` ::regclass`. The `CAST(x AS reg*)` arm requires the
+# closing paren so a column aliased `AS regclass` is not caught.
+_RECON_CAST_RE = re.compile(
+    r"::\s*(" + _recon_group(_RECON_REGTYPES) + r")\b"
+    r"|\bAS\s+(" + _recon_group(_RECON_REGTYPES) + r")\s*\)",
+    re.IGNORECASE,
+)
+
+_RECON_REMEDIATION = (
+    "Remove the server-metadata call — query only the tables and columns your model declares. "
+    "Server version, session identity, privilege probes and object-existence casts are never "
+    "executed here."
+)
+
+
+def _recon_niladic_hit(neutral: _Neutralized) -> re.Match[str] | None:
+    """The niladic keyword, skipping any occurrence that was a quoted identifier.
+
+    The ONLY consumer of `_Neutralized.quoted`. A double-quoted bare word is unambiguously an
+    identifier — `SELECT "current_user" FROM audit_log` reads a column — while the same word
+    unquoted is the special function. The neutralizer drops the delimiters (that unwrapping is what
+    keeps a welded `"pg_read_file"(...)` visible to the read-only gate), so the distinction survives
+    only in the spans it reports.
+
+    Containment must be FULL. A partial overlap means the span and the match disagree about where
+    the token is, and the safe reading of a disagreement is not to skip.
+    """
+    for match in _RECON_NILADIC_RE.finditer(neutral.text):
+        if not any(s <= match.start() and match.end() <= e for s, e in neutral.quoted):
+            return match
+    return None
+
+
+def check_no_recon(sql: str | None) -> Refusal | None:
+    """Return ``None`` when ``sql`` calls no metadata / recon function, else a ``Refusal``.
+
+    Runs immediately after :func:`check_read_only` at the shared executor chokepoint, over the SAME
+    neutralized text — comments and literals blanked, quoted identifiers unwrapped — so a recon token
+    hidden in a string cannot smuggle past and a legitimate mention inside one cannot false-trip.
+    No second parser: this module is regex over `_neutralize`, and the sqlglot pass lives in
+    `semantic_model.runtime`, which the vendored mirror cannot import.
+
+    Order is fixed, so the label is deterministic: a name on both this list and the
+    dangerous-function list refuses as ``read_only``, because that gate runs first and owns what it
+    names (principle 9).
+    """
+    if not sql or not sql.strip():
+        return None  # empty — `check_read_only` owns that rejection, and its remediation
+
+    try:
+        neutral = _neutralize(sql)
+    except _GuardReject as reject:
+        # A statement we cannot read is not a statement we caught fingerprinting the server. It
+        # fails closed either way, but as `undetermined`/`unparseable` — labelling it `recon` told
+        # the caller it had tried something it had not, and handed it a recon fix for a parse
+        # problem. Unreachable at the chokepoint, where `check_read_only` runs the same neutralizer
+        # and refuses first; reachable, and covered, as a standalone call.
+        return refuse(
+            RULE_UNPARSEABLE, detail=reject.detail, remediation=reject.remediation
+        )
+
+    match = (
+        _RECON_PAREN_RE.search(neutral.text)
+        or _recon_niladic_hit(neutral)
+        or _RECON_CAST_RE.search(neutral.text)
+    )
+    if match is None:
+        return None
+
+    # Echo the token the caller itself sent, never the alternatives. A refusal that lists what IS
+    # allowed is a schema-listing endpoint.
+    hit = match.group(0).strip(" .(:")
+    return refuse(
+        RULE_RECON,
+        detail=f"metadata/recon access is not allowed (`{hit}`)",
+        remediation=_RECON_REMEDIATION,
+    )

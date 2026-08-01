@@ -1889,6 +1889,13 @@ def execute_guarded(
         refusal = sql_guard.check_read_only(sql)
         if refusal is not None:
             return _envelope("refused", refusal=refusal)
+        # Metadata / recon functions, ABOVE the `no_safety` branch on purpose. `no_safety` skips the
+        # semantic-model pass and nothing else; server fingerprinting and object-existence probing
+        # are a hard gate for the same reason write and RCE protection are. Running second is what
+        # makes the label deterministic when a name is on both lists (principle 9).
+        refusal = sql_guard.check_no_recon(sql)
+        if refusal is not None:
+            return _envelope("refused", refusal=refusal)
         if not no_safety:
             sql, verdict = _model_safety(sql, profile, area)
             if isinstance(verdict, Refusal):
