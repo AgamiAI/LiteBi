@@ -15,6 +15,7 @@ that guarantee a test rather than an intention.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -321,3 +322,62 @@ def test_the_flat_receipt_keys_are_untouched(org):
     assert any("unreviewed join" in w for w in receipt["warnings"])
     assert receipt["named_filters"] == []
     assert receipt["default_filters_applied"] == ["o.x IS NULL"]
+
+
+# --- determinism across processes -------------------------------------------
+
+
+def _write_many_ai_columns_model(tmp_path):
+    """Six AI-written columns, so the assumptions cap of three has to CHOOSE. With fewer than four
+    every candidate survives and the ordering question never arises."""
+    yaml = __import__("yaml")
+    p = tmp_path / "many"
+    (p / "datasources" / "c").mkdir(parents=True)
+    (p / "subject_areas" / "s" / "tables").mkdir(parents=True)
+    (p / "datasource.yaml").write_text(yaml.safe_dump({
+        "datasource": "many", "version": 1,
+        "storage_connections": [{"name": "c", "ref": "datasources/c/storage.yaml"}],
+        "subject_areas": ["subject_areas/s"]}))
+    (p / "datasources" / "c" / "storage.yaml").write_text(
+        yaml.safe_dump({"name": "c", "storage_type": "PostgreSQL"}))
+    (p / "subject_areas" / "s" / "subject_area.yaml").write_text(yaml.safe_dump({
+        "name": "s", "tables": [{"storage_connection": "c", "schema": "public", "table": "wide"}]}))
+    (p / "subject_areas" / "s" / "tables" / "wide.yaml").write_text(yaml.safe_dump({
+        "name": "wide", "schema": "public", "storage_connection": "c", "grain": ["id"],
+        "description": "w",
+        "columns": [{"name": "id", "type": "integer", "primary_key": True}]
+        + [{"name": f"c{i}", "type": "string", "description_source": "ai_unknown"}
+           for i in range(6)]}))
+    return p
+
+
+_PROBE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from semantic_model import loader as L
+from semantic_model import runtime as rt
+org = L.load_datasource(sys.argv[2])
+r = rt.assemble_receipt(org, "SELECT c0, c1, c2, c3, c4, c5 FROM public.wide")
+print(json.dumps([a["column"] for a in r["assumptions"]]))
+"""
+
+
+def test_the_assumptions_cap_picks_the_same_three_in_every_process(tmp_path):
+    """REQ-022: the receipt is "the same for the same SQL and model version". The assumptions list is
+    concatenated and then capped at three, so an unsorted walk of a set of column tuples lets
+    string-hash randomization decide WHICH three a caller is shown. Same process, same seed, so this
+    can only be caught across processes: four seeds, four runs, one answer."""
+    import subprocess
+
+    root = _write_many_ai_columns_model(tmp_path)
+    pkg_src = str(REPO_ROOT / "packages" / "agami-core" / "src")
+    seen = set()
+    for seed in ("0", "1", "42", "12345"):
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE, pkg_src, str(root)],
+            capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": seed},
+        )
+        assert proc.returncode == 0, proc.stderr
+        seen.add(proc.stdout.strip())
+    assert len(seen) == 1, f"the cap chose differently across hash seeds: {seen}"
+    assert json.loads(seen.pop()) == ["public.wide.c0", "public.wide.c1", "public.wide.c2"]

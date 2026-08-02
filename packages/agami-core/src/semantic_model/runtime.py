@@ -1456,7 +1456,11 @@ def assemble_receipt(
                 ref_cols.add((cands[0], col.name))
     unknown: list[dict] = []
     unval: list[dict] = []
-    for bare, cname in ref_cols:
+    # Sorted, not raw set order: the two lists below are concatenated and then capped at three, so
+    # with more than three AI-written columns an unsorted walk decides WHICH three a caller sees by
+    # string-hash order, which differs between processes. The receipt has to be the same for the
+    # same statement and the same model version, so the choice cannot depend on the seed.
+    for bare, cname in sorted(ref_cols):
         info = tidx.get(bare)
         if not info:
             continue
