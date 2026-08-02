@@ -16,6 +16,8 @@ second copy of the sentences is a second chance for one statement to be describe
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -73,6 +75,61 @@ def test_a_deployment_without_the_model_runtime_says_so(monkeypatch):
     receipt = execute_sql._receipt_for(SQL, "acme", bounded=False)
 
     _assert_wholly_undetermined(receipt, guardrail.RECEIPT_NO_RUNTIME)
+
+
+_BROKEN_RUNTIME_PROBE = """
+import json, logging, sys
+sys.path.insert(0, sys.argv[1])
+import execute_sql, guardrail
+
+class _Broken:
+    # Raises for EVERY attribute, which is what an import of a module that blows up on the way in
+    # looks like from the outside: not an ImportError.
+    def __getattr__(self, name):
+        raise RuntimeError("the runtime module blew up on import")
+
+records = []
+logging.getLogger().addHandler(type("H", (logging.Handler,), {"emit": lambda s, r: records.append(r.getMessage())})())
+logging.getLogger().setLevel(logging.ERROR)
+
+sys.modules["semantic_model"] = _Broken()
+receipt = execute_sql._receipt_for("SELECT id FROM orders", "acme", bounded=False)
+
+print(json.dumps({
+    "reasons": sorted({getattr(receipt, n).undetermined for n in guardrail.Receipt.SECTIONS}),
+    "items": [len(getattr(receipt, n).items) for n in guardrail.Receipt.SECTIONS],
+    "logged": records,
+    "build_failed": guardrail.RECEIPT_BUILD_FAILED,
+    "no_runtime": guardrail.RECEIPT_NO_RUNTIME,
+}))
+"""
+
+
+def test_a_runtime_that_breaks_while_importing_is_a_defect_not_a_missing_install():
+    """The two are different facts and only one is actionable. A module that is not shipped is a
+    property of the deployment; a module that is shipped and raises on the way in is a bug, and
+    calling it "not available in this deployment" sends an operator looking for a missing install
+    while the real error goes unlogged. Catching only `ImportError` for the first keeps them apart.
+
+    Run in a subprocess on purpose. Simulating it means putting a hostile object at
+    `sys.modules["semantic_model"]`, which is the package the whole suite imports; a child process
+    cannot leak that back into the parent's import state no matter what the import machinery does
+    on the way through. The suite already spawns real subprocesses for the fork path, so this is the
+    established way to buy isolation here.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _BROKEN_RUNTIME_PROBE, str(PKG_SRC)],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+
+    assert out["reasons"] == [out["build_failed"]], "one reason, and it is the actionable one"
+    assert out["no_runtime"] not in out["reasons"], "a broken module is not a missing install"
+    assert out["items"] == [0] * len(guardrail.Receipt.SECTIONS)
+    assert any("failed to import" in m for m in out["logged"]), (
+        "the operator is the only one who can act on it, so the stack has to reach the log"
+    )
 
 
 def test_a_statement_that_consulted_no_model_says_so(guard_model):
