@@ -2192,10 +2192,13 @@ def execute_guarded(
     # never be the one this call's receipt describes.
     _guard_model.set(None)
     # The statement the CALLER sent, captured before `_model_safety` can rebind the local below. Every
-    # NON-OK receipt is built from this one. `_model_safety` ends in `apply_default_filters`, so the
-    # rebound string can name a table the model's own YAML injected and the caller never wrote — and a
-    # refusal built from it then describes a statement nobody sent, in model-authored text, which is
-    # precisely the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent. The `ok`
+    # NON-OK receipt is built from this one. Whatever the safety pass rewrites a statement INTO is the
+    # guard's own text, so the rebound string can name a table the caller never wrote — and a refusal
+    # built from it then describes a statement nobody sent, in model-authored text, which is precisely
+    # the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent. The reproduction came
+    # through `apply_default_filters`, which pulled the name straight out of the model's YAML; ACE-042
+    # has since deleted that injector and the fan-join `auto_rewrite` is the one rewrite still
+    # standing, but the rule is about the rebinding rather than about either mechanism. The `ok`
     # receipt is the one exception and keeps using the rebound value, because SC-6 asks it to describe
     # what actually ran.
     received_sql = sql

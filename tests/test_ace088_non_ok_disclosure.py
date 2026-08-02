@@ -1,10 +1,11 @@
 """The echo-bounded receipt belongs on EVERY non-ok body, and here is what happened when it did not.
 
 `tests/test_ace035_no_enumeration.py` is the sentinel and it is untouched. It cannot make these
-assertions about its own model: its fixture declares no `default_filters`, its warehouse and its
-model disagree about exactly one column, and its scanner reads the serialized body rather than the
-receipt's shape. This file supplies the four vectors that were reproduced against the receipt as it
-first shipped, each one a different way a NON-OK body disclosed something the caller never sent.
+assertions about its own model: nothing there makes an executed statement differ from the received
+one, its warehouse and its model disagree about exactly one column, and its scanner reads the
+serialized body rather than the receipt's shape. This file supplies the four vectors that were
+reproduced against the receipt as it first shipped, each one a different way a NON-OK body disclosed
+something the caller never sent.
 
 The design error being corrected: the bounded receipt was put on `refused` only, on the reasoning
 that a `failed` body discloses nothing an `ok` body would not — because reaching `failed` means every
@@ -15,9 +16,14 @@ of `ok`'s, and the caller chooses which name to probe.
 
 The four vectors:
 
-  * a `default_filters`-injected table name, on a `refused` body — the model's own YAML puts a table
-    into the executed statement, and a receipt built from THAT string names a table the caller never
-    wrote, in model-authored text;
+  * a table name only the guard's own rewrite put into the statement, on a `refused` body — the
+    executed string names a table the caller never wrote, and a receipt built from THAT string
+    repeats it back in model-authored text. The original reproduction used `apply_default_filters`,
+    which pulled the name straight out of the model's YAML; ACE-042 has since deleted that injector
+    and ACE-093 deletes the one rewrite left, so the divergence is installed here instead (see
+    `rewriting`). The invariant it guards is not going anywhere: whatever the guard rewrites a
+    statement INTO is the guard's own text, and a non-ok receipt must be built from the RECEIVED
+    statement;
   * a prompt-injection alias, on a `failed` body — a quoted identifier holding an instruction,
     reassembled verbatim inside `receipt.tables.items[0].alias`, plus the amplification a
     four-hundred-alias statement produced;
@@ -64,6 +70,16 @@ CANARY_MEANING = "the net amount after the clearing house has settled"
 # that prints it is describing the model's own schema, not the caller's statement.
 CANARY_PREDICATE = "o.batch_id = s.id"
 
+# What the caller sends for vector 1, and what the `rewriting` seam sends on to the executor in its
+# place. The rewritten form puts the canary exactly where the deleted `apply_default_filters` used to
+# put it — ANDed into the WHERE out of `orders`' declared filter — so the vector still reproduces the
+# shape it was written against. The difference is only that this file now installs the divergence
+# rather than borrowing a production mechanism that is being subtracted.
+RECEIVED_SQL = "SELECT count(o.id) FROM orders o"
+REWRITTEN_SQL = (
+    f"SELECT count(o.id) FROM orders o WHERE o.batch_id IN (SELECT id FROM {CANARY_TABLE})"
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate():
@@ -76,7 +92,7 @@ def _isolate():
     tools.set_injected_executor(None)
 
 
-def _write_model(root: Path, *, default_filters: list[str] | None = None) -> None:
+def _write_model(root: Path) -> None:
     """A two-table model whose second table exists ONLY in the model.
 
     `orders` is in the warehouse; `settlement_batches` is not, and neither is `orders.amount`. So a
@@ -107,8 +123,6 @@ def _write_model(root: Path, *, default_filters: list[str] | None = None) -> Non
              "description_source": "ai_unvalidated"},
         ],
     }
-    if default_filters:
-        orders["default_filters"] = default_filters
     (root / "subject_areas" / AREA / "tables" / "orders.yaml").write_text(yaml.safe_dump(orders))
     (root / "subject_areas" / AREA / "tables" / f"{CANARY_TABLE}.yaml").write_text(
         yaml.safe_dump({
@@ -133,10 +147,10 @@ def _write_model(root: Path, *, default_filters: list[str] | None = None) -> Non
     )
 
 
-def _build(tmp_path, monkeypatch, *, default_filters: list[str] | None = None):
+def _build(tmp_path, monkeypatch):
     """The model above under profile `acme`, plus a real warehouse that has only `orders(id)`."""
     artifacts = tmp_path / "artifacts"
-    _write_model(artifacts / PROFILE, default_filters=default_filters)
+    _write_model(artifacts / PROFILE)
 
     warehouse = tmp_path / "warehouse.db"
     con = sqlite3.connect(warehouse)
@@ -160,13 +174,31 @@ def declared(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def filtered(tmp_path, monkeypatch):
-    """The same model, plus a `default_filters` entry that drags the canary table into the statement
-    the executor is handed. This is the model author's own text, not the caller's."""
-    return _build(
-        tmp_path, monkeypatch,
-        default_filters=[f"{{alias}}.batch_id IN (SELECT id FROM {CANARY_TABLE})"],
-    )
+def rewriting(declared, monkeypatch):
+    """The same model, plus a seam that drags the canary table into the statement the executor is
+    handed. The canary is a name out of the model's own YAML; nothing the caller sent contains it.
+
+    `execute_guarded` rebinds its local `sql` to whatever `_model_safety` returns, so wrapping that
+    one function reproduces the hand-off a production rewrite goes through, byte for byte. The real
+    pass still runs — it is what publishes the resolved model the receipt builder reads, and a
+    statement it REFUSES keeps its own string, so the seam cannot turn a refusal into an execution.
+
+    Installed here rather than borrowed from the guard on purpose. The vector was first reproduced
+    through `apply_default_filters`, which ACE-042 has deleted, and the fan-join `auto_rewrite` that
+    would be the only substitute goes the same way in ACE-093. Borrowing either one would mean this
+    vector and its precondition quietly stop testing anything the day it is subtracted — which is
+    what happened once already.
+    """
+    real = execute_sql._model_safety
+
+    def _rewriting_model_safety(
+        sql: str, profile: str, area: str | None
+    ) -> tuple[str, guardrail.Refusal | int | None]:
+        vetted, verdict = real(sql, profile, area)
+        return (REWRITTEN_SQL if verdict is None else vetted), verdict
+
+    monkeypatch.setattr(execute_sql, "_model_safety", _rewriting_model_safety)
+    return declared
 
 
 def _route_in_process(sql: str) -> dict:
@@ -198,7 +230,7 @@ def _assert_bounded(body: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Vector 1 — a table the MODEL's own YAML put into the statement
+# Vector 1 — a table the guard's own rewrite put into the statement
 # ---------------------------------------------------------------------------
 
 
@@ -211,10 +243,10 @@ class _Slow:
         raise execute_sql._ResourceLimit(execute_sql._OUTLIVED_BUDGET)
 
 
-def test_a_refusal_never_names_a_table_the_default_filters_injected(filtered):
-    """`_model_safety` ends in `apply_default_filters`, and `execute_guarded` rebinds its local `sql`
-    to what comes back — so a receipt built from that string describes a statement the caller never
-    sent, using a table name that came out of the model's YAML.
+def test_a_refusal_never_names_a_table_only_the_rewrite_introduced(rewriting):
+    """`execute_guarded` rebinds its local `sql` to whatever the safety pass returns — so a receipt
+    built from that string describes a statement the caller never sent, using a table name that came
+    out of the model's YAML rather than out of the request.
 
     Reproduced: a caller sending `SELECT count(o.id) FROM orders o` got a `resource_limit` refusal
     naming `settlement_batches`. That is model-authored text in a refusal, which is precisely the
@@ -224,11 +256,12 @@ def test_a_refusal_never_names_a_table_the_default_filters_injected(filtered):
     The fix is a local captured at the top of `execute_guarded`, before anything can rebind it. Only
     `ok` is built from the rebound value, because only `ok` is asked to describe what actually ran.
     """
-    sql = "SELECT count(o.id) FROM orders o"
-    assert CANARY_TABLE not in sql
+    assert CANARY_TABLE not in RECEIVED_SQL
 
     tools.set_injected_executor(_Slow())
-    body = json.loads(tools.tool_execute_sql({"sql": sql, "datasource": PROFILE, "area": AREA}))
+    body = json.loads(
+        tools.tool_execute_sql({"sql": RECEIVED_SQL, "datasource": PROFILE, "area": AREA})
+    )
 
     assert body["status"] == "refused", body
     assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT, body
@@ -236,10 +269,17 @@ def test_a_refusal_never_names_a_table_the_default_filters_injected(filtered):
     assert body["receipt"]["tables"]["items"] == [{"ref": "orders", "declared": True}]
 
 
-def test_the_default_filter_really_does_inject_the_canary(filtered):
-    """The precondition, asserted separately so the test above cannot pass because the injection
-    silently stopped happening. The executor is handed a statement naming the canary table; the
-    receipt describing that outcome is not."""
+def test_the_rewritten_statement_really_does_reach_the_executor(rewriting):
+    """The precondition, asserted separately so the test above cannot pass because the divergence
+    silently stopped happening — which is exactly how it went vacuous when ACE-042 deleted the
+    injector the vector used to borrow.
+
+    It is not a tautology about the seam: what it pins is that `execute_guarded` still HONOURS the
+    statement the safety pass hands back, so the string the executor runs really is the rewritten one
+    while the receipt describing that outcome really is built from the received one. Stop rebinding,
+    or rebind and then build the receipt from the wrong local, and one of these two tests goes red
+    rather than both going quiet.
+    """
     seen: list[str] = []
 
     class _Spy:
@@ -248,8 +288,7 @@ def test_the_default_filter_really_does_inject_the_canary(filtered):
             raise execute_sql._ResourceLimit(execute_sql._OUTLIVED_BUDGET)
 
     tools.set_injected_executor(_Spy())
-    tools.tool_execute_sql({"sql": "SELECT count(o.id) FROM orders o",
-                            "datasource": PROFILE, "area": AREA})
+    tools.tool_execute_sql({"sql": RECEIVED_SQL, "datasource": PROFILE, "area": AREA})
 
     assert seen and CANARY_TABLE in seen[0], seen
 

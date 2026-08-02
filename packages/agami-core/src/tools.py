@@ -563,15 +563,15 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
     defect one layer down.
 
     KNOWN GAP, and this is where it lives. `sql` here is the statement the CALLER sent, which is the
-    only one this side of the fork has: `_model_safety` runs in the child, and both its rewrites (the
-    fan/chasm `auto_rewrite` branch and `apply_default_filters`) rebind the child's local before it
-    executes. So after a rewrite the child runs one statement and this describes another. It is
-    narrowed to `ok` alone now that every non-ok receipt is built from the RECEIVED statement on both
-    paths deliberately, and it is measured rather than left as prose by a `strict=True` xfail in
+    only one this side of the fork has: `_model_safety` runs in the child, and its surviving rewrite
+    (the fan/chasm `auto_rewrite` branch) rebinds the child's local before it executes. So after a
+    rewrite the child runs one statement and this describes another. It is narrowed to `ok` alone now
+    that every non-ok receipt is built from the RECEIVED statement on both paths deliberately, and it
+    is measured rather than left as prose by a `strict=True` xfail in
     tests/test_ace088_executed_statement.py. It closes by subtraction, not by plumbing the rewritten
-    statement back across the wire: ACE-093 deletes the fan-join rewrite and ACE-042 the
-    default-filter injection, after which executed and received are the same string and this is
-    describing it. That is the slice that deletes the marker.
+    statement back across the wire: ACE-042 has already deleted the default-filter injection and
+    ACE-093 deletes the fan-join rewrite, after which executed and received are the same string and
+    this is describing it. That is the slice that deletes the marker.
     """
     try:
         org = get_cached_org(profile)
