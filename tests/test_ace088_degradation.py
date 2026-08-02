@@ -16,6 +16,7 @@ second copy of the sentences is a second chance for one statement to be describe
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -73,6 +74,29 @@ def test_a_deployment_without_the_model_runtime_says_so(monkeypatch):
     receipt = execute_sql._receipt_for(SQL, "acme", bounded=False)
 
     _assert_wholly_undetermined(receipt, guardrail.RECEIPT_NO_RUNTIME)
+
+
+def test_a_runtime_that_breaks_while_importing_is_a_defect_not_a_missing_install(
+    monkeypatch, caplog
+):
+    """The two are different facts and only one is actionable. A module that is not shipped is a
+    property of the deployment; a module that is shipped and raises on the way in is a bug, and
+    calling it "not available in this deployment" sends an operator looking for a missing install
+    while the real error goes unlogged. Catching only `ImportError` for the first is what keeps them
+    apart."""
+
+    class _Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("the runtime module blew up on import")
+
+    monkeypatch.setitem(sys.modules, "semantic_model", _Broken())
+
+    with caplog.at_level(logging.ERROR):
+        receipt = execute_sql._receipt_for(SQL, "acme", bounded=False)
+
+    _assert_wholly_undetermined(receipt, guardrail.RECEIPT_BUILD_FAILED)
+    assert receipt.tables.undetermined != guardrail.RECEIPT_NO_RUNTIME
+    assert "failed to import" in caplog.text, "the operator is the only one who can act on it"
 
 
 def test_a_statement_that_consulted_no_model_says_so(guard_model):
