@@ -1,4 +1,4 @@
-"""The four port Protocols + their OSS default adapters.
+"""The three port Protocols + their OSS default adapters.
 
 Proves: the Protocols are importable (and dependency-free), and each OSS default adapter
 type-checks against its Protocol via @runtime_checkable + behaves as specified.
@@ -13,8 +13,6 @@ import sys
 from ports import (
     ActivitySink,
     AuthProvider,
-    GovernancePolicy,
-    GovernanceVerdict,
     Org,
     OrgResolver,
     Principal,
@@ -23,7 +21,7 @@ from ports import (
 
 def test_protocols_importable_and_runtime_checkable():
     # Each is a runtime_checkable typing.Protocol (so the isinstance checks below are valid).
-    for proto in (ActivitySink, OrgResolver, AuthProvider, GovernancePolicy):
+    for proto in (ActivitySink, OrgResolver, AuthProvider):
         assert proto.__module__ == "ports"
         assert getattr(proto, "_is_runtime_protocol", False), (
             f"{proto.__name__} not runtime_checkable"
@@ -60,13 +58,11 @@ def test_default_adapters_satisfy_protocols():
         FileActivitySink,
         PresenceAuthProvider,
         SingleTenantOrgResolver,
-        WarnOnlyGovernancePolicy,
     )
 
     assert isinstance(FileActivitySink(), ActivitySink)
     assert isinstance(SingleTenantOrgResolver(), OrgResolver)
     assert isinstance(PresenceAuthProvider(), AuthProvider)
-    assert isinstance(WarnOnlyGovernancePolicy(), GovernancePolicy)
 
 
 # --- adapter behavior -------------------------------------------------------
@@ -91,14 +87,6 @@ def test_presence_auth_accepts_nonempty_rejects_empty():
     assert isinstance(p.validate_token("any-token"), Principal)
     assert p.validate_token("") is None
     assert p.validate_token("   ") is None
-
-
-def test_warn_only_governance_never_blocks():
-    from oss_adapters import WarnOnlyGovernancePolicy
-
-    v = WarnOnlyGovernancePolicy().evaluate()
-    assert isinstance(v, GovernanceVerdict)
-    assert v.allowed is True
 
 
 def test_file_activity_sink_writes_jsonl(tmp_path):

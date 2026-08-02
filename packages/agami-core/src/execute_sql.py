@@ -1869,7 +1869,7 @@ def _builtin_execute(vetted_sql: str, creds: dict[str, str], *, profile: str) ->
 
 class _BuiltinExecutor:
     """The default ``ports.Executor``: wraps the connect-per-query dispatch as an object so it
-    satisfies the port by shape (method-style, like the other four ports). Stateless — one shared
+    satisfies the port by shape (method-style, like the other three ports). Stateless — one shared
     ``BUILTIN_EXECUTOR`` instance."""
 
     def execute(self, vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult:

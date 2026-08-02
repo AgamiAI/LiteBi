@@ -34,7 +34,6 @@ from oss_adapters import (
     FileActivitySink,
     PresenceAuthProvider,
     SingleTenantOrgResolver,
-    WarnOnlyGovernancePolicy,
 )
 from ports import Adapters, AuthProvider, Org, OrgResolver
 from starlette.applications import Starlette
@@ -170,7 +169,7 @@ def _build_org_resolver() -> SingleTenantOrgResolver:
 def default_adapters() -> Adapters:
     """The OSS default adapters bundled for the composition root (env-driven auth + org). Used only by
     `create_app(adapters=None)` — the HTTP server's defaults. `create_app` wires `auth_provider` +
-    `org_resolver` into the request path and registers `executor`; `activity_sink` + `governance` are
+    `org_resolver` into the request path and registers `executor`; `activity_sink` is
     carried on the container for consumers.
 
     `executor=BUILTIN_EXECUTOR` (ACE-028) makes the HTTP server run execution **in-process** by default
@@ -181,7 +180,6 @@ def default_adapters() -> Adapters:
         activity_sink=FileActivitySink(),
         org_resolver=_build_org_resolver(),
         auth_provider=_build_auth_provider(),
-        governance=WarnOnlyGovernancePolicy(),
         executor=BUILTIN_EXECUTOR,
     )
 

@@ -255,7 +255,6 @@ def test_create_app_wires_injected_executor_and_defaults_to_builtin(monkeypatch)
         activity_sink=base.activity_sink,
         org_resolver=base.org_resolver,
         auth_provider=base.auth_provider,
-        governance=base.governance,
         executor=fake,
     )
     mcp_http.create_app(adapters=adapters)
