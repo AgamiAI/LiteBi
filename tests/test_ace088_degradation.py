@@ -105,9 +105,16 @@ def test_an_unpinnable_model_version_is_an_unpinned_receipt_not_a_failure(monkey
     """`tools` is absent from the vendored mirror, so the version resolver cannot be reached there.
     That is a receipt without a version pin, not a receipt that could not be built.
 
+    Asserted in two halves, because the second one alone proved nothing: `_receipt_model_version`
+    already returns `None` for an unbuilt model with `tools` fully importable, so hiding the module
+    and asserting `None` passed whether or not the guard existed. The first half pins that the
+    resolver really is wired to `tools._model_version`, which is what makes the second half's `None`
+    attributable to the guard rather than to an empty artifacts dir.
     """
-    monkeypatch.setitem(sys.modules, "tools", None)
+    monkeypatch.setattr(tools, "_model_version", lambda _profile: "v-from-tools")
+    assert execute_sql._receipt_model_version("acme") == "v-from-tools"
 
+    monkeypatch.setitem(sys.modules, "tools", None)
     assert execute_sql._receipt_model_version("acme") is None
 
 

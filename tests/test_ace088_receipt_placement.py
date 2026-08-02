@@ -256,6 +256,90 @@ def test_the_receipt_is_populated_on_the_envelope_for_ok_too(declared, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# One request resolves the model once — the receipt must not be a per-query tax
+# ---------------------------------------------------------------------------
+
+
+def test_one_query_resolves_the_model_version_once(declared, monkeypatch):
+    """`_model_version` is not free where it counts: hosted, it opens a fresh unpooled psycopg2
+    connection, queries and closes it. One `ok` query reached it FIVE times — once inside each of the
+    three `get_cached_org` calls and twice more directly — for one unchanging string, and an
+    unversioned local install additionally paid three full model loads for the same YAML.
+
+    The resolve-once scope is a request rather than the process because that is the only span over
+    which the answer is guaranteed not to matter: within one request, two different versions would
+    mean one answer described by two models.
+    """
+    versions: list[str] = []
+    loads: list[str] = []
+    real_version, real_load = tools._resolve_model_version, tools._load_org
+    monkeypatch.setattr(tools, "_resolve_model_version",
+                        lambda p: (versions.append(p), real_version(p))[1])
+    monkeypatch.setattr(tools, "_load_org", lambda p: (loads.append(p), real_load(p))[1])
+    monkeypatch.setattr(execute_sql, "_load_credentials",
+                        lambda profile, org_id="local": {"type": "sqlite", "path": ":memory:"})
+
+    class _Ran:
+        def execute(self, vetted_sql, creds, *, profile):
+            return execute_sql.ExecResult(columns=["id"], rows=[(1,)], truncated=False)
+
+    tools.set_injected_executor(_Ran())
+    body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders",
+                                              "datasource": PROFILE}))
+
+    assert body["status"] == "ok", body
+    assert versions == [PROFILE], versions
+    assert loads == [PROFILE], loads
+
+
+def test_one_request_assembles_the_full_receipt_once(declared, monkeypatch):
+    """The Envelope's typed `Receipt` and the legacy flat dict are ONE set of facts in two shapes:
+    `receipt_from_assembled` maps the typed one out of the SAME dict's `sections`. Assembling twice
+    was not merely wasteful — it left two descriptions of one answer free to disagree."""
+    from semantic_model import runtime as RT
+
+    seen: list[str] = []
+    real = RT.assemble_receipt
+    monkeypatch.setattr(
+        RT, "assemble_receipt",
+        lambda org, sql, **kw: (seen.append(sql), real(org, sql, **kw))[1],
+    )
+
+    sql = "SELECT id FROM orders"
+    token = tools.begin_request_cache()
+    try:
+        typed = tools._resolve_receipt(PROFILE, sql)
+        legacy = tools._legacy_receipt_dict(PROFILE, sql)
+    finally:
+        tools.end_request_cache(token)
+
+    assert seen == [sql], seen
+    # And both shapes really did come out of that one assembly.
+    assert [i["qname"] for i in typed.tables.items] == ["public.orders"]
+    assert [t["qname"] for t in legacy["tables_used"]] == ["public.orders"]
+
+
+def test_the_resolve_once_scope_does_not_outlive_its_request(declared, monkeypatch):
+    """A memo that leaked across requests would pin a stale model version onto the next answer, which
+    is a worse defect than the cost it saves. Outside a scope the resolver is a plain call-through."""
+    versions: list[str] = []
+    real_version = tools._resolve_model_version
+    monkeypatch.setattr(tools, "_resolve_model_version",
+                        lambda p: (versions.append(p), real_version(p))[1])
+
+    token = tools.begin_request_cache()
+    try:
+        tools._model_version(PROFILE)
+        tools._model_version(PROFILE)
+    finally:
+        tools.end_request_cache(token)
+    assert versions == [PROFILE]
+
+    tools._model_version(PROFILE)
+    assert versions == [PROFILE, PROFILE], "the next request resolves for itself"
+
+
+# ---------------------------------------------------------------------------
 # A refusal decided before any model was consulted reads the same on both paths
 # ---------------------------------------------------------------------------
 
@@ -304,7 +388,7 @@ def test_a_pre_model_refusal_never_loads_a_model(declared, monkeypatch, route, s
         raise AssertionError("a pre-model refusal must not resolve a model")
 
     monkeypatch.setattr(tools, "get_cached_org", _never)
-    monkeypatch.setattr(tools, "_model_version", _never)
+    monkeypatch.setattr(tools, "_resolve_model_version", _never)
     monkeypatch.setattr(execute_sql, "_resolve_guard_model", _never)
 
     body = ROUTES[route](sql)

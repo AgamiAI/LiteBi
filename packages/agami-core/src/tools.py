@@ -277,10 +277,65 @@ def _resolve_units(profile: str, sql: str) -> dict[str, str]:
         return {}
 
 
+# Everything ONE tool call may resolve more than once and must not resolve more than once: the model
+# version pin, and the assembled full receipt. Keyed inside by profile / (profile, sql), and scoped to
+# a request rather than to the process, for two different reasons that both matter.
+#
+# **Cost.** `_model_version` is not free where it counts. Hosted, it opens a fresh unpooled psycopg2
+# connection, queries and closes it — and a single `ok` call reached it five times (once inside each
+# of the three `get_cached_org` calls, twice more directly), so one query cost up to five new Postgres
+# connections for one unchanging string. `assemble_receipt` likewise ran twice per `ok`, because the
+# legacy flat dict and the Envelope's typed `Receipt` were assembled separately from the same
+# statement rather than derived from one assembly.
+#
+# **Correctness.** A version that changes mid-request would otherwise let one answer be described by
+# two different model versions. Resolving once per request makes "the receipt pins the model this
+# answer used" true by construction rather than by the two reads happening to race the same way.
+#
+# A ContextVar rather than a module global because tool handlers run on parallel worker threads
+# (`mcp_http` off-loads them), and it holds `None` outside a scope so a caller that never opens one
+# (a direct handler call, a test) behaves exactly as it did before this cache existed.
+_request_cache: ContextVar[dict[str, Any] | None] = ContextVar(
+    "agami_request_cache", default=None
+)
+
+
+def begin_request_cache() -> Token[dict[str, Any] | None]:
+    """Open the per-request resolve-once scope. Reset with the returned token in a `finally`, so one
+    request's model version and assembled receipt can never describe the next one."""
+    return _request_cache.set({})
+
+
+def end_request_cache(token: Token[dict[str, Any] | None]) -> None:
+    """Close the scope opened by `begin_request_cache`. Separate from the opener so the pairing is
+    visible at the call site, the same shape as `set_call_source` / `reset_call_source`."""
+    _request_cache.reset(token)
+
+
+def _request_cached(key: Any, resolve: Callable[[], Any]) -> Any:
+    """`resolve()`, once per request per key. Outside a scope it is a plain call-through."""
+    cache = _request_cache.get()
+    if cache is None:
+        return resolve()
+    if key not in cache:
+        cache[key] = resolve()
+    return cache[key]
+
+
 def _model_version(profile: str) -> str | None:
     """The model-version pin the receipt records — the newest model version. Served from the DB
     when AGAMI_DB_URL is set (no file read), else the newest snapshot dir name (a content hash, what
-    the local skill reads). None if absent/unavailable (execute_sql stays usable)."""
+    the local skill reads). None if absent/unavailable (execute_sql stays usable).
+
+    Resolved at most ONCE per request per profile: on the hosted path this opens a database
+    connection, and the callers within one query are several (`get_cached_org` in each of the three
+    model consumers, plus the receipt's own pin)."""
+    return _request_cached(("model_version", profile), lambda: _resolve_model_version(profile))
+
+
+def _resolve_model_version(profile: str) -> str | None:
+    """`_model_version` without the per-request memo — the actual lookup, split out so the memo has
+    something to wrap and so a caller that genuinely wants a fresh read has one to call."""
     from store import Store
 
     store = Store.from_env()
@@ -414,11 +469,18 @@ def get_cached_org(profile: str):
     Reuses one Datasource across the loads within a query AND across queries, until the model version
     changes; a cache miss falls back to a fresh `_load_org`."""
     version = _model_version(profile)  # cheap: one DB row / dir listing, not a full model load
-    if version is None:
-        # No version to detect a model change by (e.g. file mode with no snapshot) — don't cache,
-        # so we can never serve a stale model. The DB-backed server always has a version.
-        return _load_org(profile)
     org_id = _current_org_id()
+    if version is None:
+        # No version to detect a model change by (e.g. file mode with no snapshot) — so nothing may
+        # be cached ACROSS requests, or we could serve a stale model. The DB-backed server always has
+        # a version and never takes this branch.
+        #
+        # WITHIN one request it is cached anyway, and that is not the same tradeoff: the three
+        # consumers of the model in a single query (units, the receipt, the legacy flat dict) are
+        # describing ONE answer, so serving them three separately-loaded models buys no freshness and
+        # costs three full loads of the same YAML. Before this, an unversioned local install paid all
+        # three on every query.
+        return _request_cached(("org", org_id, profile), lambda: _load_org(profile))
     key = (org_id, profile, version)
     cached = _ORG_CACHE.get(key)  # fast path: a hit is a single atomic dict.get, no lock
     if cached is not None:
@@ -519,12 +581,13 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
         _LOG.debug("no model for datasource %r; receipt undetermined", profile)
         return undetermined_receipt(RECEIPT_NO_MODEL)
     try:
-        from semantic_model import runtime as RT
+        if bounded:
+            from semantic_model import runtime as RT
 
-        assemble = RT.assemble_refusal_receipt if bounded else RT.assemble_receipt
-        return receipt_from_assembled(
-            assemble(org, sql, model_version=_model_version(profile))
-        )
+            return receipt_from_assembled(
+                RT.assemble_refusal_receipt(org, sql, model_version=_model_version(profile))
+            )
+        return receipt_from_assembled(_assemble_full_receipt(profile, sql, org))
     except Exception:
         # A model that loaded and an assembler that then broke IS a fault, and the operator is the
         # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
@@ -546,6 +609,23 @@ def _refusal_receipt(profile: str, sql: str, refusal: Refusal) -> Receipt:
     return _resolve_receipt(profile, sql, bounded=True)
 
 
+def _assemble_full_receipt(profile: str, sql: str, org: Any) -> dict:
+    """The FULL assembler's output for one statement, assembled at most ONCE per request.
+
+    Two consumers want it on an `ok` answer and they want the same facts in two shapes: the legacy
+    flat dict the chart surfaces read, and the contract's typed `Receipt` that `receipt_from_assembled`
+    maps out of the SAME dict's `sections`. Assembling twice was not merely wasteful, it left two
+    descriptions of one answer free to disagree; deriving both from one assembly makes them one fact
+    seen twice.
+    """
+    from semantic_model import runtime as RT
+
+    return _request_cached(
+        ("full_receipt", profile, sql),
+        lambda: RT.assemble_receipt(org, sql, model_version=_model_version(profile)),
+    )
+
+
 # INTERIM, and it dies in the PR that deletes `data.receipt`. `_finalize_execution` nests the FLAT
 # assembler output (tables_used / metrics / warnings) inside the ok payload, which the chart template
 # and `render_chart.py` read by those key names. `_resolve_receipt` now returns the contract's
@@ -558,10 +638,7 @@ def _legacy_receipt_dict(profile: str, sql: str) -> dict | None:
     Code and Claude Desktop. `None` only if the model deps aren't importable (execute_sql stays
     usable)."""
     try:
-        org = get_cached_org(profile)
-        from semantic_model import runtime as RT
-
-        return RT.assemble_receipt(org, sql, model_version=_model_version(profile))
+        return _assemble_full_receipt(profile, sql, get_cached_org(profile))
     except Exception:
         return None
 
@@ -1499,7 +1576,20 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     native rows. Every outcome on either path becomes ONE `Envelope` and is serialized by `_emit`, so
     a caller sees the same shape — and, for a refusal, the same rule and the same remediation —
     whichever path ran.
+
+    The whole body runs inside the per-request resolve-once scope, opened here because this is the
+    one point both paths pass through, and closed in a `finally` for the same reason
+    `_max_rows_override` is: a value left behind would describe the next call.
     """
+    cache_token = begin_request_cache()
+    try:
+        return _tool_execute_sql(args)
+    finally:
+        end_request_cache(cache_token)
+
+
+def _tool_execute_sql(args: dict[str, Any]) -> str:
+    """`tool_execute_sql`'s body, inside the per-request scope its caller opens."""
     # Clear the raw-detail carrier for THIS call, at the one point both paths pass through.
     # `execute_guarded` also clears it on entry, but that only covers the in-process path — on the
     # fork the parent never calls it, so without this a forked call would record the driver text
