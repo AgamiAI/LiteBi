@@ -90,6 +90,58 @@ def test_section_items_are_immutable():
         ReceiptSection().items = ({"x": 1},)
 
 
+# --- the two constructors ---------------------------------------------------
+
+
+def test_an_undetermined_receipt_gives_every_section_the_same_reason():
+    """The shape a caller gets when the receipt could not be built at all. Deliberately not
+    `Receipt()`: five empty sections with no reason read as "checked, found nothing", and a receipt
+    that could not be built is a fact rather than an absence."""
+    receipt = guardrail.undetermined_receipt("no parser here", model_version="v1")
+
+    assert receipt.model_version == "v1"
+    for name in Receipt.SECTIONS:
+        assert getattr(receipt, name) == ReceiptSection(items=(), undetermined="no parser here")
+    assert receipt != Receipt()
+
+
+def test_an_undetermined_receipt_covers_a_section_added_to_the_type():
+    """It iterates `Receipt.SECTIONS` rather than naming the five fields, so a sixth section cannot
+    be forgotten here and silently ship as clean. Asserted by counting rather than by reading the
+    source, because "it iterates" is the property, not the spelling."""
+    receipt = guardrail.undetermined_receipt("r")
+    marked = [name for name in Receipt.SECTIONS if getattr(receipt, name).undetermined == "r"]
+    assert len(marked) == len(Receipt.SECTIONS) == len(fields(Receipt)) - 1
+
+
+def test_an_assembled_receipt_maps_onto_the_contract_with_tuple_items():
+    """The one place the assembler's dicts-and-lists meet the contract's frozen dataclasses. `items`
+    becomes a tuple because the field is one — a list would make the frozen type shallowly
+    immutable."""
+    assembled = {
+        "model_version": "v2",
+        "sections": {name: {"items": [], "undetermined": f"{name} pending"}
+                     for name in Receipt.SECTIONS},
+    }
+    assembled["sections"]["tables"] = {"items": [{"ref": "orders"}], "undetermined": None}
+
+    receipt = guardrail.receipt_from_assembled(assembled)
+
+    assert receipt.model_version == "v2"
+    assert receipt.tables == ReceiptSection(items=({"ref": "orders"},), undetermined=None)
+    assert isinstance(receipt.tables.items, tuple)
+    assert receipt.joins.undetermined == "joins pending"
+
+
+def test_an_assembled_receipt_missing_a_section_raises_rather_than_losing_it():
+    """Strict indexing on purpose: a builder that drops a section is drifted, and every caller turns
+    this `KeyError` into an `undetermined` receipt. Silently defaulting the section would ship a
+    clean-looking one instead."""
+    with pytest.raises(KeyError):
+        guardrail.receipt_from_assembled({"sections": {"columns": {"items": [],
+                                                                   "undetermined": None}}})
+
+
 @pytest.mark.parametrize("cls", [Refusal, Failure, Receipt, ReceiptSection, Envelope])
 def test_contract_types_are_frozen(cls):
     assert cls.__dataclass_params__.frozen

@@ -278,6 +278,48 @@ class Receipt:
     re-listing them and drifting."""
 
 
+def undetermined_receipt(reason: str, *, model_version: str | None = None) -> Receipt:
+    """A receipt that establishes nothing, and gives every section the same reason why.
+
+    What a caller gets when the receipt could not be built at all: no parser, no model, or a builder
+    that raised. It is deliberately not `Receipt()` — five empty sections with no reason read as
+    "checked, found nothing", which is the exact confusion `ReceiptSection.undetermined` exists to
+    remove. A receipt that could not be built is a fact, not an absence.
+
+    Iterates `Receipt.SECTIONS` rather than naming the five fields, so a section added to the type
+    cannot be forgotten here and silently ship as clean. One `ReceiptSection` is shared by all five:
+    it is frozen and its `items` is a tuple, so the aliasing gives a caller nothing to mutate.
+    """
+    section = ReceiptSection(undetermined=reason)
+    return Receipt(model_version=model_version, **{name: section for name in Receipt.SECTIONS})
+
+
+def receipt_from_assembled(assembled: dict[str, Any]) -> Receipt:
+    """Map an assembled receipt dict — `semantic_model.runtime.assemble_receipt`'s output, or its
+    refusal-bounded sibling's — onto the contract's `Receipt`.
+
+    The assembler builds dicts and lists (it feeds a JSON chart template as well as this), the
+    contract is frozen dataclasses, and this is the ONE place the two meet, so neither the executor
+    nor the tool edge grows its own copy of the mapping. It lives in this module rather than next to
+    the assembler because the vendored `execute_sql.py` needs it and cannot import the model stack.
+
+    `items` becomes a tuple because the field is one. `Receipt.SECTIONS` is indexed strictly: an
+    assembled dict missing a section is a drifted builder, and every caller turns the resulting
+    `KeyError` into an `undetermined` receipt rather than one that quietly lost a section.
+    """
+    sections = assembled["sections"]
+    return Receipt(
+        model_version=assembled.get("model_version"),
+        **{
+            name: ReceiptSection(
+                items=tuple(sections[name]["items"]),
+                undetermined=sections[name]["undetermined"],
+            )
+            for name in Receipt.SECTIONS
+        },
+    )
+
+
 # --- Envelope ---------------------------------------------------------------
 
 Status = Literal["ok", "refused", "failed"]
