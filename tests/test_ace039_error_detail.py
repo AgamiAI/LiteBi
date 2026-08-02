@@ -275,15 +275,23 @@ def test_migrations_are_re_runnable(tmp_path):
 def test_the_fork_does_not_relay_the_models_own_notices_to_the_caller(tmp_path, monkeypatch):
     """The child's stderr is a SHARED stream, so relaying it leaked declared model surface.
 
-    `_model_safety` writes `[agami] applied default_filters: …` to stderr before execution, and
-    `main` appends the sanitized failure line after it. `_child_failure_message` relayed the
-    whole stream, so the caller received a row-level tenancy predicate it never sent — on the
-    DEFAULT transport, while the in-process path returned the clean sentence. The fork/in-process
-    parity this slice exists to establish was false exactly where it mattered.
+    The case this was written against: `_model_safety` wrote `[agami] applied default_filters: …`
+    to stderr before execution and `main` appended the sanitized failure line after it, so
+    `_child_failure_message`, relaying the whole stream, handed the caller a row-level tenancy
+    predicate it never sent — on the DEFAULT transport, while the in-process path returned the
+    clean sentence. The fork/in-process parity this slice exists to establish was false exactly
+    where it mattered.
 
     The parent now RECONSTRUCTS the message from the exit code for the sanitized band. The child
     derived that sentence from the kind, so the kind is all the parent needs, and nothing the
     child writes to stderr can reach the answer.
+
+    ACE-042 deleted that particular notice along with the injection it announced, so the model's
+    declared filter below no longer reaches stderr by that route. The assertions stay and are not
+    vacuous: `message == _ERROR_MESSAGES[kind]` pins reconstruction-from-exit-code itself, which
+    is what keeps the surviving `[agami] auto-corrected …` notice — and anything a library logs —
+    out of the answer. Kept end-to-end rather than rebuilt on the auto-rewrite notice, because
+    ACE-093 deletes that one too.
     """
     import yaml
     from store import Store

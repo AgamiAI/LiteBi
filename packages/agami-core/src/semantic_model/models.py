@@ -312,7 +312,16 @@ class Table(_Base):
     # provenance of `description` — drives "earn trust through use" (advisory, not a gate)
     description_source: Optional[DescriptionSource] = None
 
-    default_filters: list[str] = Field(default_factory=list)
+    # DESCRIPTIVE, NOT ENFORCED (ACE-042 → ACE-099). Declaring a filter here states what the org
+    # means by this table (`{alias}.is_deleted = false`); it is business logic, not a disclosure
+    # control. It is no longer AND-ed into your SQL before execution, and is not yet reported
+    # either — ACE-099 adds the per-table-reference report of which declared filters a statement
+    # applied and which it left out. Until then, write the filter into the query yourself.
+    default_filters: list[str] = Field(
+        default_factory=list,
+        description="Declared row filters for this table. Descriptive only: not applied to your "
+                    "SQL, and not yet reported (ACE-099 adds the report).",
+    )
     caveats: list[str] = Field(default_factory=list)
 
     parent_table: Optional[str] = None

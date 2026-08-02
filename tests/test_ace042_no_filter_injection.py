@@ -135,3 +135,29 @@ def test_asking_about_the_rows_a_filter_excludes_is_not_refused(guarded):
     out, verdict = guarded(sql)
     assert verdict is None
     assert out == sql
+
+
+# --- the window is disclosed, not silent ------------------------------------
+
+
+def test_the_window_is_stated_where_a_model_author_reads():
+    """SC-6. Between this spec and ACE-099 a declared filter is neither applied nor reported. The
+    change is announced in the two places it would otherwise have to be inferred from a number
+    that moved: the tool description the model reads before every query, and the model field a
+    model author is already looking at when they declare one.
+
+    ACE-099 removes both notices, so each is one contiguous block naming it.
+    """
+    import tools
+    from semantic_model import models as m
+
+    desc = tools.TOOLS["execute_sql"]["description"]
+    assert "ACE-099" in desc
+    assert "default_filters" in desc
+
+    assert "ACE-099" in tools.SERVER_INSTRUCTIONS
+    assert "default_filters" in tools.SERVER_INSTRUCTIONS
+
+    field = m.Table.model_fields["default_filters"]
+    assert field.description is not None
+    assert "ACE-099" in field.description
