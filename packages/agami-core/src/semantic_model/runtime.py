@@ -1288,6 +1288,44 @@ def _norm_sql(s: Optional[str]) -> str:
     return " ".join((s or "").split()).lower()
 
 
+# The reason each declared section carries an `undetermined` marker (ACE-088). A section whose
+# analysis has not shipped names the spec that owns it instead of sitting empty, because an empty
+# list and an unchecked list read identically to a caller: silence reads as clean. Written as
+# user-facing sentences: they surface next to the answer, not in a log.
+UNDETERMINED_COLUMNS = (
+    "Metrics are matched against the whole statement, not against an output column: a metric is "
+    "listed here when its binding SQL appears anywhere in the text, so nothing says which column "
+    "it computes, and a column that matches no metric is not reported as unmatched. ACE-058 owns "
+    "per-column metric attribution."
+)
+UNDETERMINED_TABLES = (
+    "Which of a table's declared filters this statement applied, and which it left out, is not "
+    "determined: every reference is listed, including one inside a CTE, but none of them is "
+    "accounted for against the model's filters. ACE-042 owns per-reference filter accounting."
+)
+UNDETERMINED_JOINS = (
+    "The predicate the statement actually joined on is not read out of the SQL: a relationship is "
+    "listed because the model declares it and both of its tables are in scope, not because the "
+    "statement joined on it. ACE-059 owns comparing the join predicate against the model."
+)
+UNDETERMINED_AGGREGATES = (
+    "Whether a join multiplies the rows an aggregate is computed from is not checked, so this "
+    "section is declared and empty rather than clean. ACE-060 owns aggregate fan-out."
+)
+UNDETERMINED_UNPARSED = (
+    "The statement was not parsed, so nothing in it was checked."
+)
+
+
+def _undetermined_sections(reason: str) -> dict[str, dict[str, Any]]:
+    """Every declared section, unchecked, for one reason.
+
+    Iterates `guardrail.Receipt.SECTIONS` rather than re-listing the names, so a section added to
+    the type cannot be forgotten here and silently go missing from an early-return receipt.
+    """
+    return {name: {"items": [], "undetermined": reason} for name in guardrail.Receipt.SECTIONS}
+
+
 def assemble_receipt(
     org: Datasource,
     sql: str,
@@ -1311,11 +1349,23 @@ def assemble_receipt(
     AI-written/unknown. Unreviewed metrics surface in `metrics` (review_state) for the
     approve/change banner — NOT duplicated as a warning. Callers may append ad-hoc
     (LLM-discovered) metrics to `metrics` after the fact.
+
+    `sections` carries the five sections `guardrail.Receipt` declares (columns, tables, joins,
+    aggregates, assumptions), each `{items, undetermined}`, so a consumer never has to read an
+    empty list and guess whether it means "checked, found nothing" or "not checked at all". It is
+    ADDITIVE to the flat keys above, which the chart template still reads, and it is nested under
+    one key rather than promoted to the top level for exactly one reason: `assumptions` is the name
+    of both a flat list and a section, and the two cannot share a dict. The PR that deletes the flat
+    keys unnests this in one move.
     """
     receipt: dict[str, Any] = {
         "sql": sql, "model_version": model_version,
         "tables_used": [], "relationships": [], "metrics": [],
         "named_filters": [], "assumptions": [], "warnings": [],
+        # Stands until the statement is parsed. Both early returns below leave it in place: a
+        # receipt that never got a parse tree checked nothing, and has to say so rather than hand
+        # back five clean-looking empty sections.
+        "sections": _undetermined_sections(UNDETERMINED_UNPARSED),
     }
     if not _HAVE_SQLGLOT:
         return receipt
@@ -1430,6 +1480,53 @@ def assemble_receipt(
     if pre_flight and pre_flight.risk:
         receipt["pre_flight"] = {"risk": pre_flight.risk, "action": pre_flight.action,
                                  "reason": pre_flight.reason}
+
+    # --- the five declared sections (ACE-088) --------------------------------
+    # `ref_cols` is the set the assumptions filter above just walked; every column the statement
+    # references is a receipt fact, not only the three whose description is AI-written. Sorted
+    # because it is a set, and a receipt has to be the same receipt on every run (REQ-022).
+    column_items: list[dict[str, Any]] = []
+    for bare, cname in sorted(ref_cols):
+        info = tidx.get(bare)
+        schema = info[0].schema_name if info else None
+        column_items.append({
+            "column": f"{schema}.{bare}.{cname}" if schema else f"{bare}.{cname}",
+            "metric": None,
+        })
+    # A matched metric is a statement-level fact today, so it gets its own entry with no owning
+    # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
+    column_items.extend({"column": None, "metric": met} for met in receipt["metrics"])
+
+    table_items: list[dict[str, Any]] = []
+    for written, name, alias in _table_references(tree):
+        info = tidx.get(name)
+        t = info[0] if info else None
+        ph = t.performance_hints if t else None
+        table_items.append({
+            "ref": written,
+            "alias": alias,
+            "qname": (f"{t.schema_name}.{t.name}" if t.schema_name else t.name) if t else None,
+            "declared": t is not None,
+            "rows": (ph.estimated_row_count if ph else None),
+            "rows_as_of": (ph.estimated_row_count_at if ph else None),
+            # Freshness describes a table the model declares. An undeclared reference (a CTE name,
+            # say) has no model row for it to be about, so claiming it would be a lie by shape.
+            "freshness": freshness if t else None,
+        })
+
+    # `joins` and `assumptions` hold the SAME list objects as the flat keys, not copies: they are
+    # one set of facts seen twice while both spellings exist, and a caller appending an assumption
+    # after the fact must not have it land in one view and vanish from the other.
+    receipt["sections"] = {
+        "columns": {"items": column_items, "undetermined": UNDETERMINED_COLUMNS},
+        "tables": {"items": table_items, "undetermined": UNDETERMINED_TABLES},
+        "joins": {"items": receipt["relationships"], "undetermined": UNDETERMINED_JOINS},
+        # Empty AND declared, on purpose: no aggregate fan-out analysis has run, and a consumer
+        # must never have to tell "no aggregates" apart from "aggregates not checked".
+        "aggregates": {"items": [], "undetermined": UNDETERMINED_AGGREGATES},
+        # The one section that is complete today, so the only one with no marker.
+        "assumptions": {"items": receipt["assumptions"], "undetermined": None},
+    }
     return receipt
 
 
@@ -1446,6 +1543,22 @@ def _tables_in_scope(tree: "exp.Select") -> dict[str, str]:
         alias = tbl.alias_or_name
         out[alias] = name
     return out
+
+
+def _table_references(tree: "exp.Select") -> list[tuple[str, str, Optional[str]]]:
+    """Every table REFERENCE in the statement, in written order: (as written, bare name, alias).
+
+    Deliberately not `_tables_in_scope`, which keys by alias and so collapses two references that
+    share one: a CTE reading `orders` and an outer `FROM orders` become a single entry there. The
+    receipt needs them separate: ACE-042 has to report a filter satisfied inside a CTE and absent
+    outside it accurately, rather than crediting it to the whole statement, and one entry per table
+    cannot say that.
+    """
+    refs: list[tuple[str, str, Optional[str]]] = []
+    for tbl in tree.find_all(exp.Table):
+        written = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
+        refs.append((written, tbl.name, tbl.alias or None))
+    return refs
 
 
 def _aggregate_source_tables(tree: "exp.Select", scope: dict[str, str]) -> set[str]:
