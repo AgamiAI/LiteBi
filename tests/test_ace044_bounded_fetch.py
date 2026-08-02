@@ -275,8 +275,8 @@ def test_executor_truncated_parses_the_stderr_flag():
 
     assert tools._executor_truncated('{"truncated": {"row_cap": 1000}}') is True
     # mixed with other notices on stderr
-    assert tools._executor_truncated('[agami] applied default_filters: x\n{"truncated": {"row_cap": 5}}') is True
-    assert tools._executor_truncated('[agami] applied default_filters: x') is False
+    assert tools._executor_truncated('[agami] auto-corrected fan_out: ran rewritten SQL.\n{"truncated": {"row_cap": 5}}') is True
+    assert tools._executor_truncated('[agami] auto-corrected fan_out: ran rewritten SQL.') is False
     assert tools._executor_truncated("") is False
     assert tools._executor_truncated(None) is False
     assert tools._executor_truncated('{"error": {"kind": "permission"}}') is False  # not a truncation

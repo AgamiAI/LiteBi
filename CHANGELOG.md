@@ -53,6 +53,20 @@ below corresponds to one such version.
   repointing: an unreviewed entry read "confidence ?" to every user (the phrase tested `confidence`
   as a number; it is a label), and a named-filters block that no producer ever filled is deleted.
 
+### Removed
+
+- **The `GovernancePolicy` port and the `Adapters.governance` field (ACE-095).** `GovernancePolicy`,
+  its `GovernanceVerdict` value type, and the `WarnOnlyGovernancePolicy` default adapter are gone,
+  along with the `governance` field on `ports.Adapters`. The port was declared but never called: no
+  core call site ever evaluated it, so removing it changes no behaviour and touches nothing on the
+  `execute_sql` enforcement path. `Adapters` is public API, so a consumer that constructed it with
+  `governance=...` drops that keyword; the remaining ports (`ActivitySink`, `OrgResolver`,
+  `AuthProvider`, `Executor`) are unchanged. **`Adapters` is not keyword-only, so a consumer that
+  built it POSITIONALLY must also re-check its call**: the 4th positional slot was `governance` and
+  is now `executor`, so `Adapters(sink, resolver, auth, my_policy)` still constructs but binds the
+  policy as the executor and fails later at query time with `AttributeError: 'MyPolicy' object has
+  no attribute 'execute'`. Construct `Adapters` by keyword.
+
 ### Docs
 
 - **Read-only datasource role is now a stated deploy obligation, not a suggestion (ACE-036).** The

@@ -205,7 +205,8 @@ def test_the_sanitized_band_is_rebuilt_not_relayed(code: int) -> None:
     import execute_sql
 
     kind = execute_sql.EXIT_TO_FAILURE_KIND[code]
-    noisy = f"[agami] applied default_filters: [\"t.tenant = 'X'\"]\n{execute_sql._ERROR_MESSAGES[kind]}"
+    noisy = (f"[agami] auto-corrected fan_out: ran rewritten SQL. joined t on tenant_shard\n"
+             f"{execute_sql._ERROR_MESSAGES[kind]}")
     assert tools._child_failure_message(code, noisy) == execute_sql._ERROR_MESSAGES[kind]
     assert "tenant" not in tools._child_failure_message(code, noisy)
 

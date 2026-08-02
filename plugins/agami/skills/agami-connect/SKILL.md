@@ -733,7 +733,7 @@ Don't propose metrics depending on choice-field literals you didn't detect, or c
 From samples + the domain doc, add provider-portable cleaning where evidence supports it:
 - **Caveats** (`caveats[]` on table/column/entity): data-quality notes, anti-patterns (e.g. "filter on the event date, not the load date"), dedup warnings.
 - **value_transform** on columns whose raw value needs cleaning (`regexp_replace(...)` for bracketed text, `TO_TIMESTAMP(...)` for epoch). Must parse as SQL (validator checks).
-- **default_filters** (`default_filters[]` on a table): soft-delete / tenancy filters AND-ed in at query time (use the `{alias}` placeholder, e.g. `{alias}.deleted_at IS NULL`).
+- **default_filters** (`default_filters[]` on a table): soft-delete / tenancy filters that state what the org means by the table (use the `{alias}` placeholder, e.g. `{alias}.deleted_at IS NULL`). **Declarative only** — they are not AND-ed into a query for you, and are not yet reported; the query path reads them and writes in the ones a question needs.
 - **Currency (one ask per profile):** **find the money columns with `sm suggest-units "$ROOT"` — don't hand-roll a name regex** (a bare `count` pattern matches inside `discount` and silently drops `discount_amount`; the command's matcher is word-boundary-correct and tested). It returns `{money_columns: [{area, table, column, type}]}` (numeric columns named like money — amount/price/revenue/discount/… — minus rate/count/id/score, and skipping any that already have a `unit`). Glance at the list; if a `_usd`/`_inr`-suffixed column makes the currency obvious, set it directly. Otherwise ask once: "What currency are these in?" (`USD`/`EUR`/`GBP`/`JPY`/`INR`/`Other`/`Mixed`). On the answer, apply it with **one tested command — never pipe `suggest-units` through a hand-rolled script** (that glue breaks, e.g. on empty stdin):
 
 ```bash
@@ -857,7 +857,7 @@ Output `{added, written, committed, rejected:[{question, error}]}`. For each `re
 
 ## Phase 6: Validate every seed example (the trust onboarding)
 
-**Run every seed with ONE packaged call — `sm seed-validate` — never a hand-rolled "run all the seeds" script.** It executes each written seed against the live DB **through `execute_sql`** (the same path agami-query uses), so the **fan-trap / chasm-trap pre-flight + `default_filters` always apply** — a raw-connection driver could skip that safety and let a fan-out scan the whole table. It emits the examples-validation items (`{n, question, sql, row_headers, row_preview, row_count, state}`); a seed the pre-flight refuses or that errors comes back with its `error`, not a faked result:
+**Run every seed with ONE packaged call — `sm seed-validate` — never a hand-rolled "run all the seeds" script.** It executes each written seed against the live DB **through `execute_sql`** (the same path agami-query uses), so the **fan-trap / chasm-trap pre-flight and the scope/PII gates always apply** — a raw-connection driver could skip that safety and let a fan-out scan the whole table. It emits the examples-validation items (`{n, question, sql, row_headers, row_preview, row_count, state}`); a seed the pre-flight refuses or that errors comes back with its `error`, not a faked result:
 
 ```bash
 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" seed-validate "$ROOT" --area <area> --profile <profile> > /tmp/agami-examples-items.json

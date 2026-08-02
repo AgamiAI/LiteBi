@@ -14,8 +14,8 @@ Design constraints (match the rest of agami):
     `semantic_model` package (Pydantic) lazily and surface a clear "install the model deps" error
     if it's absent — so execution still works on a bare install.
   - **No data leaves the machine.** SQL is executed locally by shelling out to `execute_sql` (the
-    same executor the skills use), which runs the fan/chasm pre-flight + default_filters safety
-    pass; the semantic model is read from `<artifacts_dir>/<profile>/`.
+    same executor the skills use), which runs the fan/chasm pre-flight, the scope gates and the
+    sensitive-column gate; the semantic model is read from `<artifacts_dir>/<profile>/`.
 """
 
 from __future__ import annotations
@@ -98,17 +98,19 @@ SERVER_INSTRUCTIONS = (
     "Flow: (1) list_datasources, then get_datasource_schema for the datasource the question "
     "touches (it sizes itself — pass a `query` to focus metrics, `dataset_names` for full table "
     "detail). (2) Examples-first — call get_prompt_examples and mirror the closest match; use "
-    "metric `calculation`/`bindings` verbatim. (3) execute_sql (safety + default_filters run "
-    "inside it). (4) Read the returned `receipt`. It is on EVERY status, and it is five sections — "
-    "columns, tables, joins, aggregates, assumptions — each `{items, undetermined}`. SHOW the user: "
-    "any join in `receipt.joins.items` whose review_state != 'approved', and any metric in "
-    "`receipt.columns.items[].metric` (the entries whose `column` is null) whose review_state != "
-    "'approved' — joins/metrics they haven't signed off; never hide them. Don't refuse on an "
-    "unreviewed metric — answer and warn. ALSO surface each section's `undetermined` sentence when "
-    "it is non-null: it says what that section did NOT establish, so an empty `items` with a marker "
-    "means NOT CHECKED while an empty `items` with a null marker means checked and clean. Reporting "
-    "only `items` turns 'not checked' back into 'nothing wrong', which is the one reading the "
-    "receipt exists to prevent.\n"
+    "metric `calculation`/`bindings` verbatim. (3) execute_sql (the safety pass runs inside it; "
+    # ACE-042 -> ACE-099: the declared-filter window; delete this clause with the one above.
+    "a table's declared `default_filters` are NOT applied — write one into the SQL yourself if "
+    "the question needs it). (4) Read the returned `receipt`. It is on EVERY status, and it is "
+    "five sections — columns, tables, joins, aggregates, assumptions — each `{items, "
+    "undetermined}`. SHOW the user: any join in `receipt.joins.items` whose review_state != "
+    "'approved', and any metric in `receipt.columns.items[].metric` (the entries whose `column` is "
+    "null) whose review_state != 'approved' — joins/metrics they haven't signed off; never hide "
+    "them. Don't refuse on an unreviewed metric — answer and warn. ALSO surface each section's "
+    "`undetermined` sentence when it is non-null: it says what that section did NOT establish, so "
+    "an empty `items` with a marker means NOT CHECKED while an empty `items` with a null marker "
+    "means checked and clean. Reporting only `items` turns 'not checked' back into 'nothing "
+    "wrong', which is the one reading the receipt exists to prevent.\n"
     "PII: a column marked `sensitive: true` restricts OUTPUT, not the query — you MAY "
     "COUNT/COUNT(DISTINCT)/filter/GROUP BY/JOIN on it, but never SELECT its raw per-row values. "
     "'unique emails' → COUNT(DISTINCT email). To disambiguate identical labels, project the "
@@ -571,15 +573,15 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
     defect one layer down.
 
     KNOWN GAP, and this is where it lives. `sql` here is the statement the CALLER sent, which is the
-    only one this side of the fork has: `_model_safety` runs in the child, and both its rewrites (the
-    fan/chasm `auto_rewrite` branch and `apply_default_filters`) rebind the child's local before it
-    executes. So after a rewrite the child runs one statement and this describes another. It is
-    narrowed to `ok` alone now that every non-ok receipt is built from the RECEIVED statement on both
-    paths deliberately, and it is measured rather than left as prose by a `strict=True` xfail in
+    only one this side of the fork has: `_model_safety` runs in the child, and its surviving rewrite
+    (the fan/chasm `auto_rewrite` branch) rebinds the child's local before it executes. So after a
+    rewrite the child runs one statement and this describes another. It is narrowed to `ok` alone now
+    that every non-ok receipt is built from the RECEIVED statement on both paths deliberately, and it
+    is measured rather than left as prose by a `strict=True` xfail in
     tests/test_ace088_executed_statement.py. It closes by subtraction, not by plumbing the rewritten
-    statement back across the wire: ACE-093 deletes the fan-join rewrite and ACE-042 the
-    default-filter injection, after which executed and received are the same string and this is
-    describing it. That is the slice that deletes the marker.
+    statement back across the wire: ACE-042 has already deleted the default-filter injection and
+    ACE-093 deletes the fan-join rewrite, after which executed and received are the same string and
+    this is describing it. That is the slice that deletes the marker.
     """
     try:
         org = get_cached_org(profile)
@@ -1193,11 +1195,13 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     **The sanitized band is RECONSTRUCTED, never relayed (ACE-039).** For every code whose message
     the child derives from `_ERROR_MESSAGES`, the parent can rebuild that exact sentence from the
     exit code alone, so relaying stderr for those codes buys nothing and carries real risk: stderr
-    is a *shared* stream, and the child writes to it before the failure line. `_model_safety`'s
-    `[agami] applied default_filters: …` notice is the concrete case — it put a declared row-level
+    is a *shared* stream, and the child writes to it before the failure line. The concrete case was
+    `_model_safety`'s `[agami] applied default_filters: …` notice — it put a declared row-level
     predicate, which the caller never sent, into `failure.message` on the DEFAULT transport, while
-    the in-process path returned the clean sentence. Anything else a library logs to stderr had the
-    same reach; the traceback guard below only ever caught the two `exc_info=True` sites.
+    the in-process path returned the clean sentence. (That notice is gone: ACE-042 deleted the
+    injection it announced. The surviving `[agami] auto-corrected …` notice and anything a library
+    logs to stderr have the same reach, so the reconstruction below is what keeps them out; the
+    traceback guard only ever caught the two `exc_info=True` sites.)
     """
     from execute_sql import (
         _AUTHORED_EXIT_CODES,
@@ -1626,10 +1630,10 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
             profile=profile, args=args, max_rows=max_rows,
         )
 
-    # The model safety pass (fan/chasm pre-flight + default_filters) runs inside
-    # execute_sql.py; pass the subject area so default_filters scope correctly.
+    # The model safety pass (fan/chasm pre-flight + scope + PII) runs inside execute_sql.py;
+    # pass the subject area so the gates scope to the right one.
     # Route through the unified executor as a module (the package is installed alongside
-    # this harness), so the read-only safety pass + default_filters + logging run once.
+    # this harness), so the read-only safety pass + logging run once.
     cmd = [sys.executable, "-m", "execute_sql", "--profile", profile, "--sql", sql]
     if args.get("area"):
         cmd += ["--area", str(args["area"])]
@@ -2072,7 +2076,13 @@ TOOLS: dict[str, dict[str, Any]] = {
             "return {columns, rows, row_count, truncated, sql, execution_ms}. SELECT-only is "
             "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
-            "Runs entirely locally via execute_sql.py — no data leaves the machine."
+            "Runs entirely locally via execute_sql.py — no data leaves the machine. "
+            # ACE-042 -> ACE-099: the declared-filter window. Delete this sentence when the
+            # adherence report lands. Spec ids stay in the comment — this string ships to every
+            # client, and an id only resolves inside the spec repo.
+            "A table's declared `default_filters` are NOT applied to your SQL, and are not yet "
+            "reported either — if a filter matters to the question, write it into the "
+            "statement yourself."
         ),
         "inputSchema": {
             "type": "object",
@@ -2084,7 +2094,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "area": {
                     "type": "string",
-                    "description": "Subject area — scopes the fan/chasm pre-flight + default_filters safety pass.",
+                    "description": "Subject area — scopes the fan/chasm pre-flight and the scope/PII gates.",
                 },
                 "raw_query": {
                     "type": "string",
