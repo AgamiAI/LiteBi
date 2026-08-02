@@ -492,6 +492,17 @@ def _resolve_receipt(profile: str, sql: str, *, refused: bool = False) -> Receip
     A build that raises returns an `undetermined` receipt, never `None`. A receipt that could not be
     built is a fact the caller can act on ("the model deps are not installed here"); `None` was an
     absence the caller could only read as silence.
+
+    KNOWN GAP, and this is where it lives. `sql` here is the statement the CALLER sent, which is the
+    only one this side of the fork has: `_model_safety` runs in the child, and both its rewrites (the
+    fan/chasm `auto_rewrite` branch and `apply_default_filters`) rebind the child's local before it
+    executes. So after a rewrite the child runs one statement and this describes another, while the
+    in-process twin `execute_sql._receipt_for` is built from the rebound value and describes what
+    ran. Measured rather than left as prose, by a `strict=True` xfail in
+    tests/test_ace088_executed_statement.py. It closes by subtraction, not by plumbing the rewritten
+    statement back across the wire: ACE-093 deletes the fan-join rewrite and ACE-042 the
+    default-filter injection, after which executed and received are the same string and this is
+    describing it. That is the slice that deletes the marker.
     """
     try:
         org = get_cached_org(profile)
