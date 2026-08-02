@@ -47,7 +47,14 @@ import agami_paths
 # nothing — unlike `sql_guard`, which is still imported lazily inside `check_read_only`. `Envelope`,
 # `Failure` and `Refusal` are CONSTRUCTED at this layer (the tool edge owns the outcomes that never
 # reach the execution chokepoint), so they cannot be TYPE_CHECKING-only the way `Refusal` was.
-from guardrail import Envelope, Failure, Refusal
+from guardrail import (
+    Envelope,
+    Failure,
+    Receipt,
+    Refusal,
+    receipt_from_assembled,
+    undetermined_receipt,
+)
 
 # The tool edge's logger. The audit write is best-effort — it must never break an answer — but
 # "best-effort" is not "silent": a permanently broken sink has to be distinguishable from a working
@@ -456,11 +463,69 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
     )
 
 
-def _resolve_receipt(profile: str, sql: str) -> dict | None:
-    """The FULL trust receipt (tables / relationships / metrics+review_state / assumptions
-    / warnings) for this query — the SAME assembler the skill uses, so the 'what did this
-    touch / what's unapproved' panel is identical in Claude Code and Claude Desktop.
-    Returns None only if the model deps aren't importable (execute_sql stays usable)."""
+# What a receipt says when the tool edge could not assemble one — the model deps are absent, the
+# model does not load, or the assembler raised. Said rather than left empty, because five empty
+# sections with no reason read as "checked, found nothing".
+RECEIPT_UNAVAILABLE = (
+    "The receipt could not be assembled for this statement, so nothing about it was established."
+)
+# The argument-validation outcome: there is no statement, so there is nothing a receipt could be
+# about. Distinct from the one above, which is a statement whose receipt could not be built.
+RECEIPT_NO_STATEMENT = (
+    "No statement was supplied, so there was nothing to establish anything about."
+)
+
+
+def _resolve_receipt(profile: str, sql: str, *, refused: bool = False) -> Receipt:
+    """The `Envelope.receipt` for a statement this process did NOT run through the chokepoint.
+
+    The fork path needs this. `tools` runs `python -m execute_sql` as a subprocess and rebuilds the
+    Envelope from the child's exit code and stderr, so the receipt the child assembled is destroyed
+    at the process boundary — on exactly the refused and failed outcomes. Building it here is what
+    keeps the two paths saying the same thing about the same statement, without changing the wire
+    format between parent and child (ACE-035 declined to scope that).
+
+    `refused` picks the bounded assembler. A refusal receipt echoes only what the caller's own
+    statement already disclosed, because a refusal is the outcome a caller can provoke on purpose —
+    see `runtime.assemble_refusal_receipt`.
+
+    A build that raises returns an `undetermined` receipt, never `None`. A receipt that could not be
+    built is a fact the caller can act on ("the model deps are not installed here"); `None` was an
+    absence the caller could only read as silence.
+    """
+    try:
+        org = get_cached_org(profile)
+    except Exception:
+        # No model for this datasource, or no model deps at all. Both are ordinary states for a bare
+        # local install rather than faults, so they are not server-log events — the fact travels to
+        # the caller on the receipt itself, which is the whole point of returning one.
+        _LOG.debug("no model for datasource %r; receipt undetermined", profile, exc_info=True)
+        return undetermined_receipt(RECEIPT_UNAVAILABLE)
+    try:
+        from semantic_model import runtime as RT
+
+        assemble = RT.assemble_refusal_receipt if refused else RT.assemble_receipt
+        return receipt_from_assembled(
+            assemble(org, sql, model_version=_model_version(profile))
+        )
+    except Exception:
+        # A model that loaded and an assembler that then broke IS a fault, and the operator is the
+        # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
+        _LOG.error("could not assemble the receipt for datasource %r", profile, exc_info=True)
+        return undetermined_receipt(RECEIPT_UNAVAILABLE)
+
+
+# INTERIM, and it dies in the PR that deletes `data.receipt`. `_finalize_execution` nests the FLAT
+# assembler output (tables_used / metrics / warnings) inside the ok payload, which the chart template
+# and `render_chart.py` read by those key names. `_resolve_receipt` now returns the contract's
+# `Receipt` instead, so the legacy consumer needs its own accessor rather than a shape the ok payload
+# would silently change under. Delete this function, its call site, and the `"receipt"` key in
+# `_finalize_execution` together, in the commit that flips the ok body onto `Envelope.receipt`.
+def _legacy_receipt_dict(profile: str, sql: str) -> dict | None:
+    """The FULL trust receipt as the FLAT dict the chart surfaces still read — the SAME assembler
+    the skill uses, so the 'what did this touch / what's unapproved' panel is identical in Claude
+    Code and Claude Desktop. `None` only if the model deps aren't importable (execute_sql stays
+    usable)."""
     try:
         org = get_cached_org(profile)
         from semantic_model import runtime as RT
@@ -1127,9 +1192,11 @@ def _finalize_execution(
 
     This is the **`ok` payload only**, and it is frozen: `_emit` merges `status` and `audit_id` onto
     what this returns and is the only thing that serializes a tool response. The nested
-    `"receipt": _resolve_receipt(...)` here is the populated `contracts.Receipt` (tables_used /
-    metrics / warnings), NOT the stdlib `Envelope.receipt` stub — the two are different types and
-    neither is wired from the other.
+    `"receipt": _legacy_receipt_dict(...)` here is the FLAT assembler output (tables_used / metrics /
+    warnings) that the chart template reads, NOT `Envelope.receipt`, which is the contract's typed
+    `guardrail.Receipt` and is now populated on all three statuses. The two describe the same
+    statement in two shapes while both spellings exist; the PR that deletes this one flips the ok
+    body onto the other in the same commit.
 
     It no longer writes the audit row. This function only ever runs on success, so hanging the write
     here is precisely why a refusal left no trace; the write moved to `_emit`, which every outcome
@@ -1158,8 +1225,10 @@ def _finalize_execution(
         # Trust receipt — provenance + anything unapproved this answer used. Same assembler
         # the agami-query skill renders, so Desktop gets the same trust panel. Clients should
         # surface receipt.warnings and any receipt.metrics whose review_state != "approved"
-        # (offer to approve/correct via the save_correction tool).
-        "receipt": _resolve_receipt(profile, sql),
+        # (offer to approve/correct via the save_correction tool). INTERIM: this flat nested dict
+        # and `_legacy_receipt_dict` die together in the PR that flips the ok body onto
+        # `Envelope.receipt`.
+        "receipt": _legacy_receipt_dict(profile, sql),
     }
     return json.dumps(result, indent=2, default=str)
 
@@ -1170,9 +1239,14 @@ def _envelope(
     data: Any | None = None,
     refusal: Refusal | None = None,
     failure: Failure | None = None,
+    receipt: Receipt | None = None,
 ) -> Envelope:
     """The ONE place the tool edge constructs an `Envelope`, and the one place it mints an
     `audit_id`.
+
+    `receipt` is optional at this signature and never optional on the wire: an outcome with no
+    receipt to hand gets one that SAYS so, rather than the empty-and-silent default, which a
+    consumer would read as "checked, found nothing".
 
     The execution chokepoint (`execute_sql.execute_guarded`) mints its own for everything that
     reaches it; this covers the outcomes that never do — a malformed argument, the read-only
@@ -1185,6 +1259,7 @@ def _envelope(
         data=data,
         refusal=refusal,
         failure=failure,
+        receipt=receipt if receipt is not None else undetermined_receipt(RECEIPT_UNAVAILABLE),
         audit_id=uuid.uuid4().hex,
     )
 
@@ -1245,6 +1320,13 @@ def _emit(
             body["sql"] = sql
         if execution_ms is not None:
             body["execution_ms"] = execution_ms
+        # `refused` and `failed` only, and only until the nested legacy dict goes. The ok body is
+        # `{"status": "ok", **payload, …}` and `payload` ALREADY carries a `"receipt"` key — the
+        # flat dict the chart template reads — so a top-level receipt there would silently overwrite
+        # one of the two. The PR that deletes `data.receipt` flips ok over in the same commit. The
+        # receipt is on the TYPE for all three statuses from this slice, which is what the contract
+        # asserts; only the ok WIRE waits.
+        body["receipt"] = asdict(env.receipt)
         body["audit_id"] = env.audit_id
         # A refused or failed call returned no rows at all — which is not the same fact as a query
         # that ran and matched nothing, but the row's `status` is what carries that distinction.
@@ -1367,7 +1449,7 @@ def _run_in_process(
         # every reachable case is a datasource-configuration problem.
         return _envelope("failed", failure=Failure(
             kind="dsn", message="Datasource configuration error.",
-        ))
+        ), receipt=_resolve_receipt(profile, sql))
     finally:
         execute_sql._max_rows_override.reset(cap_token)
 
@@ -1402,7 +1484,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         return _emit(
             _envelope("failed", failure=Failure(
                 kind="other", message="Pass a non-empty `sql` string.",
-            )),
+            ), receipt=undetermined_receipt(RECEIPT_NO_STATEMENT)),
             sql=None,
             execution_ms=None,
         )
@@ -1419,7 +1501,8 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # never even resolves credentials or forks. Same rule, same remediation as the deeper call
         # would give — and now the same audit row, too.
         return _emit(
-            _envelope("refused", refusal=refusal),
+            _envelope("refused", refusal=refusal,
+                      receipt=_resolve_receipt(profile, sql, refused=True)),
             sql=sql, execution_ms=None, profile=profile, args=args,
         )
 
@@ -1498,7 +1581,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             _envelope("failed", failure=Failure(
                 kind="timeout",
                 message="The executor did not respond within the supervisor's bound and was stopped.",
-            )),
+            ), receipt=_resolve_receipt(profile, sql)),
             sql=sql,
             execution_ms=None,
             profile=profile,
@@ -1514,14 +1597,15 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # costs nothing and keeps the Envelope's payload a real contract object, never a loose dict.
         refusal = _stderr_refusal(proc.returncode, proc.stderr)
         if refusal is not None:
-            env = _envelope("refused", refusal=Refusal(**refusal))
+            env = _envelope("refused", refusal=Refusal(**refusal),
+                            receipt=_resolve_receipt(profile, sql, refused=True))
         else:
             # Not raw stderr: see `_child_failure_message` for which of the two the caller gets and
             # why. This field is shown to the caller, so a traceback must never reach it.
             env = _envelope("failed", failure=Failure(
                 kind=_classify_exit(proc.returncode),
                 message=_child_failure_message(proc.returncode, proc.stderr),
-            ))
+            ), receipt=_resolve_receipt(profile, sql))
         # `profile` and `args` travel with the non-ok outcomes too. Omitting them wrote the audit row
         # with `datasource=''` and `question=NULL` on exactly the rows a reviewer of a refusal most
         # needs them on — and only on the fork path, which is the default, so the two paths disagreed
@@ -1544,7 +1628,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         columns=columns,
         rows=[tuple(r) for r in data_rows],
         truncated=_executor_truncated(proc.stderr),
-    ))
+    ), receipt=_resolve_receipt(profile, sql))
     return _emit(
         env, sql=sql, execution_ms=execution_ms,
         profile=profile, args=args, max_rows=max_rows,

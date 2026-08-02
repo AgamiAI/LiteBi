@@ -205,7 +205,12 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # raw driver text OUT of a failed call for the audit row, is written after the budget has already
     # been resolved and spent, and is never read to compute a bound. The hazard this test names is a
     # second INPUT to the budget that the fork cannot carry; an output carrier is not one.
-    context_vars -= {"_last_error_detail"}
+    #
+    # `_guard_model` (ACE-088) is excluded on the same test, not by exception: it carries the model
+    # the safety pass already resolved ACROSS to the receipt builder a few lines later, inside one
+    # call. Nothing reads it to compute a bound, and it is cleared at the entry to every call, so it
+    # cannot outlive the call that set it — let alone reach a child.
+    context_vars -= {"_last_error_detail", "_guard_model"}
     assert context_vars == {"_max_rows_override"}, (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"

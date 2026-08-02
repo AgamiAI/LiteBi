@@ -18,6 +18,7 @@ if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
 import execute_sql  # noqa: E402
+import guardrail  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -297,7 +298,16 @@ def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "_resolve_units", lambda *a: {})
-    monkeypatch.setattr(tools, "_resolve_receipt", lambda *a: None)
+    # There is no model behind this fake fork, and this test is about the row cap, so both receipt
+    # builders are stubbed out. They return DIFFERENT types and the stubs have to honour that:
+    # `_legacy_receipt_dict` is the flat dict the ok payload nests, `_resolve_receipt` is the
+    # contract's `Receipt` on the Envelope, and it may not be `None` (ACE-088 SC-5 — a receipt that
+    # could not be built is an `undetermined` receipt, not an absence).
+    monkeypatch.setattr(tools, "_legacy_receipt_dict", lambda *a: None)
+    monkeypatch.setattr(
+        tools, "_resolve_receipt",
+        lambda *a, **kw: guardrail.undetermined_receipt("stubbed by the test"),
+    )
 
     resp = json.loads(tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme", "max_rows": 2}))
     cmd = captured["cmd"]

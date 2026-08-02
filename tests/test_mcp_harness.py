@@ -34,7 +34,7 @@ SERVER = REPO_ROOT / "packages" / "agami-core" / "src" / "mcp_harness.py"
 from tools import (
     _classify_exit,
     _distill_for_llm,
-    _resolve_receipt,
+    _legacy_receipt_dict,
     _resolve_units,
     check_read_only,
     resolve_artifacts_dir,
@@ -316,7 +316,7 @@ def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, _ = _write_rich_model(tmp_path)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
-    r = _resolve_receipt(profile, SQL)
+    r = _legacy_receipt_dict(profile, SQL)
     assert r is not None
     # the unapproved metric is surfaced WITH its review_state (drives the approve/change banner)
     rev = next(m for m in r["metrics"] if m["name"] == "revenue")
@@ -336,7 +336,7 @@ def test_mcp_receipt_equals_shared_assembler(monkeypatch, tmp_path):
     from semantic_model import loader as L
     from semantic_model import runtime as RT
     shared = RT.assemble_receipt(L.load_datasource(root), SQL)
-    mcp = _resolve_receipt(profile, SQL)
+    mcp = _legacy_receipt_dict(profile, SQL)
     for key in ("tables_used", "relationships", "metrics", "assumptions", "warnings"):
         assert mcp[key] == shared[key], key
 

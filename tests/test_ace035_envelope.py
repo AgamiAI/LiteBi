@@ -212,8 +212,11 @@ def test_tool_edge_refused_shape(monkeypatch, _emitted):
 
     out = _tool_out("DELETE FROM t")
 
-    # No `execution_ms`: nothing was executed, so a duration would be a fabricated field.
-    assert set(out) == {"status", "refusal", "sql", "audit_id"}
+    # No `execution_ms`: nothing was executed, so a duration would be a fabricated field. The
+    # `receipt` key is new in ACE-088: a refused caller most needs the facts, so the receipt is on
+    # the refused wire from that slice (bounded to the caller's own identifiers).
+    assert set(out) == {"status", "refusal", "sql", "audit_id", "receipt"}
+    assert set(out["receipt"]) == {"model_version", *guardrail.Receipt.SECTIONS}
     assert out["status"] == "refused"
     assert set(out["refusal"]) == {"reason", "rule", "detail", "remediation"}
     assert out["refusal"]["rule"] == guardrail.RULE_READ_ONLY
@@ -233,7 +236,8 @@ def test_tool_edge_failed_shape(monkeypatch, _emitted):
     tools.set_injected_executor(_Boom())
     out = _tool_out("SELECT nope FROM t")
 
-    assert set(out) == {"status", "failure", "sql", "execution_ms", "audit_id"}
+    # `receipt` is new in ACE-088 — see the refused shape above.
+    assert set(out) == {"status", "failure", "sql", "execution_ms", "audit_id", "receipt"}
     assert out["status"] == "failed"
     assert set(out["failure"]) == {"kind", "message"}
     # Was `syntax`, which was just the exit-5 prior showing through: nothing read the text, so
@@ -261,9 +265,9 @@ def test_tool_edge_ok_shape_keeps_the_frozen_payload_and_adds_status_and_audit_i
     assert {"columns", "rows", "row_count", "truncated", "units", "markdown", "sql",
             "execution_ms", "receipt"} <= set(out)
     assert out["columns"] == ["n"] and out["rows"] == [["1"]]
-    # The nested `receipt` is the populated trust receipt from `_finalize_execution`, NOT the
-    # stdlib `Envelope.receipt` stub — the two are different types and neither is wired from the
-    # other. An empty stub serialized in here would read as "this answer has no provenance".
+    # The nested `receipt` is the FLAT trust receipt `_finalize_execution` nests, NOT the typed
+    # `Envelope.receipt` — two shapes of the same facts while both spellings exist, and the ok body
+    # keeps this one until the PR that deletes it flips ok onto the other.
     assert "receipt" in out
     assert len(_emitted) == 1
 
@@ -274,7 +278,10 @@ def test_tool_edge_omits_fields_it_has_nothing_to_say_about(_emitted):
     # "value is null".
     out = json.loads(tools.tool_execute_sql({"sql": "   "}))
 
-    assert set(out) == {"status", "failure", "audit_id"}
+    # A receipt is still present, and it SAYS it has nothing rather than looking clean: there was
+    # no statement, so there is nothing a receipt could be about.
+    assert set(out) == {"status", "failure", "audit_id", "receipt"}
+    assert out["receipt"]["tables"] == {"items": [], "undetermined": tools.RECEIPT_NO_STATEMENT}
     assert out["status"] == "failed" and out["failure"]["kind"] == "other"
     assert len(_emitted) == 1
 
@@ -282,9 +289,12 @@ def test_tool_edge_omits_fields_it_has_nothing_to_say_about(_emitted):
 def test_the_envelope_receipt_is_present_on_all_three_statuses(monkeypatch, _emitted):
     """`Envelope.receipt` exists on `ok`, `refused` AND `failed`.
 
-    It is an empty stub today (its contents are the receipt work's), but the field is on the
-    Envelope from the start so the shape does not change when it fills — and it is present on
-    `refused` in particular, because a refused caller most needs the facts.
+    The field was on the Envelope from the start so the shape would not change when it filled;
+    ACE-088 filled it. It is present on `refused` in particular, because a refused caller most needs
+    the facts — bounded there to the identifiers its own statement wrote.
+
+    This test pins the FIELD on every status. What each one contains is
+    `tests/test_ace088_receipt_placement.py`.
     """
     monkeypatch.setattr(tools, "resolve_profile", lambda ds: "acme")
     monkeypatch.setattr(execute_sql, "_load_credentials", _sqlite_creds)
@@ -384,6 +394,12 @@ def test_in_process_and_forked_refusals_are_the_same_refusal(tmp_path, monkeypat
     # And it is the GATE's rule, not a generic stand-in. Without this the assertions above would
     # still pass if both paths regressed to the same useless answer.
     assert in_process["refusal"]["rule"] != guardrail.RULE_MODEL_SAFETY
+    # The receipt is the second half of the same property (ACE-088), and the harder half: the two
+    # paths build it in two different PROCESSES. The child's Envelope is destroyed at the process
+    # boundary, so the parent assembles the fork's receipt from the same model and the same version
+    # pin — and if either side drifts, the same statement comes back described two ways.
+    assert in_process["receipt"] == forked["receipt"]
+    assert [i["ref"] for i in in_process["receipt"]["tables"]["items"]]
 
 
 def _write_sensitive_model(root: Path) -> None:
