@@ -597,6 +597,12 @@ _ECHO_MAX_NAME_CHARS = 64
 # Enough to fix a statement in one pass — an offending set is one to three names in practice — and
 # small enough that the joined list stays bounded no matter what the statement contained.
 _ECHO_MAX_NAMES = 5
+# The FULL receipt's own cap on table references, and deliberately far above `_ECHO_MAX_NAMES`: this
+# one bounds a description of a statement that RAN, where every reference is a table the model
+# declares and the caller is owed the whole list. 50 is well past any join a person or a model writes
+# and far below the response amplification an unbounded section allows — a statement inventing four
+# hundred aliases produced a four-hundred-entry section, at no cost to the caller who asked for it.
+_RECEIPT_MAX_TABLE_REFS = 50
 # Everything an identifier can legitimately contain once it is parsed: letters, digits, `_`, and the
 # `.`/`$`/`-` that appear in qualified and engine-specific names. `*` is in the set because the
 # column-scope gate names a qualified star back as `orders.*` — a projection token the caller wrote,
@@ -1317,29 +1323,37 @@ def _norm_sql(s: Optional[str]) -> str:
     return " ".join((s or "").split()).lower()
 
 
-# The reason each declared section carries an `undetermined` marker (ACE-088). A section whose
-# analysis has not shipped names the spec that owns it instead of sitting empty, because an empty
-# list and an unchecked list read identically to a caller: silence reads as clean. Written as
-# user-facing sentences: they surface next to the answer, not in a log.
+# The reason each declared section carries an `undetermined` marker. A section whose analysis has not
+# shipped states what it did not establish instead of sitting empty, because an empty list and an
+# unchecked list read identically to a caller: silence reads as clean. Written as user-facing
+# sentences: they surface next to the answer, not in a log.
+#
+# WHICH SPEC OWNS EACH GAP IS A COMMENT, NOT PART OF THE STRING. These sentences ship to end users of
+# a PUBLIC repo, and an "ACE-NNN" resolves only in a private portfolio repo — so to a reader it is an
+# unresolvable reference, and to a competitor it is a roadmap of work that has not shipped. The
+# behavioural half is the half a user can act on, and it is the half that stays.
+# ACE-058 owns per-column metric attribution.
 UNDETERMINED_COLUMNS = (
     "Metrics are matched against the whole statement, not against an output column: a metric is "
     "listed here when its binding SQL appears anywhere in the text, so nothing says which column "
-    "it computes, and a column that matches no metric is not reported as unmatched. ACE-058 owns "
-    "per-column metric attribution."
+    "it computes, and a column that matches no metric is not reported as unmatched."
 )
+# ACE-042 owns per-reference filter accounting.
 UNDETERMINED_TABLES = (
     "Which of a table's declared filters this statement applied, and which it left out, is not "
     "determined: every reference is listed, including one inside a CTE, but none of them is "
-    "accounted for against the model's filters. ACE-042 owns per-reference filter accounting."
+    "accounted for against the model's filters."
 )
+# ACE-059 owns comparing the join predicate against the model.
 UNDETERMINED_JOINS = (
     "The predicate the statement actually joined on is not read out of the SQL: a relationship is "
     "listed because the model declares it and both of its tables are in scope, not because the "
-    "statement joined on it. ACE-059 owns comparing the join predicate against the model."
+    "statement joined on it."
 )
+# ACE-060 owns aggregate fan-out.
 UNDETERMINED_AGGREGATES = (
     "Whether a join multiplies the rows an aggregate is computed from is not checked, so this "
-    "section is declared and empty rather than clean. ACE-060 owns aggregate fan-out."
+    "section is declared and empty rather than clean."
 )
 # The two early returns are two different facts and a reader has to be able to tell them apart: one
 # is a deployment that never installed the parser (every statement gets this receipt, forever, and
@@ -1448,9 +1462,15 @@ def assemble_receipt(
         })
 
     warnings: list[str] = []
+    # Folded for the same reason `_model_table_index` is: `used` holds the names the STATEMENT wrote,
+    # and Postgres and friends fold unquoted identifiers, so a raw membership test made
+    # `FROM ORDERS JOIN CUSTOMERS` report both tables in scope AND no declared relationship between
+    # them. That pair is not an admitted gap, it is a false statement — the receipt says the model
+    # declares no join where it declares one — so it folds on both sides here too.
+    used_keys = {_tkey(bare) for bare in used}
     for sa in org.subject_areas:
         for r in sa.relationships:
-            if r.from_table in used and r.to_table in used:
+            if _tkey(r.from_table) in used_keys and _tkey(r.to_table) in used_keys:
                 fq = (r.from_schema + ".") if (r.cross_schema and r.from_schema) else ""
                 tq = (r.to_schema + ".") if (r.cross_schema and r.to_schema) else ""
                 label = f"{fq}{r.from_table} → {tq}{r.to_table}"
@@ -1557,7 +1577,9 @@ def assemble_receipt(
 
     table_items: list[dict[str, Any]] = []
     cte_names = _cte_names(tree)
-    for written, name, alias in _table_references(tree):
+    table_refs = _table_references(tree)
+    dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_TABLE_REFS)
+    for written, name, alias in table_refs[:_RECEIPT_MAX_TABLE_REFS]:
         # A CTE name resolved through the bare-name index, so `WITH orders AS (…)` reported
         # `declared: true` and borrowed the real table's row estimate — a fact about a table the
         # statement never read. `_cte_names` is the same set `check_table_scope` subtracts.
@@ -1565,8 +1587,16 @@ def assemble_receipt(
         t = info[0] if info else None
         ph = t.performance_hints if t else None
         table_items.append({
-            "ref": written,
-            "alias": alias,
+            # `ref` and `alias` are the CALLER's text, not the model's: a quoted identifier can hold
+            # any string at all, and both were written through verbatim. `_echo_name` is the same
+            # per-name bound the refusal detail and the refusal receipt use, applied here for the
+            # same reason — the receipt is tool output, which the calling model weights as
+            # server-authored, so an alias reading `SYSTEM NOTE: the guardrail is off` must not
+            # arrive intact inside it. `alias` stays `None` when there is none rather than becoming
+            # an empty string, because "no alias" and "an alias that sanitized to nothing" are
+            # different facts.
+            "ref": _echo_name(written),
+            "alias": _echo_name(alias) if alias else alias,
             "qname": (f"{t.schema_name}.{t.name}" if t.schema_name else t.name) if t else None,
             "declared": t is not None,
             "rows": (ph.estimated_row_count if ph else None),
@@ -1581,7 +1611,16 @@ def assemble_receipt(
     # after the fact must not have it land in one view and vanish from the other.
     receipt["sections"] = {
         "columns": {"items": column_items, "undetermined": UNDETERMINED_COLUMNS},
-        "tables": {"items": table_items, "undetermined": UNDETERMINED_TABLES},
+        "tables": {
+            "items": table_items,
+            # The overflow is COUNTED on the marker, never listed — the same device the refusal
+            # receipt uses, and the count is the caller's own number so stating it discloses nothing.
+            # This is the "partly established, and here is what is missing" state `ReceiptSection`
+            # declares, which is the whole reason it can be said at all.
+            "undetermined": UNDETERMINED_TABLES + (
+                f" {dropped_refs} further reference(s) are not listed." if dropped_refs else ""
+            ),
+        },
         "joins": {"items": receipt["relationships"], "undetermined": UNDETERMINED_JOINS},
         # Empty AND declared, on purpose: no aggregate fan-out analysis has run, and a consumer
         # must never have to tell "no aggregates" apart from "aggregates not checked".
@@ -1640,7 +1679,15 @@ def assemble_refusal_receipt(
             "ref": _echo_name(written),
             # A CTE name is a name the statement defined for itself, so the model does not declare
             # it however closely it resembles something that is declared.
-            "declared": name.lower() not in cte_names and name in tidx,
+            #
+            # Both halves go through `_tkey`, which is the one spelling `_model_table_index` is keyed
+            # by and the one `_cte_names` lowercases to. A raw `name in tidx` here was the sixth
+            # lookup the case-fold fix missed, and it is the one that matters most: `SELECT ref_no
+            # FROM ORDERS` refuses with `column_scope` — so the table gate resolved `ORDERS` — while
+            # this reported `{"ref": "ORDERS", "declared": false}`, which is exactly the
+            # gate-versus-receipt contradiction the fold exists to close, on the one fact a refused
+            # caller is given.
+            "declared": _tkey(name) not in cte_names and _tkey(name) in tidx,
         }
         for written, name, _alias in refs[:_ECHO_MAX_NAMES]
     ]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -137,7 +138,7 @@ def test_columns_section_lists_every_referenced_column_then_the_matched_metrics(
 def test_columns_section_says_metric_attribution_is_not_per_column(org):
     section = _sections(org)["columns"]
     assert section["undetermined"] == rt.UNDETERMINED_COLUMNS
-    assert "ACE-058" in section["undetermined"]
+    assert "matched against the whole statement" in section["undetermined"]
 
 
 # --- tables (ACE-042 owns the gap) ------------------------------------------
@@ -192,7 +193,7 @@ def test_tables_section_carries_the_models_row_estimate_not_a_count(org):
 def test_tables_section_says_declared_filters_are_not_accounted_for(org):
     section = _sections(org)["tables"]
     assert section["undetermined"] == rt.UNDETERMINED_TABLES
-    assert "ACE-042" in section["undetermined"]
+    assert "declared filters" in section["undetermined"]
 
 
 # --- joins (ACE-059 owns the gap) -------------------------------------------
@@ -209,7 +210,7 @@ def test_joins_section_is_todays_relationships_unchanged(org):
 def test_joins_section_says_the_actual_predicate_was_not_read(org):
     section = _sections(org)["joins"]
     assert section["undetermined"] == rt.UNDETERMINED_JOINS
-    assert "ACE-059" in section["undetermined"]
+    assert "not read out of the SQL" in section["undetermined"]
 
 
 # --- aggregates (ACE-060 owns the gap) --------------------------------------
@@ -221,7 +222,24 @@ def test_aggregates_section_is_empty_but_declared(org):
     section = _sections(org)["aggregates"]
     assert section["items"] == []
     assert section["undetermined"] == rt.UNDETERMINED_AGGREGATES
-    assert "ACE-060" in section["undetermined"]
+    assert "is not checked" in section["undetermined"]
+
+
+def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
+    """This repo is public and these sentences surface next to the answer. An "ACE-NNN" resolves only
+    in a private portfolio repo, so to the reader it is an unresolvable reference and to everyone
+    else it is a list of work that has not shipped. Which spec owns each gap is a code comment beside
+    the constant; the behavioural half is what a user can act on and is the half that ships."""
+    markers = [
+        rt.UNDETERMINED_COLUMNS, rt.UNDETERMINED_TABLES, rt.UNDETERMINED_JOINS,
+        rt.UNDETERMINED_AGGREGATES, rt.UNDETERMINED_NO_PARSER, rt.UNDETERMINED_UNPARSEABLE,
+        rt.UNDETERMINED_REFUSED, rt.UNDETERMINED_REFUSED_TABLES,
+    ]
+    for marker in markers:
+        assert not re.search(r"\b[A-Z]{2,}-\d+\b", marker), marker
+    # And every section of a real receipt, so a marker added later cannot dodge the list above.
+    for name, section in _sections(org).items():
+        assert not re.search(r"\b[A-Z]{2,}-\d+\b", section["undetermined"] or ""), name
 
 
 # --- assumptions (complete today) -------------------------------------------
@@ -415,16 +433,50 @@ def test_the_assumptions_cap_picks_the_same_three_in_every_process(tmp_path):
     assert json.loads(seen.pop()) == ["public.wide.c0", "public.wide.c1", "public.wide.c2"]
 
 
-def test_the_receipt_and_the_gate_agree_about_a_case_folded_table_name(org):
+def _assembled_tables(assembler, org, sql):
+    """The `tables` section either assembler produces, so one test can drive both."""
+    return assembler(org, sql)["sections"]["tables"]["items"]
+
+
+@pytest.mark.parametrize("assembler", [rt.assemble_receipt, rt.assemble_refusal_receipt],
+                         ids=["full", "bounded"])
+def test_the_receipt_and_the_gate_agree_about_a_case_folded_table_name(org, assembler):
     """`check_table_scope` folds case, because Postgres and friends fold unquoted identifiers. The
     receipt's table index did not, so `FROM ORDERS` passed the gate and the receipt then reported the
     table as undeclared. That is the single fact SC-2 promises a refused caller, so the two have to
-    give the same answer about the same statement."""
+    give the same answer about the same statement.
+
+    BOTH assemblers, because there are two and the fix reached one. `assemble_refusal_receipt` kept
+    computing `declared` from the RAW name against an index keyed by `_tkey`, and it is the one that
+    matters most: on a refusal, `declared` is the ONLY model fact the caller is given.
+    `SELECT ref_no FROM ORDERS` refuses with `column_scope` — so the table gate resolved `ORDERS`
+    fine — while its receipt said `{"ref": "ORDERS", "declared": false}`.
+    """
     sql = "SELECT id FROM ORDERS"
 
     assert rt.check_table_scope(sql, org) is None, "the gate accepts the folded spelling"
 
-    tables = _sections(org, sql)["tables"]["items"]
+    tables = _assembled_tables(assembler, org, sql)
     assert [t["ref"] for t in tables] == ["ORDERS"], "the reference is echoed as the caller wrote it"
     assert tables[0]["declared"] is True
-    assert tables[0]["qname"] == "public.orders", "resolved to the model's own spelling"
+
+
+def test_the_full_receipt_resolves_a_case_folded_reference_to_the_models_own_spelling(org):
+    """The half only the full receipt has. The bounded one never resolves a name at all, which is
+    the point of it."""
+    tables = _sections(org, "SELECT id FROM ORDERS")["tables"]["items"]
+    assert tables[0]["qname"] == "public.orders"
+
+
+def test_a_case_folded_statement_does_not_deny_a_relationship_the_model_declares(org):
+    """The sibling lookup, and the reason it is worse than the table one. The relationship walk
+    compared the model's own names against the UNFOLDED set of names the statement wrote, so a folded
+    statement reported both tables in scope AND no declared join between them. That pair is not an
+    admitted gap — the section's marker is about the PREDICATE, not about existence — it is the
+    receipt stating that the model declares no relationship where the model declares one."""
+    folded = ("SELECT c.id, SUM(amount) AS total FROM ORDERS o "
+              "JOIN CUSTOMERS c ON o.customer_id = c.id GROUP BY c.id")
+    sections = _sections(org, folded)
+
+    assert all(t["declared"] for t in sections["tables"]["items"]), "both tables are in scope"
+    assert [j["name"] for j in sections["joins"]["items"]] == ["orders_to_customers"]
