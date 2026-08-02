@@ -15,7 +15,8 @@ Primitives (examples-first canonical loop):
   identify_entity           — opaque-literal type ID via value_pattern + probe-confirm
   resolve_entity_instance   — strategy chosen at runtime from sensitive + cardinality
   pre_flight_check          — fan-trap / chasm-trap detection + rewrite-vs-refuse
-  build_receipt             — receipt-panel assembly
+  assemble_receipt          — the full trust receipt for a statement that ran
+  assemble_refusal_receipt  — the echo-bounded receipt every non-ok outcome carries
 
 Pre-flight scope note (documented decision, recorded in the PR description):
 The cardinality field on every relationship is the day-1 structural gate. The
@@ -1253,51 +1254,6 @@ def _check_aggregation_semantics(
 # ---------------------------------------------------------------------------
 
 
-def build_receipt(
-    *,
-    sql: str,
-    relationships_used: Optional[list[Relationship]] = None,
-    pre_flight: Optional[PreFlightResult] = None,
-    caveats: Optional[list[str]] = None,
-    default_filters_applied: Optional[list[str]] = None,
-    model_version: Optional[str] = None,
-) -> dict[str, Any]:
-    """Assemble the receipt panel: SQL, relationships (+ confidence + signers),
-    any auto-rewrites, applied default_filters, and relevant caveats."""
-    receipt: dict[str, Any] = {"sql": sql}
-    if model_version:
-        receipt["model_version"] = model_version
-    if relationships_used:
-        receipt["relationships"] = [
-            {
-                "from": f"{r.from_table}.{r.from_column}" if r.from_column else r.from_table,
-                "to": f"{r.to_table}.{r.to_column}" if r.to_column else r.to_table,
-                "on": r.on,
-                "cardinality": r.relationship,
-                "confidence": r.confidence,
-                "review_state": r.review_state,
-                "signed_off_by": r.signed_off_by,
-                "signed_off_at": r.signed_off_at,
-                "signed_off_role": r.signed_off_role,
-            }
-            for r in relationships_used
-        ]
-    if default_filters_applied:
-        receipt["default_filters_applied"] = default_filters_applied
-    if caveats:
-        receipt["caveats"] = caveats
-    if pre_flight and pre_flight.risk:
-        receipt["pre_flight"] = {
-            "risk": pre_flight.risk,
-            "action": pre_flight.action,
-            "reason": pre_flight.reason,
-        }
-        if pre_flight.action == "auto_rewrite":
-            receipt["pre_flight"]["original_sql"] = pre_flight.original_sql
-            receipt["pre_flight"]["rewritten_sql"] = pre_flight.rewritten_sql
-    return receipt
-
-
 def _model_table_index(org: Datasource) -> dict[str, tuple]:
     """bare table name, CASE-FOLDED -> (Table, area_name). First occurrence wins (a cross-schema
     name clash is rare and the relationships now carry schema to disambiguate).
@@ -2049,7 +2005,6 @@ __all__ = [
     "PreFlightResult",
     "pre_flight_check",
     "apply_default_filters",
-    "build_receipt",
     "assemble_receipt",
     "assemble_refusal_receipt",
 ]

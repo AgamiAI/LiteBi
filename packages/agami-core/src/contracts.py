@@ -1,13 +1,17 @@
 """Shared pydantic contracts for the 4 product tools.
 
 These pin the **data shapes** the product tools exchange — `list_datasources`,
-`get_datasource_schema`, `get_prompt_examples`, `execute_sql` (incl. the trust `receipt`)
-— plus the `ActivitySink` log records, so downstream consumers build against
-fixed shapes instead of inventing their own.
+`get_datasource_schema`, `get_prompt_examples`, `execute_sql` — plus the `ActivitySink` log
+records, so downstream consumers build against fixed shapes instead of inventing their own.
 
-Source of truth = the **existing** local tool I/O in `mcp_harness.py` (the JSON each tool emits)
-and `semantic_model/runtime.assemble_receipt`. The shapes are the local, **subject-area-primary**
-model shape.
+The trust `receipt` is deliberately NOT one of them. It rides every `execute_sql` body on all
+three statuses, and it is typed by `guardrail.Receipt` — a frozen dataclass in the stdlib-only
+module the plugin mirror vendors, which is the one place both the executor and the tool edge can
+reach. A second pydantic spelling of it here would be a shape nothing validated against and a
+second thing to keep in step.
+
+Source of truth = the **existing** local tool I/O in `mcp_harness.py` (the JSON each tool emits).
+The shapes are the local, **subject-area-primary** model shape.
 
 Two stances make these contracts, not a rewrite:
   - `extra="allow"` — the local serving path is the source; a richer serving backend must still
@@ -135,47 +139,30 @@ class PromptExamplesResult(_Contract):
 
 
 # ---------------------------------------------------------------------------
-# execute_sql — incl. the trust receipt (runtime.assemble_receipt)
+# execute_sql
 # ---------------------------------------------------------------------------
-
-
-class TableUsed(_Contract):
-    qname: str
-    rows: int | None = None
-    rows_as_of: str | None = None
-    freshness: str | None = None
-
-
-class Receipt(_Contract):
-    """The trust receipt — deterministic provenance for an answer (no LLM).
-
-    tables_used / relationships / metrics / named_filters / assumptions / warnings, plus the
-    SQL and model_version. relationships and metrics carry many sign-off/review fields straight
-    from the model, so they stay loose (dicts) — the shape is owned by assemble_receipt.
-    """
-
-    sql: str | None = None
-    model_version: str | None = None
-    tables_used: list[TableUsed] = Field(default_factory=list)
-    relationships: list[dict[str, Any]] = Field(default_factory=list)
-    metrics: list[dict[str, Any]] = Field(default_factory=list)
-    named_filters: list[dict[str, Any]] = Field(default_factory=list)
-    assumptions: list[Any] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
 
 
 class ExecuteSqlResult(_Contract):
     """The `ok` half of the enveloped `execute_sql` JSON — **documentation, not a construction site**.
 
     What the tool actually returns is one guardrail Envelope, serialized by `tools._emit`. On the
-    `ok` path that body is these fields plus two the Envelope owns: `"status": "ok"` and `audit_id`,
-    the `query_executions.id` of the row recording the execution. On the other two paths the body is
-    a `refusal` or a `failure` instead, and none of the fields below appear — so this model describes
-    one branch of the wire, never the whole of it.
+    `ok` path that body is these fields plus three the Envelope owns: `"status": "ok"`, `receipt`
+    (the contract's `guardrail.Receipt`, on every status) and `audit_id`, the `query_executions.id`
+    of the row recording the execution. On the other two paths the body is a `refusal` or a
+    `failure` instead, and none of the fields below appear — so this model describes one branch of
+    the wire, never the whole of it.
 
-    Nothing in the shipped code constructs or validates against this; it is `extra="allow"` and it is
-    here so a reader (or a downstream consumer building against the surface) can see the successful
-    shape in one place. `guardrail` deliberately does not import it — that module is stdlib-only.
+    A pydantic `Receipt` used to live in this module and hang off this model as `data.receipt`. It
+    described the flat pre-section shape, nothing constructed or validated against it, and the
+    receipt it purported to type moved onto the Envelope — where `guardrail` owns it as a frozen
+    dataclass, in the stdlib-only module the plugin mirror can vendor. Two spellings of one thing,
+    one of them unreachable, is worse than none; the Envelope's is the one that ships.
+
+    Nothing in the shipped code constructs or validates against this either; it is `extra="allow"`
+    and it is here so a reader (or a downstream consumer building against the surface) can see the
+    successful shape in one place. `guardrail` deliberately does not import it — that module is
+    stdlib-only.
     """
 
     columns: list[str] = Field(default_factory=list)
@@ -186,7 +173,6 @@ class ExecuteSqlResult(_Contract):
     markdown: str | None = None  # exact full numbers (currency symbol + grouping); render as-is
     sql: str | None = None
     execution_ms: int | None = None
-    receipt: Receipt | None = None
 
 
 # ---------------------------------------------------------------------------
