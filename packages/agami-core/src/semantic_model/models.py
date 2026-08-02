@@ -319,8 +319,10 @@ class Table(_Base):
     # applied and which it left out. Until then, write the filter into the query yourself.
     default_filters: list[str] = Field(
         default_factory=list,
+        # The id stays here in the comment above rather than in `description`, which serializes
+        # into the published JSON schema. ACE-099 deletes both.
         description="Declared row filters for this table. Descriptive only: not applied to your "
-                    "SQL, and not yet reported (ACE-099 adds the report).",
+                    "SQL, and not yet reported.",
     )
     caveats: list[str] = Field(default_factory=list)
 

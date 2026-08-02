@@ -1258,6 +1258,8 @@ def build_receipt(
             }
             for r in relationships_used
         ]
+    # ACE-042 removed the only caller that supplied this; ACE-099 becomes the next one. Until then
+    # nothing in the tree passes it, so the key is absent rather than an unsubstantiated claim.
     if default_filters_applied:
         receipt["default_filters_applied"] = default_filters_applied
     if caveats:

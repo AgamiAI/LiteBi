@@ -88,8 +88,9 @@ SERVER_INSTRUCTIONS = (
     "touches (it sizes itself — pass a `query` to focus metrics, `dataset_names` for full table "
     "detail). (2) Examples-first — call get_prompt_examples and mirror the closest match; use "
     "metric `calculation`/`bindings` verbatim. (3) execute_sql (the safety pass runs inside it; "
+    # ACE-042 -> ACE-099: the declared-filter window; delete this clause with the one above.
     "a table's declared `default_filters` are NOT applied — write one into the SQL yourself if "
-    "the question needs it, see ACE-099). (4) Read the returned `receipt`: SHOW the user "
+    "the question needs it). (4) Read the returned `receipt`: SHOW the user "
     "`receipt.warnings` and any "
     "`receipt.metrics` whose review_state != 'approved' — joins/metrics they haven't signed off; "
     "never hide them. Don't refuse on an unreviewed metric — answer and warn.\n"
@@ -1894,9 +1895,12 @@ TOOLS: dict[str, dict[str, Any]] = {
             "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
             "Runs entirely locally via execute_sql.py — no data leaves the machine. "
-            "A table's declared `default_filters` are NOT applied to your SQL and are not yet "
-            "reported (ACE-042 removed the injection; ACE-099 adds the report) — if a filter "
-            "matters to the question, write it into the statement yourself."
+            # ACE-042 -> ACE-099: the declared-filter window. Delete this sentence when the
+            # adherence report lands. Spec ids stay in the comment — this string ships to every
+            # client, and an id only resolves inside the spec repo.
+            "A table's declared `default_filters` are NOT applied to your SQL, and are not yet "
+            "reported either — if a filter matters to the question, write it into the "
+            "statement yourself."
         ),
         "inputSchema": {
             "type": "object",

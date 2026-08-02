@@ -142,22 +142,41 @@ def test_asking_about_the_rows_a_filter_excludes_is_not_refused(guarded):
 
 def test_the_window_is_stated_where_a_model_author_reads():
     """SC-6. Between this spec and ACE-099 a declared filter is neither applied nor reported. The
-    change is announced in the two places it would otherwise have to be inferred from a number
-    that moved: the tool description the model reads before every query, and the model field a
-    model author is already looking at when they declare one.
+    change is announced in the places it would otherwise have to be inferred from a number that
+    moved: the tool description the model reads before every query, the server instructions, and
+    the model field a model author is already looking at when they declare one.
 
-    ACE-099 removes both notices, so each is one contiguous block naming it.
+    Each notice states the BEHAVIOUR; the `ACE-099` deletion anchor lives in the adjacent comment,
+    not in the string. These strings ship to every client, where a spec id resolves to nothing.
     """
     import tools
     from semantic_model import models as m
 
-    desc = tools.TOOLS["execute_sql"]["description"]
-    assert "ACE-099" in desc
-    assert "default_filters" in desc
-
-    assert "ACE-099" in tools.SERVER_INSTRUCTIONS
-    assert "default_filters" in tools.SERVER_INSTRUCTIONS
+    for surface in (tools.TOOLS["execute_sql"]["description"], tools.SERVER_INSTRUCTIONS):
+        assert "default_filters" in surface
+        assert "NOT applied" in surface
 
     field = m.Table.model_fields["default_filters"]
     assert field.description is not None
-    assert "ACE-099" in field.description
+    assert "not applied" in field.description
+    assert "not yet reported" in field.description
+
+
+def test_no_notice_leaks_a_spec_id_to_a_client():
+    """The window notices are the first thing in this codebase to describe an unlanded change on a
+    surface an end user can see. Spec ids are an internal tracker's vocabulary — they belong in the
+    comment that anchors the deletion, never in the payload a model could relay to a user."""
+    import re
+
+    import tools
+    from semantic_model import models as m
+
+    spec_id = re.compile(r"\b(?:ACE|AH|REQ)-\d+", re.IGNORECASE)
+    for surface in (tools.TOOLS["execute_sql"]["description"],
+                    tools.SERVER_INSTRUCTIONS,
+                    m.Table.model_fields["default_filters"].description):
+        assert not spec_id.search(surface), surface
+
+    for spec in tools.TOOLS.values():
+        for prop in spec["inputSchema"].get("properties", {}).values():
+            assert not spec_id.search(prop.get("description", ""))

@@ -1165,8 +1165,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sql", default=None)
     sp.add_argument("--sql-file", default=None, dest="sql_file")
     sp.add_argument("--applied-filters", default=None, dest="applied_filters",
-                    help="JSON list of default_filters applied. `sm prepare` no longer supplies "
-                         "these (ACE-042 removed the injection); ACE-099 reports them.")
+                    # ACE-042 removed the only producer; ACE-099 becomes the next one.
+                    help="JSON list of default_filters applied. Nothing currently produces this "
+                         "list — `sm prepare` no longer reports applied filters.")
     sp.add_argument("--freshness", default=None, help="optional freshness timestamp for tables_used")
     sp.set_defaults(func=cmd_receipt)
 

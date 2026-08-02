@@ -286,14 +286,18 @@ def test_the_fork_does_not_relay_the_models_own_notices_to_the_caller(tmp_path, 
     derived that sentence from the kind, so the kind is all the parent needs, and nothing the
     child writes to stderr can reach the answer.
 
-    ACE-042 deleted that particular notice along with the injection it announced, so the model's
-    declared filter below no longer reaches stderr by that route. The assertions stay and are not
-    vacuous: `message == _ERROR_MESSAGES[kind]` pins reconstruction-from-exit-code itself, which
-    is what keeps the surviving `[agami] auto-corrected …` notice — and anything a library logs —
-    out of the answer. Kept end-to-end rather than rebuilt on the auto-rewrite notice, because
-    ACE-093 deletes that one too.
+    **This test no longer has teeth, and says so rather than implying otherwise.** ACE-042 deleted
+    that notice along with the injection it announced, so on this path the child now writes exactly
+    one line to stderr — the sanitized sentence itself. Relay and reconstruct therefore produce the
+    same string here, and a mutation to pure relay (`if text: return text`) leaves every test in
+    this file green. What survives is an end-to-end smoke test that the fork path returns the
+    sanitized sentence at all; the discriminating version, seeded with a notice that still occurs,
+    is `test_ace035_read_only_refusal.py::test_the_sanitized_band_is_rebuilt_not_relayed`, and it
+    does kill that mutant.
+
+    Not re-seeded here with the surviving `[agami] auto-corrected …` notice, because ACE-093
+    deletes that one too and this test would need rewriting a second time.
     """
-    import yaml
     from store import Store
 
     app_db = tmp_path / "app.db"
@@ -303,15 +307,10 @@ def test_the_fork_does_not_relay_the_models_own_notices_to_the_caller(tmp_path, 
 
     artifacts = tmp_path / "artifacts"
     _write_model(artifacts / PROFILE)
-    # A declared row filter, which is business logic the caller never sends and must never see.
-    table = artifacts / PROFILE / "subject_areas" / "sales" / "tables" / "orders.yaml"
-    model = yaml.safe_load(table.read_text())
-    model["default_filters"] = ["orders.tenant_id = 'ACME-INTERNAL-7742'"]
-    table.write_text(yaml.safe_dump(model))
 
     warehouse = tmp_path / "warehouse.db"
     conn = sqlite3.connect(warehouse)
-    conn.execute("CREATE TABLE orders (id INTEGER, tenant_id TEXT)")
+    conn.execute("CREATE TABLE orders (id INTEGER)")
     conn.commit()
     conn.close()
 
@@ -326,9 +325,6 @@ def test_the_fork_does_not_relay_the_models_own_notices_to_the_caller(tmp_path, 
 
     assert body["status"] == "failed"
     message = body["failure"]["message"]
-    assert "ACME-INTERNAL-7742" not in message, "the model's row filter reached the caller"
-    assert "tenant_id" not in message
-    assert "default_filters" not in message
     assert "[agami]" not in message
     # And it is exactly the sentence the in-process path would have returned.
     assert message == execute_sql._ERROR_MESSAGES[body["failure"]["kind"]]
