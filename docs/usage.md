@@ -92,8 +92,14 @@ You: how many customers placed an order in the last 30 days?
 
 The receipt panel on the answer shows the SQL that ran, the relationships used
 (with their confidence + review state), and the model version
-(`.snapshots/45f0fefa2403/`). If a query touched an unreviewed entry, the receipt
-has a warning banner pointing back at `/agami-model` (its Review tab).
+(`.snapshots/45f0fefa2403/`). If a query touched an unreviewed join, the report
+carries a trust banner pointing back at `/agami-model` (its Review tab); an
+unapproved metric gets its own banner with Approve / Change buttons.
+
+The panel also states what it did **not** establish, section by section. An empty
+section with such a note means "not checked", and an empty section without one
+means "checked, nothing to report" — see
+[the trust layer](trust-layer.md#every-answer-ships-a-receipt).
 
 ## Common workflows
 
@@ -106,8 +112,9 @@ top 10 active customers by spend last 30 days
 The skill loads your model + examples, generates SQL, runs it, returns a markdown
 table AND a chart (by default — every result gets a chart unless the shape doesn't
 lend itself to one). The receipt panel below the chart shows the SQL, the tables
-touched, the relationships used (with confidence + review state), and the model
-snapshot hash. If a touched table is large (> 1M rows) without a date filter, the
+touched (one row per reference), the relationships used (with confidence + review
+state), the metrics invoked, the columns referenced, the assumptions agami made,
+and the model snapshot hash — plus, per section, what it did not establish. If a touched table is large (> 1M rows) without a date filter, the
 skill prompts you before running.
 
 If the question relies on a definition with multiple candidates — e.g. you ask
@@ -195,7 +202,7 @@ You: make that a bar chart by customer
 ```
 
 The skill writes `<artifacts_dir>/local/charts/<ts>.html` — self-contained
-Chart.js, the SQL receipt embedded as a collapsible panel. Supported: `bar`,
+Chart.js, the trust receipt embedded as a collapsible panel. Supported: `bar`,
 `line`, `pie`, `doughnut`, `scatter`. Tables paginate at 20 rows.
 
 ### Export to CSV
