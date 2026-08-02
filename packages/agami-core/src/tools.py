@@ -47,7 +47,18 @@ import agami_paths
 # nothing — unlike `sql_guard`, which is still imported lazily inside `check_read_only`. `Envelope`,
 # `Failure` and `Refusal` are CONSTRUCTED at this layer (the tool edge owns the outcomes that never
 # reach the execution chokepoint), so they cannot be TYPE_CHECKING-only the way `Refusal` was.
-from guardrail import Envelope, Failure, Refusal
+from guardrail import (
+    PRE_MODEL_RULES,
+    RECEIPT_BEFORE_MODEL,
+    RECEIPT_BUILD_FAILED,
+    RECEIPT_NO_MODEL,
+    Envelope,
+    Failure,
+    Receipt,
+    Refusal,
+    receipt_from_assembled,
+    undetermined_receipt,
+)
 
 # The tool edge's logger. The audit write is best-effort — it must never break an answer — but
 # "best-effort" is not "silent": a permanently broken sink has to be distinguishable from a working
@@ -269,10 +280,65 @@ def _resolve_units(profile: str, sql: str) -> dict[str, str]:
         return {}
 
 
+# Everything ONE tool call may resolve more than once and must not resolve more than once: the model
+# version pin, and the assembled full receipt. Keyed inside by profile / (profile, sql), and scoped to
+# a request rather than to the process, for two different reasons that both matter.
+#
+# **Cost.** `_model_version` is not free where it counts. Hosted, it opens a fresh unpooled psycopg2
+# connection, queries and closes it — and a single `ok` call reached it five times (once inside each
+# of the three `get_cached_org` calls, twice more directly), so one query cost up to five new Postgres
+# connections for one unchanging string. `assemble_receipt` likewise ran twice per `ok`, because the
+# legacy flat dict and the Envelope's typed `Receipt` were assembled separately from the same
+# statement rather than derived from one assembly.
+#
+# **Correctness.** A version that changes mid-request would otherwise let one answer be described by
+# two different model versions. Resolving once per request makes "the receipt pins the model this
+# answer used" true by construction rather than by the two reads happening to race the same way.
+#
+# A ContextVar rather than a module global because tool handlers run on parallel worker threads
+# (`mcp_http` off-loads them), and it holds `None` outside a scope so a caller that never opens one
+# (a direct handler call, a test) behaves exactly as it did before this cache existed.
+_request_cache: ContextVar[dict[str, Any] | None] = ContextVar(
+    "agami_request_cache", default=None
+)
+
+
+def begin_request_cache() -> Token[dict[str, Any] | None]:
+    """Open the per-request resolve-once scope. Reset with the returned token in a `finally`, so one
+    request's model version and assembled receipt can never describe the next one."""
+    return _request_cache.set({})
+
+
+def end_request_cache(token: Token[dict[str, Any] | None]) -> None:
+    """Close the scope opened by `begin_request_cache`. Separate from the opener so the pairing is
+    visible at the call site, the same shape as `set_call_source` / `reset_call_source`."""
+    _request_cache.reset(token)
+
+
+def _request_cached(key: Any, resolve: Callable[[], Any]) -> Any:
+    """`resolve()`, once per request per key. Outside a scope it is a plain call-through."""
+    cache = _request_cache.get()
+    if cache is None:
+        return resolve()
+    if key not in cache:
+        cache[key] = resolve()
+    return cache[key]
+
+
 def _model_version(profile: str) -> str | None:
     """The model-version pin the receipt records — the newest model version. Served from the DB
     when AGAMI_DB_URL is set (no file read), else the newest snapshot dir name (a content hash, what
-    the local skill reads). None if absent/unavailable (execute_sql stays usable)."""
+    the local skill reads). None if absent/unavailable (execute_sql stays usable).
+
+    Resolved at most ONCE per request per profile: on the hosted path this opens a database
+    connection, and the callers within one query are several (`get_cached_org` in each of the three
+    model consumers, plus the receipt's own pin)."""
+    return _request_cached(("model_version", profile), lambda: _resolve_model_version(profile))
+
+
+def _resolve_model_version(profile: str) -> str | None:
+    """`_model_version` without the per-request memo — the actual lookup, split out so the memo has
+    something to wrap and so a caller that genuinely wants a fresh read has one to call."""
     from store import Store
 
     store = Store.from_env()
@@ -406,11 +472,18 @@ def get_cached_org(profile: str):
     Reuses one Datasource across the loads within a query AND across queries, until the model version
     changes; a cache miss falls back to a fresh `_load_org`."""
     version = _model_version(profile)  # cheap: one DB row / dir listing, not a full model load
-    if version is None:
-        # No version to detect a model change by (e.g. file mode with no snapshot) — don't cache,
-        # so we can never serve a stale model. The DB-backed server always has a version.
-        return _load_org(profile)
     org_id = _current_org_id()
+    if version is None:
+        # No version to detect a model change by (e.g. file mode with no snapshot) — so nothing may
+        # be cached ACROSS requests, or we could serve a stale model. The DB-backed server always has
+        # a version and never takes this branch.
+        #
+        # WITHIN one request it is cached anyway, and that is not the same tradeoff: the three
+        # consumers of the model in a single query (units, the receipt, the legacy flat dict) are
+        # describing ONE answer, so serving them three separately-loaded models buys no freshness and
+        # costs three full loads of the same YAML. Before this, an unversioned local install paid all
+        # three on every query.
+        return _request_cached(("org", org_id, profile), lambda: _load_org(profile))
     key = (org_id, profile, version)
     cached = _ORG_CACHE.get(key)  # fast path: a hit is a single atomic dict.get, no lock
     if cached is not None:
@@ -459,16 +532,116 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
     )
 
 
-def _resolve_receipt(profile: str, sql: str) -> dict | None:
-    """The FULL trust receipt (tables / relationships / metrics+review_state / assumptions
-    / warnings) for this query — the SAME assembler the skill uses, so the 'what did this
-    touch / what's unapproved' panel is identical in Claude Code and Claude Desktop.
-    Returns None only if the model deps aren't importable (execute_sql stays usable)."""
+# The argument-validation outcome: there is no statement, so there is nothing a receipt could be
+# about. Distinct from every reason in `guardrail`, each of which is a statement whose receipt could
+# not be built. It lives here because the tool edge is the only layer that can reach it — the
+# chokepoint is never called without a statement.
+RECEIPT_NO_STATEMENT = (
+    "No statement was supplied, so there was nothing to establish anything about."
+)
+
+
+def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receipt:
+    """The `Envelope.receipt` for a statement this process did NOT run through the chokepoint.
+
+    The fork path needs this. `tools` runs `python -m execute_sql` as a subprocess and rebuilds the
+    Envelope from the child's exit code and stderr, so the receipt the child assembled is destroyed
+    at the process boundary — on exactly the refused and failed outcomes. Building it here is what
+    keeps the two paths saying the same thing about the same statement, without changing the wire
+    format between parent and child (ACE-035 declined to scope that).
+
+    `bounded` picks the echo-bounded assembler, and EVERY non-ok outcome asks for it — the same rule
+    the chokepoint's `_receipt_for` states and for the same reason: a `failed` body is reachable for a
+    name the model declares and the warehouse does not have, so it is a disclosure channel of its own
+    rather than a subset of `ok`'s.
+
+    A build that raises returns an `undetermined` receipt, never `None`. A receipt that could not be
+    built is a fact the caller can act on ("the model deps are not installed here"); `None` was an
+    absence the caller could only read as silence. The two failure reasons are kept apart here
+    exactly as the chokepoint keeps them apart, and they are the chokepoint's own constants: a caller
+    on the default fork path would otherwise never see the actionable one, which is this spec's own
+    defect one layer down.
+
+    KNOWN GAP, and this is where it lives. `sql` here is the statement the CALLER sent, which is the
+    only one this side of the fork has: `_model_safety` runs in the child, and its surviving rewrite
+    (the fan/chasm `auto_rewrite` branch) rebinds the child's local before it executes. So after a
+    rewrite the child runs one statement and this describes another. It is narrowed to `ok` alone now
+    that every non-ok receipt is built from the RECEIVED statement on both paths deliberately, and it
+    is measured rather than left as prose by a `strict=True` xfail in
+    tests/test_ace088_executed_statement.py. It closes by subtraction, not by plumbing the rewritten
+    statement back across the wire: ACE-042 has already deleted the default-filter injection and
+    ACE-093 deletes the fan-join rewrite, after which executed and received are the same string and
+    this is describing it. That is the slice that deletes the marker.
+    """
     try:
         org = get_cached_org(profile)
-        from semantic_model import runtime as RT
+    except Exception:
+        # No model for this datasource, or no model deps at all. Both are ordinary states for a bare
+        # local install rather than faults, so they are not server-log events — the fact travels to
+        # the caller on the receipt itself, which is the whole point of returning one. Logged without
+        # `exc_info`: a traceback here would carry the resolved artifacts path into the server log
+        # for an outcome that is not an error at all.
+        _LOG.debug("no model for datasource %r; receipt undetermined", profile)
+        return undetermined_receipt(RECEIPT_NO_MODEL)
+    try:
+        if bounded:
+            from semantic_model import runtime as RT
 
-        return RT.assemble_receipt(org, sql, model_version=_model_version(profile))
+            return receipt_from_assembled(
+                RT.assemble_refusal_receipt(org, sql, model_version=_model_version(profile))
+            )
+        return receipt_from_assembled(_assemble_full_receipt(profile, sql, org))
+    except Exception:
+        # A model that loaded and an assembler that then broke IS a fault, and the operator is the
+        # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
+        _LOG.error("could not assemble the receipt for datasource %r", profile, exc_info=True)
+        return undetermined_receipt(RECEIPT_BUILD_FAILED)
+
+
+def _refusal_receipt(profile: str, sql: str, refusal: Refusal) -> Receipt:
+    """The receipt a REFUSED Envelope carries on this side of the fork, chosen by which rule fired.
+
+    The twin of `execute_sql._refusal_receipt`, consulting the same `PRE_MODEL_RULES` set, so one
+    refusal reads one way whichever process decided it. It is also what keeps a refusal the cheap
+    path: a `read_only` or `recon` verdict is reached without a model, so building its receipt must
+    not load one — which on the hosted server is a fresh unpooled connection per refusal, on the one
+    outcome an attacker triggers at will.
+    """
+    if refusal.rule in PRE_MODEL_RULES:
+        return undetermined_receipt(RECEIPT_BEFORE_MODEL)
+    return _resolve_receipt(profile, sql, bounded=True)
+
+
+def _assemble_full_receipt(profile: str, sql: str, org: Any) -> dict:
+    """The FULL assembler's output for one statement, assembled at most ONCE per request.
+
+    Two consumers want it on an `ok` answer and they want the same facts in two shapes: the legacy
+    flat dict the chart surfaces read, and the contract's typed `Receipt` that `receipt_from_assembled`
+    maps out of the SAME dict's `sections`. Assembling twice was not merely wasteful, it left two
+    descriptions of one answer free to disagree; deriving both from one assembly makes them one fact
+    seen twice.
+    """
+    from semantic_model import runtime as RT
+
+    return _request_cached(
+        ("full_receipt", profile, sql),
+        lambda: RT.assemble_receipt(org, sql, model_version=_model_version(profile)),
+    )
+
+
+# INTERIM, and it dies in the PR that deletes `data.receipt`. `_finalize_execution` nests the FLAT
+# assembler output (tables_used / metrics / warnings) inside the ok payload, which the chart template
+# and `render_chart.py` read by those key names. `_resolve_receipt` now returns the contract's
+# `Receipt` instead, so the legacy consumer needs its own accessor rather than a shape the ok payload
+# would silently change under. Delete this function, its call site, and the `"receipt"` key in
+# `_finalize_execution` together, in the commit that flips the ok body onto `Envelope.receipt`.
+def _legacy_receipt_dict(profile: str, sql: str) -> dict | None:
+    """The FULL trust receipt as the FLAT dict the chart surfaces still read — the SAME assembler
+    the skill uses, so the 'what did this touch / what's unapproved' panel is identical in Claude
+    Code and Claude Desktop. `None` only if the model deps aren't importable (execute_sql stays
+    usable)."""
+    try:
+        return _assemble_full_receipt(profile, sql, get_cached_org(profile))
     except Exception:
         return None
 
@@ -1132,9 +1305,11 @@ def _finalize_execution(
 
     This is the **`ok` payload only**, and it is frozen: `_emit` merges `status` and `audit_id` onto
     what this returns and is the only thing that serializes a tool response. The nested
-    `"receipt": _resolve_receipt(...)` here is the populated `contracts.Receipt` (tables_used /
-    metrics / warnings), NOT the stdlib `Envelope.receipt` stub — the two are different types and
-    neither is wired from the other.
+    `"receipt": _legacy_receipt_dict(...)` here is the FLAT assembler output (tables_used / metrics /
+    warnings) that the chart template reads, NOT `Envelope.receipt`, which is the contract's typed
+    `guardrail.Receipt` and is now populated on all three statuses. The two describe the same
+    statement in two shapes while both spellings exist; the PR that deletes this one flips the ok
+    body onto the other in the same commit.
 
     It no longer writes the audit row. This function only ever runs on success, so hanging the write
     here is precisely why a refusal left no trace; the write moved to `_emit`, which every outcome
@@ -1163,8 +1338,10 @@ def _finalize_execution(
         # Trust receipt — provenance + anything unapproved this answer used. Same assembler
         # the agami-query skill renders, so Desktop gets the same trust panel. Clients should
         # surface receipt.warnings and any receipt.metrics whose review_state != "approved"
-        # (offer to approve/correct via the save_correction tool).
-        "receipt": _resolve_receipt(profile, sql),
+        # (offer to approve/correct via the save_correction tool). INTERIM: this flat nested dict
+        # and `_legacy_receipt_dict` die together in the PR that flips the ok body onto
+        # `Envelope.receipt`.
+        "receipt": _legacy_receipt_dict(profile, sql),
     }
     return json.dumps(result, indent=2, default=str)
 
@@ -1172,12 +1349,19 @@ def _finalize_execution(
 def _envelope(
     status: str,
     *,
+    receipt: Receipt,
     data: Any | None = None,
     refusal: Refusal | None = None,
     failure: Failure | None = None,
 ) -> Envelope:
     """The ONE place the tool edge constructs an `Envelope`, and the one place it mints an
     `audit_id`.
+
+    `receipt` is MANDATORY, which is what actually delivers the property this docstring used to
+    claim: an outcome with no receipt to hand must return one that SAYS so, rather than the
+    empty-and-silent default a consumer would read as "checked, found nothing". Every call site
+    already passes one, so the fallback was unreachable — and its reason named the wrong cause for
+    most of the outcomes that could have reached it.
 
     The execution chokepoint (`execute_sql.execute_guarded`) mints its own for everything that
     reaches it; this covers the outcomes that never do — a malformed argument, the read-only
@@ -1190,6 +1374,7 @@ def _envelope(
         data=data,
         refusal=refusal,
         failure=failure,
+        receipt=receipt,
         audit_id=uuid.uuid4().hex,
     )
 
@@ -1250,6 +1435,13 @@ def _emit(
             body["sql"] = sql
         if execution_ms is not None:
             body["execution_ms"] = execution_ms
+        # `refused` and `failed` only, and only until the nested legacy dict goes. The ok body is
+        # `{"status": "ok", **payload, …}` and `payload` ALREADY carries a `"receipt"` key — the
+        # flat dict the chart template reads — so a top-level receipt there would silently overwrite
+        # one of the two. The PR that deletes `data.receipt` flips ok over in the same commit. The
+        # receipt is on the TYPE for all three statuses from this slice, which is what the contract
+        # asserts; only the ok WIRE waits.
+        body["receipt"] = asdict(env.receipt)
         body["audit_id"] = env.audit_id
         # A refused or failed call returned no rows at all — which is not the same fact as a query
         # that ran and matched nothing, but the row's `status` is what carries that distinction.
@@ -1372,7 +1564,7 @@ def _run_in_process(
         # every reachable case is a datasource-configuration problem.
         return _envelope("failed", failure=Failure(
             kind="dsn", message="Datasource configuration error.",
-        ))
+        ), receipt=_resolve_receipt(profile, sql, bounded=True))
     finally:
         execute_sql._max_rows_override.reset(cap_token)
 
@@ -1389,7 +1581,20 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     native rows. Every outcome on either path becomes ONE `Envelope` and is serialized by `_emit`, so
     a caller sees the same shape — and, for a refusal, the same rule and the same remediation —
     whichever path ran.
+
+    The whole body runs inside the per-request resolve-once scope, opened here because this is the
+    one point both paths pass through, and closed in a `finally` for the same reason
+    `_max_rows_override` is: a value left behind would describe the next call.
     """
+    cache_token = begin_request_cache()
+    try:
+        return _tool_execute_sql(args)
+    finally:
+        end_request_cache(cache_token)
+
+
+def _tool_execute_sql(args: dict[str, Any]) -> str:
+    """`tool_execute_sql`'s body, inside the per-request scope its caller opens."""
     # Clear the raw-detail carrier for THIS call, at the one point both paths pass through.
     # `execute_guarded` also clears it on entry, but that only covers the in-process path — on the
     # fork the parent never calls it, so without this a forked call would record the driver text
@@ -1407,7 +1612,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         return _emit(
             _envelope("failed", failure=Failure(
                 kind="other", message="Pass a non-empty `sql` string.",
-            )),
+            ), receipt=undetermined_receipt(RECEIPT_NO_STATEMENT)),
             sql=None,
             execution_ms=None,
         )
@@ -1421,10 +1626,14 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     refusal = check_read_only(sql)
     if refusal is not None:
         # The read-only fast-fail: the same gate `execute_guarded` runs, applied here so a mutation
-        # never even resolves credentials or forks. Same rule, same remediation as the deeper call
-        # would give — and now the same audit row, too.
+        # never even resolves credentials, forks, or consults a semantic model. Same rule, same
+        # remediation as the deeper call would give — and now the same audit row, too. The receipt is
+        # the pre-model one for the same reason: `read_only` is in `PRE_MODEL_RULES`, so there is
+        # nothing a model could have been asked about this statement, and asking one anyway would put
+        # a fresh unpooled database round-trip on the cheapest outcome an attacker can trigger at will.
         return _emit(
-            _envelope("refused", refusal=refusal),
+            _envelope("refused", refusal=refusal,
+                      receipt=_refusal_receipt(profile, sql, refusal)),
             sql=sql, execution_ms=None, profile=profile, args=args,
         )
 
@@ -1503,7 +1712,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             _envelope("failed", failure=Failure(
                 kind="timeout",
                 message="The executor did not respond within the supervisor's bound and was stopped.",
-            )),
+            ), receipt=_resolve_receipt(profile, sql, bounded=True)),
             sql=sql,
             execution_ms=None,
             profile=profile,
@@ -1519,14 +1728,16 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # costs nothing and keeps the Envelope's payload a real contract object, never a loose dict.
         refusal = _stderr_refusal(proc.returncode, proc.stderr)
         if refusal is not None:
-            env = _envelope("refused", refusal=Refusal(**refusal))
+            rebuilt = Refusal(**refusal)
+            env = _envelope("refused", refusal=rebuilt,
+                            receipt=_refusal_receipt(profile, sql, rebuilt))
         else:
             # Not raw stderr: see `_child_failure_message` for which of the two the caller gets and
             # why. This field is shown to the caller, so a traceback must never reach it.
             env = _envelope("failed", failure=Failure(
                 kind=_classify_exit(proc.returncode),
                 message=_child_failure_message(proc.returncode, proc.stderr),
-            ))
+            ), receipt=_resolve_receipt(profile, sql, bounded=True))
         # `profile` and `args` travel with the non-ok outcomes too. Omitting them wrote the audit row
         # with `datasource=''` and `question=NULL` on exactly the rows a reviewer of a refusal most
         # needs them on — and only on the fork path, which is the default, so the two paths disagreed
@@ -1549,7 +1760,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         columns=columns,
         rows=[tuple(r) for r in data_rows],
         truncated=_executor_truncated(proc.stderr),
-    ))
+    ), receipt=_resolve_receipt(profile, sql))
     return _emit(
         env, sql=sql, execution_ms=execution_ms,
         profile=profile, args=args, max_rows=max_rows,

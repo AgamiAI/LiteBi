@@ -14,6 +14,7 @@ from guardrail import (
     Envelope,
     Failure,
     Receipt,
+    ReceiptSection,
     Refusal,
     refuse,
 )
@@ -53,13 +54,95 @@ def test_failure_fields_are_kind_and_message():
     assert [f.name for f in fields(Failure)] == ["kind", "message"]
 
 
-def test_receipt_is_empty():
-    """The field exists so the Envelope does not change shape when the receipt is filled in. If
-    this test starts failing because someone added a field, they wanted `contracts.Receipt`."""
-    assert fields(Receipt) == ()
+def test_receipt_fields_are_the_version_pin_and_the_five_sections_in_order():
+    """ACE-035 declared this type empty and ACE-088 fills it. The tripwire that used to read
+    `fields(Receipt) == ()` is replaced rather than deleted: it existed to stop an accidental field,
+    and the same guard now works by pinning the intended ones."""
+    assert [f.name for f in fields(Receipt)] == [
+        "model_version",
+        *Receipt.SECTIONS,
+    ]
 
 
-@pytest.mark.parametrize("cls", [Refusal, Failure, Receipt, Envelope])
+def test_every_section_defaults_to_declared_but_unestablished():
+    """Every field carries a default, so `Receipt()` still satisfies `Envelope.receipt`'s
+    `default_factory` and the Envelope's shape is unchanged."""
+    r = Receipt()
+    assert r.model_version is None
+    for name in Receipt.SECTIONS:
+        assert getattr(r, name) == ReceiptSection(items=(), undetermined=None)
+
+
+def test_a_section_distinguishes_unchecked_from_clean():
+    """The distinction the receipt exists for. An empty section with no reason means "checked, found
+    nothing"; an empty section with a reason means "not checked". They must not compare equal."""
+    clean = ReceiptSection()
+    unchecked = ReceiptSection(undetermined="sqlglot unavailable")
+    assert clean != unchecked
+    assert clean.items == unchecked.items == ()
+    assert clean.undetermined is None and unchecked.undetermined
+
+
+def test_section_items_are_immutable():
+    """A frozen dataclass holding a list is only shallowly immutable, so `items` is a tuple."""
+    assert isinstance(ReceiptSection().items, tuple)
+    with pytest.raises(FrozenInstanceError):
+        ReceiptSection().items = ({"x": 1},)
+
+
+# --- the two constructors ---------------------------------------------------
+
+
+def test_an_undetermined_receipt_gives_every_section_the_same_reason():
+    """The shape a caller gets when the receipt could not be built at all. Deliberately not
+    `Receipt()`: five empty sections with no reason read as "checked, found nothing", and a receipt
+    that could not be built is a fact rather than an absence."""
+    receipt = guardrail.undetermined_receipt("no parser here", model_version="v1")
+
+    assert receipt.model_version == "v1"
+    for name in Receipt.SECTIONS:
+        assert getattr(receipt, name) == ReceiptSection(items=(), undetermined="no parser here")
+    assert receipt != Receipt()
+
+
+def test_an_undetermined_receipt_covers_a_section_added_to_the_type():
+    """It iterates `Receipt.SECTIONS` rather than naming the five fields, so a sixth section cannot
+    be forgotten here and silently ship as clean. Asserted by counting rather than by reading the
+    source, because "it iterates" is the property, not the spelling."""
+    receipt = guardrail.undetermined_receipt("r")
+    marked = [name for name in Receipt.SECTIONS if getattr(receipt, name).undetermined == "r"]
+    assert len(marked) == len(Receipt.SECTIONS) == len(fields(Receipt)) - 1
+
+
+def test_an_assembled_receipt_maps_onto_the_contract_with_tuple_items():
+    """The one place the assembler's dicts-and-lists meet the contract's frozen dataclasses. `items`
+    becomes a tuple because the field is one — a list would make the frozen type shallowly
+    immutable."""
+    assembled = {
+        "model_version": "v2",
+        "sections": {name: {"items": [], "undetermined": f"{name} pending"}
+                     for name in Receipt.SECTIONS},
+    }
+    assembled["sections"]["tables"] = {"items": [{"ref": "orders"}], "undetermined": None}
+
+    receipt = guardrail.receipt_from_assembled(assembled)
+
+    assert receipt.model_version == "v2"
+    assert receipt.tables == ReceiptSection(items=({"ref": "orders"},), undetermined=None)
+    assert isinstance(receipt.tables.items, tuple)
+    assert receipt.joins.undetermined == "joins pending"
+
+
+def test_an_assembled_receipt_missing_a_section_raises_rather_than_losing_it():
+    """Strict indexing on purpose: a builder that drops a section is drifted, and every caller turns
+    this `KeyError` into an `undetermined` receipt. Silently defaulting the section would ship a
+    clean-looking one instead."""
+    with pytest.raises(KeyError):
+        guardrail.receipt_from_assembled({"sections": {"columns": {"items": [],
+                                                                   "undetermined": None}}})
+
+
+@pytest.mark.parametrize("cls", [Refusal, Failure, Receipt, ReceiptSection, Envelope])
 def test_contract_types_are_frozen(cls):
     assert cls.__dataclass_params__.frozen
 

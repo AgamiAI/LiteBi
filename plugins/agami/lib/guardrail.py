@@ -22,7 +22,7 @@ runs on whatever `python3` the user already has, which on stock macOS is 3.9.6. 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 if TYPE_CHECKING:
     # Type-checkers only — kept out of the runtime import graph. With `from __future__ import
@@ -85,6 +85,21 @@ RULE_ENGINE_MISMATCH = "engine_mismatch"
 # gate that produces it fills `REASON_FOR_RULE` in a reviewed diff (the contract already says that
 # entry is `undetermined`, so that is a one-line change, not a decision to re-litigate).
 RULE_UNSCOPABLE = "unscopable"
+
+PRE_MODEL_RULES: frozenset[str] = frozenset({RULE_READ_ONLY, RULE_RECON})
+"""The rules decided BEFORE any semantic model is consulted, and the home for the next one.
+
+Both gates run above the semantic-model pass — a write and a server-fingerprinting probe are stopped
+without asking what the model declares — so a statement either one refuses never resolved a model at
+all. That is a fact about the DECISION rather than about the deployment, and it has to be stated the
+same way whichever process decided it: the in-process path knows no model was loaded because it holds
+the gate, while the fork path holds only the rule the child sent back. Consulting this set is what
+lets the two reach the same receipt, and it is what keeps the fork path from loading a model in order
+to describe a refusal that never looked at one (see `RECEIPT_BEFORE_MODEL`).
+
+A gate added above the model pass belongs here in the same diff that adds it. Leaving it out is not a
+crash: it is a receipt that quietly claims no model could be resolved, which is a different fact and
+an untrue one."""
 
 # Interim. `_model_safety`'s fan/chasm pre-flight and sensitive-column branches are not converted in
 # this slice (they become receipt facts when the mutation branches are subtracted), but every path
@@ -219,20 +234,135 @@ class Failure:
 
 
 @dataclass(frozen=True)
-class Receipt:
-    """What the statement did — deliberately EMPTY.
+class ReceiptSection:
+    """One section of the receipt: what was established, and why the rest was not.
 
-    The field exists on `Envelope` from the start so the Envelope does not change shape later; its
-    contents are owned by the receipt work and are empty until then. Present on every status
-    including `refused`, because a refused caller most needs the facts.
+    The two fields are independent, which is the whole point. Four states, and the middle two are
+    the ones the receipt exists to tell apart:
 
-    **This is not `contracts.Receipt`.** That one is a populated pydantic model — the trust receipt
-    `semantic_model.runtime.assemble_receipt` builds and `tools._finalize_execution` nests inside
-    the result payload, carrying tables_used / relationships / metrics / named_filters / assumptions
-    / warnings. This one is the stdlib-only stub on the guardrail Envelope; this module may not
-    import pydantic, so the two cannot be one type until the receipt is lifted to the top level. If
-    you are reaching for content, you want `contracts.Receipt`.
+      * `items` set, `undetermined` None — established, here it is.
+      * `items` empty, `undetermined` None — checked, and there was nothing to report.
+      * `items` empty, `undetermined` set  — NOT checked, and here is why.
+      * `items` set, `undetermined` set    — partly established, and here is what is missing.
+
+    Before this, an unchecked section and a clean one were both the empty list, so silence read as
+    clean. A section whose analysis has not shipped yet says what it did not establish, in a sentence
+    a user can act on. It never names the spec that owns the gap: this repo is public, and an
+    internal spec id resolves nowhere for the reader while disclosing unshipped work to everyone else.
+
+    `items` is a tuple, not a list: this module's types are frozen, and a frozen dataclass holding a
+    list is only shallowly immutable.
     """
+
+    items: tuple[dict[str, Any], ...] = ()
+    undetermined: str | None = None
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """What the statement did — every section declared, every gap named.
+
+    Present on every status including `refused`, because a refused caller most needs the facts. Each
+    section is always there: a consumer never has to distinguish "no joins" from "joins not checked",
+    which is what `ReceiptSection.undetermined` answers.
+
+    The sections are containers; the facts inside them belong to the specs that own each analysis
+    (per-column metric match, per-join predicate, per-aggregate fan-out, per-table declared filters).
+    A container whose analysis has not landed ships with `undetermined` stating what was not
+    established, so the gap is visible at the point of use rather than inferred from an empty list.
+
+    Everything here is derivable from the SQL and the model alone: no probe queries, no sampled
+    values, no row contents. It is metadata and statement structure, and it must stay that way, or
+    the receipt becomes a disclosure channel around the sensitive-column rules.
+    """
+
+    model_version: str | None = None
+    columns: ReceiptSection = field(default_factory=ReceiptSection)
+    tables: ReceiptSection = field(default_factory=ReceiptSection)
+    joins: ReceiptSection = field(default_factory=ReceiptSection)
+    aggregates: ReceiptSection = field(default_factory=ReceiptSection)
+    assumptions: ReceiptSection = field(default_factory=ReceiptSection)
+
+    SECTIONS: ClassVar[tuple[str, ...]] = (
+        "columns",
+        "tables",
+        "joins",
+        "aggregates",
+        "assumptions",
+    )
+    """The section names, in order. Declared once so a caller that must touch every section (the
+    undetermined-everything builders, the serializers, the tests) iterates this rather than
+    re-listing them and drifting."""
+
+
+# What a receipt says when it could not be built, one reason per cause — and the reasons live HERE
+# rather than beside either builder, because there are two builders for the same four facts. The
+# execution chokepoint assembles the receipt in-process; the tool edge assembles it again in the
+# parent of a fork, since the child's Envelope is destroyed at the process boundary. Two copies of
+# these sentences is two chances for the same statement to be described two ways, which is the defect
+# this spec exists to remove one layer up. Each is a user-facing sentence, ending in a full stop:
+# they surface next to the answer, not in a log.
+RECEIPT_NO_RUNTIME = (
+    "The semantic-model runtime is not available in this deployment, so nothing about the statement "
+    "could be established."
+)
+RECEIPT_NO_MODEL = (
+    "No semantic model could be resolved for this datasource, so nothing in the statement was "
+    "checked."
+)
+RECEIPT_BUILD_FAILED = (
+    "The receipt could not be assembled for this statement. The details are in the server log."
+)
+# The fourth is NOT a degradation at all, which is why it may not borrow any of the three above. A
+# statement stopped by a `PRE_MODEL_RULES` gate was refused before anything asked the model a
+# question: a model may well exist and resolve perfectly. Saying "no model could be resolved" there
+# would report a deployment problem that is not happening.
+RECEIPT_BEFORE_MODEL = (
+    "The statement was refused before any semantic model was consulted, so nothing in it was checked "
+    "against one."
+)
+
+
+def undetermined_receipt(reason: str, *, model_version: str | None = None) -> Receipt:
+    """A receipt that establishes nothing, and gives every section the same reason why.
+
+    What a caller gets when the receipt could not be built at all: no parser, no model, or a builder
+    that raised. It is deliberately not `Receipt()` — five empty sections with no reason read as
+    "checked, found nothing", which is the exact confusion `ReceiptSection.undetermined` exists to
+    remove. A receipt that could not be built is a fact, not an absence.
+
+    Iterates `Receipt.SECTIONS` rather than naming the five fields, so a section added to the type
+    cannot be forgotten here and silently ship as clean. One `ReceiptSection` is shared by all five:
+    it is frozen and its `items` is a tuple, so the aliasing gives a caller nothing to mutate.
+    """
+    section = ReceiptSection(undetermined=reason)
+    return Receipt(model_version=model_version, **{name: section for name in Receipt.SECTIONS})
+
+
+def receipt_from_assembled(assembled: dict[str, Any]) -> Receipt:
+    """Map an assembled receipt dict — `semantic_model.runtime.assemble_receipt`'s output, or its
+    refusal-bounded sibling's — onto the contract's `Receipt`.
+
+    The assembler builds dicts and lists (it feeds a JSON chart template as well as this), the
+    contract is frozen dataclasses, and this is the ONE place the two meet, so neither the executor
+    nor the tool edge grows its own copy of the mapping. It lives in this module rather than next to
+    the assembler because the vendored `execute_sql.py` needs it and cannot import the model stack.
+
+    `items` becomes a tuple because the field is one. `Receipt.SECTIONS` is indexed strictly: an
+    assembled dict missing a section is a drifted builder, and every caller turns the resulting
+    `KeyError` into an `undetermined` receipt rather than one that quietly lost a section.
+    """
+    sections = assembled["sections"]
+    return Receipt(
+        model_version=assembled.get("model_version"),
+        **{
+            name: ReceiptSection(
+                items=tuple(sections[name]["items"]),
+                undetermined=sections[name]["undetermined"],
+            )
+            for name in Receipt.SECTIONS
+        },
+    )
 
 
 # --- Envelope ---------------------------------------------------------------

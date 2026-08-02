@@ -139,7 +139,10 @@ def test_a_rejected_execute_sql_is_an_envelope_body_not_an_error_contract():
         ),
         sql="DELETE FROM orders", execution_ms=None,
     ))
-    assert set(refused) == {"status", "refusal", "sql", "audit_id"}
+    # `receipt` joined both non-ok bodies in ACE-088: a refused caller most needs the facts, so the
+    # receipt rides every refusal and every failure (on a refusal, bounded to the identifiers the
+    # caller's own statement wrote).
+    assert set(refused) == {"status", "refusal", "sql", "audit_id", "receipt"}
     assert set(refused["refusal"]) == {"reason", "rule", "detail", "remediation"}
 
     failed = json.loads(tools._emit(
@@ -150,7 +153,7 @@ def test_a_rejected_execute_sql_is_an_envelope_body_not_an_error_contract():
         ),
         sql="SELECT nope FROM orders", execution_ms=0,
     ))
-    assert set(failed) == {"status", "failure", "sql", "execution_ms", "audit_id"}
+    assert set(failed) == {"status", "failure", "sql", "execution_ms", "audit_id", "receipt"}
     assert set(failed["failure"]) == {"kind", "message"}
 
     assert not hasattr(contracts, "ErrorResult") and not hasattr(contracts, "ToolError")

@@ -532,6 +532,10 @@ def test_main_failed_writes_bare_message_and_the_classified_exit_code(
             execute_sql._envelope(
                 "failed",
                 failure=guardrail.Failure(kind="auth", message="Postgres connect failed: refused"),
+                # Mandatory on this constructor: an outcome with no receipt to hand must return one
+                # that SAYS so, rather than the empty-and-silent default a consumer reads as
+                # "checked, found nothing".
+                receipt=guardrail.undetermined_receipt(guardrail.RECEIPT_NO_MODEL),
             )
         ),
     )
@@ -590,7 +594,8 @@ def test_main_success_serializes_result_to_stdout_csv(tmp_path, monkeypatch, cap
         "execute_guarded",
         _envelope_returning(
             execute_sql._envelope(
-                "ok", data=execute_sql.ExecResult(columns=["n"], rows=[(1,)], truncated=False)
+                "ok", data=execute_sql.ExecResult(columns=["n"], rows=[(1,)], truncated=False),
+                receipt=guardrail.undetermined_receipt(guardrail.RECEIPT_NO_MODEL),
             )
         ),
     )
