@@ -1,7 +1,10 @@
-"""OSS default adapters for the four ports.
+"""OSS default adapters for three of the four ports.
+
+The fourth port, ``Executor``, has its OSS default (``BUILTIN_EXECUTOR``) in ``execute_sql``
+instead: that module ships in the stdlib-lean plugin mirror, which cannot import this one.
 
 These defaults make the local product run out of the box — the single-tenant resolver, the
-file/jsonl activity sink, presence-only auth, and warn-only governance. They live in agami-core
+file/jsonl activity sink, and presence-only auth. They live in agami-core
 (not the ``agami-oss-adapters`` placeholder) so ``pip install agami-core`` is enough to run
 locally; richer adapters (a Postgres sink, real auth providers, enforcement) are supplied by
 their own consumers.
@@ -16,7 +19,7 @@ from pathlib import Path
 
 import agami_paths
 from contracts import QueryExecutionRecord
-from ports import GovernanceVerdict, Org, Principal
+from ports import Org, Principal
 
 
 def _append_jsonl(path: Path, record: dict) -> bool:
@@ -67,11 +70,3 @@ class PresenceAuthProvider:
 
     def validate_token(self, token: str) -> Principal | None:
         return Principal(subject=self._subject) if (token or "").strip() else None
-
-
-class WarnOnlyGovernancePolicy:
-    """Default ``GovernancePolicy`` — never blocks (``allowed=True``); any warnings are advisory
-    ("basic governance warning"). Enforcement is a paid tier."""
-
-    def evaluate(self, ctx: object | None = None) -> GovernanceVerdict:
-        return GovernanceVerdict(allowed=True, warnings=[])

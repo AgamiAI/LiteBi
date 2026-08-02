@@ -70,9 +70,6 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
 
         monkeypatch.setattr(rt, name, wrapper)
 
-    # A query on `orders` only — which declares no default_filters — so apply_default_filters
-    # injects nothing and we isolate the "guards don't re-parse the query SQL" claim (a table
-    # WITH default_filters legitimately parses each filter fragment to inject it).
     sql = "SELECT COUNT(orders.id) AS n FROM orders"
     ctx = rt.build_guard_context(sql, org)
     # Full battery WITH ctx — none of these should parse or rebuild an index again.
@@ -81,7 +78,6 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
     rt.check_column_scope(sql, org, ctx=ctx)
     rt.pre_flight_check(sql, org, ctx=ctx)
     rt.check_sensitive_projection(sql, org, ctx=ctx)
-    rt.apply_default_filters(sql, org, ctx=ctx)
 
     assert counts == {"parse": 1, "_column_index": 1, "_cardinality_index": 1,
                       "_sensitive_by_table": 1, "_model_table_index": 1}
@@ -93,7 +89,8 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
     "SELECT customers.email FROM customers",            # sensitive projection refuse
     "SELECT customers.bogus_col FROM customers",        # column-scope refuse
     "SELECT ghost.x FROM ghost",                        # table-scope refuse
-    "SELECT customers.name FROM customers",             # allow + default_filter applied
+    "SELECT customers.name FROM customers",             # allow (customers declares a default_filter,
+                                                        # which ACE-042 stopped applying)
 ])
 def test_verdict_parity_with_and_without_ctx(sql):
     """Every guard returns byte-identical results whether it builds its own work or is
@@ -113,7 +110,6 @@ def test_verdict_parity_with_and_without_ctx(sql):
     assert rt.pre_flight_check(sql, org).as_dict() == rt.pre_flight_check(sql, org, ctx=ctx).as_dict()
     assert (rt.check_sensitive_projection(sql, org).as_dict()
             == rt.check_sensitive_projection(sql, org, ctx=ctx).as_dict())
-    assert rt.apply_default_filters(sql, org) == rt.apply_default_filters(sql, org, ctx=ctx)
 
 
 def test_unparseable_sql_ctx_tree_is_none_and_guards_allow():

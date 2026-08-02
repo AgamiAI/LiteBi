@@ -121,7 +121,7 @@ def test_unconverted_model_safety_branch_still_yields_a_refusal_envelope(monkeyp
 
 
 def test_executor_receives_vetted_sql_and_resolved_creds(monkeypatch):
-    # The default_filters rewrite happens in the model pass; the executor sees the POST-guard SQL and
+    # The fan/chasm auto-rewrite happens in the model pass; the executor sees the POST-guard SQL and
     # the resolved datasource creds — never raw user input, never an unresolved profile.
     monkeypatch.setattr(
         execute_sql,
@@ -255,7 +255,6 @@ def test_create_app_wires_injected_executor_and_defaults_to_builtin(monkeypatch)
         activity_sink=base.activity_sink,
         org_resolver=base.org_resolver,
         auth_provider=base.auth_provider,
-        governance=base.governance,
         executor=fake,
     )
     mcp_http.create_app(adapters=adapters)

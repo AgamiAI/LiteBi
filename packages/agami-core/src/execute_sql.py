@@ -1657,21 +1657,25 @@ def _write_refusal(refusal: Refusal) -> None:
 
 
 def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusal | int | None]:
-    """Semantic-model safety pass before execution: fan-trap / chasm-trap pre-flight
-    + default_filters auto-application, over a model resolved from the DB (hosted) or disk (local).
+    """Semantic-model safety pass before execution: fan-trap / chasm-trap pre-flight, scope gates
+    and the sensitive-column gate, over a model resolved from the DB (hosted) or disk (local).
+
+    A table's declared ``default_filters`` are NOT applied here, and are not yet reported either —
+    ACE-042 deleted the injection (it authored SQL, and mis-scoped it on any CTE), and ACE-099 adds
+    the report. Until then a declared filter is descriptive only.
 
     Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue, a ``Refusal`` from one of
-    the five converted branches, or — from the four unconverted ones — today's bare exit code, which
+    the five converted branches, or — from the three unconverted ones — today's bare exit code, which
     the caller wraps in the interim ``model_safety`` rule. Inert (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
 
     The five converted branches — both ``model_unavailable`` sites and the three scope gates — write
     NOTHING: they hand the contract object back and ``execute_guarded`` puts it in the Envelope, so
-    the in-process caller sees the same rule the forked one does. The fan/chasm pre-flight,
-    sensitive-column and default-filter branches below still write today's ``{"error": …}`` / plain
-    text and return today's int, because those become receipt facts rather than refusals and
-    converting them here would pre-empt that decision.
+    the in-process caller sees the same rule the forked one does. The fan/chasm pre-flight and
+    sensitive-column branches below still write today's ``{"error": …}`` / plain text and return
+    today's int, because those become receipt facts rather than refusals and converting them here
+    would pre-empt that decision.
     """
     try:
         from semantic_model import runtime as RT
@@ -1766,10 +1770,6 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
         sys.stderr.write("\n")
         return sql, 1
 
-    new_sql, applied = RT.apply_default_filters(sql, org, area=area, ctx=ctx)
-    if applied:
-        sys.stderr.write(f"[agami] applied default_filters: {applied}\n")
-        sql = new_sql
     return sql, None
 
 
@@ -1893,7 +1893,7 @@ def _builtin_execute(vetted_sql: str, creds: dict[str, str], *, profile: str) ->
 
 class _BuiltinExecutor:
     """The default ``ports.Executor``: wraps the connect-per-query dispatch as an object so it
-    satisfies the port by shape (method-style, like the other four ports). Stateless — one shared
+    satisfies the port by shape (method-style, like the other three ports). Stateless — one shared
     ``BUILTIN_EXECUTOR`` instance."""
 
     def execute(self, vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult:
@@ -2148,7 +2148,8 @@ def execute_guarded(
 
     In fixed order: read-only / dangerous-SQL guard (the hard security gate — NOT bypassable via
     ``no_safety``, which skips only the semantic-model pass, never write/RCE/DoS protection) ->
-    semantic-model safety pass (fan/chasm pre-flight + scope + PII + ``default_filters`` rewrite) ->
+    semantic-model safety pass (fan/chasm pre-flight + scope + PII; declared ``default_filters``
+    are no longer applied here — ACE-042) ->
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
     SQL both guards have passed.
 
@@ -2319,9 +2320,9 @@ def main() -> int:
     src.add_argument("--sql", help="SQL statement (use --sql-file for SQL with special characters)")
     src.add_argument("--sql-file", help="Path to a file containing one SQL statement")
     p.add_argument("--area", default=None,
-                   help="Subject area for the semantic-model safety pass (pre-flight + default_filters).")
+                   help="Subject area for the semantic-model safety pass (pre-flight + scope + PII).")
     p.add_argument("--no-safety", action="store_true",
-                   help="Skip the semantic-model pre-flight / default_filters pass.")
+                   help="Skip the semantic-model safety pass.")
     p.add_argument("--max-rows", type=int, default=None,
                    help="Lower the row cap for this call (never raises it). Effective cap = "
                         "min(this, AGAMI_SQL_MAX_ROWS) — the env is the deployment cap, default 1000.")

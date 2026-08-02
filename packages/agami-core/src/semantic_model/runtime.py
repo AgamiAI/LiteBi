@@ -1282,6 +1282,8 @@ def build_receipt(
             }
             for r in relationships_used
         ]
+    # ACE-042 removed the only caller that supplied this; ACE-099 becomes the next one. Until then
+    # nothing in the tree passes it, so the key is absent rather than an unsubstantiated claim.
     if default_filters_applied:
         receipt["default_filters_applied"] = default_filters_applied
     if caveats:
@@ -1836,72 +1838,9 @@ def _drop_fanout_joins(sql: str, drop_tables: set[str]) -> Optional[str]:
     return tree.sql()
 
 
-def apply_default_filters(
-    sql: str,
-    org: Datasource,
-    *,
-    area: Optional[str] = None,
-    params: Optional[dict[str, str]] = None,
-    ctx: "GuardContext | None" = None,
-) -> tuple[str, list[str]]:
-    """Conservatively AND each in-scope table's default_filters into the SQL's WHERE.
-
-    Safety-first (this is the trust layer): only the outermost SELECT is touched;
-    a filter is injected only when its table appears as a base table there and the
-    `{alias}` placeholder can be bound to the actual alias used. Filters with
-    unresolved `:param` markers are skipped unless `params` supplies them. If
-    anything is ambiguous, the filter is left out (never emit wrong SQL) and the
-    caller can see which were applied via the returned list.
-    """
-    from .loader import _find_table  # local import to avoid cycle at module load
-
-    params = params or {}
-    if not _HAVE_SQLGLOT:
-        return sql, []
-    if ctx is not None:
-        # apply_default_filters MUTATES its tree to inject WHEREs; work on a COPY so the
-        # shared ctx.tree the read-only guards used stays pristine (ACE-045). ctx must be
-        # built from this same `sql`, which _model_safety guarantees.
-        tree = ctx.tree.copy() if ctx.tree is not None else None
-    else:
-        try:
-            tree = sqlglot.parse_one(sql, error_level="ignore")
-        except Exception:
-            return sql, []
-    if not isinstance(tree, exp.Select):
-        return sql, []
-
-    scope = _tables_in_scope(tree)  # alias -> bare table
-    applied: list[str] = []
-    conditions: list[str] = []
-    for alias, table_name in scope.items():
-        table = _find_table(org, table_name, area)
-        if table is None or not table.default_filters:
-            continue
-        for flt in table.default_filters:
-            resolved = flt.replace("{alias}", alias)
-            # bind known params; skip if any :param remains unresolved
-            for k, val in params.items():
-                resolved = resolved.replace(f":{k}", str(val))
-            if re.search(r":\w+", resolved):
-                continue  # unresolved bind param -> skip (can't run raw)
-            conditions.append(resolved)
-            applied.append(resolved)
-
-    if not conditions:
-        return sql, []
-
-    combined = " AND ".join(f"({c})" for c in conditions)
-    try:
-        cond_expr = sqlglot.parse_one(f"SELECT 1 WHERE {combined}").args["where"].this
-        where = tree.args.get("where")
-        if where is not None:
-            tree.set("where", exp.Where(this=exp.and_(where.this, cond_expr)))
-        else:
-            tree.set("where", exp.Where(this=cond_expr))
-        return tree.sql(), applied
-    except Exception:
-        return sql, []
+# `apply_default_filters` was deleted here by ACE-042: declared filters are business logic, not a
+# disclosure control, so nothing justified this module authoring SQL. Reporting which filters a
+# statement applied is ACE-099; do not re-add an injector.
 
 
 def _similarity(a: str, b: str) -> float:
@@ -2048,7 +1987,6 @@ __all__ = [
     "resolve_entity_instance",
     "PreFlightResult",
     "pre_flight_check",
-    "apply_default_filters",
     "build_receipt",
     "assemble_receipt",
     "assemble_refusal_receipt",
