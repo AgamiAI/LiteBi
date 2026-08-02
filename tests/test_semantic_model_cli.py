@@ -126,13 +126,18 @@ def test_describe_file_applies_tsv(tmp_path):
     assert total["description_source"] == "ai_unvalidated"   # source:ai → earns trust via use
 
 
-def test_prepare_allow_applies_default_filters(tmp_path):
+def test_prepare_does_not_apply_default_filters(tmp_path):
+    """ACE-042: `sm prepare` hands back the caller's statement. The model declares
+    `{alias}.deleted_at IS NULL` on `orders` and it neither reaches the SQL nor comes back as an
+    `applied_filters` key — an always-empty list would read as "we checked, none applied"."""
     _model(tmp_path)
-    rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql", "SELECT SUM(total) FROM orders"])
+    sql = "SELECT SUM(total) FROM orders"
+    rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql", sql])
     d = json.loads(out)
     assert rc == 0 and d["action"] == "allow"
-    assert d["applied_filters"] == ["orders.deleted_at IS NULL"]
-    assert "deleted_at IS NULL" in d["sql"]
+    assert d["sql"] == sql
+    assert "deleted_at" not in d["sql"]
+    assert "applied_filters" not in d
 
 
 def test_prepare_auto_rewrites_fan_trap(tmp_path):
@@ -142,7 +147,7 @@ def test_prepare_auto_rewrites_fan_trap(tmp_path):
     d = json.loads(out)
     assert rc == 0 and d["action"] == "auto_rewrite" and d["rewritten"] is True
     assert "order_items" not in d["sql"]              # fan-out join dropped
-    assert "deleted_at IS NULL" in d["sql"]           # + default_filter applied
+    assert "deleted_at" not in d["sql"]               # and nothing injected (ACE-042)
 
 
 def test_add_writes_metrics_and_skips_invalid(tmp_path):
@@ -495,8 +500,8 @@ def test_validate_tolerates_excluded_table_but_flags_genuine_orphan(tmp_path):
 def test_seed_validate_runs_through_safety_and_shapes_items(tmp_path, monkeypatch):
     """`sm seed-validate` runs each written seed and emits examples-validation items.
     The guarantees we lock: (1) every seed is executed via execute_sql.py WITH `--area`
-    and AGAMI_ARTIFACTS_DIR set — so the fan/chasm pre-flight + default_filters always
-    run (a raw driver could skip them); (2) results shape into {n, question, sql,
+    and AGAMI_ARTIFACTS_DIR set — so the fan/chasm pre-flight and the scope/PII gates
+    always run (a raw driver could skip them); (2) results shape into {n, question, sql,
     row_headers, row_preview, row_count, state}; (3) a failing seed surfaces its `error`
     instead of faking a result. The live-DB call is mocked so the test needs no DB."""
     import subprocess
@@ -537,7 +542,7 @@ def test_seed_validate_runs_through_safety_and_shapes_items(tmp_path, monkeypatc
     assert bad["error"] and bad["row_count"] == 0 and bad["row_preview"] == []
 
     # (1) safety: EVERY seed ran with --area + AGAMI_ARTIFACTS_DIR so execute_sql's
-    # fan/chasm pre-flight + default_filters apply — never bypassed.
+    # fan/chasm pre-flight and scope/PII gates apply — never bypassed.
     assert len(calls) == 2
     for cmd, env in calls:
         assert "--area" in cmd and cmd[cmd.index("--area") + 1] == "s"

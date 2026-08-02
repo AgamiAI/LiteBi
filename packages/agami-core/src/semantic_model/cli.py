@@ -201,10 +201,14 @@ def cmd_preflight(args) -> int:
 
 
 def cmd_prepare(args) -> int:
-    """Tier-independent safety pass: run the fan/chasm pre-flight, then (unless it
-    refuses) apply the area's default_filters. Returns the SQL to actually execute.
-    The query skill calls this on EVERY tier before handing SQL to psql/mysql/etc.,
-    so the safety guarantees don't depend on going through execute_sql.py."""
+    """Tier-independent safety pass: run the fan/chasm pre-flight and return the SQL to
+    actually execute. The query skill calls this on EVERY tier before handing SQL to
+    psql/mysql/etc., so the safety guarantees don't depend on going through execute_sql.py.
+
+    A table's declared `default_filters` are NOT applied here (ACE-042 deleted the injection)
+    and are not yet reported (ACE-099 adds the report), so no `applied_filters` key is emitted.
+    An always-empty list would read as "we checked, none applied", which is the silence that
+    reads as clean."""
     sql = args.sql
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
@@ -215,16 +219,14 @@ def cmd_prepare(args) -> int:
                      "suggestion": pf.suggestion, "sql": sql})
         return 1
     run_sql = pf.rewritten_sql if (pf.action == "auto_rewrite" and pf.rewritten_sql) else sql
-    final_sql, applied = RT.apply_default_filters(run_sql, org, area=args.area)
     _print_json({
         "action": pf.action,
         "risk": pf.risk,
-        "sql": final_sql,
+        "sql": run_sql,
         "rewritten": bool(pf.action == "auto_rewrite"),
-        "applied_filters": applied,
         # {output_column: unit}, traced through the final SQL — feed straight to
         # `format-table --units` so summed/aliased currency formats correctly.
-        "units": RT.resolve_result_units(org, final_sql),
+        "units": RT.resolve_result_units(org, run_sql),
         "reason": pf.reason if pf.risk else None,
     })
     return 0
@@ -678,7 +680,7 @@ def cmd_seed_examples(args) -> int:
 def cmd_seed_validate(args) -> int:
     """Phase-6 trust onboarding: run every written seed against the live DB and emit the
     examples-validation items. Each seed runs THROUGH execute_sql.py (the agami-query path)
-    so the fan/chasm pre-flight + default_filters always apply — a raw driver could skip
+    so the fan/chasm pre-flight and the scope/PII gates always apply — a raw driver could skip
     that and let a fan-out scan the whole table. A refused/errored seed is surfaced with
     its `error`, not faked. Replaces ad-hoc 'run all the seeds' scripts."""
     import csv as _csv
@@ -1151,7 +1153,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sql", required=True)
     sp.set_defaults(func=cmd_preflight)
 
-    sp = sub.add_parser("prepare", help="tier-independent safety pass: pre-flight + default_filters → SQL to run")
+    sp = sub.add_parser("prepare", help="tier-independent safety pass: fan/chasm pre-flight → SQL to run")
     sp.add_argument("root")
     sp.add_argument("--area", default=None)
     sp.add_argument("--sql", default=None)
@@ -1163,7 +1165,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sql", default=None)
     sp.add_argument("--sql-file", default=None, dest="sql_file")
     sp.add_argument("--applied-filters", default=None, dest="applied_filters",
-                    help="JSON list of default_filters applied (from `sm prepare`)")
+                    help="JSON list of default_filters applied. `sm prepare` no longer supplies "
+                         "these (ACE-042 removed the injection); ACE-099 reports them.")
     sp.add_argument("--freshness", default=None, help="optional freshness timestamp for tables_used")
     sp.set_defaults(func=cmd_receipt)
 
