@@ -120,15 +120,49 @@ def _format_sql(sql: str) -> str:
     return out.strip()
 
 
+# The five sections a receipt carries, named exactly as `semantic_model.runtime.assemble_receipt`
+# emits them and as the contract type declares them. Re-listed here rather than imported because
+# this script is stdlib-only and ships inside the plugin, with no path back to the package.
+RECEIPT_SECTIONS = ("columns", "tables", "joins", "aggregates", "assumptions")
+
+
 def _validate_receipt(receipt: dict) -> None:
-    """Light validation of the trust-receipt shape. The fields are documented
-    in chart-template.html → RECEIPT_JSON schema. Receipts are optional —
-    callers that don't have one pass None / omit --receipt-file."""
+    """Validate the trust-receipt shape. The fields are documented in chart-template.html →
+    RECEIPT_JSON schema. Receipts are optional — callers that don't have one pass None / omit
+    --receipt-file — but a receipt that IS passed must carry all five sections, each with its
+    `items` list and its `undetermined` marker.
+
+    A MISSING section is an error here, not a tolerated omission. The previous check was
+    `if arr_key in receipt`, so a receipt that had silently lost a key validated clean and the
+    panel simply drew nothing for it: the reader then could not tell a section that found nothing
+    from a section that was never reported. That is the "absent versus empty" ambiguity the whole
+    receipt shape exists to kill, and letting it back in at the last hop before the page would undo
+    it for the one surface a user actually reads.
+
+    `undetermined` must be PRESENT even when it is null: null is the positive claim "this section is
+    complete", and a key that is simply absent claims nothing.
+    """
     if not isinstance(receipt, dict):
         raise ValueError("receipt must be a JSON object")
-    for arr_key in ("tables_used", "relationships", "metrics", "named_filters", "assumptions", "warnings"):
-        if arr_key in receipt and not isinstance(receipt[arr_key], list):
-            raise ValueError(f"receipt.{arr_key} must be a list")
+    for name in RECEIPT_SECTIONS:
+        if name not in receipt:
+            raise ValueError(
+                f"receipt.{name} is missing: every section must be present, because a section that "
+                f"is absent and a section that is empty are different facts"
+            )
+        section = receipt[name]
+        if not isinstance(section, dict):
+            raise ValueError(
+                f"receipt.{name} must be an object with 'items' and 'undetermined'"
+            )
+        if not isinstance(section.get("items"), list):
+            raise ValueError(f"receipt.{name}.items must be a list")
+        if "undetermined" not in section:
+            raise ValueError(
+                f"receipt.{name}.undetermined is missing: pass null when the section is complete"
+            )
+        if not isinstance(section["undetermined"], (str, type(None))):
+            raise ValueError(f"receipt.{name}.undetermined must be a string or null")
     if "model_version" in receipt and not isinstance(receipt["model_version"], (str, type(None))):
         raise ValueError("receipt.model_version must be a string or null")
 
@@ -191,9 +225,11 @@ def main() -> int:
 
     p.add_argument(
         "--receipt-file",
-        help="Path to a JSON file with the trust receipt object (model_version, "
-             "tables_used, relationships, metrics, named_filters, warnings). "
-             "Optional — when omitted, the report renders without a receipt panel.",
+        help="Path to a JSON file with the trust receipt object: `model_version` plus the five "
+             "sections (columns, tables, joins, aggregates, assumptions), each an object with an "
+             "`items` list and an `undetermined` marker saying what the section did not establish "
+             "(null when it is complete). Produced by `sm receipt`. Optional — when omitted, the "
+             "report renders without a receipt panel.",
     )
 
     p.add_argument("--out", required=True)
