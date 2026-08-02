@@ -1929,8 +1929,18 @@ def _receipt_for(sql: str, profile: str, *, bounded: bool) -> Receipt:
     """
     try:
         from semantic_model import runtime as RT
-    except Exception:
+    except ImportError:
+        # The vendored plugin mirror ships `guardrail` and this module but no
+        # `semantic_model.runtime` at all, so the import genuinely fails there. That is a fact about
+        # the deployment, not a fault, and it is what `RECEIPT_NO_RUNTIME` says.
         return undetermined_receipt(RECEIPT_NO_RUNTIME)
+    except Exception:
+        # The module IS installed and raised while importing itself, which is a defect. Reporting it
+        # as "not available in this deployment" would send an operator looking for a missing install
+        # and leave the real error unlogged. Two different facts, and this spec exists to stop them
+        # being reported as one.
+        _LOG.error("the semantic-model runtime failed to import", exc_info=True)
+        return undetermined_receipt(RECEIPT_BUILD_FAILED)
     org = _guard_model.get()
     if org is None:
         return undetermined_receipt(RECEIPT_NO_MODEL)
