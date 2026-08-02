@@ -80,6 +80,11 @@ from typing import TYPE_CHECKING, Any
 
 import agami_paths
 from guardrail import (
+    PRE_MODEL_RULES,
+    RECEIPT_BEFORE_MODEL,
+    RECEIPT_BUILD_FAILED,
+    RECEIPT_NO_MODEL,
+    RECEIPT_NO_RUNTIME,
     RULE_MODEL_SAFETY,
     RULE_MODEL_UNAVAILABLE,
     RULE_RESOURCE_LIMIT,
@@ -1898,32 +1903,23 @@ class _BuiltinExecutor:
 BUILTIN_EXECUTOR = _BuiltinExecutor()
 
 
-# What a receipt says when it could not be built, one reason per cause. Three different facts, and a
-# reader has to be able to act on which: install the model dependencies, build a model, or read the
-# server log.
-RECEIPT_NO_RUNTIME = (
-    "The semantic-model runtime is not available in this deployment, so nothing about the statement "
-    "could be established."
-)
-RECEIPT_NO_MODEL = (
-    "No semantic model was consulted for this statement, so nothing in it was checked."
-)
-RECEIPT_BUILD_FAILED = (
-    "The receipt could not be assembled for this statement. The details are in the server log."
-)
-
-
-def _receipt_for(sql: str, profile: str, *, refused: bool) -> Receipt:
+def _receipt_for(sql: str, profile: str, *, bounded: bool) -> Receipt:
     """The ``Receipt`` this call's Envelope carries.
 
-    Built HERE, at the chokepoint, and from the sql the chokepoint holds: ``_model_safety`` may have
-    handed back a REWRITTEN statement and rebound the local ``sql``, and the receipt has to describe
-    the statement that will actually run rather than the one the caller sent.
+    ``bounded`` picks the assembler, and the difference is a security boundary rather than a detail
+    level. **Every NON-OK body gets the bounded one**, which echoes only what the caller's own
+    statement already disclosed. The rule used to be "every REFUSAL", on the reasoning that a
+    ``failed`` body discloses nothing an ``ok`` body would not, because reaching ``failed`` means the
+    statement's names passed the scope gates. That reasoning is wrong: a table or column the model
+    declares and the physical warehouse does not have can only ever produce ``failed`` — ``ok`` is
+    structurally unreachable for it — so ``failed`` is a disclosure channel of its own rather than a
+    subset of one. The full receipt therefore rides ``ok`` alone, which is the one status a caller
+    cannot provoke without the model and the warehouse already agreeing about every name in it.
 
-    ``refused`` picks the assembler, and the difference is a security boundary rather than a detail
-    level: a refusal receipt echoes only what the caller's own statement already disclosed, because
-    a refusal is the outcome a caller can provoke deliberately (see
-    ``runtime.assemble_refusal_receipt``).
+    The caller of a non-ok outcome also passes the statement it RECEIVED rather than the one that
+    ran: see ``execute_guarded``, which captures it before ``_model_safety`` can rebind the local.
+    The ok receipt is the one built from the rebound value, because SC-6 asks it to describe what
+    actually executed.
 
     Degrades rather than crashes, three ways, because every one of them is a real deployment. The
     vendored plugin mirror ships ``semantic_model/__init__.py`` and ``units.py`` and no runtime at
@@ -1939,7 +1935,7 @@ def _receipt_for(sql: str, profile: str, *, refused: bool) -> Receipt:
     if org is None:
         return undetermined_receipt(RECEIPT_NO_MODEL)
     try:
-        assemble = RT.assemble_refusal_receipt if refused else RT.assemble_receipt
+        assemble = RT.assemble_refusal_receipt if bounded else RT.assemble_receipt
         return receipt_from_assembled(
             assemble(org, sql, model_version=_receipt_model_version(profile))
         )
@@ -1948,6 +1944,24 @@ def _receipt_for(sql: str, profile: str, *, refused: bool) -> Receipt:
         # stack goes to the server log and the caller gets a receipt that says it has nothing.
         _LOG.error("could not assemble the receipt", exc_info=True)
         return undetermined_receipt(RECEIPT_BUILD_FAILED)
+
+
+def _refusal_receipt(refusal: Refusal, received_sql: str, profile: str) -> Receipt:
+    """The receipt a REFUSED Envelope carries, chosen by which rule fired.
+
+    A ``PRE_MODEL_RULES`` refusal is not a receipt that could not be built — it is a receipt there
+    was never anything to build. Those gates run above the semantic-model pass, so ``_guard_model``
+    is still the ``None`` ``execute_guarded`` cleared on entry, and asking the builder anyway
+    produced ``RECEIPT_NO_MODEL``: "no model could be resolved", about a deployment whose model
+    resolves perfectly a line later. Naming the rule instead is both truthful and free, and it is the
+    same branch ``tools`` takes on the far side of a fork, so one refusal reads one way on both paths.
+
+    Everything else is a refusal a gate reached WITH the model in hand, so it gets the echo-bounded
+    receipt built from the statement the caller sent.
+    """
+    if refusal.rule in PRE_MODEL_RULES:
+        return undetermined_receipt(RECEIPT_BEFORE_MODEL)
+    return _receipt_for(received_sql, profile, bounded=True)
 
 
 def _receipt_model_version(profile: str) -> str | None:
@@ -1974,17 +1988,21 @@ def _receipt_model_version(profile: str) -> str | None:
 def _envelope(
     status: Status,
     *,
+    receipt: Receipt,
     data: ExecResult | None = None,
     refusal: Refusal | None = None,
     failure: Failure | None = None,
-    receipt: Receipt | None = None,
 ) -> Envelope:
     """The ONE place ``execute_guarded`` constructs an ``Envelope``, and the one place this module
     mints an ``audit_id``.
 
-    ``receipt`` is optional at this signature and never optional on the wire: an outcome that has no
-    receipt to hand gets one that SAYS so, rather than the empty-and-silent default, which a
-    consumer would read as "checked, found nothing".
+    ``receipt`` is MANDATORY, which is what actually delivers the property this docstring used to
+    claim: an outcome that has no receipt to hand must return one that SAYS so, rather than the
+    empty-and-silent default a consumer would read as "checked, found nothing". While the parameter
+    carried a fallback, that promise rested on every call site remembering to pass one — and the
+    fallback itself named the wrong cause (``RECEIPT_NO_MODEL``) for the outcomes that could have
+    reached it. Every call site already passes one, so requiring it costs nothing and makes the
+    omission unrepresentable.
 
     Funnelling all five outcomes through here is what makes "every path returns exactly one
     Envelope" a property of the code rather than a claim in a docstring: a new outcome cannot reach
@@ -2003,7 +2021,7 @@ def _envelope(
         data=data,
         refusal=refusal,
         failure=failure,
-        receipt=receipt if receipt is not None else undetermined_receipt(RECEIPT_NO_MODEL),
+        receipt=receipt,
         audit_id=uuid.uuid4().hex,
     )
 
@@ -2162,13 +2180,21 @@ def execute_guarded(
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)
+    # The statement the CALLER sent, captured before `_model_safety` can rebind the local below. Every
+    # NON-OK receipt is built from this one. `_model_safety` ends in `apply_default_filters`, so the
+    # rebound string can name a table the model's own YAML injected and the caller never wrote — and a
+    # refusal built from it then describes a statement nobody sent, in model-authored text, which is
+    # precisely the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent. The `ok`
+    # receipt is the one exception and keeps using the rebound value, because SC-6 asks it to describe
+    # what actually ran.
+    received_sql = sql
     try:
         import sql_guard
 
         refusal = sql_guard.check_read_only(sql)
         if refusal is not None:
             return _envelope("refused", refusal=refusal,
-                             receipt=_receipt_for(sql, profile, refused=True))
+                             receipt=_refusal_receipt(refusal, received_sql, profile))
         # Metadata / recon functions, ABOVE the `no_safety` branch on purpose. `no_safety` skips the
         # semantic-model pass and nothing else; server fingerprinting and object-existence probing
         # are a hard gate for the same reason write and RCE protection are. Running second is what
@@ -2176,7 +2202,7 @@ def execute_guarded(
         refusal = sql_guard.check_no_recon(sql)
         if refusal is not None:
             return _envelope("refused", refusal=refusal,
-                             receipt=_receipt_for(sql, profile, refused=True))
+                             receipt=_refusal_receipt(refusal, received_sql, profile))
         if not no_safety:
             # `sql` is REBOUND here: `_model_safety` returns the statement it will actually run,
             # which the auto-rewrite branch changes. Every receipt built below therefore describes
@@ -2185,7 +2211,7 @@ def execute_guarded(
             sql, verdict = _model_safety(sql, profile, area)
             if isinstance(verdict, Refusal):
                 return _envelope("refused", refusal=verdict,
-                                 receipt=_receipt_for(sql, profile, refused=True))
+                                 receipt=_refusal_receipt(verdict, received_sql, profile))
             if verdict is not None:
                 # One of the four unconverted branches: it wrote its own diagnostic to the server
                 # log and handed back only an exit code, so this is the most we can say without
@@ -2202,7 +2228,7 @@ def execute_guarded(
                         remediation="Check the server log for the rule that fired, then adjust the "
                                     "query.",
                     ),
-                    receipt=_receipt_for(sql, profile, refused=True),
+                    receipt=_receipt_for(received_sql, profile, bounded=True),
                 )
         creds = _load_credentials(profile, org_id or "local")
         # Bounded at the CHOKEPOINT, so the limit reaches every executor rather than only the
@@ -2212,8 +2238,11 @@ def execute_guarded(
         # Inside the try on purpose: an executor that returns `None` (or anything else the contract
         # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
         # broken adapter, not a reason for the chokepoint to raise at its caller.
+        # The one receipt built from the REBOUND statement: `ok` is the status SC-6 asks to describe
+        # what actually executed, and it is also the one a caller cannot provoke without every name
+        # in it having already satisfied the scope gates and the warehouse.
         return _envelope("ok", data=result,
-                         receipt=_receipt_for(sql, profile, refused=False))
+                         receipt=_receipt_for(sql, profile, bounded=False))
     except _ResourceLimit as exc:
         # AHEAD of both handlers below: `_ResourceLimit` is an `ExecutorError` sibling, not a
         # subclass, but the catch-all would swallow it and report a bound WE imposed as an
@@ -2226,7 +2255,7 @@ def execute_guarded(
         # layer's join returned long before its own budget and has nothing to add, so the inner
         # refusal is the answer and cannot be overwritten by a later one.
         return _envelope("refused", refusal=_resource_limit_refusal(exc),
-                         receipt=_receipt_for(sql, profile, refused=True))
+                         receipt=_receipt_for(received_sql, profile, bounded=True))
     except ExecutorError as exc:
         # Two kinds of text arrive here and only one of them is ours (ACE-039).
         #
@@ -2236,7 +2265,7 @@ def execute_guarded(
         if exc.code in _AUTHORED_EXIT_CODES:
             return _envelope("failed", failure=Failure(
                 kind=EXIT_TO_FAILURE_KIND.get(exc.code, "other"), message=exc.msg,
-            ), receipt=_receipt_for(sql, profile, refused=False))
+            ), receipt=_receipt_for(received_sql, profile, bounded=True))
         # Codes 4 and 5 carry the driver's own exception, interpolated at one of the twenty
         # per-engine sites. That text is an enumeration channel: a PostgreSQL HINT names declared
         # columns the caller never sent. Classify FROM it, return a fixed sentence INSTEAD of it.
@@ -2248,7 +2277,7 @@ def execute_guarded(
         _RAW_LOG.error("database error (audit detail): %s", exc.msg)
         return _envelope("failed", failure=Failure(
             kind=kind, message=_ERROR_MESSAGES.get(kind, UNEXPECTED_FAILURE_MESSAGE),
-        ), receipt=_receipt_for(sql, profile, refused=False))
+        ), receipt=_receipt_for(received_sql, profile, bounded=True))
     except Exception:
         # Unanticipated, so unreadable: nobody has vetted what this exception's text contains, and
         # `configparser.MissingSectionHeaderError` alone carries the absolute path of the
@@ -2258,7 +2287,7 @@ def execute_guarded(
         _LOG.error("unhandled error in the guarded execution path", exc_info=True)
         return _envelope("failed", failure=Failure(
             kind="other", message=UNEXPECTED_FAILURE_MESSAGE,
-        ), receipt=_receipt_for(sql, profile, refused=False))
+        ), receipt=_receipt_for(received_sql, profile, bounded=True))
 
 
 def main() -> int:

@@ -86,6 +86,21 @@ RULE_ENGINE_MISMATCH = "engine_mismatch"
 # entry is `undetermined`, so that is a one-line change, not a decision to re-litigate).
 RULE_UNSCOPABLE = "unscopable"
 
+PRE_MODEL_RULES: frozenset[str] = frozenset({RULE_READ_ONLY, RULE_RECON})
+"""The rules decided BEFORE any semantic model is consulted, and the home for the next one.
+
+Both gates run above the semantic-model pass — a write and a server-fingerprinting probe are stopped
+without asking what the model declares — so a statement either one refuses never resolved a model at
+all. That is a fact about the DECISION rather than about the deployment, and it has to be stated the
+same way whichever process decided it: the in-process path knows no model was loaded because it holds
+the gate, while the fork path holds only the rule the child sent back. Consulting this set is what
+lets the two reach the same receipt, and it is what keeps the fork path from loading a model in order
+to describe a refusal that never looked at one (see `RECEIPT_BEFORE_MODEL`).
+
+A gate added above the model pass belongs here in the same diff that adds it. Leaving it out is not a
+crash: it is a receipt that quietly claims no model could be resolved, which is a different fact and
+an untrue one."""
+
 # Interim. `_model_safety`'s fan/chasm pre-flight and sensitive-column branches are not converted in
 # this slice (they become receipt facts when the mutation branches are subtracted), but every path
 # out of `execute_guarded` must still return an Envelope. This is the rule those two branches carry
@@ -231,7 +246,9 @@ class ReceiptSection:
       * `items` set, `undetermined` set    — partly established, and here is what is missing.
 
     Before this, an unchecked section and a clean one were both the empty list, so silence read as
-    clean. A section whose analysis has not shipped yet says so by spec id rather than sitting empty.
+    clean. A section whose analysis has not shipped yet says what it did not establish, in a sentence
+    a user can act on. It never names the spec that owns the gap: this repo is public, and an
+    internal spec id resolves nowhere for the reader while disclosing unshipped work to everyone else.
 
     `items` is a tuple, not a list: this module's types are frozen, and a frozen dataclass holding a
     list is only shallowly immutable.
@@ -251,8 +268,8 @@ class Receipt:
 
     The sections are containers; the facts inside them belong to the specs that own each analysis
     (per-column metric match, per-join predicate, per-aggregate fan-out, per-table declared filters).
-    A container whose analysis has not landed ships with `undetermined` naming the spec, so the gap
-    is visible at the point of use rather than inferred from an empty list.
+    A container whose analysis has not landed ships with `undetermined` stating what was not
+    established, so the gap is visible at the point of use rather than inferred from an empty list.
 
     Everything here is derivable from the SQL and the model alone: no probe queries, no sampled
     values, no row contents. It is metadata and statement structure, and it must stay that way, or
@@ -276,6 +293,34 @@ class Receipt:
     """The section names, in order. Declared once so a caller that must touch every section (the
     undetermined-everything builders, the serializers, the tests) iterates this rather than
     re-listing them and drifting."""
+
+
+# What a receipt says when it could not be built, one reason per cause — and the reasons live HERE
+# rather than beside either builder, because there are two builders for the same four facts. The
+# execution chokepoint assembles the receipt in-process; the tool edge assembles it again in the
+# parent of a fork, since the child's Envelope is destroyed at the process boundary. Two copies of
+# these sentences is two chances for the same statement to be described two ways, which is the defect
+# this spec exists to remove one layer up. Each is a user-facing sentence, ending in a full stop:
+# they surface next to the answer, not in a log.
+RECEIPT_NO_RUNTIME = (
+    "The semantic-model runtime is not available in this deployment, so nothing about the statement "
+    "could be established."
+)
+RECEIPT_NO_MODEL = (
+    "No semantic model could be resolved for this datasource, so nothing in the statement was "
+    "checked."
+)
+RECEIPT_BUILD_FAILED = (
+    "The receipt could not be assembled for this statement. The details are in the server log."
+)
+# The fourth is NOT a degradation at all, which is why it may not borrow any of the three above. A
+# statement stopped by a `PRE_MODEL_RULES` gate was refused before anything asked the model a
+# question: a model may well exist and resolve perfectly. Saying "no model could be resolved" there
+# would report a deployment problem that is not happening.
+RECEIPT_BEFORE_MODEL = (
+    "The statement was refused before any semantic model was consulted, so nothing in it was checked "
+    "against one."
+)
 
 
 def undetermined_receipt(reason: str, *, model_version: str | None = None) -> Receipt:

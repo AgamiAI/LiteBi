@@ -20,6 +20,15 @@ destroyed at the process boundary; the parent assembles its own from the only st
 which is the one the CALLER sent. After a rewrite the two paths therefore describe two different
 statements. That gap is pinned below as a strict xfail rather than left as prose, because a gap
 nobody measures is a gap nobody closes.
+
+**The gap is `ok`-only, and that is not a narrowing of the property but a consequence of where the
+full receipt now lives.** Every NON-ok receipt is built from the statement the caller SENT, on both
+paths and on purpose: `_model_safety` ends in `apply_default_filters`, so a refusal built from the
+rebound string names tables the model's own YAML injected and the caller never wrote. So the two
+paths agree by construction on `refused` and `failed`, and `ok` is the one status left where the
+receipt is asked to describe what executed. It has no top-level `receipt` on the wire yet, so both
+measurements below read `Envelope.receipt` through a spy on `_emit` — which is where the contract
+states the property anyway.
 """
 
 from __future__ import annotations
@@ -153,20 +162,21 @@ def _write_model(root: Path) -> None:
 def rewritten(tmp_path, monkeypatch):
     """The model above under profile `acme`, plus a real warehouse behind it.
 
-    The warehouse declares `orders` and NOTHING else: no `deleted_at` column and no `order_items`
-    table. That is deliberate and it is what keeps the fork test below honest through the specs that
-    delete the rewrites. Today the child runs the rewritten statement and SQLite rejects the
-    injected `deleted_at`; once both rewrites are gone the child runs the caller's statement and
-    SQLite rejects the missing `order_items`. Either way the outcome is `failed`, which is the
-    status whose receipt is on the wire, so the test keeps measuring the receipt rather than
-    changing shape underneath itself.
+    The warehouse has everything the REWRITTEN statement needs — `orders`, its `total`, and the
+    `deleted_at` the default filter injects — and nothing the caller's own statement additionally
+    needs: there is no `order_items` table. So today both routes reach `ok`, which is the one status
+    whose receipt is asked to describe what executed, and the two therefore describe two different
+    statements. Once ACE-093 and ACE-042 delete the rewrites, executed and received converge on a
+    statement naming `order_items`, both routes come back `failed`, and both receipts are the bounded
+    receipt of the same received string — equal, which is exactly the alarm the strict xfail below
+    exists to raise.
     """
     artifacts = tmp_path / "artifacts"
     _write_model(artifacts / PROFILE)
 
     warehouse = tmp_path / "warehouse.db"
     con = sqlite3.connect(warehouse)
-    con.execute("CREATE TABLE orders (id INTEGER, total NUMERIC)")
+    con.execute("CREATE TABLE orders (id INTEGER, total NUMERIC, deleted_at TIMESTAMP)")
     con.commit()
     con.close()
 
@@ -193,6 +203,26 @@ def _tool_out(sql: str) -> dict:
     return json.loads(
         tools.tool_execute_sql({"sql": sql, "datasource": PROFILE, "area": AREA})
     )
+
+
+def _both_routes(monkeypatch, sql: str) -> tuple[dict, dict, list[dict]]:
+    """Run `sql` down both routes and return `(in_process_body, forked_body, [receipts])`.
+
+    The receipts are read off the `Envelope` through a spy on `_emit`, not off the wire: the `ok`
+    body carries no top-level `receipt` yet, because `_emit` builds it as `{"status": "ok",
+    **payload}` and `payload` already has a legacy `"receipt"` key the chart template reads. The
+    contract states the property on the TYPE, which is what this measures.
+    """
+    seen: list = []
+    real = tools._emit
+    monkeypatch.setattr(tools, "_emit", lambda env, **kw: (seen.append(env), real(env, **kw))[1])
+
+    tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
+    in_process = _tool_out(sql)
+    tools.set_injected_executor(None)
+    forked = _tool_out(sql)
+
+    return in_process, forked, [asdict(env.receipt) for env in seen]
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +280,16 @@ def test_the_receipt_describes_the_statement_that_ran(rewritten):
         "executed == received by construction; this marker is deleted by that slice."
     ),
 )
-def test_the_forked_receipt_describes_the_statement_the_child_ran(rewritten):
+def test_the_forked_receipt_describes_the_statement_the_child_ran(rewritten, monkeypatch):
     """The half of SC-6 that cannot hold until the rewrites are gone, measured rather than asserted
     in prose. Closed by ACE-093 (with ACE-042, which it depends on).
 
     Both routes are real: the in-process one runs `execute_guarded` in this process behind the
     built-in executor, and the forked one actually spawns `python -m execute_sql` and rebuilds the
-    Envelope from what the child wrote. Both reach the same warehouse and both come back `failed`,
-    which is the status whose receipt is on the wire today.
+    Envelope from what the child wrote. Both reach the same warehouse and both come back `ok`, which
+    is the one status whose receipt is asked to describe the executed statement — every non-ok
+    receipt is deliberately built from the RECEIVED statement on both paths, so those agree by
+    construction and have nothing left to measure.
 
     The property asserted is that the two paths describe the same statement, and it is the fork half
     of "the receipt describes the executed statement" because the in-process half is anchored by
@@ -271,34 +303,28 @@ def test_the_forked_receipt_describes_the_statement_the_child_ran(rewritten):
     It fails today because the parent describes the received statement: its receipt still names
     `order_items` and the relationship reaching it, and still has no `deleted_at`.
     """
-    tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
-    in_process = _tool_out(RECEIVED_SQL)
+    in_process, forked, receipts = _both_routes(monkeypatch, RECEIVED_SQL)
 
-    tools.set_injected_executor(None)
-    forked = _tool_out(RECEIVED_SQL)
-
-    assert in_process["status"] == forked["status"] == "failed", (in_process, forked)
-    assert forked["receipt"] == in_process["receipt"]
+    assert in_process["status"] == forked["status"] == "ok", (in_process, forked)
+    assert receipts[1] == receipts[0]
 
 
-def test_the_two_paths_reach_the_same_outcome_for_the_same_statement(rewritten):
+def test_the_two_paths_reach_the_same_outcome_for_the_same_statement(rewritten, monkeypatch):
     """The precondition the xfail above rests on, asserted separately so a change that stops either
-    route from reaching a `failed` outcome is a plain failure here rather than an xfail that keeps
+    route from reaching an `ok` outcome is a plain failure here rather than an xfail that keeps
     passing for a reason nobody intended.
 
-    It also pins that the receipt is on the wire at all on that status, and that it is the contract
-    type's own five-section shape rather than the flat legacy dict the ok payload still nests.
+    It also pins that the receipt is the contract type's own five-section shape, and that the
+    divergence it measures is real rather than an artifact of comparing two receipts that establish
+    nothing.
     """
-    tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
-    in_process = _tool_out(RECEIVED_SQL)
+    in_process, forked, receipts = _both_routes(monkeypatch, RECEIVED_SQL)
 
-    tools.set_injected_executor(None)
-    forked = _tool_out(RECEIVED_SQL)
-
-    assert in_process["status"] == forked["status"] == "failed", (in_process, forked)
-    for body in (in_process, forked):
-        assert set(body["receipt"]) == {"model_version", *execute_sql.Receipt.SECTIONS}
-    # And the divergence is real rather than an artifact of comparing two empty receipts: the
-    # in-process one carries the facts the executed statement produces.
-    assert [item["ref"] for item in in_process["receipt"]["tables"]["items"]] == ["orders"]
-    assert asdict(execute_sql.undetermined_receipt("x")) != in_process["receipt"]
+    assert in_process["status"] == forked["status"] == "ok", (in_process, forked)
+    for receipt in receipts:
+        assert set(receipt) == {"model_version", *execute_sql.Receipt.SECTIONS}
+    # The in-process one carries the facts the EXECUTED statement produces: the dropped table is gone.
+    assert [item["ref"] for item in receipts[0]["tables"]["items"]] == ["orders"]
+    # The forked one still carries the caller's own FROM/JOIN list, which is the gap.
+    assert [item["ref"] for item in receipts[1]["tables"]["items"]] == ["orders", DROPPED_TABLE]
+    assert asdict(execute_sql.undetermined_receipt("x")) != receipts[0]

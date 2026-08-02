@@ -8,6 +8,10 @@ facts and collapsing them would be the same defect one layer down.
 These are the degradation branches specifically. The happy paths live in
 `test_ace088_receipt_sections.py`, and the executed-versus-received property in
 `test_ace088_executed_statement.py`.
+
+The reasons themselves live in `guardrail`, not beside either builder, because there are two builders
+for the same facts — the chokepoint's `_receipt_for` and the fork parent's `_resolve_receipt` — and a
+second copy of the sentences is a second chance for one statement to be described two ways.
 """
 
 from __future__ import annotations
@@ -66,9 +70,9 @@ def test_a_deployment_without_the_model_runtime_says_so(monkeypatch):
     the caller its receipt, never its answer, and the receipt has to say which of the two it is."""
     monkeypatch.setitem(sys.modules, "semantic_model", None)
 
-    receipt = execute_sql._receipt_for(SQL, "acme", refused=False)
+    receipt = execute_sql._receipt_for(SQL, "acme", bounded=False)
 
-    _assert_wholly_undetermined(receipt, execute_sql.RECEIPT_NO_RUNTIME)
+    _assert_wholly_undetermined(receipt, guardrail.RECEIPT_NO_RUNTIME)
 
 
 def test_a_statement_that_consulted_no_model_says_so(guard_model):
@@ -76,9 +80,9 @@ def test_a_statement_that_consulted_no_model_says_so(guard_model):
     this call, so there was nothing to check the statement against."""
     guard_model(None)
 
-    receipt = execute_sql._receipt_for(SQL, "acme", refused=False)
+    receipt = execute_sql._receipt_for(SQL, "acme", bounded=False)
 
-    _assert_wholly_undetermined(receipt, execute_sql.RECEIPT_NO_MODEL)
+    _assert_wholly_undetermined(receipt, guardrail.RECEIPT_NO_MODEL)
 
 
 def test_an_assembler_that_raises_costs_the_receipt_and_not_the_answer(monkeypatch, guard_model):
@@ -92,14 +96,16 @@ def test_an_assembler_that_raises_costs_the_receipt_and_not_the_answer(monkeypat
     guard_model(object())
     monkeypatch.setattr(runtime, "assemble_receipt", boom)
 
-    receipt = execute_sql._receipt_for(SQL, "acme", refused=False)
+    receipt = execute_sql._receipt_for(SQL, "acme", bounded=False)
 
-    _assert_wholly_undetermined(receipt, execute_sql.RECEIPT_BUILD_FAILED)
+    _assert_wholly_undetermined(receipt, guardrail.RECEIPT_BUILD_FAILED)
 
 
 def test_an_unpinnable_model_version_is_an_unpinned_receipt_not_a_failure(monkeypatch):
     """`tools` is absent from the vendored mirror, so the version resolver cannot be reached there.
-    That is a receipt without a version pin, not a receipt that could not be built."""
+    That is a receipt without a version pin, not a receipt that could not be built.
+
+    """
     monkeypatch.setitem(sys.modules, "tools", None)
 
     assert execute_sql._receipt_model_version("acme") is None
@@ -123,7 +129,7 @@ def test_the_parent_reports_a_broken_assembler_rather_than_returning_none(monkey
     receipt = tools._resolve_receipt("acme", SQL)
 
     assert receipt is not None
-    _assert_wholly_undetermined(receipt, tools.RECEIPT_UNAVAILABLE)
+    _assert_wholly_undetermined(receipt, guardrail.RECEIPT_BUILD_FAILED)
 
 
 def test_a_datasource_with_no_model_at_all_is_an_ordinary_state(monkeypatch):
@@ -135,21 +141,46 @@ def test_a_datasource_with_no_model_at_all_is_an_ordinary_state(monkeypatch):
 
     monkeypatch.setattr(tools, "get_cached_org", no_model)
 
-    _assert_wholly_undetermined(tools._resolve_receipt("acme", SQL), tools.RECEIPT_UNAVAILABLE)
+    _assert_wholly_undetermined(tools._resolve_receipt("acme", SQL), guardrail.RECEIPT_NO_MODEL)
+
+
+def test_the_two_builders_report_a_missing_model_with_one_sentence(monkeypatch, guard_model):
+    """The split the fork path never had. `tools` collapsed "no model for this datasource" and "the
+    assembler raised" into a single sentence, so a caller on the DEFAULT path — the fork — was never
+    told which one it had, while the chokepoint kept them apart. Both now read from `guardrail`, so
+    the two paths cannot drift apart again by editing one of them."""
+
+    def no_model(_profile):
+        raise FileNotFoundError("no model here")
+
+    monkeypatch.setattr(tools, "get_cached_org", no_model)
+    guard_model(None)
+
+    forked = tools._resolve_receipt("acme", SQL)
+    in_process = execute_sql._receipt_for(SQL, "acme", bounded=False)
+
+    assert forked.tables.undetermined == in_process.tables.undetermined
+    assert forked == in_process
 
 
 def test_the_four_reasons_are_four_different_sentences():
     """Collapsing any two of these would reintroduce the defect one layer down: a caller reading
     "could not be established" cannot act, while "the runtime is not installed in this deployment"
-    tells them exactly what to change."""
+    tells them exactly what to change.
+
+    `RECEIPT_BEFORE_MODEL` is the fourth and it is not a degradation at all — a model may resolve
+    perfectly for a statement a pre-model gate refused — so borrowing "no model could be resolved"
+    for it would report a deployment problem that is not happening.
+    """
     reasons = {
-        execute_sql.RECEIPT_NO_RUNTIME,
-        execute_sql.RECEIPT_NO_MODEL,
-        execute_sql.RECEIPT_BUILD_FAILED,
-        tools.RECEIPT_UNAVAILABLE,
+        guardrail.RECEIPT_NO_RUNTIME,
+        guardrail.RECEIPT_NO_MODEL,
+        guardrail.RECEIPT_BUILD_FAILED,
+        guardrail.RECEIPT_BEFORE_MODEL,
     }
     assert len(reasons) == 4
     assert all(r.strip().endswith(".") for r in reasons), "they surface next to an answer"
+    assert all("ACE-" not in r for r in reasons), "no internal spec id ships to a user"
 
 
 # --- the refusal assembler's own early returns ------------------------------

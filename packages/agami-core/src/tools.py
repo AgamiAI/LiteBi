@@ -48,6 +48,10 @@ import agami_paths
 # `Failure` and `Refusal` are CONSTRUCTED at this layer (the tool edge owns the outcomes that never
 # reach the execution chokepoint), so they cannot be TYPE_CHECKING-only the way `Refusal` was.
 from guardrail import (
+    PRE_MODEL_RULES,
+    RECEIPT_BEFORE_MODEL,
+    RECEIPT_BUILD_FAILED,
+    RECEIPT_NO_MODEL,
     Envelope,
     Failure,
     Receipt,
@@ -463,20 +467,16 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
     )
 
 
-# What a receipt says when the tool edge could not assemble one — the model deps are absent, the
-# model does not load, or the assembler raised. Said rather than left empty, because five empty
-# sections with no reason read as "checked, found nothing".
-RECEIPT_UNAVAILABLE = (
-    "The receipt could not be assembled for this statement, so nothing about it was established."
-)
 # The argument-validation outcome: there is no statement, so there is nothing a receipt could be
-# about. Distinct from the one above, which is a statement whose receipt could not be built.
+# about. Distinct from every reason in `guardrail`, each of which is a statement whose receipt could
+# not be built. It lives here because the tool edge is the only layer that can reach it — the
+# chokepoint is never called without a statement.
 RECEIPT_NO_STATEMENT = (
     "No statement was supplied, so there was nothing to establish anything about."
 )
 
 
-def _resolve_receipt(profile: str, sql: str, *, refused: bool = False) -> Receipt:
+def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receipt:
     """The `Envelope.receipt` for a statement this process did NOT run through the chokepoint.
 
     The fork path needs this. `tools` runs `python -m execute_sql` as a subprocess and rebuilds the
@@ -485,20 +485,24 @@ def _resolve_receipt(profile: str, sql: str, *, refused: bool = False) -> Receip
     keeps the two paths saying the same thing about the same statement, without changing the wire
     format between parent and child (ACE-035 declined to scope that).
 
-    `refused` picks the bounded assembler. A refusal receipt echoes only what the caller's own
-    statement already disclosed, because a refusal is the outcome a caller can provoke on purpose —
-    see `runtime.assemble_refusal_receipt`.
+    `bounded` picks the echo-bounded assembler, and EVERY non-ok outcome asks for it — the same rule
+    the chokepoint's `_receipt_for` states and for the same reason: a `failed` body is reachable for a
+    name the model declares and the warehouse does not have, so it is a disclosure channel of its own
+    rather than a subset of `ok`'s.
 
     A build that raises returns an `undetermined` receipt, never `None`. A receipt that could not be
     built is a fact the caller can act on ("the model deps are not installed here"); `None` was an
-    absence the caller could only read as silence.
+    absence the caller could only read as silence. The two failure reasons are kept apart here
+    exactly as the chokepoint keeps them apart, and they are the chokepoint's own constants: a caller
+    on the default fork path would otherwise never see the actionable one, which is this spec's own
+    defect one layer down.
 
     KNOWN GAP, and this is where it lives. `sql` here is the statement the CALLER sent, which is the
     only one this side of the fork has: `_model_safety` runs in the child, and both its rewrites (the
     fan/chasm `auto_rewrite` branch and `apply_default_filters`) rebind the child's local before it
-    executes. So after a rewrite the child runs one statement and this describes another, while the
-    in-process twin `execute_sql._receipt_for` is built from the rebound value and describes what
-    ran. Measured rather than left as prose, by a `strict=True` xfail in
+    executes. So after a rewrite the child runs one statement and this describes another. It is
+    narrowed to `ok` alone now that every non-ok receipt is built from the RECEIVED statement on both
+    paths deliberately, and it is measured rather than left as prose by a `strict=True` xfail in
     tests/test_ace088_executed_statement.py. It closes by subtraction, not by plumbing the rewritten
     statement back across the wire: ACE-093 deletes the fan-join rewrite and ACE-042 the
     default-filter injection, after which executed and received are the same string and this is
@@ -509,13 +513,15 @@ def _resolve_receipt(profile: str, sql: str, *, refused: bool = False) -> Receip
     except Exception:
         # No model for this datasource, or no model deps at all. Both are ordinary states for a bare
         # local install rather than faults, so they are not server-log events — the fact travels to
-        # the caller on the receipt itself, which is the whole point of returning one.
-        _LOG.debug("no model for datasource %r; receipt undetermined", profile, exc_info=True)
-        return undetermined_receipt(RECEIPT_UNAVAILABLE)
+        # the caller on the receipt itself, which is the whole point of returning one. Logged without
+        # `exc_info`: a traceback here would carry the resolved artifacts path into the server log
+        # for an outcome that is not an error at all.
+        _LOG.debug("no model for datasource %r; receipt undetermined", profile)
+        return undetermined_receipt(RECEIPT_NO_MODEL)
     try:
         from semantic_model import runtime as RT
 
-        assemble = RT.assemble_refusal_receipt if refused else RT.assemble_receipt
+        assemble = RT.assemble_refusal_receipt if bounded else RT.assemble_receipt
         return receipt_from_assembled(
             assemble(org, sql, model_version=_model_version(profile))
         )
@@ -523,7 +529,21 @@ def _resolve_receipt(profile: str, sql: str, *, refused: bool = False) -> Receip
         # A model that loaded and an assembler that then broke IS a fault, and the operator is the
         # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
         _LOG.error("could not assemble the receipt for datasource %r", profile, exc_info=True)
-        return undetermined_receipt(RECEIPT_UNAVAILABLE)
+        return undetermined_receipt(RECEIPT_BUILD_FAILED)
+
+
+def _refusal_receipt(profile: str, sql: str, refusal: Refusal) -> Receipt:
+    """The receipt a REFUSED Envelope carries on this side of the fork, chosen by which rule fired.
+
+    The twin of `execute_sql._refusal_receipt`, consulting the same `PRE_MODEL_RULES` set, so one
+    refusal reads one way whichever process decided it. It is also what keeps a refusal the cheap
+    path: a `read_only` or `recon` verdict is reached without a model, so building its receipt must
+    not load one — which on the hosted server is a fresh unpooled connection per refusal, on the one
+    outcome an attacker triggers at will.
+    """
+    if refusal.rule in PRE_MODEL_RULES:
+        return undetermined_receipt(RECEIPT_BEFORE_MODEL)
+    return _resolve_receipt(profile, sql, bounded=True)
 
 
 # INTERIM, and it dies in the PR that deletes `data.receipt`. `_finalize_execution` nests the FLAT
@@ -1247,17 +1267,19 @@ def _finalize_execution(
 def _envelope(
     status: str,
     *,
+    receipt: Receipt,
     data: Any | None = None,
     refusal: Refusal | None = None,
     failure: Failure | None = None,
-    receipt: Receipt | None = None,
 ) -> Envelope:
     """The ONE place the tool edge constructs an `Envelope`, and the one place it mints an
     `audit_id`.
 
-    `receipt` is optional at this signature and never optional on the wire: an outcome with no
-    receipt to hand gets one that SAYS so, rather than the empty-and-silent default, which a
-    consumer would read as "checked, found nothing".
+    `receipt` is MANDATORY, which is what actually delivers the property this docstring used to
+    claim: an outcome with no receipt to hand must return one that SAYS so, rather than the
+    empty-and-silent default a consumer would read as "checked, found nothing". Every call site
+    already passes one, so the fallback was unreachable — and its reason named the wrong cause for
+    most of the outcomes that could have reached it.
 
     The execution chokepoint (`execute_sql.execute_guarded`) mints its own for everything that
     reaches it; this covers the outcomes that never do — a malformed argument, the read-only
@@ -1270,7 +1292,7 @@ def _envelope(
         data=data,
         refusal=refusal,
         failure=failure,
-        receipt=receipt if receipt is not None else undetermined_receipt(RECEIPT_UNAVAILABLE),
+        receipt=receipt,
         audit_id=uuid.uuid4().hex,
     )
 
@@ -1460,7 +1482,7 @@ def _run_in_process(
         # every reachable case is a datasource-configuration problem.
         return _envelope("failed", failure=Failure(
             kind="dsn", message="Datasource configuration error.",
-        ), receipt=_resolve_receipt(profile, sql))
+        ), receipt=_resolve_receipt(profile, sql, bounded=True))
     finally:
         execute_sql._max_rows_override.reset(cap_token)
 
@@ -1509,11 +1531,14 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     refusal = check_read_only(sql)
     if refusal is not None:
         # The read-only fast-fail: the same gate `execute_guarded` runs, applied here so a mutation
-        # never even resolves credentials or forks. Same rule, same remediation as the deeper call
-        # would give — and now the same audit row, too.
+        # never even resolves credentials, forks, or consults a semantic model. Same rule, same
+        # remediation as the deeper call would give — and now the same audit row, too. The receipt is
+        # the pre-model one for the same reason: `read_only` is in `PRE_MODEL_RULES`, so there is
+        # nothing a model could have been asked about this statement, and asking one anyway would put
+        # a fresh unpooled database round-trip on the cheapest outcome an attacker can trigger at will.
         return _emit(
             _envelope("refused", refusal=refusal,
-                      receipt=_resolve_receipt(profile, sql, refused=True)),
+                      receipt=_refusal_receipt(profile, sql, refusal)),
             sql=sql, execution_ms=None, profile=profile, args=args,
         )
 
@@ -1592,7 +1617,7 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             _envelope("failed", failure=Failure(
                 kind="timeout",
                 message="The executor did not respond within the supervisor's bound and was stopped.",
-            ), receipt=_resolve_receipt(profile, sql)),
+            ), receipt=_resolve_receipt(profile, sql, bounded=True)),
             sql=sql,
             execution_ms=None,
             profile=profile,
@@ -1608,15 +1633,16 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         # costs nothing and keeps the Envelope's payload a real contract object, never a loose dict.
         refusal = _stderr_refusal(proc.returncode, proc.stderr)
         if refusal is not None:
-            env = _envelope("refused", refusal=Refusal(**refusal),
-                            receipt=_resolve_receipt(profile, sql, refused=True))
+            rebuilt = Refusal(**refusal)
+            env = _envelope("refused", refusal=rebuilt,
+                            receipt=_refusal_receipt(profile, sql, rebuilt))
         else:
             # Not raw stderr: see `_child_failure_message` for which of the two the caller gets and
             # why. This field is shown to the caller, so a traceback must never reach it.
             env = _envelope("failed", failure=Failure(
                 kind=_classify_exit(proc.returncode),
                 message=_child_failure_message(proc.returncode, proc.stderr),
-            ), receipt=_resolve_receipt(profile, sql))
+            ), receipt=_resolve_receipt(profile, sql, bounded=True))
         # `profile` and `args` travel with the non-ok outcomes too. Omitting them wrote the audit row
         # with `datasource=''` and `question=NULL` on exactly the rows a reviewer of a refusal most
         # needs them on — and only on the fork path, which is the default, so the two paths disagreed
