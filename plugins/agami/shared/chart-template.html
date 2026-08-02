@@ -64,6 +64,9 @@
 
       "aggregates": {"items": [], "undetermined": "..."},
 
+      // Capped at three: a person confirms three prose meanings next to an answer, not forty. The
+      // marker is null when they all fit and COUNTS the rest when they do not — it is never null
+      // over a truncated list, because null is the claim "this is all of them".
       "assumptions": {"items": [{"column":"sales.orders.amount","meaning":"net revenue, USD",
                                  "source":"ai_unvalidated"}],
                       "undetermined": null},
@@ -1005,7 +1008,11 @@
         banner.appendChild(el('strong', { text: 'Trust note' }));
         banner.appendChild(document.createTextNode(
           ' — this answer used ' + n + ' join' + (n === 1 ? '' : 's') + ' nobody has signed off yet. '
-          + 'agami still answered; the join it leaned on is just not confirmed.'));
+          // The same count decides both sentences, so it reuses the same ternary: the second one
+          // stayed singular while the first said "3 joins", and a banner that cannot count reads
+          // as a template nobody proofread.
+          + 'agami still answered; the join' + (n === 1 ? ' it leaned on is' : 's it leaned on are')
+          + ' just not confirmed.'));
         const ul = el('ul');
         unreviewed.forEach(j => {
           const li = el('li');
@@ -1312,7 +1319,6 @@
       function renderSection(name, heading, blurb, renderItems) {
         const sec = sectionOf(name);
         rb.appendChild(el('h4', { text: heading }));
-        if (blurb) rb.appendChild(el('div', { class: 'receipt-note', text: blurb }));
         if (!sec) {
           // Absent is not empty. A receipt built by hand that dropped a section cannot be shown as
           // "checked, found nothing"; render_chart.py rejects such a receipt, so this only catches
@@ -1324,6 +1330,11 @@
         const list = Array.isArray(sec.items) ? sec.items : [];
         const marker = markerOf(name);
         if (list.length) {
+          // The blurb is ABOUT the items ("these column meanings come from agami, not from you…"),
+          // so it is drawn only when there are items. Appended above the branch, an answer with no
+          // assumptions drew "If one is wrong, tell agami in chat" directly above "Checked, and
+          // there was nothing to report."
+          if (blurb) rb.appendChild(el('div', { class: 'receipt-note', text: blurb }));
           renderItems(list);
         } else if (!marker) {
           rb.appendChild(el('p', { class: 'receipt-empty',
@@ -1404,7 +1415,12 @@
           li.appendChild(document.createTextNode(' '));
           li.appendChild(badge(r.review_state));
           if (r.on) {
+            // LABELLED, and labelled "declared": this is the predicate the MODEL declares, and the
+            // marker directly under this list says the predicate the statement actually joined on
+            // was not read out of the SQL. Drawn bare, the two sat next to each other and a reader
+            // took this string for the condition that ran.
             li.appendChild(el('br'));
+            li.appendChild(el('span', { class: 'receipt-meta', text: 'declared predicate: ' }));
             li.appendChild(el('code', { class: 'receipt-meta', text: r.on }));
           }
           ul.appendChild(li);

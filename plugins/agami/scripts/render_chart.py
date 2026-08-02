@@ -121,8 +121,16 @@ def _format_sql(sql: str) -> str:
 
 
 # The five sections a receipt carries, named exactly as `semantic_model.runtime.assemble_receipt`
-# emits them and as the contract type declares them. Re-listed here rather than imported because
-# this script is stdlib-only and ships inside the plugin, with no path back to the package.
+# emits them and as `guardrail.Receipt.SECTIONS` declares them.
+#
+# Re-listed rather than imported, and NOT because the package is out of reach — `guardrail.py` is
+# vendored stdlib-only into `plugins/agami/lib/` and every sibling script that needs the library
+# reaches it through `_agami_lib.ensure_importable()`. The reason is narrower: this renderer's only
+# use for the names is to validate a JSON blob, and importing a module to read one tuple would make
+# a pure template substitution fail wherever the vendored lib is absent or stale. What the copy
+# owes is that it stays EQUAL to the source, and a copy nothing compares is a copy that drifts — so
+# `tests/test_render_chart_receipt.py` asserts the two tuples are the same, and a sixth section
+# added to the type fails there rather than leaving the renderer quietly validating five.
 RECEIPT_SECTIONS = ("columns", "tables", "joins", "aggregates", "assumptions")
 
 
