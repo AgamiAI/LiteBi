@@ -230,7 +230,7 @@ For a single profile, follow the **examples-first canonical loop** — the subje
 5. **Few-shot examples** — the ranked matches from step 2.
 6. **User question.**
 
-**The fan/chasm safety pass runs as a pre-execution step, on every tier.** Before you execute the generated SQL, pass it through `sm prepare "$ROOT" --area <area> --sql-file <path>` (Phase 3a). It runs the fan-trap / chasm-trap pre-flight (auto-rewrites the safe cases; refuses shape-changing ones) and returns the SQL to actually run. Tier-independent — works whether you execute via psql, the Python driver, or DuckDB — so the safety guarantees never depend on the execution path. The receipt panel surfaces the rewrite. It does **not** apply the area's `default_filters`; those are declarative only, so put any you need into the statement yourself at step 6. <!-- ACE-042 -> ACE-099 -->
+**The fan/chasm safety pass runs as a pre-execution step, on every tier.** Before you execute the generated SQL, pass it through `sm prepare "$ROOT" --area <area> --sql-file <path>` (Phase 3a). It runs the fan-trap / chasm-trap pre-flight (auto-rewrites the safe cases; refuses shape-changing ones) and returns the SQL to actually run. Tier-independent — works whether you execute via psql, the Python driver, or DuckDB — so the safety guarantees never depend on the execution path. The receipt panel surfaces the rewrite. It does **not** apply the area's `default_filters`; those are declarative only, so put any you need into the statement yourself at step 6.
 
 #### 2b.federation — cross-database queries
 

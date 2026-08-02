@@ -180,3 +180,30 @@ def test_no_notice_leaks_a_spec_id_to_a_client():
     for spec in tools.TOOLS.values():
         for prop in spec["inputSchema"].get("properties", {}).values():
             assert not spec_id.search(prop.get("description", ""))
+
+
+def test_no_shipped_markdown_surface_carries_a_spec_id():
+    """The same rule, for the surfaces that are *entirely* payload.
+
+    A `#` comment in `tools.py` is a fair place to park the deletion anchor — Python strips it and
+    no client ever sees it. A `<!-- … -->` in a SKILL.md is not the same thing: the skill file IS
+    the prompt, loaded verbatim, so an HTML comment reaches the model exactly like the prose around
+    it. The first version of this slice put the anchor there and it was wrong for that reason.
+
+    `main` carries zero spec ids across these trees. If you are here because this failed, that is a
+    deliberate contract change: say why in the spec's `## Decisions`, not just in the diff.
+    """
+    import re
+
+    spec_id = re.compile(r"\b(?:ACE|AH|REQ)-\d+")
+    roots = [REPO_ROOT / "plugins" / "agami" / "skills",
+             REPO_ROOT / "plugins" / "agami" / "shared",
+             REPO_ROOT / "docs"]
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{n}"
+        for root in roots
+        for path in root.rglob("*.md")
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if spec_id.search(line)
+    ]
+    assert not offenders, f"spec ids on shipped surfaces: {offenders}"
