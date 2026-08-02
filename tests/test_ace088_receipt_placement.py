@@ -18,10 +18,11 @@ The sentinel is the binding test and it is untouched. This file adds the asserti
 it scans for names the sentinel's model does not have, and it asserts on the receipt's SHAPE rather
 than only on the serialized text.
 
-The ok WIRE deliberately does not carry a top-level `receipt` yet: `_emit` builds the ok body as
-`{"status": "ok", **payload, …}` and `payload` already has a `"receipt"` key — the flat legacy dict
-the chart template reads — so a top-level one would silently overwrite one of the two. The receipt
-is on the TYPE for all three statuses from this slice, which is what the contract asserts.
+The ok WIRE carries it too, and carries exactly one. `_emit` builds the ok body as
+`{"status": "ok", **payload, …}`, and `payload` used to have a `"receipt"` key of its own — the
+flat legacy dict nested under `data.receipt` — so a top-level one would have silently overwritten
+one of the two. That key is deleted, the receipt is attached outside the per-status branch, and
+`Envelope.receipt` is the only receipt on any of the three.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -230,10 +232,34 @@ def test_a_failed_call_carries_a_receipt(declared, monkeypatch):
     assert body["receipt"]["columns"]["items"] == []
 
 
-def test_the_receipt_is_populated_on_the_envelope_for_ok_too(declared, monkeypatch):
-    """The ok WIRE is unchanged in this slice, so the property is asserted on the TYPE — which is
-    where the contract states it. An `ok` Envelope carrying the empty default would be claiming
-    "checked, found nothing" about a statement that ran."""
+def _receipt_keys(node, path=()) -> list[tuple]:
+    """Every path at which a `"receipt"` key appears anywhere in a body, however deeply nested.
+
+    Counting is the point. A body with a receipt at the top AND one nested inside the payload would
+    satisfy any assertion phrased as `body["receipt"] == …`, and that pair — two descriptions of one
+    answer, free to disagree — is exactly what SC-1 deletes.
+    """
+    found: list[tuple] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "receipt":
+                found.append(path + (key,))
+            found += _receipt_keys(value, path + (key,))
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            found += _receipt_keys(value, path + (i,))
+    return found
+
+
+def test_the_ok_body_carries_exactly_one_receipt_and_it_is_the_envelopes(declared, monkeypatch):
+    """SC-1, quoted: "`Envelope.receipt` is the only receipt. `data.receipt` is gone, grep-clean,
+    deleted not deprecated."
+
+    An `ok` body used to carry two: the Envelope's typed `Receipt`, which never reached the wire at
+    all on this status, and a flat dict nested inside the payload under `data.receipt`, which is the
+    one every consumer actually read. They were assembled separately from the same statement, so one
+    answer described itself twice and nothing made the two agree.
+    """
     seen: list[guardrail.Envelope] = []
     real = tools._emit
     monkeypatch.setattr(tools, "_emit", lambda env, **kw: (seen.append(env), real(env, **kw))[1])
@@ -249,10 +275,15 @@ def test_the_receipt_is_populated_on_the_envelope_for_ok_too(declared, monkeypat
                                               "datasource": PROFILE}))
 
     assert body["status"] == "ok"
-    assert "receipt" in body  # the legacy nested dict, untouched by this slice
-    assert body["receipt"]["tables_used"][0]["qname"] == "public.orders"
-    # And the Envelope's own receipt is real, not the empty stub.
-    assert [i["qname"] for i in seen[0].receipt.tables.items] == ["public.orders"]
+    assert _receipt_keys(body) == [("receipt",)], "one receipt, at the top level"
+    # And it IS the Envelope's, not a second thing that happens to look like one. Compared through
+    # `json` because `ReceiptSection.items` is a tuple — frozen types hold no lists — and the wire
+    # has no tuple.
+    assert body["receipt"] == json.loads(json.dumps(asdict(seen[0].receipt)))
+    # Real, not the empty stub: an `ok` Envelope carrying the default would be claiming "checked,
+    # found nothing" about a statement that ran.
+    assert [i["qname"] for i in body["receipt"]["tables"]["items"]] == ["public.orders"]
+    assert set(body["receipt"]) == {"model_version", *guardrail.Receipt.SECTIONS}
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +323,18 @@ def test_one_query_resolves_the_model_version_once(declared, monkeypatch):
     assert loads == [PROFILE], loads
 
 
-def test_one_request_assembles_the_full_receipt_once(declared, monkeypatch):
-    """The Envelope's typed `Receipt` and the legacy flat dict are ONE set of facts in two shapes:
-    `receipt_from_assembled` maps the typed one out of the SAME dict's `sections`. Assembling twice
-    was not merely wasteful — it left two descriptions of one answer free to disagree."""
+@pytest.mark.parametrize("route", list(ROUTES), ids=list(ROUTES))
+def test_one_ok_request_assembles_the_full_receipt_once(declared, monkeypatch, route):
+    """One answer, one description of it. The `ok` payload used to nest a second, separately
+    assembled receipt (`data.receipt`), so a single query ran the full assembler twice against the
+    same statement — two descriptions free to disagree, and on the in-process route two full model
+    walks. Deleting the nested one leaves exactly one assembly, and this counts it end to end on
+    both routes rather than trusting a memo to hide the second call site.
+
+    Asserted per route because the two assemble in different places: the in-process route inside
+    `execute_sql._receipt_for` (from the EXECUTED statement, SC-6), the fork route in the parent's
+    `tools._resolve_receipt` (from the received one, which is all this side has).
+    """
     from semantic_model import runtime as RT
 
     seen: list[str] = []
@@ -304,19 +343,31 @@ def test_one_request_assembles_the_full_receipt_once(declared, monkeypatch):
         RT, "assemble_receipt",
         lambda org, sql, **kw: (seen.append(sql), real(org, sql, **kw))[1],
     )
+    monkeypatch.setattr(execute_sql, "_load_credentials",
+                        lambda profile, org_id="local": {"type": "sqlite", "path": ":memory:"})
 
     sql = "SELECT id FROM orders"
-    token = tools.begin_request_cache()
-    try:
-        typed = tools._resolve_receipt(PROFILE, sql)
-        legacy = tools._legacy_receipt_dict(PROFILE, sql)
-    finally:
-        tools.end_request_cache(token)
+    if route == "in_process":
+        class _Ran:
+            def execute(self, vetted_sql, creds, *, profile):
+                return execute_sql.ExecResult(columns=["id"], rows=[(1,)], truncated=False)
 
+        tools.set_injected_executor(_Ran())
+    else:
+        # The child is a real subprocess with no warehouse behind it, and what it does inside its
+        # own process is not what this counts. Stubbing the fork isolates the PARENT's assembly,
+        # which is the one the deleted dict doubled.
+        tools.set_injected_executor(None)
+        monkeypatch.setattr(
+            tools.subprocess, "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="id\n1\n", stderr=""),
+        )
+
+    body = json.loads(tools.tool_execute_sql({"sql": sql, "datasource": PROFILE}))
+
+    assert body["status"] == "ok", body
     assert seen == [sql], seen
-    # And both shapes really did come out of that one assembly.
-    assert [i["qname"] for i in typed.tables.items] == ["public.orders"]
-    assert [t["qname"] for t in legacy["tables_used"]] == ["public.orders"]
+    assert [i["qname"] for i in body["receipt"]["tables"]["items"]] == ["public.orders"]
 
 
 def test_the_resolve_once_scope_does_not_outlive_its_request(declared, monkeypatch):

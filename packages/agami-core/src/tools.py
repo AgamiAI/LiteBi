@@ -277,20 +277,24 @@ def _resolve_units(profile: str, sql: str) -> dict[str, str]:
         return {}
 
 
-# Everything ONE tool call may resolve more than once and must not resolve more than once: the model
-# version pin, and the assembled full receipt. Keyed inside by profile / (profile, sql), and scoped to
-# a request rather than to the process, for two different reasons that both matter.
+# What ONE tool call may resolve more than once and must not resolve more than once: the model
+# version pin. Keyed inside by profile, and scoped to a request rather than to the process, for two
+# different reasons that both matter.
 #
 # **Cost.** `_model_version` is not free where it counts. Hosted, it opens a fresh unpooled psycopg2
 # connection, queries and closes it — and a single `ok` call reached it five times (once inside each
 # of the three `get_cached_org` calls, twice more directly), so one query cost up to five new Postgres
-# connections for one unchanging string. `assemble_receipt` likewise ran twice per `ok`, because the
-# legacy flat dict and the Envelope's typed `Receipt` were assembled separately from the same
-# statement rather than derived from one assembly.
+# connections for one unchanging string.
 #
 # **Correctness.** A version that changes mid-request would otherwise let one answer be described by
 # two different model versions. Resolving once per request makes "the receipt pins the model this
 # answer used" true by construction rather than by the two reads happening to race the same way.
+#
+# The assembled receipt was memoized here too, because the legacy flat dict and the Envelope's typed
+# `Receipt` were assembled separately from the same statement. There is one receipt now and one
+# consumer of it, so the memo has nothing left to absorb and the property it delivered — one
+# assembly per request — is pinned by a test on both routes instead of by a cache that hides a
+# second call site.
 #
 # A ContextVar rather than a module global because tool handlers run on parallel worker threads
 # (`mcp_http` off-loads them), and it holds `None` outside a scope so a caller that never opens one
@@ -328,8 +332,8 @@ def _model_version(profile: str) -> str | None:
     the local skill reads). None if absent/unavailable (execute_sql stays usable).
 
     Resolved at most ONCE per request per profile: on the hosted path this opens a database
-    connection, and the callers within one query are several (`get_cached_org` in each of the three
-    model consumers, plus the receipt's own pin)."""
+    connection, and the callers within one query are several (`get_cached_org` in each model
+    consumer, plus the receipt's own pin)."""
     return _request_cached(("model_version", profile), lambda: _resolve_model_version(profile))
 
 
@@ -475,11 +479,11 @@ def get_cached_org(profile: str):
         # be cached ACROSS requests, or we could serve a stale model. The DB-backed server always has
         # a version and never takes this branch.
         #
-        # WITHIN one request it is cached anyway, and that is not the same tradeoff: the three
-        # consumers of the model in a single query (units, the receipt, the legacy flat dict) are
-        # describing ONE answer, so serving them three separately-loaded models buys no freshness and
-        # costs three full loads of the same YAML. Before this, an unversioned local install paid all
-        # three on every query.
+        # WITHIN one request it is cached anyway, and that is not the same tradeoff: the consumers
+        # of the model in a single query (the unit resolver and the receipt assembler) are describing
+        # ONE answer, so serving them separately-loaded models buys no freshness and costs repeated
+        # full loads of the same YAML. Before this, an unversioned local install paid one per
+        # consumer on every query.
         return _request_cached(("org", org_id, profile), lambda: _load_org(profile))
     key = (org_id, profile, version)
     cached = _ORG_CACHE.get(key)  # fast path: a hit is a single atomic dict.get, no lock
@@ -581,13 +585,12 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
         _LOG.debug("no model for datasource %r; receipt undetermined", profile)
         return undetermined_receipt(RECEIPT_NO_MODEL)
     try:
-        if bounded:
-            from semantic_model import runtime as RT
+        from semantic_model import runtime as RT
 
-            return receipt_from_assembled(
-                RT.assemble_refusal_receipt(org, sql, model_version=_model_version(profile))
-            )
-        return receipt_from_assembled(_assemble_full_receipt(profile, sql, org))
+        assemble = RT.assemble_refusal_receipt if bounded else RT.assemble_receipt
+        return receipt_from_assembled(
+            assemble(org, sql, model_version=_model_version(profile))
+        )
     except Exception:
         # A model that loaded and an assembler that then broke IS a fault, and the operator is the
         # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
@@ -607,40 +610,6 @@ def _refusal_receipt(profile: str, sql: str, refusal: Refusal) -> Receipt:
     if refusal.rule in PRE_MODEL_RULES:
         return undetermined_receipt(RECEIPT_BEFORE_MODEL)
     return _resolve_receipt(profile, sql, bounded=True)
-
-
-def _assemble_full_receipt(profile: str, sql: str, org: Any) -> dict:
-    """The FULL assembler's output for one statement, assembled at most ONCE per request.
-
-    Two consumers want it on an `ok` answer and they want the same facts in two shapes: the legacy
-    flat dict the chart surfaces read, and the contract's typed `Receipt` that `receipt_from_assembled`
-    maps out of the SAME dict's `sections`. Assembling twice was not merely wasteful, it left two
-    descriptions of one answer free to disagree; deriving both from one assembly makes them one fact
-    seen twice.
-    """
-    from semantic_model import runtime as RT
-
-    return _request_cached(
-        ("full_receipt", profile, sql),
-        lambda: RT.assemble_receipt(org, sql, model_version=_model_version(profile)),
-    )
-
-
-# INTERIM, and it dies in the PR that deletes `data.receipt`. `_finalize_execution` nests the FLAT
-# assembler output (tables_used / metrics / warnings) inside the ok payload, which the chart template
-# and `render_chart.py` read by those key names. `_resolve_receipt` now returns the contract's
-# `Receipt` instead, so the legacy consumer needs its own accessor rather than a shape the ok payload
-# would silently change under. Delete this function, its call site, and the `"receipt"` key in
-# `_finalize_execution` together, in the commit that flips the ok body onto `Envelope.receipt`.
-def _legacy_receipt_dict(profile: str, sql: str) -> dict | None:
-    """The FULL trust receipt as the FLAT dict the chart surfaces still read — the SAME assembler
-    the skill uses, so the 'what did this touch / what's unapproved' panel is identical in Claude
-    Code and Claude Desktop. `None` only if the model deps aren't importable (execute_sql stays
-    usable)."""
-    try:
-        return _assemble_full_receipt(profile, sql, get_cached_org(profile))
-    except Exception:
-        return None
 
 
 def tool_list_datasources(_args: dict[str, Any]) -> str:
@@ -1294,22 +1263,23 @@ def _finalize_execution(
     columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
     execution_ms: int,
 ) -> str:
-    """Shape a successful result (units + exact-render markdown + trust receipt) and return the
-    result JSON. Shared by both execution paths — the subprocess fork and the in-process executor —
-    so a successful query returns the identical payload whichever ran it.
+    """Shape a successful result (units + exact-render markdown) and return the result JSON. Shared
+    by both execution paths — the subprocess fork and the in-process executor — so a successful query
+    returns the identical payload whichever ran it.
 
-    This is the **`ok` payload only**, and it is frozen: `_emit` merges `status` and `audit_id` onto
-    what this returns and is the only thing that serializes a tool response. The nested
-    `"receipt": _legacy_receipt_dict(...)` here is the FLAT assembler output (tables_used / metrics /
-    warnings) that the chart template reads, NOT `Envelope.receipt`, which is the contract's typed
-    `guardrail.Receipt` and is now populated on all three statuses. The two describe the same
-    statement in two shapes while both spellings exist; the PR that deletes this one flips the ok
-    body onto the other in the same commit.
+    This is the **`ok` payload only**, and it is frozen: `_emit` merges `status`, `receipt` and
+    `audit_id` onto what this returns and is the only thing that serializes a tool response. It no
+    longer builds a receipt of its own. It used to nest one here — the flat assembler output, under
+    `data.receipt` — beside the Envelope's typed `guardrail.Receipt`, so one answer carried two
+    descriptions of itself that were free to disagree and only the nested one reached an `ok`
+    caller. There is one receipt now, it hangs off the Envelope, and `_emit` puts it on all three
+    statuses.
 
-    It no longer writes the audit row. This function only ever runs on success, so hanging the write
-    here is precisely why a refusal left no trace; the write moved to `_emit`, which every outcome
-    passes through. Shaping a payload and recording an execution were two jobs in one place — and the
-    `args` parameter went with the write, since the tool arguments were only ever read for the log."""
+    It no longer writes the audit row either. This function only ever runs on success, so hanging the
+    write here is precisely why a refusal left no trace; the write moved to `_emit`, which every
+    outcome passes through. Shaping a payload and recording an execution were two jobs in one place —
+    and the `args` parameter went with the write, since the tool arguments were only ever read for
+    the log."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
@@ -1330,13 +1300,6 @@ def _finalize_execution(
         "markdown": markdown,  # exact, full numbers (currency symbol + grouping) — render as-is
         "sql": sql,
         "execution_ms": execution_ms,
-        # Trust receipt — provenance + anything unapproved this answer used. Same assembler
-        # the agami-query skill renders, so Desktop gets the same trust panel. Clients should
-        # surface receipt.warnings and any receipt.metrics whose review_state != "approved"
-        # (offer to approve/correct via the save_correction tool). INTERIM: this flat nested dict
-        # and `_legacy_receipt_dict` die together in the PR that flips the ok body onto
-        # `Envelope.receipt`.
-        "receipt": _legacy_receipt_dict(profile, sql),
     }
     return json.dumps(result, indent=2, default=str)
 
@@ -1391,11 +1354,17 @@ def _emit(
     is only one place that decides how a refusal reads.
 
     Per status:
-      * `ok`      — `_finalize_execution`'s frozen payload with `status` and `audit_id` merged on.
-                    Its rows are textualized here (`None` → `""`, else `str`) so both paths emit the
-                    same JSON, and the `max_rows` backstop is applied here for the same reason.
-      * `refused` — `{status, refusal, sql?, execution_ms?, audit_id}`.
-      * `failed`  — `{status, failure, sql?, execution_ms?, audit_id}`.
+      * `ok`      — `_finalize_execution`'s frozen payload with `status`, `receipt` and `audit_id`
+                    merged on. Its rows are textualized here (`None` → `""`, else `str`) so both
+                    paths emit the same JSON, and the `max_rows` backstop is applied here too.
+      * `refused` — `{status, refusal, sql?, execution_ms?, receipt, audit_id}`.
+      * `failed`  — `{status, failure, sql?, execution_ms?, receipt, audit_id}`.
+
+    The receipt is attached AFTER the branch, once, for all three — so `Envelope.receipt` is the
+    only receipt a caller can read and there is no per-status decision about whether it appears. It
+    rode the two non-ok bodies only while the `ok` payload owned a `"receipt"` key of its own (the
+    flat legacy dict), because splatting the payload would have silently overwritten one of the two.
+    That key is gone.
 
     `None` fields are omitted rather than emitted as explicit `null`, so a response never carries a
     key that says nothing (the argument-validation path, for instance, has no `sql` to report).
@@ -1418,7 +1387,7 @@ def _emit(
                 profile=profile or "", sql=sql or "", execution_ms=execution_ms or 0,
             )
         )
-        body: dict[str, Any] = {"status": "ok", **payload, "audit_id": env.audit_id}
+        body: dict[str, Any] = {"status": "ok", **payload}
         row_count = payload["row_count"]
     else:
         body = {"status": env.status}
@@ -1430,17 +1399,13 @@ def _emit(
             body["sql"] = sql
         if execution_ms is not None:
             body["execution_ms"] = execution_ms
-        # `refused` and `failed` only, and only until the nested legacy dict goes. The ok body is
-        # `{"status": "ok", **payload, …}` and `payload` ALREADY carries a `"receipt"` key — the
-        # flat dict the chart template reads — so a top-level receipt there would silently overwrite
-        # one of the two. The PR that deletes `data.receipt` flips ok over in the same commit. The
-        # receipt is on the TYPE for all three statuses from this slice, which is what the contract
-        # asserts; only the ok WIRE waits.
-        body["receipt"] = asdict(env.receipt)
-        body["audit_id"] = env.audit_id
         # A refused or failed call returned no rows at all — which is not the same fact as a query
         # that ran and matched nothing, but the row's `status` is what carries that distinction.
         row_count = 0
+
+    # Outside the branch, so every status carries the Envelope's receipt and exactly one of them.
+    body["receipt"] = asdict(env.receipt)
+    body["audit_id"] = env.audit_id
 
     _record_execution(env, sql=sql, profile=profile, args=args, row_count=row_count)
     return json.dumps(body, indent=2, default=str)

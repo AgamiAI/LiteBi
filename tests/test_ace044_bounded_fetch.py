@@ -298,12 +298,9 @@ def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "_resolve_units", lambda *a: {})
-    # There is no model behind this fake fork, and this test is about the row cap, so both receipt
-    # builders are stubbed out. They return DIFFERENT types and the stubs have to honour that:
-    # `_legacy_receipt_dict` is the flat dict the ok payload nests, `_resolve_receipt` is the
-    # contract's `Receipt` on the Envelope, and it may not be `None` (ACE-088 SC-5 — a receipt that
-    # could not be built is an `undetermined` receipt, not an absence).
-    monkeypatch.setattr(tools, "_legacy_receipt_dict", lambda *a: None)
+    # There is no model behind this fake fork, and this test is about the row cap, so the receipt
+    # builder is stubbed out. It may not return `None` (ACE-088 SC-5 — a receipt that could not be
+    # built is an `undetermined` receipt, not an absence).
     monkeypatch.setattr(
         tools, "_resolve_receipt",
         lambda *a, **kw: guardrail.undetermined_receipt("stubbed by the test"),
