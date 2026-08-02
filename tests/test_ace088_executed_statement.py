@@ -26,9 +26,8 @@ full receipt now lives.** Every NON-ok receipt is built from the statement the c
 paths and on purpose: `_model_safety` ends in `apply_default_filters`, so a refusal built from the
 rebound string names tables the model's own YAML injected and the caller never wrote. So the two
 paths agree by construction on `refused` and `failed`, and `ok` is the one status left where the
-receipt is asked to describe what executed. It has no top-level `receipt` on the wire yet, so both
-measurements below read `Envelope.receipt` through a spy on `_emit` — which is where the contract
-states the property anyway.
+receipt is asked to describe what executed. Both measurements below read `Envelope.receipt` through
+a spy on `_emit`, which is where the contract states the property.
 """
 
 from __future__ import annotations
@@ -208,10 +207,11 @@ def _tool_out(sql: str) -> dict:
 def _both_routes(monkeypatch, sql: str) -> tuple[dict, dict, list[dict]]:
     """Run `sql` down both routes and return `(in_process_body, forked_body, [receipts])`.
 
-    The receipts are read off the `Envelope` through a spy on `_emit`, not off the wire: the `ok`
-    body carries no top-level `receipt` yet, because `_emit` builds it as `{"status": "ok",
-    **payload}` and `payload` already has a legacy `"receipt"` key the chart template reads. The
-    contract states the property on the TYPE, which is what this measures.
+    The receipts are read off the `Envelope` through a spy on `_emit` rather than off the wire
+    because the contract states the property on the TYPE, which is what this measures. The two are
+    the same object now — `_emit` serializes `Envelope.receipt` onto every status, and the legacy
+    `"receipt"` key inside the `ok` payload that used to shadow it is gone — so reading it here is a
+    matter of measuring the property where it is declared, not of routing around the wire.
     """
     seen: list = []
     real = tools._emit
@@ -275,7 +275,10 @@ def test_the_receipt_describes_the_statement_that_ran(rewritten):
     strict=True,
     reason=(
         "The fork path builds the receipt in the PARENT, which only ever holds the statement the "
-        "caller sent, while the child executes the rewritten one. ACE-093 deletes the fan-join "
+        "caller sent, while the child executes the rewritten one. That receipt is now the ONLY "
+        "description an `ok` caller gets — the flat legacy receipt inside the `ok` payload that "
+        "once sat beside it is deleted — so on this path the caller is handed one account of the "
+        "answer and it is an account of a statement that did not run. ACE-093 deletes the fan-join "
         "rewrite and ACE-042 (which it depends on) deletes the default-filter injection, making "
         "executed == received by construction; this marker is deleted by that slice."
     ),
@@ -283,6 +286,14 @@ def test_the_receipt_describes_the_statement_that_ran(rewritten):
 def test_the_forked_receipt_describes_the_statement_the_child_ran(rewritten, monkeypatch):
     """The half of SC-6 that cannot hold until the rewrites are gone, measured rather than asserted
     in prose. Closed by ACE-093 (with ACE-042, which it depends on).
+
+    **What this costs a caller changed when the receipt became singular.** While the `ok` payload
+    still carried a flat receipt of its own beside the Envelope's, a caller on this path was handed
+    two accounts of one answer and could at least see them disagree. There is one receipt now, so
+    the wrong-statement account is the ONLY description an `ok` caller on the fork path gets: there
+    is nothing left to compare it against, and nothing on the wire that says it describes a
+    statement other than the one that ran. That makes the gap quieter, not smaller, which is the
+    reason to keep measuring it here.
 
     Both routes are real: the in-process one runs `execute_guarded` in this process behind the
     built-in executor, and the forked one actually spawns `python -m execute_sql` and rebuilds the

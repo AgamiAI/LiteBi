@@ -598,12 +598,19 @@ _ECHO_MAX_NAME_CHARS = 64
 # Enough to fix a statement in one pass — an offending set is one to three names in practice — and
 # small enough that the joined list stays bounded no matter what the statement contained.
 _ECHO_MAX_NAMES = 5
-# The FULL receipt's own cap on table references, and deliberately far above `_ECHO_MAX_NAMES`: this
-# one bounds a description of a statement that RAN, where every reference is a table the model
-# declares and the caller is owed the whole list. 50 is well past any join a person or a model writes
-# and far below the response amplification an unbounded section allows — a statement inventing four
-# hundred aliases produced a four-hundred-entry section, at no cost to the caller who asked for it.
-_RECEIPT_MAX_TABLE_REFS = 50
+# The FULL receipt's own cap on the references it lists, and deliberately far above
+# `_ECHO_MAX_NAMES`: this one bounds a description of a statement that RAN, where every reference is
+# one the model resolved and the caller is owed the whole list. 50 is well past any join or column
+# list a person or a model writes and far below the response amplification an unbounded section
+# allows — a statement inventing four hundred aliases produced a four-hundred-entry section, at no
+# cost to the caller who asked for it.
+#
+# ONE number for both `tables` and `columns`, not two: the two sections are the same shape of risk
+# (one entry per name the CALLER's statement wrote) so a second constant would only be a second
+# thing to keep in step. `columns` was unbounded while `tables` was capped, which meant the cap
+# could be walked straight around by qualifying four hundred column references instead of four
+# hundred tables.
+_RECEIPT_MAX_REFS = 50
 # Everything an identifier can legitimately contain once it is parsed: letters, digits, `_`, and the
 # `.`/`$`/`-` that appear in qualified and engine-specific names. `*` is in the set because the
 # column-scope gate names a qualified star back as `orders.*` — a projection token the caller wrote,
@@ -1505,9 +1512,18 @@ def assemble_receipt(
 
     # `ref_cols` is the set the assumptions filter above just walked; every column the statement
     # references is a receipt fact, not only the three whose description is AI-written. Sorted
-    # because it is a set, and a receipt has to be the same receipt on every run (REQ-022).
+    # because it is a set, and a receipt has to be the same receipt on every run (REQ-022) — which
+    # is also what makes the cap below deterministic: WHICH references survive it cannot depend on
+    # the seed either.
+    column_refs = sorted(ref_cols)
+    # The same bound `tables` puts on its own references, from the same constant. Both sections are
+    # one entry per name the CALLER's statement wrote, so a statement inventing hundreds of
+    # qualified column references amplified a small request into a large section at no cost to
+    # whoever asked for it. The overflow is COUNTED on the marker below, never listed, and the count
+    # is the caller's own number so stating it discloses nothing.
+    dropped_cols = max(0, len(column_refs) - _RECEIPT_MAX_REFS)
     column_items: list[dict[str, Any]] = []
-    for bare, cname in sorted(ref_cols):
+    for bare, cname in column_refs[:_RECEIPT_MAX_REFS]:
         info = tidx.get(_tkey(bare))
         schema = info[0].schema_name if info else None
         # Both halves of this label can be the CALLER's own text and one half always is. A qualified
@@ -1526,12 +1542,16 @@ def assemble_receipt(
         })
     # A matched metric is a statement-level fact today, so it gets its own entry with no owning
     # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
+    # Deliberately NOT subject to the cap above: there is one entry per metric the MODEL declares
+    # and whose binding the statement used, so the count is the deployment's own, not the caller's,
+    # and dropping a metric the answer leaned on to make room for a column name would trade the
+    # load-bearing fact for the incidental one.
     column_items.extend({"column": None, "metric": met} for met in metric_items)
 
     table_items: list[dict[str, Any]] = []
     table_refs = _table_references(tree)
-    dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_TABLE_REFS)
-    for written, name, alias in table_refs[:_RECEIPT_MAX_TABLE_REFS]:
+    dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_REFS)
+    for written, name, alias in table_refs[:_RECEIPT_MAX_REFS]:
         # A CTE name resolved through the bare-name index, so `WITH orders AS (…)` reported
         # `declared: true` and borrowed the real table's row estimate — a fact about a table the
         # statement never read. `_cte_names` is the same set `check_table_scope` subtracts.
@@ -1560,7 +1580,14 @@ def assemble_receipt(
 
     receipt: dict[str, Any] = {
         "model_version": model_version,
-        "columns": {"items": column_items, "undetermined": UNDETERMINED_COLUMNS},
+        "columns": {
+            "items": column_items,
+            # Counted, not listed — the same device `tables` uses below and for the same reason.
+            "undetermined": UNDETERMINED_COLUMNS + (
+                f" {dropped_cols} further column reference(s) are not listed."
+                if dropped_cols else ""
+            ),
+        },
         "tables": {
             "items": table_items,
             # The overflow is COUNTED on the marker, never listed — the same device the refusal
