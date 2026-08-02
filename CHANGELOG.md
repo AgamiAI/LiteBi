@@ -12,6 +12,16 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Removed
+
+- **The `GovernancePolicy` port and the `Adapters.governance` field (ACE-095).** `GovernancePolicy`,
+  its `GovernanceVerdict` value type, and the `WarnOnlyGovernancePolicy` default adapter are gone,
+  along with the `governance` field on `ports.Adapters`. The port was declared but never called: no
+  core call site ever evaluated it, so removing it changes no behaviour and touches nothing on the
+  `execute_sql` enforcement path. `Adapters` is public API, so a consumer that constructed it with
+  `governance=...` drops that keyword; the remaining ports (`ActivitySink`, `OrgResolver`,
+  `AuthProvider`, `Executor`) are unchanged.
+
 ### Docs
 
 - **Read-only datasource role is now a stated deploy obligation, not a suggestion (ACE-036).** The
