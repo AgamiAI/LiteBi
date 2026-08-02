@@ -413,3 +413,18 @@ def test_the_assumptions_cap_picks_the_same_three_in_every_process(tmp_path):
         seen.add(proc.stdout.strip())
     assert len(seen) == 1, f"the cap chose differently across hash seeds: {seen}"
     assert json.loads(seen.pop()) == ["public.wide.c0", "public.wide.c1", "public.wide.c2"]
+
+
+def test_the_receipt_and_the_gate_agree_about_a_case_folded_table_name(org):
+    """`check_table_scope` folds case, because Postgres and friends fold unquoted identifiers. The
+    receipt's table index did not, so `FROM ORDERS` passed the gate and the receipt then reported the
+    table as undeclared. That is the single fact SC-2 promises a refused caller, so the two have to
+    give the same answer about the same statement."""
+    sql = "SELECT id FROM ORDERS"
+
+    assert rt.check_table_scope(sql, org) is None, "the gate accepts the folded spelling"
+
+    tables = _sections(org, sql)["tables"]["items"]
+    assert [t["ref"] for t in tables] == ["ORDERS"], "the reference is echoed as the caller wrote it"
+    assert tables[0]["declared"] is True
+    assert tables[0]["qname"] == "public.orders", "resolved to the model's own spelling"

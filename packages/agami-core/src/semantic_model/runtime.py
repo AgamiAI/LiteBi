@@ -1293,13 +1293,24 @@ def build_receipt(
 
 
 def _model_table_index(org: Datasource) -> dict[str, tuple]:
-    """bare table name -> (Table, area_name). First occurrence wins (a cross-schema
-    name clash is rare and the relationships now carry schema to disambiguate)."""
+    """bare table name, CASE-FOLDED -> (Table, area_name). First occurrence wins (a cross-schema
+    name clash is rare and the relationships now carry schema to disambiguate).
+
+    Folded because `check_table_scope` folds: it compares `{name.lower()}` against the statement's
+    names, since Postgres and friends fold unquoted identifiers. When this index did not, the gate
+    and the receipt disagreed about the same statement: `FROM ORDERS` passed the gate and the
+    receipt reported the table as undeclared, which is the one fact the refusal receipt exists to
+    state. Look up through `_tkey`, never with the raw name."""
     idx: dict[str, tuple] = {}
     for sa in org.subject_areas:
         for t in sa.tables_defined:
-            idx.setdefault(t.name, (t, sa.name))
+            idx.setdefault(_tkey(t.name), (t, sa.name))
     return idx
+
+
+def _tkey(name: str) -> str:
+    """The one spelling of a table name that `_model_table_index` is keyed by."""
+    return (name or "").lower()
 
 
 def _norm_sql(s: Optional[str]) -> str:
@@ -1424,7 +1435,7 @@ def assemble_receipt(
     tidx = _model_table_index(org)
 
     for bare in sorted(used):
-        info = tidx.get(bare)
+        info = tidx.get(_tkey(bare))
         if not info:
             continue
         t, _area = info
@@ -1482,7 +1493,7 @@ def assemble_receipt(
     def _tables_defining(cname: str) -> list[str]:
         out = []
         for b in used:
-            info = tidx.get(b)
+            info = tidx.get(_tkey(b))
             if info and any(c.name == cname for c in info[0].columns):
                 out.append(b)
         return out
@@ -1504,7 +1515,7 @@ def assemble_receipt(
     # string-hash order, which differs between processes. The receipt has to be the same for the
     # same statement and the same model version, so the choice cannot depend on the seed.
     for bare, cname in sorted(ref_cols):
-        info = tidx.get(bare)
+        info = tidx.get(_tkey(bare))
         if not info:
             continue
         t, _ = info
@@ -1534,7 +1545,7 @@ def assemble_receipt(
     # because it is a set, and a receipt has to be the same receipt on every run (REQ-022).
     column_items: list[dict[str, Any]] = []
     for bare, cname in sorted(ref_cols):
-        info = tidx.get(bare)
+        info = tidx.get(_tkey(bare))
         schema = info[0].schema_name if info else None
         column_items.append({
             "column": f"{schema}.{bare}.{cname}" if schema else f"{bare}.{cname}",
@@ -1550,7 +1561,7 @@ def assemble_receipt(
         # A CTE name resolved through the bare-name index, so `WITH orders AS (…)` reported
         # `declared: true` and borrowed the real table's row estimate — a fact about a table the
         # statement never read. `_cte_names` is the same set `check_table_scope` subtracts.
-        info = None if name.lower() in cte_names else tidx.get(name)
+        info = None if _tkey(name) in cte_names else tidx.get(_tkey(name))
         t = info[0] if info else None
         ph = t.performance_hints if t else None
         table_items.append({
