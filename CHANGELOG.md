@@ -20,7 +20,11 @@ below corresponds to one such version.
   core call site ever evaluated it, so removing it changes no behaviour and touches nothing on the
   `execute_sql` enforcement path. `Adapters` is public API, so a consumer that constructed it with
   `governance=...` drops that keyword; the remaining ports (`ActivitySink`, `OrgResolver`,
-  `AuthProvider`, `Executor`) are unchanged.
+  `AuthProvider`, `Executor`) are unchanged. **`Adapters` is not keyword-only, so a consumer that
+  built it POSITIONALLY must also re-check its call**: the 4th positional slot was `governance` and
+  is now `executor`, so `Adapters(sink, resolver, auth, my_policy)` still constructs but binds the
+  policy as the executor and fails later at query time with `AttributeError: 'MyPolicy' object has
+  no attribute 'execute'`. Construct `Adapters` by keyword.
 
 ### Docs
 

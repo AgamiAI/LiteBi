@@ -1,7 +1,8 @@
-"""The three port Protocols + their OSS default adapters.
+"""Covers three of the four port Protocols + their OSS default adapters.
 
 Proves: the Protocols are importable (and dependency-free), and each OSS default adapter
-type-checks against its Protocol via @runtime_checkable + behaves as specified.
+type-checks against its Protocol via @runtime_checkable + behaves as specified. The fourth port,
+``Executor``, is exercised in ``test_ah012_executor_seam.py`` alongside the guarded path it sits in.
 """
 
 from __future__ import annotations

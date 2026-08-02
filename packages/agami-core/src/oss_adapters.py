@@ -1,4 +1,7 @@
-"""OSS default adapters for the three ports.
+"""OSS default adapters for three of the four ports.
+
+The fourth port, ``Executor``, has its OSS default (``BUILTIN_EXECUTOR``) in ``execute_sql``
+instead: that module ships in the stdlib-lean plugin mirror, which cannot import this one.
 
 These defaults make the local product run out of the box — the single-tenant resolver, the
 file/jsonl activity sink, and presence-only auth. They live in agami-core
