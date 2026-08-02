@@ -22,7 +22,7 @@ runs on whatever `python3` the user already has, which on stock macOS is 3.9.6. 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 if TYPE_CHECKING:
     # Type-checkers only — kept out of the runtime import graph. With `from __future__ import
@@ -219,20 +219,63 @@ class Failure:
 
 
 @dataclass(frozen=True)
-class Receipt:
-    """What the statement did — deliberately EMPTY.
+class ReceiptSection:
+    """One section of the receipt: what was established, and why the rest was not.
 
-    The field exists on `Envelope` from the start so the Envelope does not change shape later; its
-    contents are owned by the receipt work and are empty until then. Present on every status
-    including `refused`, because a refused caller most needs the facts.
+    The two fields are independent, which is the whole point. Four states, and the middle two are
+    the ones the receipt exists to tell apart:
 
-    **This is not `contracts.Receipt`.** That one is a populated pydantic model — the trust receipt
-    `semantic_model.runtime.assemble_receipt` builds and `tools._finalize_execution` nests inside
-    the result payload, carrying tables_used / relationships / metrics / named_filters / assumptions
-    / warnings. This one is the stdlib-only stub on the guardrail Envelope; this module may not
-    import pydantic, so the two cannot be one type until the receipt is lifted to the top level. If
-    you are reaching for content, you want `contracts.Receipt`.
+      * `items` set, `undetermined` None — established, here it is.
+      * `items` empty, `undetermined` None — checked, and there was nothing to report.
+      * `items` empty, `undetermined` set  — NOT checked, and here is why.
+      * `items` set, `undetermined` set    — partly established, and here is what is missing.
+
+    Before this, an unchecked section and a clean one were both the empty list, so silence read as
+    clean. A section whose analysis has not shipped yet says so by spec id rather than sitting empty.
+
+    `items` is a tuple, not a list: this module's types are frozen, and a frozen dataclass holding a
+    list is only shallowly immutable.
     """
+
+    items: tuple[dict[str, Any], ...] = ()
+    undetermined: str | None = None
+
+
+@dataclass(frozen=True)
+class Receipt:
+    """What the statement did — every section declared, every gap named.
+
+    Present on every status including `refused`, because a refused caller most needs the facts. Each
+    section is always there: a consumer never has to distinguish "no joins" from "joins not checked",
+    which is what `ReceiptSection.undetermined` answers.
+
+    The sections are containers; the facts inside them belong to the specs that own each analysis
+    (per-column metric match, per-join predicate, per-aggregate fan-out, per-table declared filters).
+    A container whose analysis has not landed ships with `undetermined` naming the spec, so the gap
+    is visible at the point of use rather than inferred from an empty list.
+
+    Everything here is derivable from the SQL and the model alone: no probe queries, no sampled
+    values, no row contents. It is metadata and statement structure, and it must stay that way, or
+    the receipt becomes a disclosure channel around the sensitive-column rules.
+    """
+
+    model_version: str | None = None
+    columns: ReceiptSection = field(default_factory=ReceiptSection)
+    tables: ReceiptSection = field(default_factory=ReceiptSection)
+    joins: ReceiptSection = field(default_factory=ReceiptSection)
+    aggregates: ReceiptSection = field(default_factory=ReceiptSection)
+    assumptions: ReceiptSection = field(default_factory=ReceiptSection)
+
+    SECTIONS: ClassVar[tuple[str, ...]] = (
+        "columns",
+        "tables",
+        "joins",
+        "aggregates",
+        "assumptions",
+    )
+    """The section names, in order. Declared once so a caller that must touch every section (the
+    undetermined-everything builders, the serializers, the tests) iterates this rather than
+    re-listing them and drifting."""
 
 
 # --- Envelope ---------------------------------------------------------------
