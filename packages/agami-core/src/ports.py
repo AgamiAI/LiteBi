@@ -1,4 +1,4 @@
-"""The five port Protocols — the seams adapters plug into.
+"""The four port Protocols — the seams adapters plug into.
 
 agami-core keeps one MCP implementation across deployments; deployment-specific behavior is
 swapped at the composition root through these ports, never by forking a tool:
@@ -6,7 +6,6 @@ swapped at the composition root through these ports, never by forking a tool:
   - ``ActivitySink``     — where query-execution records go (file by default)
   - ``OrgResolver``      — single vs multi tenancy as a config flag, not a schema fork
   - ``AuthProvider``     — bearer token → principal (presence by default)
-  - ``GovernancePolicy`` — warn-only by default; enforcement is a paid concern
   - ``Executor``         — the connect-and-run step, *behind* the shared guard (built-in by default;
                            a consumer injects a pooled/RBAC/tunnel executor without forking the guard)
 
@@ -14,7 +13,7 @@ These are **interfaces only** — `typing.Protocol`, so an adapter satisfies a p
 no import coupling back to core. The OSS default adapters live in ``oss_adapters`` (so the local
 product runs out of the box); a downstream consumer supplies its own.
 
-The seam value types (``Org`` / ``Principal`` / ``GovernanceVerdict``) are stdlib dataclasses, not
+The seam value types (``Org`` / ``Principal``) are stdlib dataclasses, not
 pydantic models, so this module imports with **zero dependencies** — a consumer can depend on the
 seams without pulling the model deps. The wire shapes that need validation (the 4-tool I/O) live
 in ``contracts`` (pydantic). Each type is kept minimal — only what a default adapter or a
@@ -24,7 +23,7 @@ consumer needs.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -71,17 +70,8 @@ class Principal:
     session_id: str | None = None
 
 
-@dataclass(frozen=True)
-class GovernanceVerdict:
-    """The outcome of a governance check. The default is **warn-only** — ``allowed`` is always
-    True and ``warnings`` is advisory; only a paid enforcement tier may set allowed=False."""
-
-    allowed: bool = True
-    warnings: list[str] = field(default_factory=list)
-
-
 # ---------------------------------------------------------------------------
-# The five ports
+# The four ports
 # ---------------------------------------------------------------------------
 
 
@@ -113,15 +103,6 @@ class AuthProvider(Protocol):
     OSS default = presence only (enough for a token-gated server); real providers come later."""
 
     def validate_token(self, token: str) -> Principal | None: ...
-
-
-@runtime_checkable
-class GovernancePolicy(Protocol):
-    """Evaluate a request and return a ``GovernanceVerdict`` (warnings; never blocks by default).
-
-    OSS default = warn-only ("basic governance warning"); enforcement is a paid tier."""
-
-    def evaluate(self, ctx: object | None = None) -> GovernanceVerdict: ...
 
 
 @runtime_checkable
@@ -164,11 +145,10 @@ class Adapters:
     """The port adapters, bundled so ``mcp_http.create_app`` takes them as one argument.
 
     A consumer builds this with its own implementations of the ports (its own ``OrgResolver``,
-    ``AuthProvider``, ``ActivitySink``, ``GovernancePolicy``, and optionally an ``Executor``);
+    ``AuthProvider``, ``ActivitySink``, and optionally an ``Executor``);
     passing ``adapters=None`` to ``create_app`` uses the OSS defaults (``mcp_http.default_adapters``).
     Today ``create_app`` wires ``auth_provider`` + ``org_resolver`` into the request path;
-    ``activity_sink`` + ``governance`` are carried here for consumers and not yet referenced by a
-    core call site.
+    ``activity_sink`` is carried here for consumers and not yet referenced by a core call site.
 
     ``executor`` is optional and defaults to ``None`` — meaning "use the built-in executor" (the
     subprocess/direct connect-per-query path, byte-identical to today). A consumer sets it to run
@@ -177,7 +157,6 @@ class Adapters:
     activity_sink: ActivitySink
     org_resolver: OrgResolver
     auth_provider: AuthProvider
-    governance: GovernancePolicy
     executor: Executor | None = None
     # `tool_visibility(tool_name) -> bool` narrows the ADVERTISED tool surface per request. None (the
     # default) is exactly today's behaviour — the whole registry, listed and callable. A registry

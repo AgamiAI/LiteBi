@@ -22,7 +22,6 @@ from oss_adapters import (  # noqa: E402
     FileActivitySink,
     PresenceAuthProvider,
     SingleTenantOrgResolver,
-    WarnOnlyGovernancePolicy,
 )
 from ports import Adapters, Org  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
@@ -167,7 +166,6 @@ def test_adapters_none_uses_the_oss_defaults(base_url):
     assert isinstance(a.org_resolver, SingleTenantOrgResolver)
     assert isinstance(a.auth_provider, PresenceAuthProvider)  # presence when no signing secret
     assert isinstance(a.activity_sink, FileActivitySink)
-    assert isinstance(a.governance, WarnOnlyGovernancePolicy)
 
 
 def test_create_app_uses_the_passed_adapters(base_url):
@@ -177,7 +175,6 @@ def test_create_app_uses_the_passed_adapters(base_url):
         activity_sink=FileActivitySink(),
         org_resolver=resolver,
         auth_provider=auth,
-        governance=WarnOnlyGovernancePolicy(),
     )
     kwargs = _auth_middleware_kwargs(mcp_http.create_app(adapters=adapters))
     assert kwargs["resolver"] is resolver  # the passed adapters are used at the composition root
@@ -202,7 +199,6 @@ def test_a_refusing_resolver_gives_403_not_500(base_url):
         activity_sink=FileActivitySink(),
         org_resolver=_RefusingResolver(),
         auth_provider=PresenceAuthProvider(),
-        governance=WarnOnlyGovernancePolicy(),
     )
     c = TestClient(mcp_http.create_app(adapters=adapters))
     r = c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=AUTH)
