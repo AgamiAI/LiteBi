@@ -260,11 +260,53 @@ def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
 
 
 def test_assumptions_section_carries_forward_unchanged_with_no_marker(org):
-    """The one section that is complete, so the only one with a null marker."""
+    """Complete for THIS statement, so the marker is null — the positive claim "established, here
+    it is". Null is a claim, not a default; see the cap test below for what it costs when it is
+    made falsely."""
     section = _sections(org)["assumptions"]
     assert section["undetermined"] is None
     assert [i["column"] for i in section["items"]] == ["public.orders.amount"]
     assert section["items"][0]["source"] == "ai_unvalidated"
+
+
+def test_assumptions_counts_what_its_cap_dropped_rather_than_claiming_completeness(tmp_path):
+    """The section is capped, and a capped section that reports `undetermined: None` is making the
+    four-state contract's "established, here it is" claim about a list it just truncated. Six
+    AI-written meanings went in, three came out, the marker stayed null and no surface drew one —
+    so three column meanings the answer actually leaned on vanished under a positive claim of
+    completeness, on the ONE section that claimed exemption from the markers. `columns` listed all
+    six the whole time, which is what made the drop visible from the same receipt.
+
+    Same device `tables` and `columns` use: count the overflow onto the marker, never list it. The
+    count is of the deployment's own descriptions, so stating it discloses nothing.
+
+    (`_write_many_ai_columns_model` is defined further down, beside the determinism test that also
+    needs more candidates than the cap keeps.)
+    """
+    org = L.load_datasource(_write_many_ai_columns_model(tmp_path))
+    sections = _sections(org, "SELECT c0, c1, c2, c3, c4, c5 FROM public.wide")
+    assumptions, columns = sections["assumptions"], sections["columns"]
+
+    assert len(assumptions["items"]) == rt._RECEIPT_MAX_ASSUMPTIONS
+    assert assumptions["undetermined"] is not None, "a truncated section may not claim completeness"
+    assert "3 further" in assumptions["undetermined"]
+    # The dropped meanings are COUNTED, never listed: the three that did not fit are nowhere in the
+    # section, marker included.
+    for dropped in ("c3", "c4", "c5"):
+        assert dropped not in json.dumps(assumptions)
+    # And the sibling section still carries every reference, which is what made the silent drop
+    # visible from inside one receipt.
+    assert len([i for i in columns["items"] if i["column"]]) == 6
+
+
+def test_assumptions_keeps_a_null_marker_when_nothing_was_dropped(tmp_path):
+    """The other half of the same claim, and the reason the marker is not simply always set: a
+    section that fits IS complete, and saying otherwise would turn the four states back into two."""
+    org = L.load_datasource(_write_many_ai_columns_model(tmp_path))
+    sections = _sections(org, "SELECT c0, c1, c2 FROM public.wide")
+
+    assert len(sections["assumptions"]["items"]) == 3
+    assert sections["assumptions"]["undetermined"] is None
 
 
 # --- the four states --------------------------------------------------------
@@ -463,15 +505,52 @@ def test_a_cte_shadowing_a_table_does_not_credit_that_tables_relationships(org):
     ]
 
 
-def test_a_cte_name_does_not_attribute_an_unqualified_column_to_the_real_table(org):
-    """The same subtraction, one section over. Unqualified columns are attributed to whichever
-    in-scope table defines them, so a CTE shadowing a declared table also claimed that table's
-    columns for a statement that never read it."""
-    shadowing = "WITH orders AS (SELECT 1 AS amount) SELECT amount FROM orders"
+@pytest.mark.parametrize("shadowing,expected_columns", [
+    ("WITH orders AS (SELECT 1 AS amount) SELECT amount FROM orders", []),
+    ("WITH orders AS (SELECT 1 AS amount) SELECT orders.amount FROM orders", ["orders.amount"]),
+    ("WITH orders AS (SELECT 1 AS amount) SELECT o.amount FROM orders o", ["orders.amount"]),
+], ids=["unqualified", "qualified", "aliased"])
+def test_a_cte_name_does_not_lend_the_real_tables_columns_to_the_receipt(
+        org, shadowing, expected_columns):
+    """The same subtraction, two sections over, in EVERY spelling of a column reference.
+
+    Columns are attributed to whichever in-scope table defines them, so a CTE shadowing a declared
+    table also claimed that table's columns for a statement that never read it. The fix reached the
+    unqualified spelling only — this test's earlier self scoped itself to that one, which is how the
+    gap survived — while a QUALIFIED reference resolved its alias straight into the model index with
+    no CTE subtraction anywhere in between. One receipt then contradicted itself: `tables` said the
+    model declares no such table, and `columns` handed back that table's schema-qualified columns
+    while `assumptions` handed back its AI-written prose. The prose half is the one that reaches a
+    person — the query skill reads `assumptions.items[]` aloud — so agami asked the user to confirm
+    the meaning of a column the answer never touched.
+
+    The reference itself survives, unresolved: a dropped reference is an unchecked one. It renders
+    as the statement wrote it, with no schema prefix, because there is no model row for a schema to
+    come from.
+    """
     sections = _sections(org, shadowing)
 
-    assert sections["columns"]["items"] == []
+    assert [i["column"] for i in sections["columns"]["items"] if i["column"]] == expected_columns
     assert sections["assumptions"]["items"] == []
+    # Nothing anywhere in the receipt resolves the shadowed name to the real table's row.
+    assert "public.orders" not in json.dumps(sections)
+    assert [(t["ref"], t["declared"]) for t in sections["tables"]["items"]] == [("orders", False)]
+
+
+def test_one_column_is_spelled_one_way_in_the_two_sections_that_carry_it(org):
+    """`columns` and `assumptions` describe the same column, and a consumer joins them on the label.
+    The two composed it differently: `columns` echoed the CALLER's casing and `assumptions` used the
+    model's, so `SELECT ORDERS.amount FROM ORDERS` produced `public.ORDERS.amount` in one section
+    and `public.orders.amount` in the other, and the join found nothing.
+
+    A resolved reference is the model's own name, composed unbounded like the schema half always
+    was; the caller's spelling survives only where nothing resolved it (see the bound tests above).
+    """
+    sections = _sections(org, "SELECT ORDERS.amount FROM ORDERS")
+    labels = [i["column"] for i in sections["columns"]["items"] if i["column"]]
+
+    assert labels == ["public.orders.amount"]
+    assert [a["column"] for a in sections["assumptions"]["items"]] == labels
 
 
 # --- determinism across processes -------------------------------------------
