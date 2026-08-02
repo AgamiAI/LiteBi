@@ -18,7 +18,9 @@ This page is the deep dive. For the summary, see the [README](../README.md#the-t
    (Rule 1); **joins and entities** are usable-but-flagged until confirmed (Rule 2).
 3. **Every answer ships a receipt** — the exact SQL, the joins and metrics it used with
    their review state, and the model snapshot it pinned. If any unreviewed entry was
-   used, the receipt says so, plainly.
+   used, the receipt says so, plainly. And where an analysis has not shipped yet, the
+   receipt says *that* plainly too, rather than leaving the section empty and letting
+   silence read as clean.
 
 There is **no threshold to tune.** The trust layer is driven by review *state*
 (`unreviewed` / `approved` / `rejected` / `stale`), not a numeric score you configure —
@@ -68,15 +70,17 @@ Everything inferred stays `unreviewed` and surfaces in the Review tab.
   skews every report that uses it. The validator enforces all three before a
   metric can be `approved`.
 - **Rule 2 — joins & entities** (lazy): usable while `unreviewed`; they
-  self-approve as you query and surface as receipt warnings until confirmed. No
+  self-approve as you query and surface on the answer's receipt until confirmed. No
   threshold to tune — it's review *state*, not a number.
 
 At runtime, `agami-query` still **answers** questions that use `unreviewed`
-metrics, joins, or entities — but every unreviewed entry it relied on surfaces as
-a **warning** in the receipt (e.g. *"Used metric `revenue` which has not been
-signed off"*), with a one-click link to the Review tab. Nothing is silently
-trusted; nothing is hard-blocked. Only `rejected` (excluded) entries are dropped
-entirely — those never appear in an answer.
+metrics, joins, or entities — but every unreviewed entry it relied on arrives on
+the receipt carrying its own `review_state`, and the report reads that state to
+raise its banners: an unreviewed **join** raises the trust banner (with a pointer
+to the Review tab), an unapproved **metric** raises the approve/change banner,
+whose buttons write your decision straight back into the model. Nothing is
+silently trusted; nothing is hard-blocked. Only `rejected` (excluded) entries are
+dropped entirely — those never appear in an answer.
 
 **Hybrid review order in `/agami-connect`**: Phase 4 surfaces a Rule 1 sign-off
 gate *before* seed examples are generated (Phase 5). Reason: seed SQL exercises
@@ -105,17 +109,47 @@ into chat. agami applies each edit, runs the validator, commits the result to
 
 ## Every answer ships a receipt
 
-Every `agami-query` answer includes a "Provenance for this answer" panel:
+The receipt is **five sections** — columns, tables, joins, aggregates, assumptions —
+and every one of them is always present. Each carries what it established (`items`)
+and, separately, a plain sentence saying what it did **not** (`undetermined`). Those
+are two different facts, and keeping them apart is the whole point:
 
-- The literal SQL that ran (no paraphrase)
-- Tables touched + row count per table
-- Relationships used, each with its confidence + review state
+| `items` | `undetermined` | what it means |
+| --- | --- | --- |
+| set | null | established, here it is |
+| empty | null | checked, and there was nothing to report |
+| empty | set | **not checked**, and here is why |
+| set | set | partly established, and here is what is missing |
+
+Before this, an unchecked section and a clean one were both the empty list, so
+silence read as clean. Today an analysis that has not shipped says so where you
+read the answer. Aggregate fan-out is the live example: the receipt reports that
+whether a join multiplies the rows an aggregate is computed from **was not
+checked**, rather than shipping an empty section you would read as "no problem".
+
+Every `agami-query` answer includes a "Provenance for this answer" panel drawing
+all of it:
+
+- Tables touched — **one row per reference**, not per table, so a table read twice
+  is listed twice; each with the name as written, the name the model resolved it
+  to, and a row estimate. A reference the model does not declare (a CTE, say) says
+  so instead of showing blanks
+- Relationships used, each with its cardinality, confidence + review state
 - Metric definitions invoked, with author + sign-off date
-- Named-filter predicates used (named, not anonymous)
+- The columns the statement referenced
 - Source-data freshness per table (when the DB exposes it)
+- The assumptions agami made: the AI-written column meanings the answer leaned on
+- Each section's "not established" sentence, where it has one
 - Model snapshot hash (so the answer is reproducible from
   `<artifacts_dir>/<profile>/.snapshots/<hash>/`)
-- A warning banner if any unreviewed entry was used
+
+The statement itself is not in this panel: each report section carries its own
+SQL, under that section's own disclosure, next to the numbers it produced.
+
+Above the report, two banners: one if any join it used is unreviewed, one if any
+metric it used is unapproved. The metric banner's Approve / Change buttons queue
+your decision; your choice goes back to Claude to apply. Nothing lands in the
+model until you send it.
 
 ## Examples validation
 

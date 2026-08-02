@@ -2,8 +2,10 @@
 
 The load-bearing check: a real sample of each tool's **current** stdio output parses into its
 contract and dumps back **without loss** — proving the contracts match the local,
-subject-area-primary shape. Samples here are copied from the dicts in `mcp_harness.py` /
-`runtime.assemble_receipt`.
+subject-area-primary shape. Samples here are copied from the dicts in `mcp_harness.py`.
+
+The trust receipt is deliberately not among them: it is typed by `guardrail.Receipt` and asserted
+against the real tool-edge serializer, not respelled in pydantic here.
 """
 
 from __future__ import annotations
@@ -86,7 +88,7 @@ def test_prompt_examples_empty_roundtrip():
     assert _roundtrip(PromptExamplesResult, sample) == sample
 
 
-def test_execute_sql_result_with_receipt_roundtrip():
+def test_execute_sql_result_roundtrip():
     sample = {
         "columns": ["total"],
         "rows": [[148.95]],
@@ -96,20 +98,29 @@ def test_execute_sql_result_with_receipt_roundtrip():
         "markdown": "| total |\n| --- |\n| $148.95 |",
         "sql": "SELECT SUM(amount) AS total FROM orders",
         "execution_ms": 12,
-        "receipt": {
-            "sql": "SELECT SUM(amount) AS total FROM orders",
-            "model_version": "abc123",
-            "tables_used": [
-                {"qname": "public.orders", "rows": 4000, "rows_as_of": None, "freshness": None},
-            ],
-            "relationships": [],
-            "metrics": [],
-            "named_filters": [],
-            "assumptions": [],
-            "warnings": ["Used an unreviewed join (orders→customers)."],
-        },
     }
     assert _roundtrip(ExecuteSqlResult, sample) == sample
+
+
+def test_the_receipt_is_the_envelopes_and_this_module_does_not_respell_it():
+    """`contracts.Receipt` is gone, and its absence is asserted rather than left to be noticed.
+
+    It typed a `data.receipt` that no longer exists, in the flat pre-section shape, and nothing in
+    shipped code ever constructed or validated against it. The receipt a caller actually gets is
+    `guardrail.Receipt` — the frozen dataclass in the stdlib-only module both the executor and the
+    tool edge can reach, and the plugin mirror can vendor. A second pydantic spelling here would be
+    a shape nothing checks and a second thing to keep in step.
+
+    `extra="allow"` is why this needs a test at all: a stray `receipt=` on `ExecuteSqlResult` would
+    parse and round-trip silently rather than fail.
+    """
+    import guardrail
+
+    assert not hasattr(contracts, "Receipt")
+    assert not hasattr(contracts, "TableUsed")
+    assert "receipt" not in ExecuteSqlResult.model_fields
+    assert guardrail.Receipt.SECTIONS == (
+        "columns", "tables", "joins", "aggregates", "assumptions")
 
 
 def test_a_rejected_execute_sql_is_an_envelope_body_not_an_error_contract():

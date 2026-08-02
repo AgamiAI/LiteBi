@@ -15,7 +15,8 @@ Primitives (examples-first canonical loop):
   identify_entity           — opaque-literal type ID via value_pattern + probe-confirm
   resolve_entity_instance   — strategy chosen at runtime from sensitive + cardinality
   pre_flight_check          — fan-trap / chasm-trap detection + rewrite-vs-refuse
-  build_receipt             — receipt-panel assembly
+  assemble_receipt          — the full trust receipt for a statement that ran
+  assemble_refusal_receipt  — the echo-bounded receipt every non-ok outcome carries
 
 Pre-flight scope note (documented decision, recorded in the PR description):
 The cardinality field on every relationship is the day-1 structural gate. The
@@ -597,12 +598,26 @@ _ECHO_MAX_NAME_CHARS = 64
 # Enough to fix a statement in one pass — an offending set is one to three names in practice — and
 # small enough that the joined list stays bounded no matter what the statement contained.
 _ECHO_MAX_NAMES = 5
-# The FULL receipt's own cap on table references, and deliberately far above `_ECHO_MAX_NAMES`: this
-# one bounds a description of a statement that RAN, where every reference is a table the model
-# declares and the caller is owed the whole list. 50 is well past any join a person or a model writes
-# and far below the response amplification an unbounded section allows — a statement inventing four
-# hundred aliases produced a four-hundred-entry section, at no cost to the caller who asked for it.
-_RECEIPT_MAX_TABLE_REFS = 50
+# The FULL receipt's own cap on the references it lists, and deliberately far above
+# `_ECHO_MAX_NAMES`: this one bounds a description of a statement that RAN, where every reference is
+# one the model resolved and the caller is owed the whole list. 50 is well past any join or column
+# list a person or a model writes and far below the response amplification an unbounded section
+# allows — a statement inventing four hundred aliases produced a four-hundred-entry section, at no
+# cost to the caller who asked for it.
+#
+# ONE number for both `tables` and `columns`, not two: the two sections are the same shape of risk
+# (one entry per name the CALLER's statement wrote) so a second constant would only be a second
+# thing to keep in step. `columns` was unbounded while `tables` was capped, which meant the cap
+# could be walked straight around by qualifying four hundred column references instead of four
+# hundred tables.
+_RECEIPT_MAX_REFS = 50
+# And the `assumptions` cap, which is a DIFFERENT kind of number and so is its own: the entries are
+# the model's own AI-written column descriptions, not the caller's names, so this is not a response
+# bound at all. It is an attention bound — three prose meanings is what a person will actually read
+# and confirm next to an answer, and a list of forty is one nobody checks. It was a bare `[:3]` in
+# the assembler; naming it is what lets the drop be counted onto the section's marker rather than
+# vanishing under a claim that the section is complete.
+_RECEIPT_MAX_ASSUMPTIONS = 3
 # Everything an identifier can legitimately contain once it is parsed: letters, digits, `_`, and the
 # `.`/`$`/`-` that appear in qualified and engine-specific names. `*` is in the set because the
 # column-scope gate names a qualified star back as `orders.*` — a projection token the caller wrote,
@@ -1253,53 +1268,6 @@ def _check_aggregation_semantics(
 # ---------------------------------------------------------------------------
 
 
-def build_receipt(
-    *,
-    sql: str,
-    relationships_used: Optional[list[Relationship]] = None,
-    pre_flight: Optional[PreFlightResult] = None,
-    caveats: Optional[list[str]] = None,
-    default_filters_applied: Optional[list[str]] = None,
-    model_version: Optional[str] = None,
-) -> dict[str, Any]:
-    """Assemble the receipt panel: SQL, relationships (+ confidence + signers),
-    any auto-rewrites, applied default_filters, and relevant caveats."""
-    receipt: dict[str, Any] = {"sql": sql}
-    if model_version:
-        receipt["model_version"] = model_version
-    if relationships_used:
-        receipt["relationships"] = [
-            {
-                "from": f"{r.from_table}.{r.from_column}" if r.from_column else r.from_table,
-                "to": f"{r.to_table}.{r.to_column}" if r.to_column else r.to_table,
-                "on": r.on,
-                "cardinality": r.relationship,
-                "confidence": r.confidence,
-                "review_state": r.review_state,
-                "signed_off_by": r.signed_off_by,
-                "signed_off_at": r.signed_off_at,
-                "signed_off_role": r.signed_off_role,
-            }
-            for r in relationships_used
-        ]
-    # ACE-042 removed the only caller that supplied this; ACE-099 becomes the next one. Until then
-    # nothing in the tree passes it, so the key is absent rather than an unsubstantiated claim.
-    if default_filters_applied:
-        receipt["default_filters_applied"] = default_filters_applied
-    if caveats:
-        receipt["caveats"] = caveats
-    if pre_flight and pre_flight.risk:
-        receipt["pre_flight"] = {
-            "risk": pre_flight.risk,
-            "action": pre_flight.action,
-            "reason": pre_flight.reason,
-        }
-        if pre_flight.action == "auto_rewrite":
-            receipt["pre_flight"]["original_sql"] = pre_flight.original_sql
-            receipt["pre_flight"]["rewritten_sql"] = pre_flight.rewritten_sql
-    return receipt
-
-
 def _model_table_index(org: Datasource) -> dict[str, tuple]:
     """bare table name, CASE-FOLDED -> (Table, area_name). First occurrence wins (a cross-schema
     name clash is rare and the relationships now carry schema to disambiguate).
@@ -1340,7 +1308,9 @@ UNDETERMINED_COLUMNS = (
     "listed here when its binding SQL appears anywhere in the text, so nothing says which column "
     "it computes, and a column that matches no metric is not reported as unmatched."
 )
-# ACE-042 owns per-reference filter accounting.
+# ACE-099 owns per-reference filter accounting. (ACE-042 owned it until it landed, and what it landed
+# was the DELETION of the injector: this layer no longer adds a declared filter to anyone's
+# statement, so the only thing left to build here is the report, and that is ACE-099's.)
 UNDETERMINED_TABLES = (
     "Which of a table's declared filters this statement applied, and which it left out, is not "
     "determined: every reference is listed, including one inside a CTE, but none of them is "
@@ -1404,83 +1374,77 @@ def assemble_receipt(
     pre_flight: Optional[PreFlightResult] = None,
     freshness: Optional[str] = None,
 ) -> dict[str, Any]:
-    """The FULL trust receipt for a query, assembled from the model + the SQL.
+    """The FULL trust receipt for a statement that RAN, assembled from the model + the SQL.
 
-    This is the single source of truth shared by the agami-query skill and the MCP
-    server, so the SAME "what did this answer touch / what hasn't been approved" panel
-    surfaces in Claude Code and in Claude Desktop. Output matches the RECEIPT_JSON schema
-    the chart template renders (tables_used, relationships, metrics, named_filters,
-    assumptions, warnings, model_version).
+    The five sections `guardrail.Receipt` declares — columns, tables, joins, aggregates,
+    assumptions — are TOP-LEVEL keys here, each `{items, undetermined}`, beside the `model_version`
+    pin and nothing else. That is the whole shape: `guardrail.receipt_from_assembled` maps this and
+    its refusal-bounded sibling with no branch, so one statement is described one way whichever
+    assembler ran and whichever process ran it.
 
-    Deterministic, no LLM: tables come from the FROM/JOIN scope; a relationship is
-    "used" when both endpoints are in scope; a metric is "used" when its binding SQL
-    appears in the query; assumptions are the load-bearing columns whose description is
-    AI-written/unknown. Unreviewed metrics surface in `metrics` (review_state) for the
-    approve/change banner — NOT duplicated as a warning. Callers may append ad-hoc
-    (LLM-discovered) metrics to `metrics` after the fact.
+    The sections were briefly nested under a `sections` key beside a parallel set of flat keys
+    (`tables_used`, `relationships`, `metrics`, `named_filters`, `warnings`, `sql`), because
+    `assumptions` named both a flat list and a section and one dict cannot hold both. Deleting the
+    flat keys removed the collision. `warnings` is the only one with a consumer to re-point: it
+    carried one sentence per unreviewed join, which is `joins.items[].review_state != "approved"`
+    read out loud, so a surface that wants a banner derives it rather than being handed a
+    pre-rendered string it cannot filter.
 
-    `sections` carries the five sections `guardrail.Receipt` declares (columns, tables, joins,
-    aggregates, assumptions), each `{items, undetermined}`, so a consumer never has to read an
-    empty list and guess whether it means "checked, found nothing" or "not checked at all". It is
-    ADDITIVE to the flat keys above, which the chart template still reads, and it is nested under
-    one key rather than promoted to the top level for exactly one reason: `assumptions` is the name
-    of both a flat list and a section, and the two cannot share a dict. The PR that deletes the flat
-    keys unnests this in one move.
+    A section states what it did NOT establish rather than sitting empty, because an empty list and
+    an unchecked list read identically to a consumer: silence reads as clean.
+
+    Deterministic, no LLM: tables come from the FROM/JOIN scope; a relationship is "used" when both
+    endpoints are in scope; a metric is "used" when its binding SQL appears in the query;
+    assumptions are the load-bearing columns whose description is AI-written/unknown. Everything is
+    metadata and statement structure — never a sampled value or a row — or the receipt becomes a
+    disclosure channel around the sensitive-column rules.
     """
-    receipt: dict[str, Any] = {
-        "sql": sql, "model_version": model_version,
-        "tables_used": [], "relationships": [], "metrics": [],
-        "named_filters": [], "assumptions": [], "warnings": [],
-        # Stands until the statement is parsed: a receipt that never got a parse tree checked
-        # nothing, and has to say so rather than hand back five clean-looking empty sections. The
-        # two early returns below carry DIFFERENT reasons — see UNDETERMINED_NO_PARSER.
-        "sections": _undetermined_sections(UNDETERMINED_NO_PARSER),
-    }
     if not _HAVE_SQLGLOT:
-        return receipt
+        # A receipt that never got a parse tree checked nothing, and has to say so rather than hand
+        # back five clean-looking empty sections. This return and the next carry DIFFERENT reasons —
+        # see UNDETERMINED_NO_PARSER.
+        return {"model_version": model_version,
+                **_undetermined_sections(UNDETERMINED_NO_PARSER)}
     try:
         tree = sqlglot.parse_one(sql, error_level="ignore")
     except Exception:
         tree = None
     if tree is None:
-        receipt["sections"] = _undetermined_sections(UNDETERMINED_UNPARSEABLE)
-        return receipt
+        return {"model_version": model_version,
+                **_undetermined_sections(UNDETERMINED_UNPARSEABLE)}
 
     scope = _tables_in_scope(tree)            # alias/name -> bare table name
-    used = set(scope.values())
+    cte_names = _cte_names(tree)
+    # A CTE name is a name the statement defined for itself, so it is not a table in scope however
+    # closely it resembles one the model declares. Subtracted here for the same reason the `tables`
+    # section subtracts it below and `check_table_scope` has always subtracted it: without this,
+    # `WITH orders AS (…)` credited every relationship declared on the REAL `orders`, so the receipt
+    # reported a join the statement never made. It also drives which unqualified columns are
+    # attributed to a table, and attributing one to a table nothing read is the same error.
+    used = {bare for bare in scope.values() if _tkey(bare) not in cte_names}
     tidx = _model_table_index(org)
 
-    for bare in sorted(used):
-        info = tidx.get(_tkey(bare))
-        if not info:
-            continue
-        t, _area = info
-        ph = t.performance_hints
-        receipt["tables_used"].append({
-            "qname": f"{t.schema_name}.{t.name}" if t.schema_name else t.name,
-            "rows": (ph.estimated_row_count if ph else None),
-            "rows_as_of": (ph.estimated_row_count_at if ph else None),
-            "freshness": freshness,
-        })
-
-    warnings: list[str] = []
     # Folded for the same reason `_model_table_index` is: `used` holds the names the STATEMENT wrote,
     # and Postgres and friends fold unquoted identifiers, so a raw membership test made
     # `FROM ORDERS JOIN CUSTOMERS` report both tables in scope AND no declared relationship between
     # them. That pair is not an admitted gap, it is a false statement — the receipt says the model
     # declares no join where it declares one — so it folds on both sides here too.
     used_keys = {_tkey(bare) for bare in used}
+    join_items: list[dict[str, Any]] = []
     for sa in org.subject_areas:
         for r in sa.relationships:
             if _tkey(r.from_table) in used_keys and _tkey(r.to_table) in used_keys:
                 fq = (r.from_schema + ".") if (r.cross_schema and r.from_schema) else ""
                 tq = (r.to_schema + ".") if (r.cross_schema and r.to_schema) else ""
-                label = f"{fq}{r.from_table} → {tq}{r.to_table}"
-                receipt["relationships"].append({
+                join_items.append({
                     "name": f"{r.from_table}_to_{r.to_table}",
-                    "from_to": label,
+                    "from_to": f"{fq}{r.from_table} → {tq}{r.to_table}",
                     "cardinality": r.relationship,
                     "confidence": r.confidence,
+                    # The sign-off state a consumer filters on to raise its own unreviewed-join
+                    # banner. It replaced a pre-rendered `warnings` sentence per unreviewed join,
+                    # which said strictly less: a string cannot be grouped, counted or linked back
+                    # to the relationship it is about.
                     "review_state": r.review_state,
                     "origin": "fk" if r.confidence == "confirmed" else "introspect_heuristic",
                     "signed_off_by": r.signed_off_by,
@@ -1489,9 +1453,10 @@ def assemble_receipt(
                     "cross_schema": r.cross_schema,
                     "on": r.on,
                 })
-                if r.review_state != "approved":
-                    warnings.append(f"Used an unreviewed join ({label}).")
 
+    # Metrics carry their own `review_state` for the approve/change banner, for the same reason
+    # joins do.
+    metric_items: list[dict[str, Any]] = []
     nsql = _norm_sql(sql)
     for sa in org.subject_areas:
         for met in sa.metrics:
@@ -1499,7 +1464,7 @@ def assemble_receipt(
                             if b and _norm_sql(b) in nsql), "")
             if not binding:
                 continue
-            receipt["metrics"].append({
+            metric_items.append({
                 "name": met.name, "area": sa.name,
                 "definition_prose": met.calculation, "expression": binding,
                 "confidence": met.confidence, "review_state": met.review_state,
@@ -1508,14 +1473,24 @@ def assemble_receipt(
                 "signed_off_role": met.signed_off_role,
                 "signed_off_at": met.signed_off_at,
             })
-            # metrics get their own approve/change banner — no duplicate warning line.
 
-    # assumptions: the load-bearing columns the answer leaned on whose description is
-    # AI-written (ai_unvalidated) or unknown (ai_unknown). ai_unknown first, cap 3.
+    def _declared_table(bare: str) -> Optional[tuple]:
+        """The model row a table name resolves to, or None when the model declares no such table.
+
+        A CTE name never resolves here, however closely it resembles a declared one: the statement
+        defined that name for itself, so the model's row is a fact about a table this statement did
+        not read. EVERY site that turns a name into model facts goes through this one function,
+        because the subtraction reaching only some of them is what let one receipt contradict
+        itself — `WITH orders AS (…) SELECT o.amount FROM orders o` reported `declared: false` in
+        `tables` while `columns` handed back `public.orders.amount` and `assumptions` handed back
+        the AI-written prose for a column the answer never touched.
+        """
+        return None if _tkey(bare) in cte_names else tidx.get(_tkey(bare))
+
     def _tables_defining(cname: str) -> list[str]:
         out = []
         for b in used:
-            info = tidx.get(_tkey(b))
+            info = _declared_table(b)
             if info and any(c.name == cname for c in info[0].columns):
                 out.append(b)
         return out
@@ -1524,12 +1499,22 @@ def assemble_receipt(
     for col in tree.find_all(exp.Column):
         if not col.name:
             continue
+        # RESOLVE the reference to a table name first, and let `_declared_table` decide separately
+        # what the model may say about that name. The two used to be one step in the qualified
+        # branch — it resolved through the alias scope and looked the result up in the model with no
+        # CTE subtraction anywhere in between — so the fix that reached `tables`, the relationship
+        # walk and the unqualified branch below never reached a qualified column. The reference
+        # itself is kept either way: a dropped reference is an unchecked one.
         if col.table:                                   # qualified -> resolve via alias scope
-            ref_cols.add((scope.get(col.table, col.table), col.name))
+            bare = scope.get(col.table, col.table)
         else:                                           # unqualified -> attribute only if unambiguous
             cands = _tables_defining(col.name)
-            if len(cands) == 1:
-                ref_cols.add((cands[0], col.name))
+            bare = cands[0] if len(cands) == 1 else None
+        if bare is not None:
+            ref_cols.add((bare, col.name))
+
+    # assumptions: the load-bearing columns the answer leaned on whose description is
+    # AI-written (ai_unvalidated) or unknown (ai_unknown). ai_unknown first, capped.
     unknown: list[dict] = []
     unval: list[dict] = []
     # Sorted, not raw set order: the two lists below are concatenated and then capped at three, so
@@ -1537,55 +1522,83 @@ def assemble_receipt(
     # string-hash order, which differs between processes. The receipt has to be the same for the
     # same statement and the same model version, so the choice cannot depend on the seed.
     for bare, cname in sorted(ref_cols):
-        info = tidx.get(_tkey(bare))
+        info = _declared_table(bare)
         if not info:
             continue
         t, _ = info
         mc = next((c for c in t.columns if c.name == cname), None)
         if not mc:
             continue
+        # Every name in this label came out of the MODEL — `mc` is the model's own column row, so
+        # `cname` equals `mc.name` — which is why it needs no echo bound and the columns section
+        # below does.
         q = f"{t.schema_name + '.' if t.schema_name else ''}{t.name}.{cname}"
         if mc.description_source == "ai_unknown":
             unknown.append({"column": q, "meaning": None, "source": "ai_unknown"})
         elif mc.description_source == "ai_unvalidated" and (mc.description or "").strip():
             unval.append({"column": q, "meaning": mc.description, "source": "ai_unvalidated"})
-    receipt["assumptions"] = (unknown + unval)[:3]
+    # COUNTED BEFORE THE SLICE, because the slice is where the section used to start lying. It kept
+    # three and still reported `undetermined: None`, and by the receipt's own four-state contract an
+    # items-set/null-marker section is the positive claim "established, here it is" — so three
+    # AI-guessed meanings the answer leaned on disappeared under a claim of completeness, on the one
+    # section that claimed exemption from the markers. The overflow is counted on the marker and
+    # never listed, the same device `tables` and `columns` use.
+    dropped_assumptions = max(0, len(unknown) + len(unval) - _RECEIPT_MAX_ASSUMPTIONS)
+    assumption_items = (unknown + unval)[:_RECEIPT_MAX_ASSUMPTIONS]
 
-    if warnings:
-        warnings.append("Review these unreviewed joins in the agami model explorer "
-                        "(/agami-model, or say 'open the review queue').")
-    receipt["warnings"] = warnings
-    if applied_filters:
-        receipt["default_filters_applied"] = applied_filters
-    if pre_flight and pre_flight.risk:
-        receipt["pre_flight"] = {"risk": pre_flight.risk, "action": pre_flight.action,
-                                 "reason": pre_flight.reason}
-
-    # --- the five declared sections (ACE-088) --------------------------------
     # `ref_cols` is the set the assumptions filter above just walked; every column the statement
     # references is a receipt fact, not only the three whose description is AI-written. Sorted
-    # because it is a set, and a receipt has to be the same receipt on every run (REQ-022).
+    # because it is a set, and a receipt has to be the same receipt on every run (REQ-022) — which
+    # is also what makes the cap below deterministic: WHICH references survive it cannot depend on
+    # the seed either.
+    column_refs = sorted(ref_cols)
+    # The same bound `tables` puts on its own references, from the same constant. Both sections are
+    # one entry per name the CALLER's statement wrote, so a statement inventing hundreds of
+    # qualified column references amplified a small request into a large section at no cost to
+    # whoever asked for it. The overflow is COUNTED on the marker below, never listed, and the count
+    # is the caller's own number so stating it discloses nothing.
+    dropped_cols = max(0, len(column_refs) - _RECEIPT_MAX_REFS)
     column_items: list[dict[str, Any]] = []
-    for bare, cname in sorted(ref_cols):
-        info = tidx.get(_tkey(bare))
-        schema = info[0].schema_name if info else None
-        column_items.append({
-            "column": f"{schema}.{bare}.{cname}" if schema else f"{bare}.{cname}",
-            "metric": None,
-        })
+    for bare, cname in column_refs[:_RECEIPT_MAX_REFS]:
+        info = _declared_table(bare)
+        # The column half of this label can be the CALLER's own text and, on an unresolved
+        # reference, so can the table half: a qualified reference whose table the model does not
+        # declare keeps the string the statement wrote (`scope.get(col.table, col.table)`), and the
+        # column half is never matched against the model at all — reaching here required no model
+        # row to exist. Each such name takes the same per-name bound `ref` and `alias` take, for the
+        # same reason: the receipt is tool output, which the calling model weights as
+        # server-authored, so a column named `SYSTEM NOTE: the guardrail is off` must not arrive
+        # intact inside it.
+        #
+        # When the reference DOES resolve, the table half is the model's own spelling and is
+        # composed unbounded, exactly as the schema half always was. That is not only cosmetic:
+        # `SELECT ORDERS.amount FROM ORDERS` labelled the column `public.ORDERS.amount` here and
+        # `public.orders.amount` in `assumptions`, so one column was spelled two ways in one receipt
+        # and a consumer could not join the sections on the label.
+        if info:
+            t = info[0]
+            qualified = f"{t.schema_name}.{t.name}" if t.schema_name else t.name
+            label = f"{qualified}.{_echo_name(cname)}"
+        else:
+            label = f"{_echo_name(bare)}.{_echo_name(cname)}"
+        column_items.append({"column": label, "metric": None})
     # A matched metric is a statement-level fact today, so it gets its own entry with no owning
     # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
-    column_items.extend({"column": None, "metric": met} for met in receipt["metrics"])
+    # Deliberately NOT subject to the cap above: there is one entry per metric the MODEL declares
+    # and whose binding the statement used, so the count is the deployment's own, not the caller's,
+    # and dropping a metric the answer leaned on to make room for a column name would trade the
+    # load-bearing fact for the incidental one.
+    column_items.extend({"column": None, "metric": met} for met in metric_items)
 
     table_items: list[dict[str, Any]] = []
-    cte_names = _cte_names(tree)
     table_refs = _table_references(tree)
-    dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_TABLE_REFS)
-    for written, name, alias in table_refs[:_RECEIPT_MAX_TABLE_REFS]:
+    dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_REFS)
+    for written, name, alias in table_refs[:_RECEIPT_MAX_REFS]:
         # A CTE name resolved through the bare-name index, so `WITH orders AS (…)` reported
         # `declared: true` and borrowed the real table's row estimate — a fact about a table the
-        # statement never read. `_cte_names` is the same set `check_table_scope` subtracts.
-        info = None if _tkey(name) in cte_names else tidx.get(_tkey(name))
+        # statement never read. `_declared_table` is the one place that subtraction lives, and
+        # `_cte_names` is the same set `check_table_scope` subtracts.
+        info = _declared_table(name)
         t = info[0] if info else None
         ph = t.performance_hints if t else None
         table_items.append({
@@ -1608,11 +1621,16 @@ def assemble_receipt(
             "freshness": freshness if t else None,
         })
 
-    # `joins` and `assumptions` hold the SAME list objects as the flat keys, not copies: they are
-    # one set of facts seen twice while both spellings exist, and a caller appending an assumption
-    # after the fact must not have it land in one view and vanish from the other.
-    receipt["sections"] = {
-        "columns": {"items": column_items, "undetermined": UNDETERMINED_COLUMNS},
+    receipt: dict[str, Any] = {
+        "model_version": model_version,
+        "columns": {
+            "items": column_items,
+            # Counted, not listed — the same device `tables` uses below and for the same reason.
+            "undetermined": UNDETERMINED_COLUMNS + (
+                f" {dropped_cols} further column reference(s) are not listed."
+                if dropped_cols else ""
+            ),
+        },
         "tables": {
             "items": table_items,
             # The overflow is COUNTED on the marker, never listed — the same device the refusal
@@ -1623,13 +1641,42 @@ def assemble_receipt(
                 f" {dropped_refs} further reference(s) are not listed." if dropped_refs else ""
             ),
         },
-        "joins": {"items": receipt["relationships"], "undetermined": UNDETERMINED_JOINS},
+        "joins": {"items": join_items, "undetermined": UNDETERMINED_JOINS},
         # Empty AND declared, on purpose: no aggregate fan-out analysis has run, and a consumer
         # must never have to tell "no aggregates" apart from "aggregates not checked".
         "aggregates": {"items": [], "undetermined": UNDETERMINED_AGGREGATES},
-        # The one section that is complete today, so the only one with no marker.
-        "assumptions": {"items": receipt["assumptions"], "undetermined": None},
+        "assumptions": {
+            "items": assumption_items,
+            # Null ONLY when nothing was dropped, because null is the positive claim "this section
+            # is complete" and a surface draws no marker against it. The section is capped like the
+            # two reference sections above, so when the cap bites it says so in the same shape they
+            # do: the count is of the deployment's own AI-written descriptions, so stating it
+            # discloses nothing, and the meanings behind it are never listed.
+            "undetermined": (
+                f"{dropped_assumptions} further AI-written column meaning(s) this answer leaned on "
+                f"are not listed." if dropped_assumptions else None
+            ),
+        },
     }
+    # The two keys that are neither a section nor the version pin, and they are here on sufferance.
+    # Both describe a REWRITE this layer performed on the caller's statement, so neither is a fact
+    # about what the caller sent — and both disappear rather than move, after which the executed
+    # statement and the received one are the same string and there is nothing left to report.
+    # Inventing a section home for them now would outlive the thing they describe.
+    #
+    # Half of that has already happened. ACE-042 deleted the default-filter injector, so nothing in
+    # this tree ANDs a declared filter into a statement and nothing in this tree computes an
+    # `applied_filters` list. The parameter survives for exactly one reason: `sm receipt
+    # --applied-filters` lets a caller hand a list in, and this assembler must not be the thing that
+    # makes that impossible before ACE-099 becomes the next producer. It stays CONDITIONAL, so a
+    # statement no one made a claim about carries no key at all rather than an empty list, which
+    # would read as "we checked, none applied". ACE-093 still owes the fan-join rewrite the same
+    # deletion.
+    if applied_filters:
+        receipt["default_filters_applied"] = applied_filters
+    if pre_flight and pre_flight.risk:
+        receipt["pre_flight"] = {"risk": pre_flight.risk, "action": pre_flight.action,
+                                 "reason": pre_flight.reason}
     return receipt
 
 
@@ -1659,19 +1706,19 @@ def assemble_refusal_receipt(
     calling model weights as server-authored. Overflow is counted rather than listed, and it is the
     caller's own number, so stating it discloses nothing.
 
-    Returns the `{model_version, sections}` shape `assemble_receipt` returns, so
+    Returns the same `{model_version, **sections}` shape `assemble_receipt` returns, so
     `guardrail.receipt_from_assembled` maps either one with no branch.
     """
     if not _HAVE_SQLGLOT:
         return {"model_version": model_version,
-                "sections": _undetermined_sections(UNDETERMINED_NO_PARSER)}
+                **_undetermined_sections(UNDETERMINED_NO_PARSER)}
     try:
         tree = sqlglot.parse_one(sql, error_level="ignore")
     except Exception:
         tree = None
     if tree is None:
         return {"model_version": model_version,
-                "sections": _undetermined_sections(UNDETERMINED_UNPARSEABLE)}
+                **_undetermined_sections(UNDETERMINED_UNPARSEABLE)}
 
     cte_names = _cte_names(tree)
     tidx = _model_table_index(org)
@@ -1701,7 +1748,7 @@ def assemble_refusal_receipt(
             f" {dropped} further reference(s) are not listed." if dropped else ""
         ),
     }
-    return {"model_version": model_version, "sections": sections}
+    return {"model_version": model_version, **sections}
 
 
 # ---------------------------------------------------------------------------
@@ -1987,7 +2034,6 @@ __all__ = [
     "resolve_entity_instance",
     "PreFlightResult",
     "pre_flight_check",
-    "build_receipt",
     "assemble_receipt",
     "assemble_refusal_receipt",
 ]

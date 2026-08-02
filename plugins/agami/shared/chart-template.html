@@ -27,21 +27,74 @@
     AGAMI_LOGO_DARK_TEXT   — full SVG content of shared/agami-logo-dark.svg  (light bg)
     AGAMI_LOGO_LIGHT_TEXT  — full SVG content of shared/agami-logo-light.svg (dark bg)
 
-  RECEIPT_JSON schema — single object (not array):
+  RECEIPT_JSON schema — single object (not array). Five SECTIONS, each of them
+  {"items": [...], "undetermined": "<sentence>" | null}, beside the model-version pin:
+
     {
-      "model_version":   "string — short content hash of the model snapshot (.snapshots/<hash>/)",
-      "tables_used":     [{"qname":"public.orders", "rows":5000, "freshness":"2026-05-09T23:00:00Z (nightly batch)"}, ...],
-      "relationships":   [{"name":"orders_to_customers","from_to":"orders → customers",
-                           "confidence":"inferred","review_state":"unreviewed","origin":"introspect_heuristic"}, ...],
-      "metrics":         [{"name":"revenue","area":"sales","definition_prose":"...","review_state":"approved",
-                           "signed_off_by":"jane@x.com","signed_off_role":"cfo","signed_off_at":"2026-03-15T10:00:00Z"},
-                          // on-the-fly calc the user hasn't approved → drives the top approve/change banner:
-                          {"name":"gross_margin","area":"sales","definition_prose":"(net_revenue - cogs) / net_revenue",
-                           "expression":"(SUM(nr)-SUM(cogs))/NULLIF(SUM(nr),0)","review_state":"unreviewed","origin":"ad_hoc"}, ...],
-      "named_filters":   [{"name":"active_customer","expression":"...","definition_prose":"..."}, ...],
-      "assumptions":     [{"column":"sales.orders.amount","meaning":"net revenue, USD","source":"ai_unvalidated"}, ...],
-      "warnings":        ["⚠ Used 1 unreviewed join (orders → customers, conf 0.62). Review now?", ...]
+      "model_version": "string — short content hash of the model snapshot (.snapshots/<hash>/), or null",
+
+      // Every column the statement referenced, PLUS the model metrics whose binding SQL appears
+      // in it. A metric match is a statement-level fact today, so it rides here with no owning
+      // column: `column` null, `metric` set. A plain column reference is the mirror image.
+      "columns": {"items": [{"column": "public.orders.amount", "metric": null},
+                            {"column": null,
+                             "metric": {"name":"revenue","area":"sales","definition_prose":"...",
+                                        "expression":"SUM(amount)","confidence":"...",
+                                        "review_state":"approved","origin":"model",
+                                        "signed_off_by":"you@example.com","signed_off_role":"cfo",
+                                        "signed_off_at":"2026-03-15T10:00:00Z"}}],
+                  "undetermined": "..."},
+
+      // ONE ENTRY PER REFERENCE, not per table: a table read twice appears twice, which is what
+      // lets a filter satisfied inside a CTE and absent outside it be reported accurately.
+      // `ref` is the name AS THE STATEMENT WROTE IT; `qname` is what the model resolved it to.
+      // An UNDECLARED reference (a CTE name, say) carries declared:false and null qname / rows /
+      // rows_as_of / freshness, because there is no model row for those to be about.
+      "tables": {"items": [{"ref":"orders","alias":"o","qname":"public.orders","declared":true,
+                            "rows":5000,"rows_as_of":"2026-05-01",
+                            "freshness":"2026-05-09T23:00:00Z (nightly batch)"}],
+                 "undetermined": "..."},
+
+      "joins": {"items": [{"name":"orders_to_customers","from_to":"orders → customers",
+                           "cardinality":"many_to_one","confidence":"inferred",
+                           "review_state":"unreviewed","origin":"introspect_heuristic",
+                           "signed_off_by":null,"signed_off_role":null,"signed_off_at":null,
+                           "cross_schema":false,"on":"orders.customer_id = customers.id"}],
+                "undetermined": "..."},
+
+      "aggregates": {"items": [], "undetermined": "..."},
+
+      // Capped at three: a person confirms three prose meanings next to an answer, not forty. The
+      // marker is null when they all fit and COUNTS the rest when they do not — it is never null
+      // over a truncated list, because null is the claim "this is all of them".
+      "assumptions": {"items": [{"column":"sales.orders.amount","meaning":"net revenue, USD",
+                                 "source":"ai_unvalidated"}],
+                      "undetermined": null},
+
+      // Conditional, CLI path only — present when there is something to report.
+      "default_filters_applied": ["orders.deleted_at IS NULL"],
+      "pre_flight": {"risk":"...","action":"...","reason":"..."}
     }
+
+  `undetermined` IS LOAD-BEARING, and this surface renders it. It is the sentence saying what the
+  section did NOT establish, and it is the only thing that tells an empty section apart from an
+  unchecked one:
+
+      items set,   undetermined null : established, here it is.
+      items empty, undetermined null : checked, and there was nothing to report.
+      items empty, undetermined set  : NOT checked, and here is why.
+      items set,   undetermined set  : partly established, and here is what is missing.
+
+  Render the marker. A section drawn as items-only turns "not checked" back into "clean", which
+  is the exact defect the marker exists to remove. `aggregates` ships empty WITH a marker today,
+  so a correct rendering visibly says aggregates were not checked; that is honest, not a bug.
+
+  There is no `warnings` key. The unreviewed-join banner is DERIVED here, from `joins.items`
+  filtered to review_state != "approved": a review state can be counted, grouped and linked back
+  to the join it is about, and a pre-rendered sentence cannot. There is no `named_filters` key
+  (nothing ever produced one) and no `sql` key (each section carries its own `sql` in
+  SECTIONS_JSON, and the tool response carries the statement on the body).
+
   Pass `null` for RECEIPT_JSON on legacy callers that don't yet build a receipt.
 
   SECTIONS_JSON schema — array of these objects, one per section:
@@ -235,6 +288,7 @@
       line-height: 1.5;
     }
     .trust-warning-banner ul { margin: 4px 0 0; padding-left: 20px; }
+    .trust-warning-banner p.trust-warning-cta { margin: 8px 0 0; }
     @media (prefers-color-scheme: dark) {
       .trust-warning-banner {
         background: #422006;
@@ -305,6 +359,27 @@
     .receipt-body h4:first-child { margin-top: 0; }
     .receipt-body ul { margin: 0; padding-left: 20px; }
     .receipt-body li { margin: 4px 0; line-height: 1.5; }
+    .receipt-body h5 {
+      font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+      color: var(--muted); margin: 10px 0 4px; text-transform: none;
+    }
+    /* The "what this section did NOT establish" sentence. Styled to be READ, not skimmed past:
+       an unchecked section that looks like a clean one is the whole defect the marker removes. */
+    .receipt-undetermined {
+      margin: 6px 0 0; padding: 8px 10px;
+      border-left: 3px solid #f59e0b;
+      background: rgba(245, 158, 11, 0.08);
+      border-radius: 0 6px 6px 0;
+      font-size: 12px; line-height: 1.5;
+    }
+    .receipt-undetermined .lbl {
+      display: inline-block; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.06em; font-size: 10px; margin-right: 6px;
+    }
+    .receipt-empty { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+    .receipt-note { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+    .receipt-cols { margin: 0; font-size: 12px; line-height: 1.9; word-break: break-word; }
+    .receipt-cols code { margin-right: 2px; }
     .receipt-meta {
       font-size: 11px;
       color: var(--muted);
@@ -510,11 +585,110 @@
     const feedback = {};  // sectionIdx -> {title, originalSql, sql|null, note|null}
     // Metric approve/change decisions made in the top banner, queued for the same paste-back.
     const metricFeedback = {};  // metricName -> {name, area, definition, action:'approve'|'change', newDefinition|null}
+    // ---- Reading the receipt ------------------------------------------------------------
+    // Every section is `{items, undetermined}`. The two fields are independent and BOTH are
+    // rendered: `items` is what the section established, `undetermined` is the sentence saying
+    // what it did not. An empty `items` with a marker means "not checked"; an empty `items` with
+    // a null marker means "checked, found nothing". Drawing the two the same way is how silence
+    // starts reading as clean, so nothing below is allowed to drop the marker.
+    function sectionOf(name) {
+      const s = receipt && receipt[name];
+      return (s && typeof s === 'object' && !Array.isArray(s)) ? s : null;
+    }
+    function itemsOf(name) {
+      const s = sectionOf(name);
+      return (s && Array.isArray(s.items)) ? s.items : [];
+    }
+    function markerOf(name) {
+      const s = sectionOf(name);
+      const u = s ? s.undetermined : null;
+      return (typeof u === 'string' && u.trim()) ? u.trim() : null;
+    }
+    // The metrics this answer used. They live in `columns.items`: a metric match is a
+    // statement-level fact today rather than a per-column one, so it rides as an entry with no
+    // owning column.
+    function receiptMetrics() {
+      return itemsOf('columns').map(i => i && i.metric).filter(Boolean);
+    }
+    // The plain column references, i.e. the other half of the same section.
+    function receiptColumns() {
+      return itemsOf('columns').filter(i => i && i.column).map(i => i.column);
+    }
+    // The joins the answer leaned on that nobody has signed off. This is DERIVED rather than read
+    // from a pre-rendered list of warning sentences: a review state can be counted, grouped and
+    // linked back to the relationship it is about; a string cannot.
+    function unreviewedJoins() {
+      return itemsOf('joins').filter(
+        j => j && (j.review_state || 'unreviewed').toLowerCase() !== 'approved');
+    }
     // A metric the answer used but the user hasn't signed off — either unreviewed in the model
     // or calculated on the fly (origin "ad_hoc"). approved/rejected don't need the banner.
     function metricNeedsApproval(m) {
       const rs = (m && m.review_state || 'unreviewed').toLowerCase();
       return rs !== 'approved' && rs !== 'rejected';
+    }
+    // Display a sign-off role nicely: known roles use their canonical label, acronyms
+    // upper-case (cto → CTO), free-text title-cases (data engineer → Data Engineer).
+    function prettifyRole(role) {
+      if (!role) return '';
+      const key = String(role).trim().toLowerCase();
+      const KNOWN = { cfo: 'CFO', cto: 'CTO', ceo: 'CEO', coo: 'COO', cio: 'CIO', cdo: 'CDO',
+                      data_lead: 'Data Lead', engineer: 'Engineer', analyst: 'Analyst' };
+      if (KNOWN[key]) return KNOWN[key];
+      const ACR = { cto: 'CTO', ceo: 'CEO', cfo: 'CFO', coo: 'COO', cio: 'CIO', cdo: 'CDO',
+                    vp: 'VP', pm: 'PM', bi: 'BI', hr: 'HR', it: 'IT' };
+      return key.replace(/_/g, ' ').split(/\s+/).filter(Boolean)
+        .map(w => ACR[w] || (w.charAt(0).toUpperCase() + w.slice(1))).join(' ');
+    }
+    // Build a readable approval phrase like:
+    //   "auto-approved (FK declared in DB)"
+    //   "approved by you@example.com (CFO), Mar 15"
+    //   "unreviewed (confidence inferred)"
+    // Shared by the trust banner at the top and the provenance panel at the bottom, so one
+    // relationship never gets described two ways in one report.
+    function approvalPhrase(entry) {
+      const state = (entry.review_state || 'unreviewed').toLowerCase();
+      if (state === 'approved') {
+        // System-approved (auto) vs human-approved.
+        if (entry.signed_off_by === 'agami_introspect_v1' || entry.signed_off_role === 'system') {
+          const reasons = {
+            fk:                    'FK declared in DB',
+            column_comment:        'DBA-authored column comment',
+            introspect_heuristic:  'unique-index + name match',
+          };
+          const why = reasons[entry.origin] || 'introspect signal';
+          return 'auto-approved (' + why + ')';
+        }
+        let txt = 'approved';
+        if (entry.signed_off_by) {
+          txt += ' by ' + entry.signed_off_by;
+          if (entry.signed_off_role && entry.signed_off_role !== 'system') {
+            txt += ' (' + prettifyRole(entry.signed_off_role) + ')';
+          }
+        }
+        if (entry.signed_off_at) {
+          const d = new Date(entry.signed_off_at);
+          if (!isNaN(d.getTime())) {
+            txt += ', ' + d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+          }
+        }
+        return txt;
+      }
+      if (state === 'rejected') return 'rejected';
+      if (state === 'stale')    return 'stale (schema drift — needs reconciliation)';
+      // unreviewed. `confidence` is a LABEL (confirmed / inferred / proposed), never a number — the
+      // branch here used to be `typeof entry.confidence === 'number' ? toFixed(2) : '?'`, which
+      // never matched, so every unreviewed entry read "confidence ?" to every user who opened the
+      // panel. An entry with no confidence at all (a metric composed for this one answer) says so
+      // rather than inventing an "unknown" label the model never uses.
+      if (entry.origin === 'ad_hoc') return 'calculated for this answer, not yet in your model';
+      return entry.confidence
+        ? 'unreviewed (confidence ' + entry.confidence + ')'
+        : 'unreviewed, not signed off';
+    }
+    function badge(state) {
+      const cls = (state || 'unreviewed').toLowerCase();
+      return el('span', { class: 'conf-badge ' + cls, text: state || 'unreviewed' });
     }
     function storeFeedback(i, sec, sqlVal, noteVal) {
       const orig = (sec.sql || '').trim();
@@ -730,8 +904,8 @@
     // Every metric this answer used that the user hasn't signed off — whether it's an
     // unreviewed model metric or one agami calculated on the fly. Each gets Approve / Change
     // controls; the choice queues into the same paste-back that goes back to Claude.
-    if (receipt && Array.isArray(receipt.metrics)) {
-      const unapproved = receipt.metrics.filter(metricNeedsApproval);
+    if (receipt) {
+      const unapproved = receiptMetrics().filter(metricNeedsApproval);
       if (unapproved.length) {
         const wrap = document.querySelector('.wrap');
         const body0 = document.getElementById('report-body');
@@ -820,23 +994,44 @@
       }
     }
 
-    // ---- Trust warning banner (top of report, only if there are warnings) ----
-    if (receipt && Array.isArray(receipt.warnings) && receipt.warnings.length > 0) {
-      const wrap = document.querySelector('.wrap');
-      const banner = el('div', { class: 'trust-warning-banner' });
-      const intro = el('strong', { text: 'Trust note' });
-      banner.appendChild(intro);
-      banner.appendChild(document.createTextNode(' — '));
-      if (receipt.warnings.length === 1) {
-        banner.appendChild(document.createTextNode(receipt.warnings[0]));
-      } else {
+    // ---- Trust warning banner (top of report, only if an unreviewed join was used) ----
+    // DERIVED from the joins section, not handed over as a list of pre-rendered sentences. The
+    // receipt used to carry a `warnings` array whose entries were already prose; a surface could
+    // only print them. Reading `review_state` instead lets this count them, name each relationship,
+    // and link the reader at the queue that clears them.
+    if (receipt) {
+      const unreviewed = unreviewedJoins();
+      if (unreviewed.length) {
+        const wrap = document.querySelector('.wrap');
+        const banner = el('div', { class: 'trust-warning-banner' });
+        const n = unreviewed.length;
+        banner.appendChild(el('strong', { text: 'Trust note' }));
+        banner.appendChild(document.createTextNode(
+          ' — this answer used ' + n + ' join' + (n === 1 ? '' : 's') + ' nobody has signed off yet. '
+          // The same count decides both sentences, so it reuses the same ternary: the second one
+          // stayed singular while the first said "3 joins", and a banner that cannot count reads
+          // as a template nobody proofread.
+          + 'agami still answered; the join' + (n === 1 ? ' it leaned on is' : 's it leaned on are')
+          + ' just not confirmed.'));
         const ul = el('ul');
-        receipt.warnings.forEach(w => ul.appendChild(el('li', { text: w })));
+        unreviewed.forEach(j => {
+          const li = el('li');
+          li.appendChild(el('code', { text: j.from_to || j.name || '(unnamed join)' }));
+          if (j.cardinality) li.appendChild(document.createTextNode(' (' + j.cardinality + ')'));
+          li.appendChild(document.createTextNode(' — ' + approvalPhrase(j)));
+          ul.appendChild(li);
+        });
         banner.appendChild(ul);
+        // The call to action the pre-rendered warning list used to end with. It is re-authored here
+        // because it is a fact about THIS surface (where to go to clear the queue), not a fact about
+        // the statement, so the assembler is the wrong place for it.
+        banner.appendChild(el('p', { class: 'trust-warning-cta', text:
+          'Review these unreviewed joins in the agami model explorer (/agami-model, or say '
+          + '“open the review queue”).' }));
+        // Insert before the report body
+        const body0 = document.getElementById('report-body');
+        wrap.insertBefore(banner, body0);
       }
-      // Insert before the report body
-      const body0 = document.getElementById('report-body');
-      wrap.insertBefore(banner, body0);
     }
 
     // ---- Sections ----
@@ -1108,23 +1303,78 @@
     });
 
     // ---- Trust receipt panel (bottom of report, collapsed by default) ----
+    // Renders BOTH halves of every section: what it established, and the `undetermined` sentence
+    // saying what it did not. A section drawn as items-only reads as clean when it was never
+    // checked, which is the exact confusion the marker exists to remove, so the marker is drawn
+    // whatever the item count — "50 references listed, none accounted for against the model's
+    // filters" is as real a gap as "nothing checked at all".
     if (receipt) {
       const det = el('details', { class: 'trust-receipt' });
       det.appendChild(el('summary', { text: 'Provenance for this answer' }));
       const rb = el('div', { class: 'receipt-body' });
 
-      function badge(state) {
-        const cls = (state || 'unreviewed').toLowerCase();
-        return el('span', { class: 'conf-badge ' + cls, text: state || 'unreviewed' });
+      // One section: heading, an optional blurb, the items, then the marker. `renderItems` is only
+      // called when there is something to draw; the three empty cases are handled here so no
+      // section can accidentally render "nothing" as "nothing wrong".
+      function renderSection(name, heading, blurb, renderItems) {
+        const sec = sectionOf(name);
+        rb.appendChild(el('h4', { text: heading }));
+        if (!sec) {
+          // Absent is not empty. A receipt built by hand that dropped a section cannot be shown as
+          // "checked, found nothing"; render_chart.py rejects such a receipt, so this only catches
+          // one that reached the template some other way.
+          rb.appendChild(el('p', { class: 'receipt-empty', text:
+            'This receipt carried no such section, so nothing here was reported either way.' }));
+          return;
+        }
+        const list = Array.isArray(sec.items) ? sec.items : [];
+        const marker = markerOf(name);
+        if (list.length) {
+          // The blurb is ABOUT the items ("these column meanings come from agami, not from you…"),
+          // so it is drawn only when there are items. Appended above the branch, an answer with no
+          // assumptions drew "If one is wrong, tell agami in chat" directly above "Checked, and
+          // there was nothing to report."
+          if (blurb) rb.appendChild(el('div', { class: 'receipt-note', text: blurb }));
+          renderItems(list);
+        } else if (!marker) {
+          rb.appendChild(el('p', { class: 'receipt-empty',
+            text: 'Checked, and there was nothing to report.' }));
+        }
+        if (marker) {
+          const box = el('div', { class: 'receipt-undetermined' });
+          box.appendChild(el('span', { class: 'lbl', text: 'Not established' }));
+          box.appendChild(document.createTextNode(' ' + marker));
+          rb.appendChild(box);
+        }
       }
 
-      // Tables touched
-      if (Array.isArray(receipt.tables_used) && receipt.tables_used.length) {
-        rb.appendChild(el('h4', { text: 'Tables touched' }));
+      // Tables touched — ONE ENTRY PER REFERENCE, not per table, so a table read twice is listed
+      // twice. `ref` is what the statement wrote; `qname` is what the model resolved it to.
+      renderSection('tables', 'Tables touched', null, list => {
         const ul = el('ul');
-        receipt.tables_used.forEach(t => {
+        list.forEach(t => {
           const li = el('li');
-          li.appendChild(el('code', { text: t.qname || '<unknown>' }));
+          li.appendChild(el('code', { text: t.ref || '(unnamed reference)' }));
+          if (t.alias && t.alias !== t.ref) {
+            li.appendChild(el('span', { class: 'receipt-meta', text: ' as ' + t.alias }));
+          }
+          if (t.qname && t.qname !== t.ref) {
+            li.appendChild(document.createTextNode(' → '));
+            li.appendChild(el('code', { text: t.qname }));
+          }
+          if (t.declared === false) {
+            // An undeclared reference has no model row, so there is no row estimate and no
+            // freshness for it to be about. Say that, rather than leaving three blank cells that
+            // read as "agami forgot".
+            li.appendChild(document.createTextNode(' '));
+            li.appendChild(el('span', { class: 'conf-badge stale', text: 'not a modelled table' }));
+            li.appendChild(el('br'));
+            li.appendChild(el('span', { class: 'receipt-meta', text:
+              'The model declares no table by this name (typically a CTE or subquery the statement '
+              + 'named for itself), so there is no row estimate or freshness to report.' }));
+            ul.appendChild(li);
+            return;
+          }
           if (t.rows !== undefined && t.rows !== null) {
             // estimated_row_count is an introspection-time ESTIMATE — mark it (≈) and, when
             // we know when the count was last checked (`rows_as_of`), say so.
@@ -1148,143 +1398,102 @@
           ul.appendChild(li);
         });
         rb.appendChild(ul);
-      }
+      });
 
-      // Build a readable approval phrase like:
-      //   "auto-approved (FK declared in DB)"
-      //   "approved by jane@example.com (cfo), Mar 15"
-      //   "unreviewed (confidence inferred)"
-      // Display a sign-off role nicely: known roles use their canonical label, acronyms
-      // upper-case (cto → CTO), free-text title-cases (data engineer → Data Engineer).
-      function prettifyRole(role) {
-        if (!role) return '';
-        const key = String(role).trim().toLowerCase();
-        const KNOWN = { cfo: 'CFO', cto: 'CTO', ceo: 'CEO', coo: 'COO', cio: 'CIO', cdo: 'CDO',
-                        data_lead: 'Data Lead', engineer: 'Engineer', analyst: 'Analyst' };
-        if (KNOWN[key]) return KNOWN[key];
-        const ACR = { cto: 'CTO', ceo: 'CEO', cfo: 'CFO', coo: 'COO', cio: 'CIO', cdo: 'CDO',
-                      vp: 'VP', pm: 'PM', bi: 'BI', hr: 'HR', it: 'IT' };
-        return key.replace(/_/g, ' ').split(/\s+/).filter(Boolean)
-          .map(w => ACR[w] || (w.charAt(0).toUpperCase() + w.slice(1))).join(' ');
-      }
-
-      function approvalPhrase(entry) {
-        const state = (entry.review_state || 'unreviewed').toLowerCase();
-        if (state === 'approved') {
-          // System-approved (auto) vs human-approved.
-          if (entry.signed_off_by === 'agami_introspect_v1' || entry.signed_off_role === 'system') {
-            const reasons = {
-              fk:                    'FK declared in DB',
-              column_comment:        'DBA-authored column comment',
-              introspect_heuristic:  'unique-index + name match',
-            };
-            const why = reasons[entry.origin] || 'introspect signal';
-            return 'auto-approved (' + why + ')';
-          }
-          let txt = 'approved';
-          if (entry.signed_off_by) {
-            txt += ' by ' + entry.signed_off_by;
-            if (entry.signed_off_role && entry.signed_off_role !== 'system') {
-              txt += ' (' + prettifyRole(entry.signed_off_role) + ')';
-            }
-          }
-          if (entry.signed_off_at) {
-            const d = new Date(entry.signed_off_at);
-            if (!isNaN(d.getTime())) {
-              txt += ', ' + d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-            }
-          }
-          return txt;
-        }
-        if (state === 'rejected') return 'rejected';
-        if (state === 'stale')    return 'stale (schema drift — needs reconciliation)';
-        // unreviewed
-        const c = (typeof entry.confidence === 'number') ? entry.confidence.toFixed(2) : '?';
-        return 'unreviewed (confidence ' + c + ')';
-      }
-
-      // Relationships used
-      if (Array.isArray(receipt.relationships) && receipt.relationships.length) {
-        rb.appendChild(el('h4', { text: 'Relationships used' }));
+      // Relationships used. Same items the trust banner at the top filtered for its warning, so a
+      // join flagged up there is findable down here with its full sign-off trail.
+      renderSection('joins', 'Relationships used', null, list => {
         const ul = el('ul');
-        receipt.relationships.forEach(r => {
+        list.forEach(r => {
           const li = el('li');
           li.appendChild(el('code', { text: r.from_to || r.name || '<unknown>' }));
+          if (r.cardinality) {
+            li.appendChild(el('span', { class: 'receipt-meta', text: ' (' + r.cardinality + ')' }));
+          }
           li.appendChild(document.createTextNode(' — '));
           li.appendChild(document.createTextNode(approvalPhrase(r)));
           li.appendChild(document.createTextNode(' '));
           li.appendChild(badge(r.review_state));
-          ul.appendChild(li);
-        });
-        rb.appendChild(ul);
-      }
-
-      // Metrics used
-      if (Array.isArray(receipt.metrics) && receipt.metrics.length) {
-        rb.appendChild(el('h4', { text: 'Metric definitions invoked' }));
-        const ul = el('ul');
-        receipt.metrics.forEach(m => {
-          const li = el('li');
-          // identifier → monospace <code> (like relationships) so snake_case names read
-          // as identifiers, not bold prose where underscores look like a strikethrough.
-          li.appendChild(el('code', { text: m.name || '<unnamed>' }));
-          li.appendChild(document.createTextNode(' '));
-          li.appendChild(badge(m.review_state));   // metrics get the trust badge too, not just relationships
-          if (m.definition_prose) {
-            li.appendChild(document.createTextNode(' — ' + m.definition_prose));
-          }
-          li.appendChild(el('br'));
-          li.appendChild(el('span', { class: 'receipt-meta', text: approvalPhrase(m) }));
-          ul.appendChild(li);
-        });
-        rb.appendChild(ul);
-      }
-
-      // Named filters used
-      if (Array.isArray(receipt.named_filters) && receipt.named_filters.length) {
-        rb.appendChild(el('h4', { text: 'Named filters applied' }));
-        const ul = el('ul');
-        receipt.named_filters.forEach(nf => {
-          const li = el('li');
-          li.appendChild(el('code', { text: nf.name || '<unnamed>' }));
-          if (nf.review_state) {
-            li.appendChild(document.createTextNode(' '));
-            li.appendChild(badge(nf.review_state));
-          }
-          if (nf.definition_prose) {
-            li.appendChild(document.createTextNode(' — ' + nf.definition_prose));
-          }
-          if (nf.expression) {
+          if (r.on) {
+            // LABELLED, and labelled "declared": this is the predicate the MODEL declares, and the
+            // marker directly under this list says the predicate the statement actually joined on
+            // was not read out of the SQL. Drawn bare, the two sat next to each other and a reader
+            // took this string for the condition that ran.
             li.appendChild(el('br'));
-            li.appendChild(el('code', { text: nf.expression }));
+            li.appendChild(el('span', { class: 'receipt-meta', text: 'declared predicate: ' }));
+            li.appendChild(el('code', { class: 'receipt-meta', text: r.on }));
           }
           ul.appendChild(li);
         });
         rb.appendChild(ul);
-      }
+      });
+
+      // Columns and metrics are ONE section of the receipt, and they share one marker: the gap the
+      // marker names is precisely that a matched metric cannot yet be tied to the column it
+      // computes. So they are drawn under one heading, metrics first because they are the
+      // load-bearing half, and the marker lands once, under both.
+      renderSection('columns', 'Columns and metric definitions used', null, () => {
+        const metrics = receiptMetrics();
+        const columns = receiptColumns();
+        if (metrics.length) {
+          rb.appendChild(el('h5', { text: 'Metric definitions invoked' }));
+          const ul = el('ul');
+          metrics.forEach(m => {
+            const li = el('li');
+            // identifier → monospace <code> (like relationships) so snake_case names read
+            // as identifiers, not bold prose where underscores look like a strikethrough.
+            li.appendChild(el('code', { text: m.name || '<unnamed>' }));
+            li.appendChild(document.createTextNode(' '));
+            li.appendChild(badge(m.review_state));   // metrics get the trust badge too, not just relationships
+            if (m.definition_prose) {
+              li.appendChild(document.createTextNode(' — ' + m.definition_prose));
+            }
+            li.appendChild(el('br'));
+            li.appendChild(el('span', { class: 'receipt-meta', text: approvalPhrase(m) }));
+            ul.appendChild(li);
+          });
+          rb.appendChild(ul);
+        }
+        if (columns.length) {
+          rb.appendChild(el('h5', { text: 'Columns referenced' }));
+          const p = el('p', { class: 'receipt-cols' });
+          columns.forEach((c, i) => {
+            p.appendChild(el('code', { text: c }));
+            if (i < columns.length - 1) p.appendChild(document.createTextNode(', '));
+          });
+          rb.appendChild(p);
+        }
+      });
+
+      // Declared and empty on purpose: no fan-out analysis has run, so this section exists to say
+      // so. A reader must never have to tell "no aggregates" apart from "aggregates not checked".
+      renderSection('aggregates', 'Aggregates', null, list => {
+        const ul = el('ul');
+        list.forEach(a => ul.appendChild(el('li', { text: a.name || JSON.stringify(a) })));
+        rb.appendChild(ul);
+      });
 
       // Assumptions: AI-written column meanings this answer relied on (not yet confirmed).
       // Surfaced here so a wrong description is caught in context — no upfront review queue.
-      if (Array.isArray(receipt.assumptions) && receipt.assumptions.length) {
-        rb.appendChild(el('h4', { text: 'Assumptions agami made' }));
-        rb.appendChild(el('div', {
-          style: 'font-size:12px;color:var(--muted,#6b7280);margin:2px 0 6px;',
-          text: 'These column meanings come from agami, not from you. If one is wrong (or you can fill in a blank), tell agami in chat — or say “looks right” to lock in the guesses.' }));
-        const ul = el('ul');
-        receipt.assumptions.forEach(a => {
-          const li = el('li');
-          li.appendChild(el('code', { text: a.column }));
-          if (a.meaning) {
-            li.appendChild(document.createTextNode(' = ' + a.meaning));
-          } else {
-            // ai_unknown — agami used a column it couldn't read
-            li.appendChild(document.createTextNode(' — '));
-            li.appendChild(el('strong', { text: 'agami has no description for this column. Is it the right one?' }));
-          }
-          ul.appendChild(li);
+      renderSection('assumptions', 'Assumptions agami made',
+        'These column meanings come from agami, not from you. If one is wrong (or you can fill in '
+        + 'a blank), tell agami in chat — or say “looks right” to lock in the guesses.',
+        list => {
+          const ul = el('ul');
+          list.forEach(a => {
+            const li = el('li');
+            li.appendChild(el('code', { text: a.column }));
+            if (a.meaning) {
+              li.appendChild(document.createTextNode(' = ' + a.meaning));
+            } else {
+              // ai_unknown — agami used a column it couldn't read
+              li.appendChild(document.createTextNode(' — '));
+              li.appendChild(el('strong', { text: 'agami has no description for this column. Is it the right one?' }));
+            }
+            ul.appendChild(li);
+          });
+          rb.appendChild(ul);
         });
-        rb.appendChild(ul);
-      }
 
       // Model version pin
       if (receipt.model_version) {

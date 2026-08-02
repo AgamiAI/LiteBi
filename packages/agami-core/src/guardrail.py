@@ -348,17 +348,21 @@ def receipt_from_assembled(assembled: dict[str, Any]) -> Receipt:
     nor the tool edge grows its own copy of the mapping. It lives in this module rather than next to
     the assembler because the vendored `execute_sql.py` needs it and cannot import the model stack.
 
+    The sections are the assembled dict's own TOP-LEVEL keys, named exactly as this type names them.
+    They were briefly nested under a `sections` key, which existed only so a parallel set of flat
+    keys could sit beside them while both spellings shipped; with the flat keys deleted there is one
+    spelling and no wrapper.
+
     `items` becomes a tuple because the field is one. `Receipt.SECTIONS` is indexed strictly: an
     assembled dict missing a section is a drifted builder, and every caller turns the resulting
     `KeyError` into an `undetermined` receipt rather than one that quietly lost a section.
     """
-    sections = assembled["sections"]
     return Receipt(
         model_version=assembled.get("model_version"),
         **{
             name: ReceiptSection(
-                items=tuple(sections[name]["items"]),
-                undetermined=sections[name]["undetermined"],
+                items=tuple(assembled[name]["items"]),
+                undetermined=assembled[name]["undetermined"],
             )
             for name in Receipt.SECTIONS
         },

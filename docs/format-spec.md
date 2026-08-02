@@ -297,7 +297,9 @@ The MCP server writes to this same file when no database is configured, and its 
 
 ## 6. Chart artifacts (`<artifacts_dir>/local/charts/<ts>.html`)
 
-Self-contained Chart.js v4 HTML, rendered from [plugins/agami/shared/chart-template.html](../plugins/agami/shared/chart-template.html) with placeholders substituted (`{{TITLE}}`, `{{CHART_TYPE}}`, `{{LABELS}}`, `{{DATASETS}}`, `{{GENERATED_AT}}`, `{{SQL}}`). Open in any browser.
+Self-contained Chart.js v4 HTML, rendered from [plugins/agami/shared/chart-template.html](../plugins/agami/shared/chart-template.html) with placeholders substituted (`{{REPORT_TITLE}}`, `{{REPORT_SUMMARY_JSON}}`, `{{GENERATED_AT}}`, `{{SECTIONS_JSON}}`, `{{RECEIPT_JSON}}`). Open in any browser.
+
+`{{RECEIPT_JSON}}` is the trust receipt: `model_version` plus five sections (`columns`, `tables`, `joins`, `aggregates`, `assumptions`), each an object with an `items` list and an `undetermined` sentence saying what the section did not establish (`null` when it is complete). The full field list is documented at the top of the template itself; the object is produced by `sm receipt` (`semantic_model.runtime.assemble_receipt`), which is the same builder the MCP server uses, so one statement is described one way on both surfaces.
 
 ## 7. CSV exports (`<artifacts_dir>/local/exports/<ts>.csv`)
 

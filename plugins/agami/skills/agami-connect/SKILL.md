@@ -800,7 +800,7 @@ bash "$AGAMI_PLUGIN_ROOT/scripts/sm" curate "$ROOT" --ops-file /tmp/agami-area-d
 
 ## Phase 4: Curate before examples — exclude + sign off what seeds depend on
 
-Seeds reference **columns, tables, metrics, and entities** — so settle those *before* generating examples (a seed that uses a column you'd later exclude breaks at query time, and a seed built on an unreviewed metric bakes in a guessed definition). **Relationships are NOT gated here** — they stay lazy: FK joins are already auto-approved by the engine (the DB declared them), and inferred joins self-approve as you query / surface as receipt warnings. So you're not asked to rubber-stamp database-declared foreign keys.
+Seeds reference **columns, tables, metrics, and entities** — so settle those *before* generating examples (a seed that uses a column you'd later exclude breaks at query time, and a seed built on an unreviewed metric bakes in a guessed definition). **Relationships are NOT gated here** — they stay lazy: FK joins are already auto-approved by the engine (the DB declared them), and inferred joins self-approve as you query, and an unreviewed one raises the trust banner on the answer's report. So you're not asked to rubber-stamp database-declared foreign keys.
 
 **4a — The curate gate: open the explorer whenever there's anything to curate.** One call returns the decision (turn-boundary-safe — same answer on a fresh run or a resume):
 
@@ -949,7 +949,7 @@ Then **AskUserQuestion**: `Open the review queue` (→ `/agami-model review` —
 
 (No telemetry — agami has none; don't surface anything about it.)
 
-**8a — gate on Rule 1 status:** count metrics/named-filters with `review_state != approved`. If > 0, use the **in-progress** framing (8b); else the **fully-set-up** framing (8c). Unsigned Rule 1 metrics don't *block* queries — agami still answers — but an answer that uses one carries a "not signed off yet" **warning** on its receipt until you approve it, so reviewing them is still worth doing.
+**8a — gate on Rule 1 status:** count metrics/named-filters with `review_state != approved`. If > 0, use the **in-progress** framing (8b); else the **fully-set-up** framing (8c). Unsigned Rule 1 metrics don't *block* queries — agami still answers — but an answer that uses one carries the metric on its receipt with `review_state: unreviewed`, which raises the report's approve/change banner until you sign it off, so reviewing them is still worth doing.
 
 **8b — in-progress:**
 ```

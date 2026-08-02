@@ -163,19 +163,10 @@ def test_resolve_entity_instance(kwargs, expected):
 
 
 # --- receipt ---
-
-
-def test_build_receipt_surfaces_trust_and_rewrite():
-    rel = m.Relationship(from_table="a", to_table="b", from_column="x", to_column="y",
-                         relationship="many_to_one", confidence="confirmed",
-                         signed_off_by="dl@x.com", signed_off_role="data_lead")
-    pf = rt.PreFlightResult("fan_trap", "auto_rewrite", "SELECT SUM(a.v) FROM a JOIN b ON ...",
-                            rewritten_sql="SELECT SUM(a.v) FROM a", reason="dropped fan-out join")
-    receipt = rt.build_receipt(sql="SELECT SUM(a.v) FROM a", relationships_used=[rel],
-                               pre_flight=pf, caveats=["heads up"],
-                               default_filters_applied=["a.deleted_at IS NULL"])
-    assert receipt["relationships"][0]["signed_off_by"] == "dl@x.com"
-    assert receipt["pre_flight"]["action"] == "auto_rewrite"
-    assert receipt["pre_flight"]["rewritten_sql"] == "SELECT SUM(a.v) FROM a"
-    assert receipt["caveats"] == ["heads up"]
-    assert receipt["default_filters_applied"] == ["a.deleted_at IS NULL"]
+#
+# `build_receipt` was a SECOND receipt builder here — its own key names (`from`/`to`, `caveats`,
+# `original_sql`/`rewritten_sql`), assembled from a caller-supplied relationship list rather than
+# from the SQL. Its only caller was the test that covered it, so it was two descriptions of one
+# thing with one of them unreachable. `assemble_receipt` is the builder that ships, and the whole
+# of its behaviour is covered by tests/test_ace088_receipt_sections.py. Deleted rather than
+# deprecated: nothing else was covering it, because there was nothing else to cover.

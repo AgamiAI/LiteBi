@@ -23,9 +23,12 @@ Then point agami at it (in Claude Code or by hand):
 ```ini
 # <artifacts_dir>/local/credentials
 [default]
-db_type = sqlite
-path    = <absolute path to shop.db>
+type = sqlite
+path = <absolute path to shop.db>
 ```
+
+The key is `type`, not `db_type`. `_load_credentials` reads `type`, and `db_type` fails with
+"Credentials profile [default] is missing the 'type' field" before anything else runs.
 
 Set `chmod 600 <artifacts_dir>/local/credentials`.
 
@@ -106,11 +109,45 @@ top 5 customers by spend
 Watch the HTML report for:
 
 - **Trust receipt collapsible** at the bottom — collapsed by default. Open it.
-- Inside: tables touched (with row counts + freshness), relationships used (with confidence + review-state badge), metric definitions (if any), named filters (if any), model version pin.
-- **If any unreviewed entry was used** (likely, since SQLite has no column comments and field descriptions are unreviewed), a **yellow warning banner** appears at the top of the report: *"Trust note — Used N unreviewed entr… Review now?"*
-- **Model version** at the bottom of the receipt matches the model snapshot hash (the `.snapshots/<hash>/` the answer pinned).
+- Inside, **five sections, always all five**: tables touched (one row per table REFERENCE, not per
+  table, so a table read twice appears twice), relationships used, columns and metric definitions
+  used, aggregates, and assumptions. Plus the model version pin.
+- **Every section that was not established says so**, in an amber "Not established" box naming what
+  is missing. On this fixture expect **four** of them (tables, relationships, columns, aggregates)
+  and none on assumptions. An empty section with no box means "checked, and there was nothing to
+  report" and renders that sentence. Those two are different facts and the panel must not blur them:
+  that distinction is the whole point of the receipt.
+- **Model version** at the bottom of the receipt matches the model snapshot hash (the
+  `.snapshots/<hash>/` the answer pinned).
+- **The trust banner is conditional on unreviewed JOINS, not on unreviewed field descriptions.**
+  On this fixture all three relationships are FKs and auto-approve, so the banner correctly does
+  **not** appear. To exercise it, flip one relationship's `review_state` to `unreviewed` in
+  `relationships.yaml` and re-run; the banner then names that join and points at the review queue.
+- **Unapproved metrics** drive a separate banner with Approve / Change buttons that queue a decision
+  and hand it back to Claude to apply. This fixture seeds no metrics, so expect no metric banner.
 
-**Pass criteria:** receipt panel renders, contents match what the SQL actually used, warning banner triggers correctly.
+**Pass criteria:** receipt panel renders all five sections, the "Not established" boxes appear where
+the analysis has not shipped, contents match what the SQL actually used, and the trust banner tracks
+unreviewed joins.
+
+### Running section 4 without the interactive skills
+
+The panel can be exercised straight from the CLIs, which is the fastest way to smoke it:
+
+```bash
+SQL="SELECT c.name, SUM(oi.quantity * oi.unit_price) AS spend FROM customers c
+     JOIN orders o ON o.customer_id = c.id
+     JOIN order_items oi ON oi.order_id = o.id
+     GROUP BY c.name ORDER BY spend DESC LIMIT 5"
+
+python -m execute_sql --profile default --sql "$SQL"                       # the answer
+python -m semantic_model.cli receipt <artifacts_dir>/default --sql "$SQL" > receipt.json
+python plugins/agami/scripts/render_chart.py --title "Top 5 customers by spend" \
+    --sections-file sections.json --receipt-file receipt.json --out report.html
+```
+
+`receipt.json` should have exactly six top-level keys: `model_version` and the five sections, each
+`{items, undetermined}`. A section is never absent.
 
 ---
 

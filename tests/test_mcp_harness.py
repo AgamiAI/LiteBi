@@ -34,7 +34,7 @@ SERVER = REPO_ROOT / "packages" / "agami-core" / "src" / "mcp_harness.py"
 from tools import (
     _classify_exit,
     _distill_for_llm,
-    _legacy_receipt_dict,
+    _resolve_receipt,
     _resolve_units,
     check_read_only,
     resolve_artifacts_dir,
@@ -316,29 +316,40 @@ def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, _ = _write_rich_model(tmp_path)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
-    r = _legacy_receipt_dict(profile, SQL)
-    assert r is not None
-    # the unapproved metric is surfaced WITH its review_state (drives the approve/change banner)
-    rev = next(m for m in r["metrics"] if m["name"] == "revenue")
+    r = _resolve_receipt(profile, SQL)
+    # The unapproved metric is surfaced WITH its review_state, which is what drives a client's
+    # approve/change banner. It rides the columns section as its own entry: metric attribution is
+    # statement-level today, so it is not claimed against a column we cannot identify.
+    rev = next(i["metric"] for i in r.columns.items
+               if i["metric"] and i["metric"]["name"] == "revenue")
     assert rev["review_state"] == "unreviewed"
-    # the unreviewed join is warned about; the ai-written column is flagged as an assumption
-    assert any("unreviewed join" in w for w in r["warnings"])
-    assert any(a["column"].endswith("orders.amount") for a in r["assumptions"])
+    # The unreviewed join is a `review_state` on the join itself rather than a pre-rendered warning
+    # sentence, so a client can group, count and link it back to the relationship it is about.
+    assert [j["review_state"] for j in r.joins.items] == ["unreviewed"]
+    # The ai-written column is flagged as an assumption.
+    assert any(a["column"].endswith("orders.amount") for a in r.assumptions.items)
 
 
 def test_mcp_receipt_equals_shared_assembler(monkeypatch, tmp_path):
     """Golden parity: the MCP receipt IS the shared assembler's output — no divergent
-    second implementation. (model_version is the only MCP-added field.)"""
+    second implementation. (model_version is the only MCP-added field.)
+
+    Compared section by section over `guardrail.Receipt.SECTIONS`, so a section added to the
+    contract is covered here the day it lands rather than when someone remembers to extend a list
+    of key names.
+    """
     import pytest
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, root = _write_rich_model(tmp_path)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
+    import guardrail
     from semantic_model import loader as L
     from semantic_model import runtime as RT
-    shared = RT.assemble_receipt(L.load_datasource(root), SQL)
-    mcp = _legacy_receipt_dict(profile, SQL)
-    for key in ("tables_used", "relationships", "metrics", "assumptions", "warnings"):
-        assert mcp[key] == shared[key], key
+    shared = guardrail.receipt_from_assembled(
+        RT.assemble_receipt(L.load_datasource(root), SQL))
+    mcp = _resolve_receipt(profile, SQL)
+    for name in guardrail.Receipt.SECTIONS:
+        assert getattr(mcp, name) == getattr(shared, name), name
 
 
 # save_correction is no longer an MCP tool (it's a skill operation, off both transports), so its

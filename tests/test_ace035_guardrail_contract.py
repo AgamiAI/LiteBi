@@ -120,10 +120,9 @@ def test_an_assembled_receipt_maps_onto_the_contract_with_tuple_items():
     immutable."""
     assembled = {
         "model_version": "v2",
-        "sections": {name: {"items": [], "undetermined": f"{name} pending"}
-                     for name in Receipt.SECTIONS},
+        **{name: {"items": [], "undetermined": f"{name} pending"} for name in Receipt.SECTIONS},
     }
-    assembled["sections"]["tables"] = {"items": [{"ref": "orders"}], "undetermined": None}
+    assembled["tables"] = {"items": [{"ref": "orders"}], "undetermined": None}
 
     receipt = guardrail.receipt_from_assembled(assembled)
 
@@ -138,8 +137,7 @@ def test_an_assembled_receipt_missing_a_section_raises_rather_than_losing_it():
     this `KeyError` into an `undetermined` receipt. Silently defaulting the section would ship a
     clean-looking one instead."""
     with pytest.raises(KeyError):
-        guardrail.receipt_from_assembled({"sections": {"columns": {"items": [],
-                                                                   "undetermined": None}}})
+        guardrail.receipt_from_assembled({"columns": {"items": [], "undetermined": None}})
 
 
 @pytest.mark.parametrize("cls", [Refusal, Failure, Receipt, ReceiptSection, Envelope])

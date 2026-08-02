@@ -12,6 +12,47 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The trust receipt is five sections, and each one says what it did NOT establish (ACE-088).**
+  Every answer's receipt now carries `columns`, `tables`, `joins`, `aggregates` and `assumptions`,
+  always all five, each an object `{items, undetermined}` beside the `model_version` pin.
+  `undetermined` is a plain sentence naming what that section did not check; it is `null` only when
+  the section is complete. **This is the point of the change**: before it, a section nobody had
+  checked and a section that found nothing were both the empty list, so silence read as clean.
+  Aggregate fan-out is the live example — the receipt now states, where you read the answer, that
+  whether a join multiplies the rows an aggregate is computed from was not checked, instead of
+  shipping an empty section you would read as "no problem". `assumptions` is the section that most
+  often has nothing to admit, and it earns its `null` rather than assuming it: it lists at most
+  three AI-written column meanings and counts any beyond that onto its own marker, because a
+  truncated list under a null marker is a positive claim of completeness.
+
+  The receipt also rides on **every** status, not just `ok`. Every non-ok body carries the bounded
+  form — the caller's own identifiers and, per reference, whether the model declares that name;
+  nothing else about the model. `tables` is now **one entry per reference** rather than per table,
+  so a table read twice is listed twice and a reference the model does not declare says so. A name
+  the statement defined for itself — a CTE, including one that shadows a real table — is not a
+  declared table in ANY section: it borrows no row estimate, no schema-qualified column label and
+  no model-written column meaning, in every spelling of a column reference.
+
+  **Breaking for anything reading the old flat keys.** `tables_used` → `tables.items[]`;
+  `relationships` → `joins.items[]`; `metrics` → the `columns.items[]` entries whose `metric` is
+  non-null; `assumptions` → `assumptions.items[]`; `warnings` → derive it from `joins.items[]`
+  filtered to `review_state != "approved"` (a review state can be counted and linked back to its
+  join; a pre-rendered sentence could only be printed); `named_filters` and `sql` are gone (nothing
+  ever produced the former, and the statement is on the response body). The HTML report, the MCP
+  server instructions, `render_chart.py` and the `agami-query` skill all move with it, and
+  `render_chart.py` now **rejects** a receipt that is missing a section rather than silently
+  rendering nothing for it.
+
+- **The answer report renders the whole receipt.** The provenance panel draws every section with its
+  marker, lists tables per reference (an undeclared one explains itself instead of showing blanks),
+  and adds the columns the statement referenced. The unreviewed-join banner is derived from the join
+  review states, so it can count them and name each one. The unapproved-metric banner and its
+  Approve / Change write-back are unchanged in behaviour. Two long-standing display bugs fixed while
+  repointing: an unreviewed entry read "confidence ?" to every user (the phrase tested `confidence`
+  as a number; it is a label), and a named-filters block that no producer ever filled is deleted.
+
 ### Removed
 
 - **The `GovernancePolicy` port and the `Adapters.governance` field (ACE-095).** `GovernancePolicy`,

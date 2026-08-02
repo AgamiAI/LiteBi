@@ -224,13 +224,13 @@ For a single profile, follow the **examples-first canonical loop** — the subje
 1. **System** — "Write one valid SQL statement for `<DB_TYPE>` (ANSI_SQL + `<DB_TYPE>` tweaks per dialect-rules.md). Output ONLY SQL. Prefer indexed/`recommended_filters` columns on large tables. Apply each column's `value_transform` when selecting/filtering it. **A `sensitive` column is restricted at the OUTPUT layer, not the query layer.** You MAY use it in `COUNT`/`COUNT(DISTINCT …)`, `GROUP BY`, `WHERE`, and `JOIN`; you must NOT put its **raw per-row values** in the result. So: (a) a question *about* a sensitive column still RUNS — answer with an aggregate, never a refusal or an empty result: 'how many unique customer emails?' → `SELECT COUNT(DISTINCT email)` and report the count; 'list customer emails' → return that distinct count and note the raw addresses are withheld. (b) To disambiguate identical display labels (two customers with the same name), put the entity's **non-sensitive key (`id`)** in the output — never the raw email/phone. Neither rule is overridable 'to be helpful.' **This is also enforced deterministically** in `execute_sql.py`'s safety pass (`runtime.check_sensitive_projection`) — a raw sensitive projection is refused with a `{"error":{"kind":"sensitive_columns",…}}` result regardless of tier or host (skill, MCP server, cron). Generate the aggregate up front so you don't eat the refusal round-trip. Use a metric's `bindings` SQL VERBATIM when the question names that metric (or a synonym)."
 2. **Schema context** — the `get_table_context` output for the chosen tables (columns + types + caveats + value_transforms), the area's relationships (rendered as `from.col → to.col [cardinality]`), and the area's metrics (`<name>: <binding> -- <calculation>` + synonyms). **`default_filters` ARE yours to apply.** Nothing applies them for you, and nothing reports whether you did. If a table declares one and the question does not deliberately ask about the rows it excludes, write it into the `WHERE` clause. Two things to watch, because `get_table_context` has already rewritten them: the `{alias}` placeholder is gone — each filter comes back qualified with the **bare table name**, so re-qualify it to whatever alias you actually used, or the database rejects the statement. And a filter that still carries a `:param` marker (e.g. `orders.tenant_id = :tenant_id`) has no value to bind — leave it OUT and say so in the answer rather than emitting SQL that won't parse. Also DO honor any caveats.
 
-   **Unreviewed metrics are USED, not refused.** When the question names a metric whose `review_state ≠ approved`, still use its binding and answer — do NOT block or refuse on it. The trust layer surfaces it as a **warning on the receipt** (Phase 4e.iii.5: *"Used metric `X` which has not been signed off"*), not a hard gate. The loader already drops only `rejected` metrics; an `unreviewed`/`proposed` one is yours to use, with the warning carrying the honesty. (Same for unreviewed joins/entities and `stale` entries — warn, never refuse.)
+   **Unreviewed metrics are USED, not refused.** When the question names a metric whose `review_state ≠ approved`, still use its binding and answer — do NOT block or refuse on it. The trust layer surfaces it **on the receipt**, not as a hard gate: the metric rides in `receipt.columns.items[].metric` carrying its own `review_state`, and the report's approve/change banner is driven off exactly that field (Phase 4e.iii.5). The loader already drops only `rejected` metrics; an `unreviewed`/`proposed` one is yours to use, with the surfaced review state carrying the honesty. (Same for unreviewed joins/entities and `stale` entries — surface, never refuse.)
 3. **Datasource context** — `datasource.md` (step 1d.2), heading `## Datasource context`. Binding domain context.
 4. **User memory** — `USER_MEMORY.md` (step 1d.1), heading `## User memory (preferences and policies)`.
 5. **Few-shot examples** — the ranked matches from step 2.
 6. **User question.**
 
-**The fan/chasm safety pass runs as a pre-execution step, on every tier.** Before you execute the generated SQL, pass it through `sm prepare "$ROOT" --area <area> --sql-file <path>` (Phase 3a). It runs the fan-trap / chasm-trap pre-flight (auto-rewrites the safe cases; refuses shape-changing ones) and returns the SQL to actually run. Tier-independent — works whether you execute via psql, the Python driver, or DuckDB — so the safety guarantees never depend on the execution path. The receipt panel surfaces the rewrite. It does **not** apply the area's `default_filters`; those are declarative only, so put any you need into the statement yourself at step 6.
+**The fan/chasm safety pass runs as a pre-execution step, on every tier.** Before you execute the generated SQL, pass it through `sm prepare "$ROOT" --area <area> --sql-file <path>` (Phase 3a). It runs the fan-trap / chasm-trap pre-flight (auto-rewrites the safe cases; refuses shape-changing ones) and returns the SQL to actually run. Tier-independent — works whether you execute via psql, the Python driver, or DuckDB — so the safety guarantees never depend on the execution path. It does **not** apply the area's `default_filters`, and nothing else does either: those are declarative only, so put any you need into the statement yourself at step 6, and `sm prepare` returns no `applied_filters` list for you to hand on. The pre-flight verdict does not ride on the receipt — `sm receipt` re-runs the check on whatever SQL you hand it, and you hand it the SQL that ran, which is the rewritten one, on which there is nothing left to report. The rewrite is not drawn by the report panel either, so **say what was rewritten in the chat answer**: that sentence is the only place the user learns of it.
 
 #### 2b.federation — cross-database queries
 
@@ -371,10 +371,10 @@ bash "$AGAMI_PLUGIN_ROOT/scripts/sm" prepare "$ROOT" --area <area> --sql-file /t
 
 It returns JSON: `{action, risk, sql, rewritten, units, reason}` (on a refuse it instead returns `{action, risk, reason, suggestion, sql}` with exit 1). (`units` is the `{output_column: unit}` map traced through the final SQL — keep it for the table render in 4d.)
 - `action: "refuse"` (a fan/chasm trap that would change result shape) → **don't execute, and don't silently guess.** Read `reason` + `suggestion`, then branch on whether a faithful rebuild is unambiguous:
-  - **Single faithful rebuild** — there's one restructuring that preserves exactly what the user asked for (typically a chasm trap: pre-aggregate each measure in its own CTE, then outer-join; or move the aggregate into a window function to keep raw rows). Regenerate the SQL per `suggestion`, re-prepare, and **note in the receipt** that the query was restructured to avoid a `<risk>`. The user gets the right number *with* provenance — not a silent swap.
+  - **Single faithful rebuild** — there's one restructuring that preserves exactly what the user asked for (typically a chasm trap: pre-aggregate each measure in its own CTE, then outer-join; or move the aggregate into a window function to keep raw rows). Regenerate the SQL per `suggestion`, re-prepare, and **say in the answer** that the query was restructured to avoid a `<risk>` (nothing else will say it: the restructured statement no longer trips the check, so the receipt assembled from it carries no verdict, and the panel draws none — the sentence is yours to write). The user gets the right number *with* provenance — not a silent swap.
   - **Ambiguous rebuild** — the fan-out join is also filtering or grouping, so the candidate rewrites return *different numbers* (e.g. "loans with ≥1 payment since January" vs a payment-weighted total). Do **not** pick one. Surface the ambiguity to the user as a short "Did you mean…?" with 2–3 concrete interpretations, one plain-language sentence each (no SQL). Generate SQL for the interpretation they choose, then re-prepare.
   - If you can't form a faithful rebuild, or `prepare` still refuses after restructuring: stop and tell the user plainly what the conflict is (the `reason`, in one sentence). Don't loop.
-- `action: "auto_rewrite"` → a fan/chasm trap was auto-corrected; use the returned `sql` (note `rewritten: true` + `reason` in the receipt).
+- `action: "auto_rewrite"` → a fan/chasm trap was auto-corrected; use the returned `sql`, and say in the answer what was rewritten and why (`rewritten: true` + `reason`).
 - `action: "allow"` → use the returned `sql`; it is your statement verbatim. Nothing was AND-ed into it, so do **not** claim any declared filter on the receipt — if the question needed one, you wrote it in yourself at step 6.
 
 **Step 2 — execute the returned `sql`** via the tier's tool from [`shared/connection-reference.md → CLI Connection Commands`](../../shared/connection-reference.md#cli-connection-commands) — psql / mysql / snowsql / sqlite3 / DuckDB, or the Python driver. (If you use `python -m execute_sql`, pass `--no-safety` since `prepare` already ran the pass — avoids doubling it.) Wrap in a high-resolution timer; capture stdout (CSV rows), stderr (errors), exit code. Route a non-zero exit through the error classifier (Phase 3b).
@@ -592,7 +592,7 @@ Notes the script handles for you: a time-bucket `label_col` is formatted from it
 
 #### 4e.iii.5 — build the trust receipt via `sm receipt` (do NOT hand-build it)
 
-The receipt documents provenance: tables touched, relationships + metrics used, unreviewed-warnings, assumptions, and the model-version pin. **It is assembled deterministically from the SQL + the model** by `runtime.assemble_receipt` — the SAME builder the MCP server uses — so it never depends on you extracting fields by hand:
+The receipt documents provenance: the tables the statement touched, the joins and metrics it used, the columns it referenced, the assumptions it leaned on, and the model-version pin. **It is assembled deterministically from the SQL + the model** by `runtime.assemble_receipt` — the SAME builder the MCP server uses — so it never depends on you extracting fields by hand:
 
 ```bash
 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" receipt "$ROOT" \
@@ -600,11 +600,32 @@ bash "$AGAMI_PLUGIN_ROOT/scripts/sm" receipt "$ROOT" \
   > /tmp/agami-receipt-<ts>.json
 ```
 
-It emits the full receipt object — `model_version`, `tables_used` (with each table's `estimated_row_count` + `rows_as_of`), `relationships` (every trust field), `metrics` (model metrics whose binding appears in the SQL), `named_filters`, `assumptions` (the load-bearing columns whose description is `ai_unvalidated`/`ai_unknown`), and `warnings` (one per unreviewed join/filter the SQL used). It parses the FROM/JOIN scope and matches model entries itself. `--applied-filters` is optional and currently has no producer: `sm prepare` no longer reports which declared filters a statement applied, so leave it off. `model_version` comes from the newest `.snapshots/<hash>/` dir (null on a pre-trust-layer model — renders gracefully).
+It emits `model_version` plus **five sections** — `columns`, `tables`, `joins`, `aggregates`, `assumptions` — each an object of the form `{"items": [...], "undetermined": "<sentence>" | null}`. It parses the FROM/JOIN scope and matches model entries itself:
 
-**The ONE thing you add by hand — an ad-hoc metric.** If you composed a non-trivial metric for THIS answer that isn't a model metric (e.g. `(SUM(net_revenue) - SUM(cogs)) / SUM(net_revenue)` for "gross margin", with no such model metric), the script can't know it. Append one entry to the receipt's `metrics` array: `{name: "<snake_case>", area: "<area>", origin: "ad_hoc", review_state: "unreviewed", definition_prose: "<plain English>", expression: "<SQL fragment>"}`. This feeds the "metrics you haven't approved" banner. **Don't flag trivial primitives** (a bare `COUNT(*)` / `SUM(amount)`). For a multi-section report, run `sm receipt` per section's SQL and merge `tables_used`/`relationships`/`metrics` (dedup by name), or pass the dominant query's SQL.
+| section | what `items[]` holds |
+| --- | --- |
+| `columns` | every column the statement referenced, as `{"column": "<schema>.<table>.<col>", "metric": null}` — **plus** each model metric whose binding SQL appears in the statement, as `{"column": null, "metric": {...}}`. A metric match is a statement-level fact today, so it has no owning column. The metric object carries `name`, `area`, `definition_prose`, `expression`, `confidence`, `review_state`, `origin`, `signed_off_by`/`_role`/`_at` |
+| `tables` | **one entry per REFERENCE, not per table** — a table read twice appears twice. `ref` (the name as the statement wrote it), `alias`, `qname` (what the model resolved it to), `declared`, `rows`, `rows_as_of`, `freshness`. An **undeclared** reference (a CTE name, say) has `declared: false` and null `qname`/`rows`/`rows_as_of`/`freshness`, because there is no model row for those to be about |
+| `joins` | every declared relationship both of whose tables are in scope, with its full trust block: `name`, `from_to`, `cardinality`, `confidence`, `review_state`, `origin`, `signed_off_by`/`_role`/`_at`, `cross_schema`, `on` |
+| `aggregates` | empty today, and **declared rather than omitted** |
+| `assumptions` | the load-bearing columns whose description is `ai_unvalidated` / `ai_unknown`, at most three. Any beyond the third are COUNTED on this section's `undetermined`, never listed — so a null marker here means the list is whole, not merely short |
 
-For a 1×1 scalar answer with no chart (Phase 4e skips the report), still run `sm receipt` so you can surface any `warnings` inline in the chat answer ("Note: this used 1 unreviewed join").
+**`undetermined` is the half you must not drop.** It is a plain sentence stating what that section did NOT establish. An empty `items` **with** a marker means the section was not checked; an empty `items` with a **null** marker means it was checked and there was nothing to report. Report only `items` and you turn "not checked" back into "nothing wrong", which is the exact reading the receipt exists to prevent. The HTML report renders every marker; when you talk about the receipt in chat, do the same for any section that carries one and bears on the answer.
+
+`--applied-filters` is optional and **currently has no producer**: nothing applies a declared filter to your statement any more, so `sm prepare` reports none and there is no list to pass. Leave the flag off. (When something does hand you one, it lands as a top-level `default_filters_applied`, outside the five sections.) `model_version` comes from the newest `.snapshots/<hash>/` dir (null on a pre-trust-layer model — renders gracefully).
+
+**The ONE thing you add by hand — an ad-hoc metric.** If you composed a non-trivial metric for THIS answer that isn't a model metric (e.g. `(SUM(net_revenue) - SUM(cogs)) / SUM(net_revenue)` for "gross margin", with no such model metric), the script can't know it. Append ONE entry to `receipt["columns"]["items"]` (there is no top-level `metrics` key):
+
+```json
+{"column": null,
+ "metric": {"name": "<snake_case>", "area": "<area>", "origin": "ad_hoc",
+            "review_state": "unreviewed", "definition_prose": "<plain English>",
+            "expression": "<SQL fragment>"}}
+```
+
+That is exactly what the report's "metrics you haven't approved" banner reads, so an entry written any other way silently never appears. **Don't flag trivial primitives** (a bare `COUNT(*)` / `SUM(amount)`). For a multi-section report, run `sm receipt` per section's SQL and merge each section's `items` (dedup tables by `ref`+`qname`, joins and metrics by name) while KEEPING each section's `undetermined` — or pass the dominant query's SQL.
+
+For a 1×1 scalar answer with no chart (Phase 4e skips the report), still run `sm receipt`, and surface inline in the chat answer every join in `joins.items` whose `review_state != "approved"` ("Note: this used 1 unreviewed join, orders → customers"). Same for any metric in `columns.items[].metric` that isn't approved.
 
 #### 4e.iv — render via `render_chart.py` (do NOT inline-substitute through the Write tool)
 
@@ -637,9 +658,9 @@ The helper reads `shared/chart-template.html` + the two logo SVGs once, validate
 
 `--summary` is the executive summary used for multi-section reports; for single-section reports pass an empty string and the section's own insight covers it. `--title` is the user's original question.
 
-`--receipt-file` is **MANDATORY — always build and pass it.** The receipt is the answer-side half of the trust pitch; without it the chart renders but loses provenance (no tables-touched list, no relationships-used, no model-version pin, no warning banner) — an answer no auditor can trace back to a model version. (The LLM has skipped this; don't.)
+`--receipt-file` is **MANDATORY — always build and pass it.** The receipt is the answer-side half of the trust pitch; without it the chart renders but loses provenance (no tables-touched list, no relationships-used, no model-version pin, no unreviewed-join banner, and none of the "not established" markers) — an answer no auditor can trace back to a model version. (The LLM has skipped this; don't.)
 
-The receipt construction logic is in Phase 4e.iii.5 above. If trust fields are genuinely missing on every entry the SQL touched (very old model from before the trust spine shipped), build the receipt with empty `relationships: []`, `metrics: []`, `named_filters: []`, `warnings: []` — but always pass `tables_used`, `executed_sql`, and `model_version`. The receipt panel renders gracefully on partial data; what you must NEVER do is omit `--receipt-file` entirely.
+The receipt construction logic is in Phase 4e.iii.5 above. If trust fields are genuinely missing on every entry the SQL touched (very old model from before the trust spine shipped), pass what `sm receipt` produced anyway: **all five sections must be present**, each with its `items` list (empty is fine) and its `undetermined` marker (null is fine). `render_chart.py` **rejects** a receipt that is missing a section, because a section that is absent and a section that is empty are different facts and a reader cannot tell them apart. Never edit a marker out to make the panel look cleaner, and never omit `--receipt-file` entirely.
 
 If the user pinned a chart type via `--chart bar` (etc.), the LLM still chooses per section — the flag from 2a is hint, not override. Multi-section reports often need different chart types per section.
 
@@ -685,7 +706,7 @@ If you genuinely detect that you're running in Claude Desktop (which has a worki
 
 For hosts that support inline artifacts, also embed the HTML as a Claude artifact block (a single block; don't emit one per section).
 
-**Assumption nudge (only when `assumptions` is non-empty).** If the receipt's `assumptions[]` has entries, add ONE short line right after the answer (before the follow-ups) so a wrong/unknown meaning is caught in context. Phrase by `source`:
+**Assumption nudge (only when `assumptions.items` is non-empty).** If the receipt's `assumptions.items[]` has entries, add ONE short line right after the answer (before the follow-ups) so a wrong/unknown meaning is caught in context. Phrase by `source`:
 - `ai_unvalidated` (a guess) → *"read `net_margin` as '(revenue − cost) ÷ revenue'"*.
 - `ai_unknown` (no description) → *"used `xyz`, which I don't have a description for — is that the right column?"* (lead with these; they're riskier).
 
@@ -693,7 +714,7 @@ e.g.:
 ```
 ℹ This answer used xyz, which I don't have a description for — is that the right column? It also read net_margin as "(revenue − cost) ÷ revenue". Tell me if anything's off (or what xyz means); say "looks right" to confirm the rest.
 ```
-Keep it to the columns in `assumptions[]` (≤3), one clause each, plain English. Skip the line entirely when `assumptions` is empty. Soft nudge, never a blocking question.
+Keep it to the columns in `assumptions.items[]` (≤3), one clause each, plain English. Skip the line entirely when `assumptions.items` is empty. Soft nudge, never a blocking question.
 
 #### 4e.viii — assumption confirm / correct loop
 
