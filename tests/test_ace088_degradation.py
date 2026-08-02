@@ -204,9 +204,9 @@ def test_a_refusal_on_an_unparseable_statement_still_returns_a_reasoned_receipt(
     assembled = runtime.assemble_refusal_receipt(object(), ";;;", model_version="v1")
 
     assert assembled["model_version"] == "v1"
-    reasons = {s["undetermined"] for s in assembled["sections"].values()}
-    assert reasons == {runtime.UNDETERMINED_UNPARSEABLE}
-    assert all(s["items"] == [] for s in assembled["sections"].values())
+    sections = [assembled[name] for name in guardrail.Receipt.SECTIONS]
+    assert {s["undetermined"] for s in sections} == {runtime.UNDETERMINED_UNPARSEABLE}
+    assert all(s["items"] == [] for s in sections)
 
 
 def test_a_refusal_without_a_parser_says_that_instead(monkeypatch):
@@ -217,6 +217,6 @@ def test_a_refusal_without_a_parser_says_that_instead(monkeypatch):
 
     assembled = runtime.assemble_refusal_receipt(object(), "SELECT id FROM orders")
 
-    reasons = {s["undetermined"] for s in assembled["sections"].values()}
+    reasons = {assembled[name]["undetermined"] for name in guardrail.Receipt.SECTIONS}
     assert reasons == {runtime.UNDETERMINED_NO_PARSER}
     assert runtime.UNDETERMINED_NO_PARSER != runtime.UNDETERMINED_UNPARSEABLE

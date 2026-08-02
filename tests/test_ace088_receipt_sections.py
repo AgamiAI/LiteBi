@@ -6,10 +6,12 @@ test is not "the sections exist" but that the four states of a section stay dist
 empty list with no marker means "checked, found nothing", and an empty list WITH one means "not
 checked, and here is why". Before this, both were the empty list and silence read as clean.
 
-In this slice the sections are ADDITIVE: the flat keys the chart template reads are untouched, and
-the sections live under `receipt["sections"]` because `assumptions` names both a flat list and a
-section and the two cannot share a dict. `test_the_flat_receipt_keys_are_untouched` is what makes
-that guarantee a test rather than an intention.
+The sections are the assembler's TOP-LEVEL keys and they are the whole of what it returns, beside
+the `model_version` pin. They were briefly nested under a `sections` key beside a parallel set of
+flat ones (`tables_used`, `relationships`, `metrics`, `named_filters`, `warnings`, `sql`), because
+`assumptions` named both a flat list and a section and one dict could not hold both. Deleting the
+flat keys removed the collision; `test_the_receipt_is_the_sections_and_the_version_pin` is what
+keeps a flat key from coming back.
 """
 
 from __future__ import annotations
@@ -101,7 +103,13 @@ def org(tmp_path):
 
 
 def _sections(org, sql=SQL, **kw):
-    return rt.assemble_receipt(org, sql, **kw)["sections"]
+    """The five sections of an assembled receipt, keyed by name.
+
+    A helper rather than the raw dict because the assembler also returns the version pin and, when
+    a rewrite happened, the two conditional keys — and every assertion below is about a section.
+    """
+    receipt = rt.assemble_receipt(org, sql, **kw)
+    return {name: receipt[name] for name in guardrail.Receipt.SECTIONS}
 
 
 # --- the container ----------------------------------------------------------
@@ -110,8 +118,9 @@ def _sections(org, sql=SQL, **kw):
 def test_every_declared_section_is_present_and_shaped(org):
     """Empty-but-declared, never absent: a consumer must not have to tell "no joins" from "joins
     not checked", and it cannot do that if the key is sometimes missing."""
+    receipt = rt.assemble_receipt(org, SQL)
+    assert tuple(receipt) == ("model_version", *guardrail.Receipt.SECTIONS)
     sections = _sections(org)
-    assert tuple(sections) == guardrail.Receipt.SECTIONS
     for name, section in sections.items():
         assert set(section) == {"items", "undetermined"}, name
         assert isinstance(section["items"], list), name
@@ -174,7 +183,7 @@ def test_a_cte_that_shadows_a_declared_table_is_not_declared(org):
     refusal path, where it is the ONE model fact a refused caller is told.
     """
     shadowing = ("WITH orders AS (SELECT 1 AS id) SELECT id FROM orders")
-    items = rt.assemble_receipt(org, shadowing)["sections"]["tables"]["items"]
+    items = rt.assemble_receipt(org, shadowing)["tables"]["items"]
 
     assert [i["ref"] for i in items] == ["orders"]
     assert items[0]["declared"] is False
@@ -199,12 +208,17 @@ def test_tables_section_says_declared_filters_are_not_accounted_for(org):
 # --- joins (ACE-059 owns the gap) -------------------------------------------
 
 
-def test_joins_section_is_todays_relationships_unchanged(org):
-    receipt = rt.assemble_receipt(org, SQL)
-    section = receipt["sections"]["joins"]
-    assert section["items"] == receipt["relationships"]
+def test_joins_section_names_the_declared_relationship_and_its_review_state(org):
+    """`review_state` is what a client filters on to raise its own unreviewed-join banner. It
+    replaced a `warnings` list of pre-rendered sentences ("Used an unreviewed join (…)."), which
+    said strictly less: a string cannot be grouped, counted, or linked back to the relationship it
+    is about, and a consumer that wanted anything other than that exact sentence could not have it.
+    """
+    section = _sections(org)["joins"]
     assert [i["name"] for i in section["items"]] == ["orders_to_customers"]
     assert section["items"][0]["review_state"] == "unreviewed"
+    unreviewed = [j for j in section["items"] if j["review_state"] != "approved"]
+    assert [j["from_to"] for j in unreviewed] == ["orders → customers"]
 
 
 def test_joins_section_says_the_actual_predicate_was_not_read(org):
@@ -247,10 +261,8 @@ def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
 
 def test_assumptions_section_carries_forward_unchanged_with_no_marker(org):
     """The one section that is complete, so the only one with a null marker."""
-    receipt = rt.assemble_receipt(org, SQL)
-    section = receipt["sections"]["assumptions"]
+    section = _sections(org)["assumptions"]
     assert section["undetermined"] is None
-    assert section["items"] == receipt["assumptions"]
     assert [i["column"] for i in section["items"]] == ["public.orders.amount"]
     assert section["items"][0]["source"] == "ai_unvalidated"
 
@@ -314,7 +326,7 @@ def test_the_same_statement_and_model_produce_an_equal_receipt(org):
     first = rt.assemble_receipt(org, CTE_SQL, model_version="v1", freshness="hourly")
     second = rt.assemble_receipt(org, CTE_SQL, model_version="v1", freshness="hourly")
     assert first == second
-    assert first["sections"] == second["sections"]
+    assert list(first) == list(second), "the key ORDER is part of being the same receipt"
 
 
 # --- data sensitivity -------------------------------------------------------
@@ -353,25 +365,35 @@ def test_sections_carry_metadata_and_structure_only_never_values(org):
     assert CTE_LITERAL not in json.dumps(sections)
 
 
-# --- the additive guarantee -------------------------------------------------
+# --- the whole of what the assembler returns --------------------------------
+
+# The keys the receipt USED to carry beside the sections, all of them now deleted. `sql` was never
+# rendered by any consumer, `named_filters` never had a producer anywhere in the repo, and the
+# other four are the sections' own facts under older names.
+DELETED_FLAT_KEYS = {"sql", "tables_used", "relationships", "metrics", "named_filters", "warnings"}
 
 
-def test_the_flat_receipt_keys_are_untouched(org):
-    """The sections are additive in this slice. The chart template, `render_chart.py` and four test
-    files still read the flat keys; a later PR deletes them and repoints those surfaces. Until then
-    a vanished key is a silently missing trust banner on main."""
-    receipt = rt.assemble_receipt(org, SQL, model_version="v1", applied_filters=["o.x IS NULL"])
-    assert set(receipt) - {"sections"} == {
-        "sql", "model_version", "tables_used", "relationships", "metrics",
-        "named_filters", "assumptions", "warnings", "default_filters_applied",
-    }
-    assert receipt["sql"] == SQL
+def test_the_receipt_is_the_sections_and_the_version_pin(org):
+    """SC-1's shape half. One spelling of one set of facts: five sections and the model this answer
+    was described against. A flat key coming back would mean two descriptions of one statement that
+    are free to disagree, which is the defect the sections exist to remove."""
+    receipt = rt.assemble_receipt(org, SQL, model_version="v1")
+    assert list(receipt) == ["model_version", *guardrail.Receipt.SECTIONS]
     assert receipt["model_version"] == "v1"
-    assert [t["qname"] for t in receipt["tables_used"]] == ["public.customers", "public.orders"]
-    assert [m["name"] for m in receipt["metrics"]] == ["revenue"]
-    assert any("unreviewed join" in w for w in receipt["warnings"])
-    assert receipt["named_filters"] == []
-    assert receipt["default_filters_applied"] == ["o.x IS NULL"]
+    assert not (set(receipt) & DELETED_FLAT_KEYS)
+
+
+def test_the_two_rewrite_keys_are_the_only_conditional_ones(org):
+    """`default_filters_applied` and `pre_flight` describe a REWRITE this layer performed on the
+    caller's statement, so neither is a fact about what the caller sent and neither has a section
+    home. Both are conditional — absent when nothing was rewritten — and both disappear rather than
+    move when the rewrites they describe are subtracted."""
+    plain = rt.assemble_receipt(org, SQL)
+    assert "default_filters_applied" not in plain and "pre_flight" not in plain
+
+    rewritten = rt.assemble_receipt(org, SQL, applied_filters=["o.x IS NULL"])
+    assert set(rewritten) - set(plain) == {"default_filters_applied"}
+    assert rewritten["default_filters_applied"] == ["o.x IS NULL"]
 
 
 # --- determinism across processes -------------------------------------------
@@ -408,7 +430,7 @@ from semantic_model import loader as L
 from semantic_model import runtime as rt
 org = L.load_datasource(sys.argv[2])
 r = rt.assemble_receipt(org, "SELECT c0, c1, c2, c3, c4, c5 FROM public.wide")
-print(json.dumps([a["column"] for a in r["assumptions"]]))
+print(json.dumps([a["column"] for a in r["assumptions"]["items"]]))
 """
 
 
@@ -435,7 +457,7 @@ def test_the_assumptions_cap_picks_the_same_three_in_every_process(tmp_path):
 
 def _assembled_tables(assembler, org, sql):
     """The `tables` section either assembler produces, so one test can drive both."""
-    return assembler(org, sql)["sections"]["tables"]["items"]
+    return assembler(org, sql)["tables"]["items"]
 
 
 @pytest.mark.parametrize("assembler", [rt.assemble_receipt, rt.assemble_refusal_receipt],

@@ -232,10 +232,10 @@ def cmd_prepare(args) -> int:
 
 def cmd_receipt(args) -> int:
     """Assemble the trust receipt for an executed query — deterministically, from the
-    SQL + the model. Replaces the LLM hand-building the receipt JSON in prose: tables,
-    relationships, metrics, unreviewed-warnings, and model_version all come from
-    parsing the SQL against the model (the SAME `runtime.assemble_receipt` the MCP
-    server uses). The LLM may still append ad-hoc metrics + assumptions afterward."""
+    SQL + the model. Replaces the LLM hand-building the receipt JSON in prose: the five
+    sections (columns, tables, joins, aggregates, assumptions) and the model_version pin
+    all come from parsing the SQL against the model (the SAME `runtime.assemble_receipt`
+    the MCP server uses), so the skill and the server describe one statement one way."""
     from . import snapshot as SN
     sql = args.sql
     if args.sql_file:
@@ -1164,7 +1164,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sql-file", default=None, dest="sql_file")
     sp.add_argument("--applied-filters", default=None, dest="applied_filters",
                     help="JSON list of default_filters applied (from `sm prepare`)")
-    sp.add_argument("--freshness", default=None, help="optional freshness timestamp for tables_used")
+    sp.add_argument("--freshness", default=None,
+                    help="optional freshness timestamp for the receipt's tables section")
     sp.set_defaults(func=cmd_receipt)
 
     sp = sub.add_parser("review-queue", help="trust-review items needing sign-off (Rule 1/2)")
