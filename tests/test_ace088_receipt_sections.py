@@ -163,6 +163,24 @@ def test_tables_section_marks_a_reference_the_model_does_not_declare(org):
     assert (cte["rows"], cte["rows_as_of"], cte["freshness"]) == (None, None, None)
 
 
+def test_a_cte_that_shadows_a_declared_table_is_not_declared(org):
+    """`declared` was resolved against a bare-name index, so a CTE named after a declared table
+    reported `declared: true` and borrowed the real table's row estimate — a fact about a table this
+    statement never read. `check_table_scope` has always subtracted CTE names; the receipt now
+    subtracts the same set.
+
+    It matters more from this slice on than it did before it: `declared` becomes user-facing on the
+    refusal path, where it is the ONE model fact a refused caller is told.
+    """
+    shadowing = ("WITH orders AS (SELECT 1 AS id) SELECT id FROM orders")
+    items = rt.assemble_receipt(org, shadowing)["sections"]["tables"]["items"]
+
+    assert [i["ref"] for i in items] == ["orders"]
+    assert items[0]["declared"] is False
+    assert items[0]["qname"] is None
+    assert (items[0]["rows"], items[0]["rows_as_of"]) == (None, None)
+
+
 def test_tables_section_carries_the_models_row_estimate_not_a_count(org):
     orders = next(i for i in _sections(org, freshness="hourly")["tables"]["items"]
                   if i["qname"] == "public.orders")
@@ -244,7 +262,7 @@ def test_an_unparseable_statement_reports_every_section_undetermined(org):
     assert tuple(sections) == guardrail.Receipt.SECTIONS
     for name, section in sections.items():
         assert section["items"] == [], name
-        assert section["undetermined"] == rt.UNDETERMINED_UNPARSED, name
+        assert section["undetermined"] == rt.UNDETERMINED_UNPARSEABLE, name
 
 
 def test_a_missing_parser_reports_every_section_undetermined(org, monkeypatch):
@@ -252,7 +270,21 @@ def test_a_missing_parser_reports_every_section_undetermined(org, monkeypatch):
     a missing sqlglot is a real deployment, not a hypothetical."""
     monkeypatch.setattr(rt, "_HAVE_SQLGLOT", False)
     sections = _sections(org)
-    assert all(s == {"items": [], "undetermined": rt.UNDETERMINED_UNPARSED} for s in sections.values())
+    assert all(
+        s == {"items": [], "undetermined": rt.UNDETERMINED_NO_PARSER} for s in sections.values()
+    )
+
+
+def test_the_two_early_returns_do_not_share_one_reason(org, monkeypatch):
+    """SC-4. A deployment with no parser and a statement this parser cannot read are different
+    facts with different fixes — install sqlglot, or rewrite the statement — and a reader who is
+    handed the same sentence for both cannot tell which one they have."""
+    unparseable = _sections(org, ";;;")["tables"]["undetermined"]
+    monkeypatch.setattr(rt, "_HAVE_SQLGLOT", False)
+    no_parser = _sections(org)["tables"]["undetermined"]
+
+    assert unparseable != no_parser
+    assert "sqlglot" in no_parser and "sqlglot" not in unparseable
 
 
 # --- determinism (REQ-022) --------------------------------------------------
