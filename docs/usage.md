@@ -90,11 +90,14 @@ You: skip
 You: how many customers placed an order in the last 30 days?
 ```
 
-The receipt panel on the answer shows the SQL that ran, the relationships used
-(with their confidence + review state), and the model version
-(`.snapshots/45f0fefa2403/`). If a query touched an unreviewed join, the report
-carries a trust banner pointing back at `/agami-model` (its Review tab); an
-unapproved metric gets its own banner with Approve / Change buttons.
+The receipt panel on the answer shows the tables it touched, the relationships
+used (with their confidence + review state), the columns and metric definitions
+it leaned on, and the model version (`.snapshots/45f0fefa2403/`). The SQL is not
+in that panel: each report section carries its own, next to the numbers it
+produced. If a query touched an unreviewed join, the report carries a trust
+banner pointing back at `/agami-model` (its Review tab); an unapproved metric
+gets its own banner with Approve / Change buttons, which queue the decision for
+Claude to apply.
 
 The panel also states what it did **not** establish, section by section. An empty
 section with such a note means "not checked", and an empty section without one

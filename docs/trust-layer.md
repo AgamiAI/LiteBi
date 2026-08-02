@@ -130,7 +130,6 @@ checked**, rather than shipping an empty section you would read as "no problem".
 Every `agami-query` answer includes a "Provenance for this answer" panel drawing
 all of it:
 
-- The literal SQL that ran (no paraphrase)
 - Tables touched — **one row per reference**, not per table, so a table read twice
   is listed twice; each with the name as written, the name the model resolved it
   to, and a row estimate. A reference the model does not declare (a CTE, say) says
@@ -144,9 +143,13 @@ all of it:
 - Model snapshot hash (so the answer is reproducible from
   `<artifacts_dir>/<profile>/.snapshots/<hash>/`)
 
+The statement itself is not in this panel: each report section carries its own
+SQL, under that section's own disclosure, next to the numbers it produced.
+
 Above the report, two banners: one if any join it used is unreviewed, one if any
-metric it used is unapproved. The metric banner's Approve / Change buttons write
-your decision back into the model.
+metric it used is unapproved. The metric banner's Approve / Change buttons queue
+your decision; your choice goes back to Claude to apply. Nothing lands in the
+model until you send it.
 
 ## Examples validation
 
