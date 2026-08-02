@@ -157,41 +157,9 @@ def test_resolve_entity_instance(kwargs, expected):
     assert rt.resolve_entity_instance(e, **kwargs) == expected
 
 
-# --- apply_default_filters ---
-
-
-def _filter_org():
-    t = m.Table(name="orders", schema="public", storage_connection="c", grain=["id"],
-                description="o",
-                columns=[m.Column(name="id", type="integer"),
-                         m.Column(name="deleted_at", type="timestamp"),
-                         m.Column(name="total", type="decimal"),
-                         m.Column(name="tenant_id", type="integer")],
-                default_filters=["{alias}.deleted_at IS NULL"])
-    return m.Datasource(datasource="S",
-                          subject_areas=[m.SubjectArea(name="s",
-                              tables=[m.TableRef(storage_connection="c", schema="public", table="orders")],
-                              tables_defined=[t])])
-
-
-def test_apply_default_filters_with_where():
-    org = _filter_org()
-    new, applied = rt.apply_default_filters("SELECT SUM(o.total) FROM orders o WHERE o.total > 0",
-                                            org, area="s")
-    assert "deleted_at IS NULL" in new and "o.total > 0" in new and applied
-
-
-def test_apply_default_filters_no_where():
-    org = _filter_org()
-    new, applied = rt.apply_default_filters("SELECT SUM(orders.total) FROM orders", org, area="s")
-    assert "WHERE" in new.upper() and applied
-
-
-def test_apply_default_filters_skips_unresolved_param():
-    org = _filter_org()
-    org.subject_areas[0].tables_defined[0].default_filters.append("{alias}.tenant_id = :tenant_id")
-    new, applied = rt.apply_default_filters("SELECT 1 FROM orders o", org, area="s")
-    assert not any("tenant_id" in a for a in applied)
+# The three `apply_default_filters` tests that lived here were deleted by ACE-042 along with the
+# injector they asserted. Their replacement is tests/test_ace042_no_filter_injection.py, which
+# pins the absence at the `_model_safety` chokepoint plus the CTE case the injection got wrong.
 
 
 # --- receipt ---
