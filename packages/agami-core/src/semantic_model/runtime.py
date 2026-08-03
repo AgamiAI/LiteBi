@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 # Absolute, not relative: `guardrail` is a flat top-level module that sits ALONGSIDE the
 # `semantic_model` package in both layouts — next to it in `packages/agami-core/src/`, and next to it
@@ -589,7 +589,7 @@ def _projected_sensitive(tree, org: Datasource,
 
     offending: set[str] = set()
     for sel in _output_selects(tree):
-        scope = _tables_in_scope(sel)
+        scope = _alias_map(sel)
         direct = _direct_from_tables(sel)
         for proj in sel.expressions:
             # (a) a raw projection of a sensitive column, not protected by COUNT
@@ -924,12 +924,6 @@ def check_column_scope(sql: str, org: Datasource,
     declared = {t.lower(): {c.lower() for c in cols} for t, cols in colidx.items()}
     cte_names = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
 
-    def _enclosing_select(node):
-        p = node.parent
-        while p is not None and not isinstance(p, exp.Select):
-            p = p.parent
-        return p
-
     def _select_chain(node):
         """Enclosing selects innermost -> outermost (alias visibility + correlation)."""
         chain, p = [], node
@@ -1114,7 +1108,7 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     `ctx` supplies the shared cardinality/column indices (ACE-045); `tree` is always the
     caller's own SELECT (a set-op arm ≠ `ctx.tree`), so only the indices come from `ctx`."""
     rels = ctx.cardinality_index if ctx is not None else _cardinality_index(org)
-    tables_in_scope = _tables_in_scope(tree)  # alias -> table
+    tables_in_scope = _alias_map(tree)  # alias -> table
     table_set = set(tables_in_scope.values())
     findings: list[Finding] = []
 
@@ -1481,7 +1475,7 @@ def assemble_receipt(
         return {"model_version": model_version,
                 **_undetermined_sections(UNDETERMINED_UNPARSEABLE)}
 
-    scope = _tables_in_scope(tree)            # alias/name -> bare table name
+    scope = _alias_map(tree)                  # alias/name -> bare table name
     cte_names = _cte_names(tree)
     # A CTE name is a name the statement defined for itself, so it is not a table in scope however
     # closely it resembles one the model declares. Subtracted here for the same reason the `tables`
@@ -1676,12 +1670,12 @@ def assemble_receipt(
     table_items: list[dict[str, Any]] = []
     table_refs = _table_references(tree)
     dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_REFS)
-    for written, name, alias in table_refs[:_RECEIPT_MAX_REFS]:
+    for r in table_refs[:_RECEIPT_MAX_REFS]:
         # A CTE name resolved through the bare-name index, so `WITH orders AS (…)` reported
         # `declared: true` and borrowed the real table's row estimate — a fact about a table the
         # statement never read. `_declared_table` is the one place that subtraction lives, and
         # `_cte_names` is the same set `check_table_scope` subtracts.
-        info = _declared_table(name)
+        info = _declared_table(r.bare)
         t = info[0] if info else None
         ph = t.performance_hints if t else None
         table_items.append({
@@ -1693,8 +1687,8 @@ def assemble_receipt(
             # arrive intact inside it. `alias` stays `None` when there is none rather than becoming
             # an empty string, because "no alias" and "an alias that sanitized to nothing" are
             # different facts.
-            "ref": _echo_name(written),
-            "alias": _echo_name(alias) if alias else alias,
+            "ref": _echo_name(r.written),
+            "alias": _echo_name(r.alias) if r.alias else r.alias,
             "qname": (f"{t.schema_name}.{t.name}" if t.schema_name else t.name) if t else None,
             "declared": t is not None,
             "rows": (ph.estimated_row_count if ph else None),
@@ -1836,7 +1830,7 @@ def assemble_refusal_receipt(
     refs = _table_references(tree)
     items: list[dict[str, Any]] = [
         {
-            "ref": _echo_name(written),
+            "ref": _echo_name(r.written),
             # A CTE name is a name the statement defined for itself, so the model does not declare
             # it however closely it resembles something that is declared.
             #
@@ -1847,9 +1841,9 @@ def assemble_refusal_receipt(
             # this reported `{"ref": "ORDERS", "declared": false}`, which is exactly the
             # gate-versus-receipt contradiction the fold exists to close, on the one fact a refused
             # caller is given.
-            "declared": _tkey(name) not in cte_names and _tkey(name) in tidx,
+            "declared": _tkey(r.bare) not in cte_names and _tkey(r.bare) in tidx,
         }
-        for written, name, _alias in refs[:_ECHO_MAX_NAMES]
+        for r in refs[:_ECHO_MAX_NAMES]
     ]
     dropped = len(refs) - len(items)
     sections = _undetermined_sections(UNDETERMINED_REFUSED)
@@ -1867,30 +1861,104 @@ def assemble_refusal_receipt(
 # ---------------------------------------------------------------------------
 
 
-def _tables_in_scope(tree: "exp.Select") -> dict[str, str]:
-    """alias (or table name) -> bare table name."""
-    out: dict[str, str] = {}
-    for tbl in tree.find_all(exp.Table):
-        name = tbl.name
-        alias = tbl.alias_or_name
-        out[alias] = name
+def _enclosing_select(node: "exp.Expression") -> "exp.Select | None":
+    """The nearest SELECT a node sits inside, or None when it sits inside no SELECT at all."""
+    p = node.parent
+    while p is not None and not isinstance(p, exp.Select):
+        p = p.parent
+    return p
+
+
+def _cte_body_scopes(root: "exp.Expression") -> dict[int, str]:
+    """id(<the SELECT that is a CTE's body>) -> the name that CTE binds.
+
+    Keyed by object identity, not by the node, because exp nodes hash by STRUCTURE — two CTEs whose
+    bodies are written identically would collide on the node itself and the second would silently
+    take the first one's name. This is the same reason `check_column_scope` keys its per-select maps
+    by `id()`.
+
+    Not answerable from `_cte_names`, which is about a CTE REFERENCE (`FROM orders` where `orders`
+    is a WITH-bound name) and says nothing about which SELECT is that CTE's body. `cte.this` is
+    guarded because a malformed WITH can parse to a CTE with no body, and a `None` key would then
+    match every reference whose enclosing select we failed to find.
+    """
+    out: dict[int, str] = {}
+    for cte in root.find_all(exp.CTE):
+        if cte.this is None:
+            continue
+        out[id(cte.this)] = cte.alias_or_name
     return out
 
 
-def _table_references(tree: "exp.Select") -> list[tuple[str, str, Optional[str]]]:
-    """Every table REFERENCE in the statement, in written order: (as written, bare name, alias).
+class TableRef(NamedTuple):
+    """One table reference, resolved to the query scope that wrote it.
 
-    Deliberately not `_tables_in_scope`, which keys by alias and so collapses two references that
-    share one: a CTE reading `orders` and an outer `FROM orders` become a single entry there. The
-    receipt needs them separate: ACE-042 has to report a filter satisfied inside a CTE and absent
-    outside it accurately, rather than crediting it to the whole statement, and one entry per table
-    cannot say that.
+    A NamedTuple rather than a tuple because `scope` is the fourth field and positional unpacking
+    of four things at two call sites is where the wrong element gets read silently. It stays a
+    tuple underneath, so nothing that already indexes a reference changes meaning.
     """
-    refs: list[tuple[str, str, Optional[str]]] = []
-    for tbl in tree.find_all(exp.Table):
+
+    written: str  # as the statement wrote it, e.g. "public.orders"
+    bare: str  # "orders"
+    alias: Optional[str]  # "o", or None when there is none
+    # "main" | "cte:<name>" | "subquery" — which query scope the reference was written in. A filter
+    # satisfied inside a CTE body is not satisfied for the statement that reads that CTE, so a
+    # reference has to carry the scope it lives in or the two cannot be told apart downstream.
+    scope: str
+
+
+def _table_references(node: "exp.Expression") -> list[TableRef]:
+    """Every table REFERENCE in the statement, in written order, resolved to its query scope.
+
+    Deliberately not one entry per table, which is what keying by alias would give: a CTE reading
+    `orders` and an outer `FROM orders` collapse into a single entry that way. The receipt needs
+    them separate — a filter satisfied inside a CTE and absent outside it has to be reported as
+    exactly that, rather than credited to the whole statement, and one entry per table cannot say
+    it. `_alias_map` below is the alias-keyed view, derived from this same walk.
+
+    `scope` is that distinction made explicit:
+      * `cte:<name>` — the reference sits in the body of the WITH-bound `<name>`;
+      * `main` — the reference sits in a SELECT whose projection reaches the query OUTPUT, which is
+        the top-level SELECT or, for a set operation, ANY arm. An arm is an output query rather than
+        a nested one, so every arm of a UNION reads `main`;
+      * `subquery` — anything else, including a reference whose enclosing SELECT we cannot find.
+        Conservative on purpose: an unrecognized scope must never be mistaken for the main query.
+
+    The CTE name goes through `_echo_name` because it is CALLER-written text: a quoted identifier
+    can hold any string at all, and this label lands in a receipt, which is tool output the calling
+    model weights as server-authored.
+    """
+    cte_scopes = _cte_body_scopes(node)
+    output_ids = {id(sel) for sel in _output_selects(node)}
+    refs: list[TableRef] = []
+    for tbl in node.find_all(exp.Table):
         written = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
-        refs.append((written, tbl.name, tbl.alias or None))
+        sel = _enclosing_select(tbl)
+        if sel is not None and id(sel) in cte_scopes:
+            scope = "cte:" + _echo_name(cte_scopes[id(sel)])
+        elif sel is not None and (sel is node or id(sel) in output_ids):
+            scope = "main"
+        else:
+            scope = "subquery"
+        refs.append(TableRef(written, tbl.name, tbl.alias or None, scope))
     return refs
+
+
+def _alias_map(node: "exp.Expression") -> dict[str, str]:
+    """alias (or table name) -> bare table name, derived from the one reference walk.
+
+    Exactly what the former `_tables_in_scope` returned, and derived rather than walked a second
+    time: `r.alias or r.bare` is sqlglot's own `alias_or_name` (the alias when set, else the name),
+    over the same `find_all(exp.Table)` order, so a repeated key resolves to the same reference in
+    both. Case is preserved rather than folded — the fan/chasm and sensitive-projection callers
+    resolve a column qualifier through this map, and folding it here would change which references
+    they resolve, which is a behaviour change dressed as a refactor.
+
+    Per NODE, never per tree: each caller passes the SELECT it is analyzing, so an arm of a UNION
+    sees only its own tables. Flattening the whole tree into one map would let a table read by one
+    arm decide the other arm's fan-trap and sensitive-projection results.
+    """
+    return {(r.alias or r.bare): r.bare for r in _table_references(node)}
 
 
 def _aggregate_source_tables(tree: "exp.Select", scope: dict[str, str]) -> set[str]:
