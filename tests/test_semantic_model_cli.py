@@ -140,14 +140,24 @@ def test_prepare_does_not_apply_default_filters(tmp_path):
     assert "applied_filters" not in d
 
 
-def test_prepare_auto_rewrites_fan_trap(tmp_path):
+def test_prepare_refuses_the_fan_trap_it_used_to_rewrite(tmp_path):
+    """`sm prepare` is a second execution path, not a reporter: the query skill calls it on every
+    tier and runs whatever `sql` comes back. It used to answer a fan trap with a rewritten statement,
+    which meant the non-`execute_sql` tiers ran something the caller never wrote. It refuses now, and
+    the refusal is an exit code the caller cannot mistake for a statement to run.
+
+    The echoed `sql` is the caller's own, byte for byte, on the refuse path too."""
     _model(tmp_path)
-    rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql",
-                    "SELECT SUM(orders.total) FROM orders JOIN order_items ON order_items.order_id=orders.id"])
+    sql = "SELECT SUM(orders.total) FROM orders JOIN order_items ON order_items.order_id=orders.id"
+    rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql", sql])
     d = json.loads(out)
-    assert rc == 0 and d["action"] == "auto_rewrite" and d["rewritten"] is True
-    assert "order_items" not in d["sql"]              # fan-out join dropped
+
+    assert rc == 1
+    assert d["action"] == "refuse" and d["risk"] == "fan_trap"
+    assert d["sql"] == sql                            # echoed, not rewritten
+    assert "order_items" in d["sql"]                  # the join is still there
     assert "deleted_at" not in d["sql"]               # and nothing injected (ACE-042)
+    assert d["suggestion"]                            # the caller gets a way forward
 
 
 def test_add_writes_metrics_and_skips_invalid(tmp_path):

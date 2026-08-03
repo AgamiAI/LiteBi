@@ -14,19 +14,20 @@ Primitives (examples-first canonical loop):
   resolve_metrics           — lexical match query -> metrics (cold-start)
   identify_entity           — opaque-literal type ID via value_pattern + probe-confirm
   resolve_entity_instance   — strategy chosen at runtime from sensitive + cardinality
-  pre_flight_check          — fan-trap / chasm-trap detection + rewrite-vs-refuse
+  pre_flight_check          — fan-trap / chasm-trap detection + refuse-vs-allow
   assemble_receipt          — the full trust receipt for a statement that ran
   assemble_refusal_receipt  — the echo-bounded receipt every non-ok outcome carries
 
 Pre-flight scope note (documented decision, recorded in the PR description):
 The cardinality field on every relationship is the day-1 structural gate. The
 detector here is **complete and deterministic** for both fan-trap and chasm-trap.
-For the *rewrite*, we auto-rewrite the textbook aggregation-only fan-trap (drop a
-redundant fan-out join → correct scalar) because we can guarantee the rewrite is
-result-preserving. For chasm-traps and fan-traps where the many-side participates
-in SELECT/WHERE/GROUP BY, we return the policy decision + the suggested fix rather
-than synthesizing a CTE rewrite we can't prove correct — never emit wrong SQL.
-Generic CTE synthesis is the planner follow-on (plan: "fan-trap detector v1.5+").
+There is no rewrite. Every detected trap returns the decision plus a suggested fix,
+and the caller's statement is what runs or nothing does. This module used to rewrite
+the textbook aggregation-only fan-trap by dropping the redundant join, on the grounds
+that the transform was provably result-preserving; the transform was, but the premise
+was not. Whether a multiplied total is wrong depends on the question, which this layer
+never sees: the same statement is wrong for order revenue and right for line-item
+exposure. So the analysis stays and the authoring goes.
 """
 
 from __future__ import annotations
@@ -976,13 +977,15 @@ def _many_side_facing_one(rels: list[Relationship], table: str, dim: str) -> boo
 
 def pre_flight_check(sql: str, org: Datasource,
                      ctx: "GuardContext | None" = None) -> PreFlightResult:
-    """Detect fan-trap / chasm-trap and decide rewrite-vs-refuse-vs-allow.
+    """Detect fan-trap / chasm-trap and decide refuse-vs-allow.
 
     A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not exp.Select;
-    each arm is analyzed on its own and a trap in ANY arm refuses the whole query. Arms
-    are not auto-rewritten (splicing a rewrite into one arm of a set operation is out of
-    scope), so a rewriteable arm-trap becomes a refuse. Degrades to allow when sqlglot is
-    unavailable, the SQL doesn't parse, or it contains no SELECT."""
+    each arm is analyzed on its own and a trap in ANY arm refuses the whole query. An arm
+    and a top-level SELECT are treated identically — they used to differ only in whether a
+    fan trap was rewrite-eligible, and nothing is. Degrades to allow when sqlglot is
+    unavailable, the SQL doesn't parse, or it contains no SELECT.
+
+    The statement returned is always the caller's own `sql`, on every path."""
     if not _HAVE_SQLGLOT:
         return PreFlightResult(None, "allow", sql, reason="sqlglot unavailable; skipped")
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
@@ -992,10 +995,12 @@ def pre_flight_check(sql: str, org: Datasource,
     if tree is None or tree.find(exp.Select) is None:
         return PreFlightResult(None, "allow", sql, reason="no SELECT; skipped")
     if isinstance(tree, exp.Select):
-        return _preflight_select(tree, org, sql, allow_rewrite=True, ctx=ctx)
+        return _preflight_select(tree, org, sql, ctx=ctx)
     # Set operation: analyze each arm; a trap in any arm inflates that arm's aggregate.
+    # `arm.sql()` re-serializes, but only to carry the arm's own text into a message —
+    # it is never executed, and the statement returned below is always the caller's `sql`.
     for arm in _output_selects(tree):
-        res = _preflight_select(arm, org, arm.sql(), allow_rewrite=False, ctx=ctx)
+        res = _preflight_select(arm, org, arm.sql(), ctx=ctx)
         if res.risk and res.action == "refuse":
             # tie the arm's diagnosis back to the full set-operation query
             return PreFlightResult(res.risk, "refuse", sql, reason=res.reason,
@@ -1003,11 +1008,11 @@ def pre_flight_check(sql: str, org: Datasource,
     return PreFlightResult(None, "allow", sql, reason="no fan/chasm or aggregation issue in any arm")
 
 
-def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewrite: bool,
+def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
                       ctx: "GuardContext | None" = None) -> PreFlightResult:
     """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT. `sql` is that
-    select's own text (used for the join rewrite + messages). When `allow_rewrite` is
-    False (a set-operation arm), a rewriteable fan trap is refused, not rewritten.
+    select's own text, used for messages only. A top-level SELECT and a set-operation
+    arm are analyzed identically; there is no longer a rewrite for one to be eligible for.
 
     `ctx` supplies the shared cardinality/column indices (ACE-045); `tree` is always the
     caller's own SELECT (a set-op arm ≠ `ctx.tree`), so only the indices come from `ctx`."""
@@ -1017,7 +1022,6 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
 
     # aggregates: list of (table, is_aggregate)
     agg_sources = _aggregate_source_tables(tree, tables_in_scope)
-    has_raw_columns = _has_raw_non_grouped_columns(tree, tables_in_scope)
     has_aggregate = bool(agg_sources)
     no_aggregation = not has_aggregate
 
@@ -1060,36 +1064,17 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str, allow_rewri
             _bare(r.from_table) if _bare(r.to_table) == measure_table else _bare(r.to_table)
             for r in fan_rels
         }
-        # Can we safely auto-rewrite? Only if the many side participates ONLY in
-        # the FROM/JOIN (not in SELECT / WHERE / GROUP BY / HAVING / ORDER BY)
-        # AND the SELECT is aggregation-only (no raw rows).
-        many_aliases = {a for a, t in tables_in_scope.items() if t in many_tables}
-        referenced_elsewhere = _tables_referenced_outside_from(tree, tables_in_scope) & many_tables
-        if allow_rewrite and not has_raw_columns and not referenced_elsewhere:
-            rewritten = _drop_fanout_joins(sql, many_aliases | many_tables)
-            if rewritten and rewritten.strip() != sql.strip():
-                return PreFlightResult(
-                    "fan_trap",
-                    "auto_rewrite",
-                    sql,
-                    rewritten_sql=rewritten,
-                    reason=(
-                        f"fan trap: aggregating {measure_table!r} (one side) across a "
-                        f"join to {sorted(many_tables)} (many side) would multiply the "
-                        "measure. Redundant fan-out join dropped; result shape unchanged."
-                    ),
-                    triggering_joins=[
-                        f"{measure_table} (1) <- {mt} (N)" for mt in sorted(many_tables)
-                    ],
-                )
-        # mixed raw + aggregate, or many-side used in WHERE/GROUP BY -> refuse
+        # Every fan trap refuses. There is no aggregation-only case that gets rewritten
+        # instead: dropping a join the caller wrote is authoring their statement for them,
+        # and whether the multiplied total is even wrong depends on the question, which
+        # this layer does not have.
         return PreFlightResult(
             "fan_trap",
             "refuse",
             sql,
             reason=(
                 f"fan trap: aggregating {measure_table!r} (one side) across a join to "
-                f"{sorted(many_tables)} (many side). Rewrite would change result shape."
+                f"{sorted(many_tables)} (many side)."
             ),
             suggestion=(
                 "Either pre-aggregate the one-side measure in a CTE before joining, "
@@ -1794,46 +1779,10 @@ def _aggregate_source_tables(tree: "exp.Select", scope: dict[str, str]) -> set[s
     return sources
 
 
-def _has_raw_non_grouped_columns(tree: "exp.Select", scope: dict[str, str]) -> bool:
-    """Does the SELECT include bare (non-aggregated) columns? (GROUP BY keys count
-    as raw context for the mixed-shape refuse case.)"""
-    for select_expr in tree.expressions:
-        # an expression that is itself not an aggregate and contains a column
-        if select_expr.find(exp.AggFunc):
-            continue
-        if select_expr.find(exp.Column):
-            return True
-    return False
-
-
-def _tables_referenced_outside_from(tree: "exp.Select", scope: dict[str, str]) -> set[str]:
-    """Tables whose columns are referenced in SELECT/WHERE/GROUP BY/HAVING/ORDER BY
-    (i.e. anywhere that is NOT just the FROM/JOIN ON-clause)."""
-    referenced: set[str] = set()
-
-    def collect(node):
-        if node is None:
-            return
-        for col in node.find_all(exp.Column):
-            t = _resolve_col_table(col, scope)
-            if t:
-                referenced.add(t)
-
-    for e in tree.expressions:  # SELECT list
-        collect(e)
-    where = tree.args.get("where")
-    collect(where.this if where else None)
-    group = tree.args.get("group")
-    if group:
-        for e in group.expressions:
-            collect(e)
-    having = tree.args.get("having")
-    collect(having.this if having else None)
-    order = tree.args.get("order")
-    if order:
-        for e in order.expressions:
-            collect(e)
-    return referenced
+# `_has_raw_non_grouped_columns` and `_tables_referenced_outside_from` were deleted here with the
+# fan-join rewrite. Both existed only to answer "is this trap safe to rewrite instead of refuse",
+# and every fan trap refuses now, so the question has no caller. Do not re-add either as a general
+# helper: the shape they compute is rewrite-eligibility, not a fact about the statement.
 
 
 def _resolve_col_table(col: "exp.Column", scope: dict[str, str]) -> Optional[str]:
@@ -1859,35 +1808,16 @@ def _shared_dimension(
     return None
 
 
-def _drop_fanout_joins(sql: str, drop_tables: set[str]) -> Optional[str]:
-    """Remove JOINs whose target table/alias is in drop_tables. Used for the
-    safe aggregation-only fan-trap rewrite."""
-    try:
-        tree = sqlglot.parse_one(sql, error_level="ignore")
-    except Exception:
-        return None
-    if not isinstance(tree, exp.Select):
-        return None
-    joins = tree.args.get("joins") or []
-    kept = []
-    changed = False
-    for j in joins:
-        target = j.this
-        tname = target.alias_or_name if isinstance(target, exp.Table) else None
-        tbare = target.name if isinstance(target, exp.Table) else None
-        if tname in drop_tables or tbare in drop_tables:
-            changed = True
-            continue
-        kept.append(j)
-    if not changed:
-        return None
-    tree.set("joins", kept)
-    return tree.sql()
-
-
 # `apply_default_filters` was deleted here by ACE-042: declared filters are business logic, not a
 # disclosure control, so nothing justified this module authoring SQL. Reporting which filters a
 # statement applied is ACE-099; do not re-add an injector.
+#
+# `_drop_fanout_joins` was deleted here for the same reason, and it was the last one. It parsed the
+# caller's statement, removed the JOINs a fan trap ran through, and returned `tree.sql()` — a
+# re-serialization of a statement nobody sent — which the guard then executed. Two things follow
+# from its absence and both are asserted in tests/test_ace093_byte_identity.py: the statement handed
+# to the driver is now byte-for-byte the statement received, and no path re-serializes a parsed
+# statement back onto the execution path. Do not re-add a rewriter of any shape.
 
 
 def _similarity(a: str, b: str) -> float:
