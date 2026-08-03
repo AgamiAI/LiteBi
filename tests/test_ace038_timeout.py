@@ -210,7 +210,12 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # the safety pass already resolved ACROSS to the receipt builder a few lines later, inside one
     # call. Nothing reads it to compute a bound, and it is cleared at the entry to every call, so it
     # cannot outlive the call that set it — let alone reach a child.
-    context_vars -= {"_last_error_detail", "_guard_model"}
+    #
+    # `_guard_shape` (ACE-087) passes the same test for the third time: it carries the shape the
+    # safety pass read off the statement across to the refusal builder, within one call, and is
+    # cleared at entry beside `_guard_model`. It is read only to choose the WORDING of a refusal
+    # that has already been decided — never to compute a bound, and never before one is spent.
+    context_vars -= {"_last_error_detail", "_guard_model", "_guard_shape"}
     assert context_vars == {"_max_rows_override"}, (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"

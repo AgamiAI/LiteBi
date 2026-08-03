@@ -1300,6 +1300,19 @@ _last_error_detail: ContextVar[str | None] = ContextVar("_last_error_detail", de
 # carry a value only the receipt wants is a worse trade than this carrier.
 _guard_model: ContextVar[Any | None] = ContextVar("_guard_model", default=None)
 
+# The shape `_model_safety` read off THIS call's parsed statement — "aggregate", "listing", or None
+# when there was no tree to read. Carried for exactly one consumer: the result-bound refusal, which
+# must not tell an aggregate caller to add a `LIMIT` (ACE-087).
+#
+# It is a carrier for the same reason `_guard_model` is, plus one this module cannot get around: the
+# classification needs sqlglot and this module ships in the stdlib-only vendored mirror, so the
+# verdict site literally cannot compute it. `semantic_model.runtime.statement_shape` does it where
+# the tree already is, and the answer travels as a plain string.
+#
+# None is a real, reachable answer rather than an error: the mirror has no `runtime` to call, and
+# `no_safety=True` skips the pass that would set this. Both get the shape-neutral remediation.
+_guard_shape: ContextVar[str | None] = ContextVar("_guard_shape", default=None)
+
 
 def _resolve_row_cap() -> int:
     """Effective result-row cap. `AGAMI_SQL_MAX_ROWS` is the operator-configurable DEPLOYMENT cap
@@ -1440,19 +1453,63 @@ _EXECUTOR_SATURATED = "the executor already has its limit of abandoned calls out
 _NARROW_IT = ("Narrow the time range, reduce the grouping, or add a selective filter, "
               "then run it again.")
 
+# The transfer bound's remediation, keyed by the shape `_guard_shape` carries. Three entries rather
+# than one, because the right fix genuinely differs and the wrong one is not merely unhelpful:
+#
+#   * A LISTING can be bounded. `LIMIT` without `ORDER BY` still returns an arbitrary subset — the
+#     engine's emission order is not a promise — so the ORDER BY is what turns "some rows" into "the
+#     rows you asked for", and it is named first for that reason.
+#   * An AGGREGATE cannot. `LIMIT` on a grouped result silently drops groups, and a partial breakdown
+#     reads exactly like a complete one: no row is wrong, the total is. That is a worse outcome than
+#     the refusal the caller just got. The text does not warn against `LIMIT`; it does not mention it
+#     at all. The reader here is usually an LLM, negation is what an LLM follows least reliably, and
+#     "do not add a LIMIT" puts the token in front of it either way. Absence is the stronger control,
+#     and it is also what makes the acceptance check a plain one.
+#   * None means nothing parsed the statement — the vendored mirror has no `runtime` to call, and
+#     `no_safety=True` skips the pass that sets the shape. Guessing "listing" here would hand an
+#     aggregate caller the one instruction that corrupts their answer, so this text hands the fork
+#     back to the caller, who does know which they wrote, and makes `LIMIT` conditional on it.
+_RESULT_BOUND_REMEDIATION = {
+    "listing": "Bound the result with LIMIT, and add an ORDER BY so the rows you get back are the "
+               "ones you meant to ask for.",
+    "aggregate": "Narrow the grouping, or add a selective filter, so the whole breakdown fits within "
+                 "the row cap, then run it again.",
+    None: "Add a selective filter to narrow the result. If it is a plain row listing rather than an "
+          "aggregate, you can instead bound it with LIMIT and an ORDER BY.",
+}
 
-def _resource_limit_refusal(exc: _ResourceLimit) -> Refusal:
-    """The ONE `resource_limit` refusal, built from whichever of the three bounds raised.
+
+def _resource_limit_refusal(exc: _ResourceLimit | None) -> Refusal:
+    """The ONE `resource_limit` refusal, built from whichever of the four bounds stopped the call.
 
     Single-sourced because two entries into the engines lead here — the guarded chokepoint and the
-    subprocess/CLI adapter — and a caller must not be able to tell which one it came through.
+    subprocess/CLI adapter — so neither can drift into wording the other does not have.
 
-    The budget is re-resolved rather than carried on the marker: the marker stays a plain exception,
-    and nothing between the engine call and here can change the environment the resolver reads, so it
-    is the same number the watchdog used. The configured number belongs in the detail — it is a
-    deployment setting, not a data value, and a bound the caller cannot see is one it cannot plan
-    around.
+    `exc is None` is the fourth bound, and the only one that is not a time bound: the result-transfer
+    ceiling (ACE-087). It arrives with no marker because there is nothing to raise — overflow is a
+    flag on a result the executor already returned — so the absence of an exception IS the signal.
+
+    What this deliberately no longer preserves is indistinguishability. The three time bounds still
+    read alike, but a transfer refusal names rows where a timeout names seconds, and its remediation
+    is shaped by the statement. That is the point of it: "add a LIMIT" and "narrow the grouping" are
+    different fixes, and a caller who gets the wrong one is worse off than one who gets neither. The
+    invariant that survives is one rule with one emit site, not one sentence.
+
+    The budget is re-resolved rather than carried: nothing between the engine call and here can
+    change the environment the resolvers read, so both `_resolve_timeout_s` and `_resolve_row_cap`
+    return the same number the bound itself used. The configured number belongs in the detail — it
+    is a deployment setting, not a data value, and a bound the caller cannot see is one it cannot
+    plan around.
     """
+    if exc is None:
+        # The transfer bound. No rows come back with this: an unordered prefix of a larger result is
+        # an arbitrary sample, and returning it under a `status=ok` is a wrong answer wearing a right
+        # one's clothes.
+        detail = (
+            f"The result exceeded the {_resolve_row_cap()}-row limit, so it was not returned."
+        )
+        return refuse(RULE_RESOURCE_LIMIT, detail=detail,
+                      remediation=_RESULT_BOUND_REMEDIATION[_guard_shape.get()])
     timeout_s = _resolve_timeout_s()
     if isinstance(exc, _ExecutorSaturated):
         # Nothing ran, so nothing about THIS statement is the finding. Saying "your query was too
@@ -1731,6 +1788,10 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     # rebuilding its index (audit P2 / ACE-045). Behaviour-preserving: a guard given `ctx`
     # returns the same verdict as one that builds its own.
     ctx = RT.build_guard_context(sql, org)
+    # Published for the result-bound refusal, off the tree that was just parsed rather than a second
+    # one. Set here and not at the chokepoint because the chokepoint cannot import sqlglot — see
+    # `_guard_shape`. Stays None when `ctx` is None (no sqlglot) or the statement did not parse.
+    _guard_shape.set(RT.statement_shape(ctx))
 
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
@@ -2193,6 +2254,9 @@ def execute_guarded(
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)
+    # And the same again for the shape. A stale value here is worse than none: it would word this
+    # call's refusal for a statement somebody else sent, and the two wordings give opposite advice.
+    _guard_shape.set(None)
     # The statement the CALLER sent. Every NON-OK receipt is built from this one, and the rule is
     # about the REBINDING rather than about any particular mechanism: whatever a safety pass rewrites
     # a statement INTO is the guard's own text, so a rebound string can name a table the caller never
@@ -2241,6 +2305,18 @@ def execute_guarded(
         # Inside the try on purpose: an executor that returns `None` (or anything else the contract
         # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
         # broken adapter, not a reason for the chokepoint to raise at its caller.
+        # The transfer bound, checked BEFORE the `ok` envelope can be built (ACE-087). It sits here
+        # rather than in `_collect_cursor` because that function is only one of three ways a result
+        # arrives: BigQuery has no DB-API cursor and bounds itself, and an injected `ports.Executor`
+        # — the pooled / per-user-RBAC seam a hosted consumer supplies — reaches neither. All three
+        # set `truncated` on the ExecResult, so reading it here is the one place that covers them.
+        #
+        # The rows are dropped rather than returned. `_envelope("refused", …)` carries no data by
+        # construction, which is the whole point: what the executor holds is whichever rows the
+        # engine emitted first, and with no ORDER BY that is an arbitrary sample of the real result.
+        if result.truncated:
+            return _envelope("refused", refusal=_resource_limit_refusal(None),
+                             receipt=_receipt_for(received_sql, profile, bounded=True))
         # The one receipt built from the REBOUND statement: `ok` is the status SC-6 asks to describe
         # what actually executed, and it is also the one a caller cannot provoke without every name
         # in it having already satisfied the scope gates and the warehouse.

@@ -117,6 +117,34 @@ def build_guard_context(sql: str, org: Datasource) -> "GuardContext | None":
         model_table_index=_model_table_index(org),
     )
 
+
+def statement_shape(ctx: "GuardContext | None") -> "str | None":
+    """`"aggregate"` when the statement groups, `"listing"` otherwise, `None` when there is no
+    tree to read (sqlglot absent, or the SQL did not parse).
+
+    This exists so that `execute_sql` can word the result-bound refusal for the right shape
+    without importing sqlglot (ACE-087). It cannot live there: `execute_sql` ships in the
+    stdlib-only vendored mirror, which does not carry this module — the same reason
+    `sql_guard` is regex rather than a parse. So the classification happens here, where the
+    tree `build_guard_context` already parsed is in hand, and travels as a plain string.
+
+    `GROUP BY` anywhere in the tree is the whole predicate, and it is deliberately coarse.
+    `exp.Group` covers `GROUP BY`, `ROLLUP`, `CUBE` and `GROUPING SETS`, and looking anywhere
+    rather than at the outermost select means a set operation with one grouped arm reads as an
+    aggregate. That is the direction to be wrong in: the aggregate remediation never says
+    `LIMIT`, and telling a caller to `LIMIT` an aggregate hands them a partial breakdown that
+    reads as complete. A bare `COUNT(*)` returns one row and cannot reach the bound at all; a
+    window function returns one row per input row, which is a listing, and `LIMIT` is right
+    for it.
+
+    Being a pure function of the tree is what keeps principle 9 true of the refusal's wording:
+    the same statement against the same model produces the same remediation, every run.
+    """
+    if ctx is None or ctx.tree is None:
+        return None
+    return "aggregate" if ctx.tree.find(exp.Group) is not None else "listing"
+
+
 # Ambiguity threshold — "ask, don't guess" when top-two are within this delta.
 AMBIGUITY_DELTA = 0.15
 
