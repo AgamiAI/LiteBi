@@ -21,8 +21,17 @@ case found here — the FROM clause disappears:
     SELECT payload:cust.ssn FROM secret   ->   SELECT payload AS :cust
 
 Every gate then judges a statement that reads no tables at all, so an undeclared table is
-reached with nothing raised anywhere. This one is worse than shape 1: shape 1 needs a
-non-default engine, and this needs only a two-level path.
+reached with nothing raised anywhere.
+
+**Scope of shape 2, measured on a live Postgres rather than assumed.** The reach needs an
+engine whose grammar actually accepts the truncated construct. `payload:cust.ssn` is
+Snowflake's spelling, so there it executes; on PostgreSQL the guard allows the statement and
+the *database* rejects it as a syntax error — a `failed`, not a refusal, which is principle 4's
+distinction working exactly as intended. Eleven PostgreSQL-specific constructs were probed for
+the same truncation (`@>`, `SIMILAR TO`, `DISTINCT ON`, `TABLESAMPLE`, `FILTER`, `LATERAL`,
+`~`, `::`, `IS NOT DISTINCT FROM`, `FETCH FIRST`, `ONLY`) and **none** of them truncates; table
+scope fires on every one. So this is not a general Postgres hole, and it is not decoration
+either: Snowflake is a supported engine and this is its own syntax.
 
 **Every test here is `xfail(strict=True)`, and that is the deliverable.** ACE-096 specifies what
 the three 4b gates refuse; this file is the part of that specification the code does not yet meet,
