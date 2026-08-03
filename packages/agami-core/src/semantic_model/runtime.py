@@ -1881,12 +1881,24 @@ def _cte_body_scopes(root: "exp.Expression") -> dict[int, str]:
     is a WITH-bound name) and says nothing about which SELECT is that CTE's body. `cte.this` is
     guarded because a malformed WITH can parse to a CTE with no body, and a `None` key would then
     match every reference whose enclosing select we failed to find.
+
+    EVERY output select of the body is registered, not only the body node itself. A CTE body can be
+    a set operation — `WITH recent AS (SELECT … UNION SELECT …)` parses `cte.this` to a
+    `SetOperation`, not a `Select` — and a table inside an arm resolves through `_enclosing_select`
+    to that ARM, whose id is not the body's. Keying only the body left every such reference falling
+    through to `subquery`, which is precisely the label that says "this scope is not one we
+    recognized": a filter satisfied in a UNION-ed CTE was reported as satisfied nowhere nameable.
+    `_output_selects` returns `[cte.this]` unchanged when the body is a plain SELECT, so the extra
+    registration below is only ever a second write of the same pair in that case.
     """
     out: dict[int, str] = {}
     for cte in root.find_all(exp.CTE):
         if cte.this is None:
             continue
-        out[id(cte.this)] = cte.alias_or_name
+        name = cte.alias_or_name
+        out[id(cte.this)] = name
+        for sel in _output_selects(cte.this):
+            out[id(sel)] = name
     return out
 
 
@@ -1907,14 +1919,30 @@ class TableRef(NamedTuple):
     scope: str
 
 
-def _table_references(node: "exp.Expression") -> list[TableRef]:
-    """Every table REFERENCE in the statement, in written order, resolved to its query scope.
+class _RefSite(NamedTuple):
+    """One resolved `TableRef` beside the `exp.Table` node it was read from.
+
+    Internal, and the node stays here rather than on `TableRef` because `TableRef` is
+    receipt-facing: its fields are rendered into tool output, and a parse-tree node is neither
+    renderable nor meaningful to a reader of the receipt. What needs the node is the analysis —
+    `check_declared_filters` resolves a reference's own enclosing SELECT from it — and an analysis
+    that re-walked `exp.Table` to find the node again would be walking the tree a second time to
+    recover something the first walk had in hand.
+    """
+
+    ref: TableRef
+    node: "exp.Table"
+
+
+def _reference_sites(node: "exp.Expression") -> list[_RefSite]:
+    """The one walk of `exp.Table`: every table REFERENCE, resolved to its scope, with its node.
 
     Deliberately not one entry per table, which is what keying by alias would give: a CTE reading
     `orders` and an outer `FROM orders` collapse into a single entry that way. The receipt needs
     them separate — a filter satisfied inside a CTE and absent outside it has to be reported as
     exactly that, rather than credited to the whole statement, and one entry per table cannot say
-    it. `_alias_map` below is the alias-keyed view, derived from this same walk.
+    it. `_table_references` is the receipt-facing view of this list and `_alias_map` the
+    alias-keyed one; both are derived here rather than walked again.
 
     `scope` is that distinction made explicit:
       * `cte:<name>` — the reference sits in the body of the WITH-bound `<name>`;
@@ -1930,7 +1958,7 @@ def _table_references(node: "exp.Expression") -> list[TableRef]:
     """
     cte_scopes = _cte_body_scopes(node)
     output_ids = {id(sel) for sel in _output_selects(node)}
-    refs: list[TableRef] = []
+    sites: list[_RefSite] = []
     for tbl in node.find_all(exp.Table):
         written = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
         sel = _enclosing_select(tbl)
@@ -1940,8 +1968,22 @@ def _table_references(node: "exp.Expression") -> list[TableRef]:
             scope = "main"
         else:
             scope = "subquery"
-        refs.append(TableRef(written, tbl.name, tbl.alias or None, scope))
-    return refs
+        sites.append(_RefSite(TableRef(written, tbl.name, tbl.alias or None, scope), tbl))
+    return sites
+
+
+def _table_references(node: "exp.Expression") -> list[TableRef]:
+    """Every table REFERENCE in the statement, resolved to its query scope — the receipt's view.
+
+    The order is sqlglot's own traversal order, NOT the order the references appear in the text.
+    The two differ wherever a WITH is involved: the parse reaches the outer query before it reaches
+    a CTE body, so `WITH x AS (SELECT … FROM orders) SELECT … FROM payments` yields `payments`
+    first and `orders` second. That is stated rather than fixed, because `_RECEIPT_MAX_REFS`
+    truncates from the FRONT of exactly this order — reordering the walk would silently change
+    which references a capped receipt lists, and the parse order is at least deterministic for a
+    given statement, which is what a receipt needs.
+    """
+    return [site.ref for site in _reference_sites(node)]
 
 
 def _alias_map(node: "exp.Expression") -> dict[str, str]:
@@ -2139,6 +2181,303 @@ def resolve_result_units(org: Datasource, sql: str) -> dict[str, str]:
             out[name] = unit                 # by output name (aliased / named columns)
         if not has_star:
             out[f"#{i}"] = unit              # by position — covers unaliased MAX(amount) etc.
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Declared-filter adherence
+#
+# A table's `default_filters` are business logic — "what this org MEANS by `orders`" — not a
+# disclosure control. ACE-042 established that by deleting the injector that ANDed them into the
+# caller's statement: Agami never authors or alters SQL, and a filter this layer added silently was
+# both an edit nobody asked for and, for a reference bound inside a CTE, an edit that manufactured
+# a database error. What is left is the honest half — REPORTING which declared filters the
+# statement the caller wrote actually applied, per REFERENCE, because a filter satisfied inside a
+# CTE body is not satisfied for the statement that reads that CTE.
+#
+# Nothing below refuses and nothing below rewrites. Every statement this reads runs exactly as
+# written; the answer is a fact for the receipt. DO NOT re-add an injector here — the module has a
+# tombstone for `apply_default_filters` and `tests/test_ace042_no_filter_injection.py` fails the
+# build on the name.
+#
+# The determination is deliberately shallow, and the shallowness is the design. Three states, and
+# only an outright ABSENCE earns `omitted`: a written predicate that is not the declared one but
+# touches the same column is `undetermined`, never `omitted`, because deciding that `amount > 100`
+# does or does not honour a declared `amount > 0` is implication, and implication needs a solver.
+# A solver would make the reported status depend on how hard we tried, which is exactly the kind of
+# answer a trust receipt must not give. A confident "omitted" we cannot stand behind is silence.
+# ---------------------------------------------------------------------------
+
+# A `:param` bind marker a model author left for an executor to fill. The lookbehind keeps the `::`
+# cast Postgres and friends write (`amount::numeric`) from reading as a marker: the first colon is
+# preceded by a word character and the second by a colon, so neither matches.
+_BIND_MARKER = re.compile(r"(?<![:\w]):[A-Za-z_]\w*")
+
+
+def _parse_declared_predicate(text: str) -> "exp.Expression | None":
+    """One declared filter's text, parsed into a predicate tree; None when it will not parse.
+
+    Wrapped in a throwaway `SELECT 1 WHERE …` because a bare predicate is not a statement and
+    sqlglot parses statements. THIS IS PARSE-ONLY, and it is worth saying plainly because the line
+    has the shape of the deleted injector and a reader will look twice: nothing built here is ever
+    serialized back into SQL, nothing here is handed to a driver, and the caller's bytes reach the
+    engine untouched (`tests/test_ace093_byte_identity.py` pins that). The only consumer of the
+    tree returned is a structural comparison whose entire output is one of three status strings.
+
+    Degrades to None rather than raising, on the module's usual posture: a model author's filter
+    text is not validated as SQL anywhere, so an unparseable one is a thing that happens and it
+    makes the status `undetermined`, not the receipt an error.
+    """
+    try:
+        stmt = sqlglot.parse_one(f"SELECT 1 WHERE {text}")
+    except Exception:
+        return None
+    where = stmt.args.get("where") if isinstance(stmt, exp.Select) else None
+    return where.this if where is not None else None
+
+
+def _where_predicate(sel: "exp.Select") -> "exp.Expression | None":
+    """This SELECT's own WHERE predicate, unwrapped from the `exp.Where` clause node holding it.
+
+    A named helper for one attribute access because nothing else in this module reads a WHERE at
+    all: the guards all work from tables and columns. So the knowledge that `args["where"]` is the
+    clause and `.this` is the predicate inside it lives in exactly one place.
+    """
+    where = sel.args.get("where")
+    return where.this if where is not None else None
+
+
+def _inner_join_predicates(sel: "exp.Select") -> list["exp.Expression"]:
+    """The `ON` predicate of every INNER join in this SELECT — the join predicates that FILTER.
+
+    Excluding outer joins is the whole reason this is not simply "every join's ON". A predicate in
+    a LEFT join's ON does not remove a row from the result: the outer row survives with NULLs where
+    the inner side failed the test, so the row set the answer counted is not the filtered one.
+    Crediting a declared filter to it would be the same class of error the CTE scope exists to
+    prevent — a filter satisfied somewhere that is not where the answer came from.
+
+    sqlglot marks an outer join by setting `side` (LEFT / RIGHT / FULL) and leaves it unset for
+    INNER, so the test is on `side`; `kind` carries CROSS and OUTER instead and would not separate
+    the two. A CROSS join carries no ON and so contributes nothing here either way.
+    """
+    out: list["exp.Expression"] = []
+    for join in sel.args.get("joins") or []:
+        if join.args.get("side"):
+            continue
+        on = join.args.get("on")
+        if on is not None:
+            out.append(on)
+    return out
+
+
+def _all_join_predicates(sel: "exp.Select") -> list["exp.Expression"]:
+    """Every join's ON predicate, OUTER joins included — the looser sibling of the above.
+
+    It exists for the one question where looseness is the safe direction: whether a declared filter
+    is outright ABSENT from the statement. A filter written into a LEFT join's ON is not applied,
+    but it is plainly not absent either, and reporting it `omitted` would be a confident claim
+    about a statement that says otherwise in its own text.
+    """
+    out: list["exp.Expression"] = []
+    for join in sel.args.get("joins") or []:
+        on = join.args.get("on")
+        if on is not None:
+            out.append(on)
+    return out
+
+
+def _and_conjuncts(node: "exp.Expression | None") -> list["exp.Expression"]:
+    """One predicate flattened over AND into the top-level facts it asserts.
+
+    Recursive because sqlglot parses `a AND b AND c` into a nested tree of `exp.And`: unwrapping a
+    single level would leave `a AND b` standing as one conjunct, and a filter written first in a
+    three-way AND would then never match anything. `exp.Paren` is unwrapped for the same reason —
+    `(a AND b)` asserts both, and the bracket is the author's readability, not a change of meaning.
+
+    `exp.Or` is deliberately NOT descended into. Its arms are alternatives, not facts: a row can
+    satisfy `a = 1 OR b = 2` while failing `a = 1`, so returning the arms here would report a
+    filter as applied on a row set that never had it applied.
+    """
+    if node is None:
+        return []
+    if isinstance(node, exp.And):
+        return _and_conjuncts(node.left) + _and_conjuncts(node.right)
+    if isinstance(node, exp.Paren):
+        return _and_conjuncts(node.this)
+    return [node]
+
+
+def _filtering_conjuncts(sel: "exp.Select") -> list["exp.Expression"]:
+    """Every top-level predicate that filters THIS select's own row set: WHERE plus INNER-join ONs.
+
+    This is the list a declared filter has to appear in verbatim to be reported `applied`. Per
+    select and never per tree, for the same reason `_alias_map` is: a filter satisfied in a CTE
+    body or a nested subquery filters that scope's rows, not the caller's.
+    """
+    conjuncts: list["exp.Expression"] = _and_conjuncts(_where_predicate(sel))
+    for on in _inner_join_predicates(sel):
+        conjuncts.extend(_and_conjuncts(on))
+    return conjuncts
+
+
+def _mentioned_predicates(sel: "exp.Select") -> list["exp.Expression"]:
+    """Every predicate tree this select writes, whether or not it filters: WHERE plus ALL join ONs.
+
+    Whole trees, not conjuncts, because the question this answers is "does the statement talk about
+    this column anywhere in its predicates" — a column buried under an OR or inside a LEFT join's
+    ON is still talked about, and that is enough to disqualify a claim that the filter is absent.
+    """
+    predicates: list["exp.Expression"] = []
+    where = _where_predicate(sel)
+    if where is not None:
+        predicates.append(where)
+    predicates.extend(_all_join_predicates(sel))
+    return predicates
+
+
+def _fold_unquoted_identifiers(node: "exp.Expression") -> "exp.Expression":
+    """A COPY of `node` with every UNQUOTED identifier lowercased, for structural comparison.
+
+    Unquoted identifiers fold case in Postgres and friends, so `O.IS_DELETED` and `o.is_deleted`
+    are the same column and a comparison that says otherwise would report a correctly applied
+    filter as missing. Quoted identifiers do NOT fold and are left exactly as written, and neither
+    does anything else in the tree — a string literal above all. `status != 'Test'` and
+    `status != 'test'` select different rows, and a normalizer that flattened both would report the
+    wrong one as the declared filter applied.
+
+    That is the reason this is a named helper and not `_norm_sql`, which is the module's other
+    normalizer and wrong for this job twice over: it lowercases the WHOLE string, literals
+    included, and it is used for substring containment, so a declared `amount > 0` would "match" a
+    written `amount > 0.5`. Copied rather than mutated in place because the nodes belong to the
+    caller's parse tree, which other analyses in the same receipt still read.
+    """
+    folded = node.copy()
+    for ident in folded.find_all(exp.Identifier):
+        if not ident.quoted and isinstance(ident.this, str):
+            ident.set("this", ident.this.lower())
+    return folded
+
+
+def _predicate_columns(node: "exp.Expression") -> set[str]:
+    """The bare column names a predicate references, case-folded.
+
+    BARE and folded on purpose, so the membership test built on it errs toward `undetermined`. A
+    declared filter on `orders` whose column also appears qualified to another table in the same
+    WHERE will read as mentioned and the status will be `undetermined` rather than `omitted` — the
+    conservative direction, since `omitted` is the one status that makes a definite claim about
+    what the statement left out.
+    """
+    return {col.name.lower() for col in node.find_all(exp.Column) if col.name}
+
+
+def _mentions_any_column(predicates: list["exp.Expression"], names: set[str]) -> bool:
+    """Whether any of these predicate trees references any of these (folded, bare) column names."""
+    return any(
+        (col.name or "").lower() in names
+        for predicate in predicates
+        for col in predicate.find_all(exp.Column)
+    )
+
+
+def _declared_filter_status(declared: str, site: _RefSite) -> dict[str, str]:
+    """One declared filter, judged against the scope the reference was written in.
+
+    `{alias}` binds to THIS reference's own identifier — its alias when it has one, else its bare
+    name — which is what makes the answer per-reference rather than per-table. The substituted text
+    goes through `_echo_name` first and that is the only point at which it can: the alias is the
+    CALLER's text (a quoted identifier holds any string at all) and `expr` ends up in a receipt,
+    which is tool output the calling model weights as server-authored. Bounding afterwards is not
+    an option — `_ECHO_UNSAFE` turns spaces and operators into `?`, so running it over the finished
+    predicate would mangle the model author's own text. Nothing else in `expr` comes from the
+    statement.
+
+    Degrades to `undetermined` at every uncertain step and never raises: an unbound `:param`, an
+    unparseable filter, a reference with no enclosing SELECT. The declared text is reported either
+    way, because a reader who cannot be told the status is still owed the filter it is about.
+    """
+    ref = site.ref
+    bound = declared.replace("{alias}", _echo_name(ref.alias or ref.bare))
+    entry = {"expr": bound, "status": "undetermined"}
+    # A surviving bind marker means the predicate is incomplete — whatever the executor would have
+    # bound decides what it selects, and comparing the unbound text would compare a different
+    # predicate than the one the author declared.
+    if _BIND_MARKER.search(bound):
+        return entry
+    declared_predicate = _parse_declared_predicate(bound)
+    if declared_predicate is None:
+        return entry
+    sel = _enclosing_select(site.node)
+    if sel is None:
+        return entry
+
+    target = _fold_unquoted_identifiers(declared_predicate)
+    # An extra conjunct beside the declared one never weakens the answer: `WHERE is_deleted = false
+    # AND amount > 100` still applied the declared filter, it just also applied something else.
+    if any(_fold_unquoted_identifiers(c) == target for c in _filtering_conjuncts(sel)):
+        entry["status"] = "applied"
+        return entry
+    # Not applied. `omitted` is the strong claim, so it is reserved for a statement whose predicates
+    # never mention the columns at all. Everything else — the same column under a different
+    # comparison, the predicate reachable only through an OR, the predicate sitting in an outer
+    # join's ON — is a statement we cannot read confidently, and it says so.
+    if _mentions_any_column(_mentioned_predicates(sel), _predicate_columns(declared_predicate)):
+        return entry
+    entry["status"] = "omitted"
+    return entry
+
+
+def check_declared_filters(
+    # Annotated Optional rather than merely guarded: `GuardContext.tree` is None whenever the SQL
+    # did not parse, so a caller threading a context through has a None to hand and the signature
+    # should say that it may.
+    node: "exp.Expression | None",
+    org: Datasource,
+    *,
+    refs: "list[_RefSite] | None" = None,
+    ctx: "GuardContext | None" = None,
+) -> list[tuple[TableRef, list[dict[str, str]]]]:
+    """Which of each table reference's declared `default_filters` this statement applied.
+
+    One `(reference, filters)` pair per table REFERENCE, in the walk order `_reference_sites`
+    returns. Pairs rather than a list positionally aligned with a reference list, because an
+    index-aligned second list is a coupling that breaks silently: a caller that caps or filters one
+    of them and not the other reports one reference's filters against another reference's name.
+
+    Each filter entry is `{"expr": <the declared text, alias bound>, "status": …}` where status is
+    `applied`, `omitted`, or `undetermined`. A reference with no model row — an undeclared table,
+    or a CTE name, which never resolves to a model table however closely it matches — gets `[]`,
+    and so does a declared table whose `default_filters` list is empty. There is no fourth status
+    for "not a declared table": the receipt's own `declared: false` on that reference already says
+    why, and a second way to say it is a second thing to keep in step.
+
+    `refs` lets a caller that has ALREADY walked the tree hand the walk in, so the receipt's
+    reference list and this determination cost one walk of `exp.Table` between them rather than
+    two. Omitted, it walks itself, which is what a standalone caller wants.
+
+    Degrades, never raises, never prints. sqlglot missing or no tree means an empty list; every
+    per-filter uncertainty is `undetermined` on that filter and the walk carries on, the same
+    posture the guards take with their per-item `continue`s.
+    """
+    if not _HAVE_SQLGLOT or node is None:
+        return []
+    sites = refs if refs is not None else _reference_sites(node)
+    tidx = ctx.model_table_index if ctx is not None else _model_table_index(org)
+    # The same case-folded lookup every other model resolution uses, with the same CTE subtraction:
+    # `WITH orders AS (…)` names a result the statement defined for itself, so reporting the real
+    # `orders` table's declared filters against it would be an accounting of a table nothing read.
+    cte_names = _cte_names(node)
+    out: list[tuple[TableRef, list[dict[str, str]]]] = []
+    for site in sites:
+        key = _tkey(site.ref.bare)
+        info = None if key in cte_names else tidx.get(key)
+        table = info[0] if info else None
+        # RAW `Table.default_filters`, deliberately not `loader.collect_default_filters`: that one
+        # binds `{alias}` to the table's bare name and dedupes across tables, and both destroy the
+        # per-reference answer this function exists to give — an aliased reference would be judged
+        # against an identifier it never wrote, and two references to the same table would collapse
+        # into one entry that cannot say a filter was applied on one of them and not the other.
+        filters = [_declared_filter_status(f, site) for f in table.default_filters] if table else []
+        out.append((site.ref, filters))
     return out
 
 
