@@ -401,10 +401,16 @@ def resolve_entity_instance(
 
 @dataclass
 class PreFlightResult:
-    risk: Optional[str]  # "fan_trap" | "chasm_trap" | None
-    action: str  # "auto_rewrite" | "refuse" | "allow"
-    original_sql: str
-    rewritten_sql: Optional[str] = None
+    """What the pre-flight found. It carries no statement of any kind.
+
+    It used to carry two: `original_sql`, and `rewritten_sql` for the fan-join rewrite to hand back
+    the statement it had authored. Both went with that rewrite. `original_sql` names a distinction
+    that stopped existing along with it — there is no non-original version left to contrast against,
+    so the field would have meant "the statement", stored on a result whose caller already holds it.
+    """
+
+    risk: Optional[str]  # "fan_trap" | "chasm_trap" | "bad_aggregation" | "semi_additive" | None
+    action: str  # "refuse" | "allow"
     reason: str = ""
     suggestion: Optional[str] = None
     triggering_joins: list[str] = field(default_factory=list)
@@ -413,8 +419,6 @@ class PreFlightResult:
         return {
             "risk": self.risk,
             "action": self.action,
-            "original_sql": self.original_sql,
-            "rewritten_sql": self.rewritten_sql,
             "reason": self.reason,
             "suggestion": self.suggestion,
             "triggering_joins": self.triggering_joins,
@@ -987,13 +991,13 @@ def pre_flight_check(sql: str, org: Datasource,
 
     The statement returned is always the caller's own `sql`, on every path."""
     if not _HAVE_SQLGLOT:
-        return PreFlightResult(None, "allow", sql, reason="sqlglot unavailable; skipped")
+        return PreFlightResult(None, "allow", reason="sqlglot unavailable; skipped")
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
     # call are byte-identical: _parse_sql swallows an unparseable statement to None exactly as a
     # prebuilt ctx.tree would be None, and both then report the one "no SELECT; skipped" reason.
     tree = ctx.tree if ctx is not None else _parse_sql(sql)
     if tree is None or tree.find(exp.Select) is None:
-        return PreFlightResult(None, "allow", sql, reason="no SELECT; skipped")
+        return PreFlightResult(None, "allow", reason="no SELECT; skipped")
     if isinstance(tree, exp.Select):
         return _preflight_select(tree, org, sql, ctx=ctx)
     # Set operation: analyze each arm; a trap in any arm inflates that arm's aggregate.
@@ -1003,9 +1007,9 @@ def pre_flight_check(sql: str, org: Datasource,
         res = _preflight_select(arm, org, arm.sql(), ctx=ctx)
         if res.risk and res.action == "refuse":
             # tie the arm's diagnosis back to the full set-operation query
-            return PreFlightResult(res.risk, "refuse", sql, reason=res.reason,
+            return PreFlightResult(res.risk, "refuse", reason=res.reason,
                                    suggestion=res.suggestion, triggering_joins=res.triggering_joins)
-    return PreFlightResult(None, "allow", sql, reason="no fan/chasm or aggregation issue in any arm")
+    return PreFlightResult(None, "allow", reason="no fan/chasm or aggregation issue in any arm")
 
 
 def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
@@ -1030,7 +1034,6 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
         return PreFlightResult(
             None,
             "allow",
-            sql,
             reason="no aggregation present; join is not a fan/chasm trap",
         )
 
@@ -1042,7 +1045,6 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
             return PreFlightResult(
                 "chasm_trap",
                 "refuse",  # documented: CTE synthesis is the planner follow-on
-                sql,
                 reason=(
                     f"chasm trap: independent measures from {srcs} both join shared "
                     f"dimension {shared!r}; cross-product inflates both aggregates."
@@ -1071,7 +1073,6 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
         return PreFlightResult(
             "fan_trap",
             "refuse",
-            sql,
             reason=(
                 f"fan trap: aggregating {measure_table!r} (one side) across a join to "
                 f"{sorted(many_tables)} (many side)."
@@ -1090,7 +1091,7 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
     if semantic is not None:
         return semantic
 
-    return PreFlightResult(None, "allow", sql, reason="no fan/chasm or aggregation issue")
+    return PreFlightResult(None, "allow", reason="no fan/chasm or aggregation issue")
 
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1203,7 @@ def _check_aggregation_semantics(
             if bad:
                 verb = "SUM" if is_sum else "AVG"
                 return PreFlightResult(
-                    "bad_aggregation", "refuse", sql,
+                    "bad_aggregation", "refuse",
                     reason=(
                         f"{verb}({col.name}) is meaningless: {col.name!r} is classified "
                         f"`{cls}` ("
@@ -1234,7 +1235,7 @@ def _check_aggregation_semantics(
                 if mm is not None:
                     how = mm.semi_additive_agg or "last"
                     return PreFlightResult(
-                        "semi_additive", "refuse", sql,
+                        "semi_additive", "refuse",
                         reason=(
                             f"SUM({col.name}) across time is wrong: {col.name!r} backs the "
                             f"semi-additive metric {mm.name!r} ({mm.non_additive_dimensions}) — "
@@ -1356,7 +1357,6 @@ def assemble_receipt(
     *,
     model_version: Optional[str] = None,
     applied_filters: Optional[list[str]] = None,
-    pre_flight: Optional[PreFlightResult] = None,
     freshness: Optional[str] = None,
 ) -> dict[str, Any]:
     """The FULL trust receipt for a statement that RAN, assembled from the model + the SQL.
@@ -1643,25 +1643,26 @@ def assemble_receipt(
             ),
         },
     }
-    # The two keys that are neither a section nor the version pin, and they are here on sufferance.
-    # Both describe a REWRITE this layer performed on the caller's statement, so neither is a fact
-    # about what the caller sent — and both disappear rather than move, after which the executed
-    # statement and the received one are the same string and there is nothing left to report.
-    # Inventing a section home for them now would outlive the thing they describe.
+    # One key left that is neither a section nor the version pin, and it is here on sufferance. It
+    # describes a REWRITE this layer performed on the caller's statement, so it is not a fact about
+    # what the caller sent, and it disappears rather than moves once the rewrite it describes is
+    # subtracted. Inventing a section home for it would outlive the thing it describes.
     #
-    # Half of that has already happened. ACE-042 deleted the default-filter injector, so nothing in
-    # this tree ANDs a declared filter into a statement and nothing in this tree computes an
-    # `applied_filters` list. The parameter survives for exactly one reason: `sm receipt
-    # --applied-filters` lets a caller hand a list in, and this assembler must not be the thing that
-    # makes that impossible before ACE-099 becomes the next producer. It stays CONDITIONAL, so a
+    # `pre_flight` was the other one and it is gone. It carried the fan/chasm verdict, including the
+    # `auto_rewrite` action, and the rewrite it reported no longer exists. What survives the
+    # subtraction is the ANALYSIS, not the verdict: a fan trap is now a refusal, and a refusal never
+    # reaches this assembler because there is no result to describe. Routing the finding into a
+    # section, for a statement that ran and carries a trap, is ACE-094's job and needs a section
+    # home this key never had.
+    #
+    # `applied_filters` survives for exactly one reason: ACE-042 deleted the default-filter injector,
+    # so nothing in this tree ANDs a declared filter into a statement or computes this list, but `sm
+    # receipt --applied-filters` lets a caller hand one in, and this assembler must not be the thing
+    # that makes that impossible before ACE-099 becomes the next producer. It stays CONDITIONAL, so a
     # statement no one made a claim about carries no key at all rather than an empty list, which
-    # would read as "we checked, none applied". ACE-093 still owes the fan-join rewrite the same
-    # deletion.
+    # would read as "we checked, none applied".
     if applied_filters:
         receipt["default_filters_applied"] = applied_filters
-    if pre_flight and pre_flight.risk:
-        receipt["pre_flight"] = {"risk": pre_flight.risk, "action": pre_flight.action,
-                                 "reason": pre_flight.reason}
     return receipt
 
 

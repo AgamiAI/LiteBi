@@ -247,13 +247,11 @@ def cmd_receipt(args) -> int:
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
-    pf = RT.pre_flight_check(sql, org)
     applied = json.loads(args.applied_filters) if args.applied_filters else None
     receipt = RT.assemble_receipt(
         org, sql,
         model_version=SN.newest_version(args.root),
         applied_filters=applied,
-        pre_flight=pf,
         freshness=args.freshness,
     )
     _print_json(receipt)
