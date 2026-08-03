@@ -12,6 +12,42 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Added
+
+- **The receipt now tells you which of a table's declared filters your statement actually applied
+  (ACE-099).** Declaring `default_filters` on a table has never applied them to your SQL, and since
+  the filter injector was removed nothing reported on them either — so `SELECT COUNT(*) FROM orders`
+  returned every row where it once returned the undeleted ones, and nothing on the answer said the
+  number meant something different from what the model says the table means.
+
+  Each entry in the receipt's `tables` section now carries `filters`, one `{expr, status}` per
+  declared filter, with `status` one of `applied`, `omitted` or `undetermined`, plus a `scope`
+  naming where in the statement that reference sits.
+
+  The determination is **per reference, not per table**, which is the part that makes it worth
+  trusting. A filter satisfied inside a CTE and absent from the outer query is two different answers
+  about the same table, and reporting one verdict for both is what made the old injection unsafe:
+
+  ```
+  WITH recent AS (SELECT id FROM orders o WHERE o.status != 'cancelled')
+  SELECT o.id FROM orders o JOIN recent r ON o.id = r.id
+  ```
+  ```
+  orders  scope=cte:recent  filters=[{expr: "o.status != 'cancelled'", status: applied}]
+  orders  scope=main        filters=[{expr: "o.status != 'cancelled'", status: omitted}]
+  ```
+
+  `applied` means the declared predicate is one of the top-level `AND` conjuncts of that reference's
+  own scope; extra conditions beside it do not weaken that. Anything the check cannot stand behind
+  is `undetermined` rather than a verdict — a predicate on the same column that is not identical, one
+  reachable only through an `OR`, one that only appears in an outer join's `ON`. Only an outright
+  absence is `omitted`, because a confident "you left this out" that turns out to be wrong is worse
+  than saying nothing. **An omitted filter is never a refusal**: whether it matters depends on the
+  question, which only you have.
+
+  The shipped sample declares one (`orders`: `status != 'cancelled'`), so this is visible the first
+  time you run it.
+
 ### Removed
 
 - **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
@@ -53,6 +89,19 @@ below corresponds to one such version.
 
 ### Contract changes
 
+- Receipt `tables` items gain **`scope`** and **`filters`** (ACE-099). `ref` is unchanged and is
+  still a string. A `refused` or `failed` receipt is unchanged too — it carries `{ref, declared}`
+  and neither new field, because a declared filter names the columns and literals the model author
+  wrote and a refusal is the one outcome a caller can provoke on purpose.
+- `tables.undetermined` is now **`null` when the section is complete** (ACE-099). It used to be a
+  fixed sentence on every receipt saying the filter accounting was not done. It now names only what
+  was genuinely not established — references whose filters could not be accounted for, references a
+  shadowing CTE name stopped resolving, and the count the reference cap dropped. If you branch on
+  this field being present, that branch changes meaning: present now means something really is
+  missing.
+- `sm receipt --applied-filters` is **gone**, and the receipt no longer emits a top-level
+  `default_filters_applied` key (ACE-099). Nothing had produced either since the filter injector was
+  removed; the fact lives in `tables.items[].filters` now, in one shape rather than two.
 - `sm prepare` returns `{sql, findings, units}` and **always exits 0**. It previously returned
   `{action, risk, sql, units, reason}`, or exited 1 with a refusal. It runs the reporting checks,
   not the refusing gates — do not pair it with `--no-safety`.
