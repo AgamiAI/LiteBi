@@ -222,3 +222,76 @@ def test_statement_shape_is_none_without_a_tree():
 
     assert RT.statement_shape(None) is None       # sqlglot absent -> no GuardContext at all
     assert RT.statement_shape(_Ctx()) is None     # SQL did not parse -> no tree
+
+
+# --- the refusal discloses nothing --------------------------------------------------------------
+
+
+def test_the_refusal_echoes_nothing_from_the_statement(_no_creds):
+    """`Refusal.detail` and `remediation` are value-free by contract: never raw SQL, never a data
+    value, and never an enumeration of the declared surface.
+
+    Structurally this refusal cannot leak — its four strings are constants and the only thing
+    interpolated is an integer from the environment. Asserted anyway, because "the text happens to
+    be static today" is exactly the property a later edit breaks while adding something helpful."""
+    env = execute_sql.execute_guarded(
+        "SELECT secret_column FROM confidential_table", "acme", None,
+        executor=_Executor(truncated=True), no_safety=True,
+    )
+
+    text = env.refusal.detail + env.refusal.remediation
+    assert "secret_column" not in text
+    assert "confidential_table" not in text
+    assert "SELECT" not in text
+
+
+# --- the deletions are deletions ----------------------------------------------------------------
+
+
+def test_the_trim_is_deleted_not_bypassed():
+    """The trim and its plumbing are gone from the modules, not merely unreachable.
+
+    Asserted on the imported modules rather than on their source text, for two reasons. A text scan
+    cannot tell code from a comment, and several of these names are still *written about* in
+    comments that explain what was removed and why — which is the documentation working, not a
+    leftover. And `truncated` on its own is still a live word in `tools`: the schema-sizing tool has
+    a flag of that name, the model index has a floor, and the audit row carries `sql_truncated`.
+    None of those are this. Naming the symbols avoids both traps.
+
+    The `--max-rows` flag is covered where it is observable —
+    `test_ace044_bounded_fetch.py::test_the_fork_command_carries_no_per_call_cap` asserts the parent
+    no longer appends it, which is what would break every forked call if it did."""
+    import tools
+
+    for module, gone in (
+        (execute_sql, "_flag_truncated"),
+        (execute_sql, "_max_rows_override"),
+        (execute_sql, "_write_cursor_csv"),
+        (execute_sql, "_emit_or_err"),
+        (tools, "_executor_truncated"),
+    ):
+        assert not hasattr(module, gone), f"{module.__name__}.{gone} survived the deletion"
+
+    # The ten per-engine CSV wrappers went with `_emit_or_err` — they trimmed and flagged with no
+    # refusal, so anything wired back onto them would have gone round the chokepoint. `_run_<db>`,
+    # the shared connect-and-run behind the built-in executor, is what stayed.
+    for engine in ("postgres", "mysql", "snowflake", "bigquery", "sqlite",
+                   "sqlserver", "oracle", "databricks", "trino", "duckdb"):
+        assert not hasattr(execute_sql, f"_execute_{engine}")
+        assert hasattr(execute_sql, f"_run_{engine}")
+
+
+def test_the_tool_surface_advertises_neither_max_rows_nor_truncated():
+    """Both halves of what a client can see: the argument it may send and the shape it is promised.
+
+    Read off the live registry rather than the source text, so this cannot pass because a literal
+    moved."""
+    import tools
+
+    spec = tools.TOOLS["execute_sql"]
+    assert "max_rows" not in spec["inputSchema"]["properties"]
+    # `additionalProperties: False` already rejects a caller that still sends it, which is the
+    # behaviour we want over silently ignoring one.
+    assert spec["inputSchema"]["additionalProperties"] is False
+    assert "truncated" not in spec["description"]
+    assert "max_rows" not in spec["description"]
