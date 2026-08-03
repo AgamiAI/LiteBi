@@ -50,9 +50,24 @@
       // `ref` is the name AS THE STATEMENT WROTE IT; `qname` is what the model resolved it to.
       // An UNDECLARED reference (a CTE name, say) carries declared:false and null qname / rows /
       // rows_as_of / freshness, because there is no model row for those to be about.
+      //
+      // `scope` is the query scope the reference was written in — "main", "cte:<name>", or
+      // "subquery". It is what tells two entries with the SAME `ref` apart, and without it the
+      // `filters` list below cannot be read: a filter satisfied inside a CTE body is not satisfied
+      // for the statement that READS that CTE.
+      //
+      // `filters` is one entry per declared `default_filters` condition of that table, each
+      // {expr, status} with status "applied" | "omitted" | "undetermined" — did THAT reference's
+      // own scope write that exact predicate. Nothing applies a declared filter for the caller, so
+      // an `omitted` one is a live gap between what the org means by the table and what the answer
+      // counted, and this panel draws it. `[]` means the table declares none (or the reference is
+      // not a modelled table at all — `declared` above says which).
       "tables": {"items": [{"ref":"orders","alias":"o","qname":"public.orders","declared":true,
                             "rows":5000,"rows_as_of":"2026-05-01",
-                            "freshness":"2026-05-09T23:00:00Z (nightly batch)"}],
+                            "freshness":"2026-05-09T23:00:00Z (nightly batch)",
+                            "scope":"main",
+                            "filters":[{"expr":"orders.is_deleted = false","status":"applied"},
+                                       {"expr":"orders.region <> 'sandbox'","status":"omitted"}]}],
                  "undetermined": "..."},
 
       "joins": {"items": [{"name":"orders_to_customers","from_to":"orders → customers",
@@ -69,11 +84,13 @@
       // over a truncated list, because null is the claim "this is all of them".
       "assumptions": {"items": [{"column":"sales.orders.amount","meaning":"net revenue, USD",
                                  "source":"ai_unvalidated"}],
-                      "undetermined": null},
-
-      // Conditional, CLI path only — present when there is something to report.
-      "default_filters_applied": ["orders.deleted_at IS NULL"]
+                      "undetermined": null}
     }
+
+  Which declared filters a statement honored is a fact about each table REFERENCE, not about the
+  statement as a whole, so it rides on `tables.items[].filters` above and there is no flat
+  top-level key for it: one list per statement could not say whether the filter was satisfied in
+  the scope that mattered.
 
   `undetermined` IS LOAD-BEARING, and this surface renders it. It is the sentence saying what the
   section did NOT establish, and it is the only thing that tells an empty section apart from an
@@ -377,6 +394,12 @@
     }
     .receipt-empty { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
     .receipt-note { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+    /* One declared filter per row, under the table reference it was decided for. Unbulleted: the
+       badge is the marker, and a bullet beside it reads as a second one. Qualified by
+       `.receipt-body` so the padding wins against the `.receipt-body ul` rule above, which is the
+       more specific selector and would otherwise keep its own indent. */
+    .receipt-body ul.receipt-filters { margin: 2px 0 4px; padding-left: 12px; list-style: none; }
+    .receipt-body ul.receipt-filters li { margin: 2px 0; font-size: 12px; line-height: 1.6; }
     .receipt-cols { margin: 0; font-size: 12px; line-height: 1.9; word-break: break-word; }
     .receipt-cols code { margin-right: 2px; }
     .receipt-meta {
@@ -689,6 +712,13 @@
       const cls = (state || 'unreviewed').toLowerCase();
       return el('span', { class: 'conf-badge ' + cls, text: state || 'unreviewed' });
     }
+    // A declared filter's verdict, mapped onto the three badge styles the panel already has rather
+    // than three new ones: `applied` reads like an approved thing, `omitted` is the amber state a
+    // reader has to act on (the org said what it means by this table and the query did not say it),
+    // and `undetermined` is the grey "we could not tell", which is not a failure. An unknown status
+    // falls through to grey for the same reason — inventing a green for a word we do not recognise
+    // would be the one direction that lies.
+    const FILTER_BADGE = { applied: 'approved', omitted: 'unreviewed', undetermined: 'stale' };
     function storeFeedback(i, sec, sqlVal, noteVal) {
       const orig = (sec.sql || '').trim();
       const sqlChanged = (sqlVal || '').trim() && (sqlVal || '').trim() !== orig;
@@ -1361,6 +1391,17 @@
             li.appendChild(document.createTextNode(' → '));
             li.appendChild(el('code', { text: t.qname }));
           }
+          // WHICH query scope wrote this reference. Drawn only when it is not the main SELECT,
+          // because "main" is the unremarkable case and labelling every row with it would bury the
+          // one that matters. It is also the ONLY thing that tells two entries apart when a
+          // statement reads the same table twice under the same name and no alias — and it is what
+          // makes the filter verdicts below readable, since a filter satisfied inside a CTE body
+          // is not satisfied for the statement that reads that CTE.
+          const scope = t.scope ? String(t.scope) : '';
+          if (scope && scope !== 'main') {
+            li.appendChild(el('span', { class: 'receipt-meta', text: scope.startsWith('cte:')
+              ? ' · read inside the CTE ' + scope.slice(4) : ' · read inside a subquery' }));
+          }
           if (t.declared === false) {
             // An undeclared reference has no model row, so there is no row estimate and no
             // freshness for it to be about. Say that, rather than leaving three blank cells that
@@ -1393,6 +1434,47 @@
             const label = (ISO_TIME_RE.test(f) || ISO_DATE_RE.test(f))
               ? ' · data as of ' + maybePrettifyDate(f) : ' · ' + f;
             li.appendChild(document.createTextNode(label));
+          }
+          // The declared-filter verdicts for THIS reference. Nothing applies a declared filter to
+          // the statement, so an `omitted` one means the answer counted rows the model's own
+          // definition of the table leaves out — and until this was drawn, that arrived on the page
+          // as nothing at all: the section's marker is null once the accounting completes, which it
+          // does whether every filter came back applied or every one came back omitted.
+          const filters = Array.isArray(t.filters) ? t.filters : [];
+          if (filters.length) {
+            li.appendChild(el('br'));
+            li.appendChild(el('span', { class: 'receipt-meta',
+              text: 'declared filters (none are applied for you):' }));
+            const fl = el('ul', { class: 'receipt-filters' });
+            filters.forEach(f => {
+              const fli = el('li');
+              fli.appendChild(el('code', { text: f.expr || '(unnamed filter)' }));
+              fli.appendChild(el('span', {
+                class: 'conf-badge ' + (FILTER_BADGE[f.status] || 'stale'),
+                text: f.status || 'undetermined' }));
+              fl.appendChild(fli);
+            });
+            li.appendChild(fl);
+            // A sentence per state that needs one, and only when there is something to act on. A
+            // reference whose filters all came back `applied` needs no explaining — the badges say
+            // it. The two gaps are DIFFERENT facts and get different sentences: `omitted` is a
+            // confident "the query does not say this", `undetermined` is "we could not tell", and
+            // reading the second as the first would put a claim on the page nobody can stand behind.
+            const omitted = filters.filter(f => f.status === 'omitted').length;
+            const unsettled = filters.filter(
+              f => f.status !== 'omitted' && f.status !== 'applied').length;
+            if (omitted) {
+              li.appendChild(el('div', { class: 'receipt-note', text:
+                'The query does not state ' + (omitted === 1 ? 'that condition' : 'those ' + omitted
+                + ' conditions') + ', so this answer counted rows your model says are not part of '
+                + 'what this table means — unless the question was deliberately about them.' }));
+            }
+            if (unsettled) {
+              li.appendChild(el('div', { class: 'receipt-note', text:
+                (unsettled === 1 ? 'One condition' : unsettled + ' conditions')
+                + ' could not be settled either way — the query says something about the same '
+                + 'columns, but not the condition your model declares. Read the SQL to decide.' }));
+            }
           }
           ul.appendChild(li);
         });

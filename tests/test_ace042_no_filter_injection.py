@@ -10,16 +10,24 @@ Getting one wrong produces a wrong answer, not a leak.
 It **injected**: Agami never authors or alters SQL, and the one carve-out that permitted this
 transform rested on the misclassification above.
 
-And it was **broken**. `_tables_in_scope` is `tree.find_all(exp.Table)`, which descends into CTEs
-and subqueries, so an alias bound INSIDE a CTE was collected and its filter ANDed onto the OUTER
-`WHERE`, where that alias does not exist. The database rejected the statement and the receipt
-claimed the filter had been applied — Agami's own edit manufacturing a database failure.
-`test_the_cte_case_reaches_the_driver_unchanged` is that defect, pinned.
+And it was **broken**. The scope it injected against was one flat `tree.find_all(exp.Table)` walk of
+the whole statement, which descends into CTEs and subqueries, so an alias bound INSIDE a CTE was
+collected and its filter ANDed onto the OUTER `WHERE`, where that alias does not exist. The database
+rejected the statement and the receipt claimed the filter had been applied — Agami's own edit
+manufacturing a database failure. `test_the_cte_case_reaches_the_driver_unchanged` is that defect,
+pinned. The walk now resolves each reference to the query scope that wrote it, which is what lets
+the same fact be REPORTED per reference instead of injected across all of them.
 
-**The window.** Between this and ACE-099 a declared filter is neither applied nor reported:
-`SELECT COUNT(*) FROM orders` returns every row where it previously returned the undeleted ones.
-That is accepted deliberately and is DISCLOSED rather than silent —
-`test_the_window_is_stated_where_a_model_author_reads` pins the two places that say so.
+**The window is closed.** Between this spec and ACE-099 a declared filter was neither applied nor
+reported: `SELECT COUNT(*) FROM orders` returned every row where it previously returned the
+undeleted ones, and nothing on the answer said so. The first half is permanent — nothing applies a
+declared filter for a caller, and re-adding an injector is what
+`test_the_injector_is_gone_not_wrapped` fails the build on. The second half ended when ACE-099 put
+the determination on the receipt, per table reference, as
+`tables.items[].filters`. So the surfaces a model author reads no longer announce a gap; they point
+at the report. `test_the_surfaces_say_filters_are_unapplied_and_reported` pins both halves at once,
+which is the only way to pin them: a surface that dropped "not applied" would be as wrong as one
+that still claims nothing is reported.
 """
 
 from __future__ import annotations
@@ -137,29 +145,89 @@ def test_asking_about_the_rows_a_filter_excludes_is_not_refused(guarded):
     assert out == sql
 
 
-# --- the window is disclosed, not silent ------------------------------------
+# --- what those surfaces say now --------------------------------------------
+
+# The phrases the window notices used to end on. Each was true while the report did not exist and
+# is false now, and each shipped on a surface a model or a user reads. Matched case-insensitively
+# because they were written in three different casings across the surfaces they stood on.
+RETIRED_CLAIMS = (
+    "not yet reported",
+    "are not yet reported",
+    "nothing reports whether you did",
+    "currently has no producer",
+    "default_filters_applied",
+)
 
 
-def test_the_window_is_stated_where_a_model_author_reads():
-    """SC-6. Between this spec and ACE-099 a declared filter is neither applied nor reported. The
-    change is announced in the places it would otherwise have to be inferred from a number that
-    moved: the tool description the model reads before every query, the server instructions, and
-    the model field a model author is already looking at when they declare one.
+def test_the_surfaces_say_filters_are_unapplied_and_reported():
+    """SC-6, after the report landed. The two halves are one assertion on purpose.
 
-    Each notice states the BEHAVIOUR; the `ACE-099` deletion anchor lives in the adjacent comment,
-    not in the string. These strings ship to every client, where a spec id resolves to nothing.
+    Nothing applies a declared filter to a caller's statement — that is permanent, and the surfaces
+    still say it, because a model that stops writing the filter in gets a wrong answer. What ended
+    is the second half: the receipt now decides, per table reference, which declared filters the
+    statement satisfied, so a surface that merely dropped the old sentence would leave the model
+    unaware the data it should read exists.
+
+    Pinned on the tool description the model reads before every query, the server instructions, and
+    the model field a model author is already looking at when they declare a filter. Each states the
+    BEHAVIOUR; spec ids live in the adjacent comments, never in the string, because these ship to
+    every client where an id resolves to nothing.
     """
     import tools
     from semantic_model import models as m
 
     for surface in (tools.TOOLS["execute_sql"]["description"], tools.SERVER_INSTRUCTIONS):
         assert "default_filters" in surface
+        # Still not applied for you.
         assert "NOT applied" in surface
+        # And the report exists, named where the reader can go and find it.
+        assert "tables.items[].filters" in surface
+        assert "omitted" in surface
 
     field = m.Table.model_fields["default_filters"]
     assert field.description is not None
     assert "not applied" in field.description
-    assert "not yet reported" in field.description
+    assert "reports" in field.description
+    assert "per table reference" in field.description
+
+
+def test_no_shipped_surface_still_says_the_report_does_not_exist():
+    """The sweep the notice deletion is worth nothing without.
+
+    Six surfaces carried the same window sentence in six spellings, and four of them had no grep
+    anchor because the anchor comment WAS the shipped text. So the guard is on the retired claims
+    themselves, over every surface a model or a user reads: the two tool strings, the model field,
+    every SKILL.md, every shared template, and the docs tree.
+
+    `default_filters_applied` is in the list for a second reason — it was a receipt key with no
+    producer, and the fact it named now lives per reference on the `tables` section. A surface
+    naming the flat key would be documenting a channel that no longer exists.
+    """
+    import tools
+    from semantic_model import models as m
+
+    surfaces: list[tuple[str, str]] = [
+        ("tools.TOOLS['execute_sql'].description", tools.TOOLS["execute_sql"]["description"]),
+        ("tools.SERVER_INSTRUCTIONS", tools.SERVER_INSTRUCTIONS),
+        ("Table.default_filters.description", m.Table.model_fields["default_filters"].description),
+    ]
+    trees = [
+        (REPO_ROOT / "plugins" / "agami" / "skills", "*.md"),
+        (REPO_ROOT / "plugins" / "agami" / "shared", "*.html"),
+        (REPO_ROOT / "docs", "*.md"),
+    ]
+    for root, pattern in trees:
+        surfaces.extend(
+            (str(path.relative_to(REPO_ROOT)), path.read_text()) for path in root.rglob(pattern)
+        )
+
+    offenders = [
+        f"{name}: {claim!r}"
+        for name, text in surfaces
+        for claim in RETIRED_CLAIMS
+        if claim.lower() in text.lower()
+    ]
+    assert not offenders, f"surfaces still deny the declared-filter report: {offenders}"
 
 
 def test_no_notice_leaks_a_spec_id_to_a_client():

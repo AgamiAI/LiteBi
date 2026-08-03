@@ -6,7 +6,8 @@ grain:
 - id
 description: Customer orders — one row per order. total_amount is the order-grain total (sum of its line
   items).
-default_filters: []
+default_filters:
+- '{alias}.status != ''cancelled'''
 caveats: []
 performance_hints:
   estimated_row_count: 4000
