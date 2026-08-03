@@ -12,12 +12,9 @@ tests also covered is gone with `--max-rows`.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import sys
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"

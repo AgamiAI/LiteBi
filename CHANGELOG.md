@@ -48,7 +48,32 @@ below corresponds to one such version.
   The shipped sample declares one (`orders`: `status != 'cancelled'`), so this is visible the first
   time you run it.
 
+### Changed
+
+- **A result too large to return is refused, not trimmed.** A query whose result exceeded the
+  deployment ceiling (`AGAMI_SQL_MAX_ROWS`, default 1000, unchanged) used to come back cut down to
+  that many rows with a flag saying so. It now comes back as a structured refusal carrying no rows.
+
+  The trim was unsound before it was anything else. Without an `ORDER BY` a SQL result has no
+  defined prefix, so what you got was whichever rows the engine happened to emit first — different
+  between runs, different between engines, and presented as the answer. It was not a smaller version
+  of your result; it was an arbitrary sample of it.
+
+  The refusal tells you which fix applies to the statement you sent, because the wrong one is worse
+  than none: a row listing should be bounded with a `LIMIT` and an `ORDER BY`, while an aggregate
+  should have its grouping narrowed or a filter added — putting a `LIMIT` on a grouped result drops
+  groups, and the breakdown you get back reads exactly like a complete one.
+
 ### Removed
+
+- **`max_rows` is no longer an argument to `execute_sql`,** and `--max-rows` is gone from the
+  command line. It could only ever *lower* the deployment ceiling, so the one case where a caller
+  knows better than the operator — wanting more data — was the case it could not serve. Ask for the
+  rows you want in the statement: `LIMIT 200` says what it means to everything that reads it.
+
+- **`truncated` is no longer a field on a successful result.** With an oversized result refused, it
+  could only ever be `false`, and a field that is always `false` is one a client can only branch on
+  wrongly.
 
 - **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
   across a one-to-many join, touching the many side nowhere but the `ON` clause, used to have that
