@@ -1310,8 +1310,11 @@ _guard_model: ContextVar[Any | None] = ContextVar("_guard_model", default=None)
 # verdict site literally cannot compute it. `semantic_model.runtime.statement_shape` does it where
 # the tree already is, and the answer travels as a plain string.
 #
-# None is a real, reachable answer rather than an error: the mirror has no `runtime` to call, and
-# `no_safety=True` skips the pass that would set this. Both get the shape-neutral remediation.
+# None is a real, reachable answer rather than an error, and by more routes than the obvious one:
+# the vendored mirror has no `runtime` to import, `no_safety=True` skips the pass entirely, and a
+# local install returns from `_model_safety` before the classify line when the model package is
+# absent or no model has been built yet. All of them get the shape-neutral remediation, which is why
+# that third text is not a defensive branch — it is the answer for every deployment without a model.
 _guard_shape: ContextVar[str | None] = ContextVar("_guard_shape", default=None)
 
 

@@ -172,9 +172,22 @@ def test_sqlite_end_to_end_caps_without_rewriting_sql(tmp_path, monkeypatch, cap
     assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
     assert env.data is None
 
-    # Under the cap the same statement runs untouched and returns every row it asked for. The cap
-    # came from the bounded fetch, never a rewrite: no LIMIT is injected on either path, which
-    # `test_ace093_byte_identity` pins independently.
+    # A statement carrying its OWN bound, under the ceiling, runs untouched and returns exactly the
+    # rows it asked for — the behaviour the refusal's remediation tells a caller to reach for, and
+    # which `sql-generation-rules.md` now instructs the model to rely on. Asserted with a real
+    # `LIMIT` rather than by raising the ceiling: those are different statements, and only this one
+    # is the fix being recommended. That the cap came from the bounded fetch and never a rewrite is
+    # pinned independently by `test_ace093_byte_identity`.
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "4")
+    env = execute_sql.execute_guarded(
+        "SELECT n FROM t ORDER BY n LIMIT 3", "acme", None,
+        executor=execute_sql.BUILTIN_EXECUTOR, no_safety=True,
+    )
+
+    assert env.status == "ok"
+    assert env.data.rows == [(0,), (1,), (2,)]  # exactly the three it asked for, at a ceiling of 4
+
+    # And with no bound of its own, under a ceiling that fits, the whole result comes back.
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "20")
     env = execute_sql.execute_guarded(
         "SELECT n FROM t ORDER BY n", "acme", None,

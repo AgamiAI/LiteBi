@@ -309,6 +309,12 @@ def test_the_stdio_surface_records_a_result_bound_refusal(env, monkeypatch):
 
     _assert_recorded(env.app_db, body, "refused", guardrail.RULE_RESOURCE_LIMIT)
     assert "rows" not in body  # refused carries no data, across the process boundary too
+    # The SHAPE crossed the fork too, not just the rule. `SELECT id FROM orders` is a listing, so the
+    # remediation must be the listing one and not the shape-neutral fallback — which also names LIMIT
+    # and ORDER BY, and so would satisfy a laxer assertion. Without this, a regression that stopped
+    # the child publishing the shape (the parent passing `--no-safety`, a model-resolution change)
+    # would silently drop stdio onto the fallback with the whole suite green.
+    assert "if it is a plain row listing" not in body["refusal"]["remediation"].lower()
 
 
 def test_the_http_surface_records_a_result_bound_refusal(env, monkeypatch):
