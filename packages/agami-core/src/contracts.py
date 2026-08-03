@@ -167,7 +167,6 @@ class ExecuteSqlResult(_Contract):
     columns: list[str] = Field(default_factory=list)
     rows: list[list[Any]] = Field(default_factory=list)
     row_count: int = 0
-    truncated: bool = False
     units: dict[str, str] = Field(default_factory=dict)
     markdown: str | None = None  # exact full numbers (currency symbol + grouping); render as-is
     sql: str | None = None

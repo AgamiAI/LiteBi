@@ -1732,23 +1732,35 @@ def test_a_cancel_that_lands_without_raising_is_still_a_refusal(engine, monkeypa
         case.run()
 
 
-def test_the_cli_adapter_renders_the_marker_as_a_refusal_not_a_traceback(monkeypatch, capsys):
-    """The per-engine CSV wrappers are the SECOND entry into the engine functions, and the engines
-    raise the internal marker.
+def test_the_cli_renders_the_marker_as_a_refusal_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """A marker raised inside an engine reaches the CLI wire as a refusal — one JSON object on
+    stderr and exit 1 — rather than as a traceback.
 
-    That adapter caught only `ExecutorError`, so a per-statement timeout reached through it escaped
-    as a traceback rather than as the exit code its contract documents. It renders what `main`
-    renders for any refusal — the one JSON object on stderr and exit 1 — so the two entries cannot
-    disagree about what a bound we imposed looks like.
+    This was asserted on `_execute_sqlite`, one of the per-engine CSV wrappers, which were the SECOND
+    entry into the engine functions and caught only `ExecutorError` until this test was written.
+    ACE-087 deleted that whole family: nothing in production reached it, and it trimmed results with
+    no refusal, so it was a route around the chokepoint that looked like a route through it. With one
+    entry left there is no longer a second renderer to disagree with, and the assertion moves to the
+    entry that survived.
     """
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setattr(execute_sql, "_deadline", _deadline_already_fired)
     case = ENGINE_CASES["sqlite"]
     case.install(monkeypatch, on_execute=lambda: RuntimeError("interrupted"))
+    # `main` routes through `execute_guarded`, which resolves credentials itself; the engine case
+    # carries only its driver-specific keys, so the dispatch key is added here.
+    creds = {**case.creds, "type": "sqlite"}
+    monkeypatch.setattr(execute_sql, "_load_credentials", lambda p, org_id="local": creds)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["execute_sql", "--profile", "acme", "--sql", "SELECT c FROM orders", "--no-safety"],
+    )
 
-    code = execute_sql._execute_sqlite(case.creds, "SELECT c FROM orders")
+    code = execute_sql.main()
 
     assert code == 1
-    body = json.loads(capsys.readouterr().err)  # one JSON object, on one line, and nothing else
+    err = capsys.readouterr().err
+    body = json.loads(err)  # parses WHOLE, so nothing rides alongside it
     assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
     assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
 

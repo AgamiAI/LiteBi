@@ -171,7 +171,14 @@ class ExecResult:
     Decimals, datetimes, ``None``), not stringified. Serializing to text — CSV for the subprocess
     wire, JSON at the MCP-tool edge — is the *caller's* single, final step, so an in-process
     executor never pays a serialize→re-parse round-trip and never loses a type or confuses NULL
-    with "". ``truncated`` mirrors the ``fetchmany(cap + 1)`` bound: True when the result was capped.
+    with "".
+
+    ``truncated`` mirrors the ``fetchmany(cap + 1)`` bound: True when a (cap+1)th row existed. It is
+    an INTERNAL carrier, not a caller-visible fact — ``execute_guarded`` reads it and refuses, so a
+    True never reaches an ``ok`` envelope and the rows beside it are discarded. Every executor must
+    set it, including an injected one: it is the only channel this contract has for saying "there
+    was more", and a consumer that leaves it False on a bounded read presents a partial result as a
+    whole one.
 
     This lives here (not in ``ports``) because ``execute_sql`` ships in the stdlib-lean plugin
     mirror, which does not include ``ports``; ``ports.Executor`` references it under TYPE_CHECKING.
@@ -1585,20 +1592,14 @@ def _deadline(cancel: Callable[[], None], timeout_s: float) -> Iterator[threadin
         timer.cancel()  # belt and braces, for a timer that has not started running yet
 
 
-def _flag_truncated(cap: int) -> None:
-    """Signal a bounded-fetch truncation to the caller — a non-error `{"truncated": …}` marker on
-    stderr (distinct from the guards' `{"error": …}`), so a truncated result is never mistaken for a
-    complete one (ACE-044). Shared by every engine's materialization path. One write so the
-    marker is always a single line, even if other notices surround it."""
-    sys.stderr.write(json.dumps({"truncated": {"row_cap": cap}}) + "\n")
-
-
 def _collect_cursor(cur: Any) -> ExecResult:
     """Fetch at most the row cap from a DB-API cursor into an ``ExecResult`` with **native types**.
     `fetchmany(cap + 1)` — never `fetchall` — so a huge result can't be buffered whole; a (cap+1)th
-    row means the result was truncated. The SQL itself is untouched (no injected LIMIT). This is the
-    single bounded-fetch implementation both the CSV wire (`_write_cursor_csv`) and the in-process
-    executor path share, so the row cap is enforced once, identically, for every caller.
+    row means there was more, and `execute_guarded` turns that into a refusal (ACE-087). The rows
+    below the cap are still returned here rather than dropped on the spot: this function reports what
+    it found and the chokepoint decides, which is what keeps the decision in one place. The SQL
+    itself is untouched (no injected LIMIT). Every DB-API engine shares this one implementation, so
+    the bound is applied once, identically.
 
     Fetch FIRST, then read ``cur.description``: a psycopg2 **server-side (named) cursor** — which the
     Postgres/Redshift path uses to bound transfer — reports ``description is None`` until the
@@ -1616,25 +1617,20 @@ def _collect_cursor(cur: Any) -> ExecResult:
 
 
 def _emit_result_csv(result: ExecResult) -> None:
-    """Serialize an ``ExecResult`` to stdout as CSV — the subprocess/CLI wire. Byte-for-byte what the
-    old inline cursor→CSV writer produced: header row then data rows, and a truncation marker on
-    stderr when capped. This is the *single, final* text serialization for the fork path; the
-    in-process path skips it and returns the native rows straight to the tool edge."""
+    """Serialize an ``ExecResult`` to stdout as CSV — the subprocess/CLI wire: header row then data
+    rows. This is the *single, final* text serialization for the fork path; the in-process path
+    skips it and returns the native rows straight to the tool edge.
+
+    Nothing is written to stderr any more. A `{"truncated": …}` marker used to ride there beside the
+    rows; a result that overflows never reaches this function now, because ``main`` branches to
+    ``_write_refusal`` before it (ACE-087). That also restores a property ``_write_refusal``'s
+    docstring asserts and the marker quietly broke: stderr carries one JSON object or nothing."""
     if not result.columns:  # cursor had no description → wrote nothing (e.g. a non-row statement)
         return
     writer = csv.writer(sys.stdout)
     writer.writerow(result.columns)
     for row in result.rows:
         writer.writerow(row)
-    if result.truncated:
-        _flag_truncated(_resolve_row_cap())
-
-
-def _write_cursor_csv(cur: Any) -> None:
-    """Collect the bounded result and write it to stdout as CSV — the per-engine sink the subprocess
-    path uses. Kept as the thin composition ``_emit_result_csv(_collect_cursor(cur))`` so the fetch
-    bound and the CSV shape stay single-sourced (and the existing bounded-fetch tests still pin it)."""
-    _emit_result_csv(_collect_cursor(cur))
 
 
 def _hosted() -> bool:
@@ -1842,69 +1838,16 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
 # the default connect-per-query path, unchanged; a consumer injects its own `ports.Executor`
 # (pooled / RBAC / tunnelled) *behind* the same guard — no fork of the guard, per REQ-002/REQ-014.
 # The subprocess `main` and the in-process MCP handler both go through `execute_guarded`, so the
-# guard is applied identically and can't be bypassed. The per-engine `_execute_<db>` CSV wrappers
-# below are the subprocess/CLI adapter (they emit CSV + return an exit code); `_run_<db>` is the
-# shared connect-and-run that returns native rows to either caller.
-
-
-def _emit_or_err(run: Callable[[], ExecResult]) -> int:
-    """Subprocess/CLI adapter over a ``_run_<db>`` function: write its result to stdout as CSV and
-    return exit code 0, or translate an ``ExecutorError`` into the stderr message + exit code the CLI
-    contract documents (byte-identical to what the old ``_execute_<db>`` emitted).
-
-    The watchdog marker gets an arm of its own, AHEAD of the classified one, because this is the
-    second entry into the engine functions and they raise it. Without it a per-statement timeout
-    reached through here would escape as a traceback rather than as the exit code this docstring
-    promises. It renders exactly what ``main`` renders for a refusal — the one JSON object on stderr
-    and exit 1 — so the two entries cannot disagree about what a bound we imposed looks like."""
-    try:
-        _emit_result_csv(run())
-    except _ResourceLimit as exc:
-        _write_refusal(_resource_limit_refusal(exc))
-        return 1
-    except ExecutorError as e:
-        return _err(e.msg, code=e.code)
-    return 0
-
-
-def _execute_postgres(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_postgres(creds, sql))
-
-
-def _execute_mysql(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_mysql(creds, sql))
-
-
-def _execute_snowflake(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_snowflake(creds, sql))
-
-
-def _execute_bigquery(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_bigquery(creds, sql))
-
-
-def _execute_sqlite(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_sqlite(creds, sql))
-
-
-def _execute_sqlserver(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_sqlserver(creds, sql))
-
-
-def _execute_oracle(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_oracle(creds, sql))
-
-
-def _execute_databricks(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_databricks(creds, sql))
-
-
-def _execute_trino(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_trino(creds, sql))
-
-
-def _execute_duckdb(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_duckdb(creds, sql))
+# guard is applied identically and can't be bypassed. `_run_<db>` is the shared connect-and-run that
+# returns native rows to either caller.
+#
+# There is deliberately no second route into `_run_<db>`. A family of per-engine `_execute_<db>` CSV
+# wrappers used to sit here, reached through `_emit_or_err`, and by the time it was deleted (ACE-087)
+# nothing in production called them: `main` reaches the engines through `execute_guarded` and the
+# built-in executor. They mattered because they still TRIMMED and flagged, with no refusal and no
+# receipt, so anything wired back onto them would have gone round the chokepoint while looking like
+# it went through it. Keeping the single chokepoint true structurally, rather than by nobody
+# happening to call the alternative, is worth more than the wrappers were.
 
 
 def _builtin_execute(vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult:

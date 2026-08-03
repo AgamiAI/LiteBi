@@ -183,5 +183,8 @@ def test_in_process_default_matches_subprocess_result_envelope(monkeypatch, tmp_
     inproc = json.loads(tools.tool_execute_sql(args))
 
     assert "columns" in sub, sub  # subprocess actually produced a result (not a creds error)
-    for key in ("columns", "rows", "row_count", "truncated"):
+    # `truncated` left this tuple with the key itself (ACE-087): a result over the ceiling is refused
+    # on both paths now, so there is no `ok` body for it to be a field of.
+    for key in ("columns", "rows", "row_count"):
         assert sub[key] == inproc[key]  # identical successful envelope whichever ran it
+    assert "truncated" not in sub and "truncated" not in inproc

@@ -1248,20 +1248,6 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     return UNEXPECTED_FAILURE_MESSAGE
 
 
-def _executor_truncated(stderr: str | None) -> bool:
-    """True if execute_sql flagged a bounded-fetch truncation (ACE-044). The executor emits a
-    non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
-    for line in (stderr or "").splitlines():
-        line = line.strip()
-        if line.startswith("{") and '"truncated"' in line:
-            try:
-                if isinstance(json.loads(line).get("truncated"), dict):
-                    return True
-            except ValueError:
-                pass
-    return False
-
-
 # The composition-root executor (AH-012). ``None`` (the default) means "fork the execute_sql
 # subprocess" — the byte-identical local/single-user path. A consumer injects a ``ports.Executor``
 # via ``create_app(adapters=…)`` to run execution IN-PROCESS behind the same guard (no fork, native
@@ -1287,8 +1273,7 @@ def set_injected_executor(executor: Any | None) -> None:
 
 
 def _finalize_execution(
-    columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
-    execution_ms: int,
+    columns: list, data_rows: list, *, profile: str, sql: str, execution_ms: int,
 ) -> str:
     """Shape a successful result (units + exact-render markdown) and return the result JSON. Shared
     by both execution paths — the subprocess fork and the in-process executor — so a successful query
@@ -1322,7 +1307,6 @@ def _finalize_execution(
         "columns": columns,
         "rows": data_rows,
         "row_count": len(data_rows),
-        "truncated": truncated,
         "units": unit_map,
         "markdown": markdown,  # exact, full numbers (currency symbol + grouping) — render as-is
         "sql": sql,
@@ -1401,10 +1385,9 @@ def _emit(
     if env.status == "ok":
         columns = list(env.data.columns)
         rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
-        truncated = env.data.truncated
         payload = json.loads(
             _finalize_execution(
-                columns, rows, truncated,
+                columns, rows,
                 profile=profile or "", sql=sql or "", execution_ms=execution_ms or 0,
             )
         )
@@ -1720,7 +1703,6 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
     env = _envelope("ok", data=ExecResult(
         columns=columns,
         rows=[tuple(r) for r in data_rows],
-        truncated=_executor_truncated(proc.stderr),
     ), receipt=_resolve_receipt(profile, sql))
     return _emit(
         env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
@@ -2062,7 +2044,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_execute_sql,
         "description": (
             "Execute a single read-only SELECT / WITH...SELECT against the local datasource and "
-            "return {columns, rows, row_count, truncated, sql, execution_ms}. SELECT-only is "
+            "return {columns, rows, row_count, sql, execution_ms}. SELECT-only is "
             "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
             "Runs entirely locally via execute_sql.py — no data leaves the machine. "
