@@ -281,6 +281,92 @@ def test_the_trim_is_deleted_not_bypassed():
         assert hasattr(execute_sql, f"_run_{engine}")
 
 
+# --- the shape actually reaches the refusal ------------------------------------------------------
+#
+# Everything above sets `_guard_shape` by hand, which tests the builder and nothing else. These two
+# drive a real statement through the real model pass, so the whole chain is on the hook: the safety
+# pass classifies off the tree it already parsed, publishes the shape, and the chokepoint reads it
+# back out to word the refusal. Deleting the one line that publishes it leaves every other test in
+# this repo green, which is exactly why these exist.
+
+
+_AREA = "sales"
+_PROFILE = "acme"
+
+
+@pytest.fixture()
+def shop(tmp_path, monkeypatch):
+    """The smallest model the safety pass will accept, over a warehouse with two groups in it."""
+    yaml = pytest.importorskip("yaml")
+    pytest.importorskip("pydantic")
+    pytest.importorskip("sqlglot")
+
+    root = tmp_path / "artifacts" / _PROFILE
+    (root / "subject_areas" / _AREA / "tables").mkdir(parents=True)
+    (root / "datasource.yaml").write_text(
+        yaml.safe_dump({"datasource": "Shop", "version": 1,
+                        "subject_areas": [f"subject_areas/{_AREA}"]})
+    )
+    (root / "subject_areas" / _AREA / "subject_area.yaml").write_text(
+        yaml.safe_dump({"name": _AREA, "tables": [
+            {"storage_connection": "c", "schema": "public", "table": "orders"}]})
+    )
+    (root / "subject_areas" / _AREA / "tables" / "orders.yaml").write_text(
+        yaml.safe_dump({
+            "name": "orders", "schema": "public", "storage_connection": "c", "grain": ["id"],
+            "description": "orders", "columns": [
+                {"name": "id", "type": "integer", "primary_key": True},
+                {"name": "grp", "type": "string"},
+            ],
+        })
+    )
+
+    warehouse = tmp_path / "warehouse.db"
+    con = __import__("sqlite3").connect(warehouse)
+    con.execute("CREATE TABLE orders (id INTEGER, grp TEXT)")
+    con.executemany("INSERT INTO orders VALUES (?, ?)", [(i, f"g{i % 4}") for i in range(20)])
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("DATASOURCE_URL__ACME", f"sqlite:///{warehouse}")
+    for var in ("AGAMI_DB_URL", "APP_DATABASE_URL", "AGAMI_ORG_ID", "AGAMI_SQL_TIMEOUT_S"):
+        monkeypatch.delenv(var, raising=False)
+    # One row over the cap on both statements below: 20 rows, and 4 groups.
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "3")
+
+
+def _refuse(sql: str):
+    env = execute_sql.execute_guarded(
+        sql, _PROFILE, _AREA, executor=execute_sql.BUILTIN_EXECUTOR,
+    )
+    assert env.status == "refused", env
+    assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
+    return env.refusal
+
+
+def test_a_row_listing_is_told_to_bound_it(shop):
+    remediation = _refuse("SELECT id FROM orders").remediation
+
+    assert "LIMIT" in remediation and "ORDER BY" in remediation
+    # Not the shape-neutral fallback, which also names both but makes them conditional. Without
+    # this the test passes whether or not the shape ever reached the refusal.
+    assert "if it is a plain row listing" not in remediation.lower()
+
+
+def test_an_aggregate_is_told_to_narrow_the_grouping(shop):
+    """The whole reason the shape is carried at all.
+
+    This statement groups, so the refusal must not tell the caller to add a `LIMIT` — that would
+    drop groups and hand back a breakdown that reads as complete. If the safety pass ever stops
+    publishing the shape, this refusal silently falls back to the shape-neutral text and this
+    assertion is what notices."""
+    remediation = _refuse("SELECT grp, COUNT(*) FROM orders GROUP BY grp").remediation
+
+    assert "LIMIT" not in remediation.upper()
+    assert "grouping" in remediation
+
+
 def test_the_tool_surface_advertises_neither_max_rows_nor_truncated():
     """Both halves of what a client can see: the argument it may send and the shape it is promised.
 
