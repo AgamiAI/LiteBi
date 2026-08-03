@@ -33,6 +33,7 @@ satisfied for the statement that reads that CTE, and a per-table answer cannot s
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -355,3 +356,36 @@ def test_the_determination_is_reachable_the_way_the_other_checks_are():
     assert callable(rt.check_declared_filters)
     for sibling in ("check_table_scope", "check_column_scope"):
         assert callable(getattr(rt, sibling))
+
+
+# --- and a refusal is told none of it ---------------------------------------
+
+
+def test_a_refusal_receipt_carries_no_declared_filter_at_all():
+    """The determination lands on the receipt of a statement that RAN, and only on that one.
+
+    A declared filter names a column and, often, a literal the MODEL author wrote — `is_deleted`,
+    `'Test'` — so it is a fact about a part of the model, in the same class as the resolved `qname`
+    and the AI-written column prose the refusal receipt already withholds. A refusal is the one
+    outcome a caller can provoke on purpose, which makes it the one receipt that doubles as a recon
+    surface, and a filter list there would answer "what else does this model say about the table you
+    guessed at?" one deliberately-wrong statement at a time.
+
+    Pinned as a CLOSED item shape plus an absence sweep of the whole body: the shape is what says
+    neither `scope` nor `filters` reached an item, and the sweep is what says the filter TEXT did
+    not arrive under some other key instead.
+    """
+    org = _org()
+    sql = "SELECT v.id FROM visits v JOIN orders o ON o.id = v.id WHERE o.amount > 0"
+    receipt = rt.assemble_refusal_receipt(org, sql)
+    body = json.dumps(receipt)
+
+    assert {frozenset(i) for i in receipt["tables"]["items"]} == {frozenset({"ref", "declared"})}
+    # Every declared filter in the fixture, including the ones on tables this statement did not
+    # name: the second kind is the recon a refusal receipt exists to refuse. `{alias}` is dropped
+    # rather than bound, so the assertion is about the model author's own text either way.
+    for declared in (d for filters in DECLARED.values() for d in filters):
+        assert declared.replace("{alias}", "") not in body
+    # And the columns those filters name, which is the half a caller could act on.
+    for column in ("is_deleted", "status", "occurred_at", "amount"):
+        assert column not in body

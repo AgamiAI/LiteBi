@@ -1366,14 +1366,11 @@ UNDETERMINED_COLUMNS = (
     "listed here when its binding SQL appears anywhere in the text, so nothing says which column "
     "it computes, and a column that matches no metric is not reported as unmatched."
 )
-# ACE-099 owns per-reference filter accounting. (ACE-042 owned it until it landed, and what it landed
-# was the DELETION of the injector: this layer no longer adds a declared filter to anyone's
-# statement, so the only thing left to build here is the report, and that is ACE-099's.)
-UNDETERMINED_TABLES = (
-    "Which of a table's declared filters this statement applied, and which it left out, is not "
-    "determined: every reference is listed, including one inside a CTE, but none of them is "
-    "accounted for against the model's filters."
-)
+# `UNDETERMINED_TABLES` stood here and is gone. It said the accounting was not done, and the
+# accounting is done: every reference carries its own `filters` list, so the sentence describing the
+# section is now composed per receipt from what THIS statement left unestablished rather than being
+# one fixed claim about every statement. See the `tables` section in `assemble_receipt`, which builds
+# it the way `assumptions` builds its own — null when there is nothing missing.
 # ACE-059 owns comparing the join predicate against the model.
 UNDETERMINED_JOINS = (
     "The predicate the statement actually joined on is not read out of the SQL: a relationship is "
@@ -1455,9 +1452,12 @@ def assemble_receipt(
     A section states what it did NOT establish rather than sitting empty, because an empty list and
     an unchecked list read identically to a consumer: silence reads as clean.
 
-    Deterministic, no LLM: tables come from the FROM/JOIN scope; a relationship is "used" when both
-    endpoints are in scope; a metric is "used" when its binding SQL appears in the query;
-    assumptions are the load-bearing columns whose description is AI-written/unknown. Everything is
+    Deterministic, no LLM: tables come from the FROM/JOIN scope; a declared filter is "applied" when
+    the reference's own scope wrote that exact predicate, and the answer is per REFERENCE because a
+    filter satisfied inside a CTE body is not satisfied for the statement reading that CTE; a
+    relationship is "used" when both endpoints are in scope; a metric is "used" when its binding SQL
+    appears in the query; assumptions are the load-bearing columns whose description is
+    AI-written/unknown. Everything is
     metadata and statement structure — never a sampled value or a row — or the receipt becomes a
     disclosure channel around the sensitive-column rules.
     """
@@ -1668,9 +1668,31 @@ def assemble_receipt(
     column_items.extend({"column": None, "metric": met} for met in metric_items)
 
     table_items: list[dict[str, Any]] = []
-    table_refs = _table_references(tree)
-    dropped_refs = max(0, len(table_refs) - _RECEIPT_MAX_REFS)
-    for r in table_refs[:_RECEIPT_MAX_REFS]:
+    # ONE walk of `exp.Table` for both halves of this section. `_reference_sites` carries each
+    # reference beside the node it was read from, which is exactly what `check_declared_filters`
+    # needs to resolve that reference's own enclosing SELECT — so handing the walk in keeps the
+    # assembler at one traversal of the tree instead of the two it would take to build the list here
+    # and re-derive it there. `_table_references` is the same list with the nodes dropped, and it is
+    # not called here for that reason.
+    sites = _reference_sites(tree)
+    dropped_refs = max(0, len(sites) - _RECEIPT_MAX_REFS)
+    # How many of the LISTED references the accounting could not settle, for the marker below. A
+    # reference counts here only when it has declared filters and every one of them came back
+    # `undetermined`; see the marker for why a partial answer is not counted.
+    unaccounted_refs = 0
+    # The determination is computed for the references that SURVIVE the cap and no others: a filter
+    # verdict about a reference this section does not list has no item to land on, and the walk is
+    # per-reference work we would be paying for to throw away.
+    #
+    # `ctx=None` for the same reason `_projected_sensitive` and `_collect_findings` above pass it:
+    # this assembler is handed a datasource and a string, so there is no `GuardContext` in scope,
+    # and inventing one here would build a second index of the same model to hand to one callee.
+    #
+    # Iterated as the PAIRS the check returns rather than by index into `sites`, because that is the
+    # coupling the pair shape exists to remove: a cap applied to one list and not the other would
+    # report one reference's filters under another reference's name.
+    for r, ref_filters in check_declared_filters(
+            tree, org, refs=sites[:_RECEIPT_MAX_REFS], ctx=None):
         # A CTE name resolved through the bare-name index, so `WITH orders AS (…)` reported
         # `declared: true` and borrowed the real table's row estimate — a fact about a table the
         # statement never read. `_declared_table` is the one place that subtraction lives, and
@@ -1696,7 +1718,26 @@ def assemble_receipt(
             # Freshness describes a table the model declares. An undeclared reference (a CTE name,
             # say) has no model row for it to be about, so claiming it would be a lie by shape.
             "freshness": freshness if t else None,
+            # Which query scope wrote this reference: `main`, `cte:<name>`, or `subquery`. It is the
+            # fact that makes the `filters` list below readable — a filter satisfied inside a CTE
+            # body is not satisfied for the statement that READS that CTE, and two entries for the
+            # same table would otherwise be told apart only by an alias they need not have. The
+            # caller-written half of the label (the CTE's own name) is already `_echo_name`-bounded
+            # where the scope is decided, so it is composed here unchanged.
+            "scope": r.scope,
+            # Which of this reference's declared `default_filters` the statement applied, omitted,
+            # or left undetermined. Deliberately NOT subject to `_RECEIPT_MAX_REFS`: its length is
+            # the number of filters the DEPLOYMENT declared on that table, not a number the caller's
+            # statement can inflate, so the response-amplification argument behind the cap does not
+            # apply to it — the same reasoning that exempts `metric_items` above. A reference the
+            # model does not declare, a CTE name, or a declared table with nothing declared about
+            # its rows all get `[]`; `declared` above already says which of those it was.
+            "filters": ref_filters,
         })
+        # Counted from the same list that was just written onto the item, so the marker below cannot
+        # disagree with what a reader sees beside it.
+        if ref_filters and all(f["status"] == "undetermined" for f in ref_filters):
+            unaccounted_refs += 1
 
     # The four analyses that used to refuse, run on the tree THIS function already parsed rather
     # than on a second parse of the same statement — `_collect_findings` takes a tree for exactly
@@ -1730,13 +1771,30 @@ def assemble_receipt(
         },
         "tables": {
             "items": table_items,
-            # The overflow is COUNTED on the marker, never listed — the same device the refusal
-            # receipt uses, and the count is the caller's own number so stating it discloses nothing.
-            # This is the "partly established, and here is what is missing" state `ReceiptSection`
-            # declares, which is the whole reason it can be said at all.
-            "undetermined": UNDETERMINED_TABLES + (
-                f" {dropped_refs} further reference(s) are not listed." if dropped_refs else ""
-            ),
+            # Null ONLY when the section is genuinely complete, exactly as `assumptions` below is
+            # null only when nothing was dropped: null is the positive claim "nothing is missing
+            # here" and a surface draws no marker against it. The fixed sentence that used to stand
+            # here said the declared-filter accounting was not done, which stopped being true the
+            # moment `filters` landed on the items — and a report shipped underneath a marker
+            # denying the report exists is the one way this section could contradict itself.
+            #
+            # What remains is composed from what THIS statement left unestablished, in at most two
+            # clauses. Both are COUNTS of the caller's OWN references and neither names anything, so
+            # stating either discloses nothing: it hands back a number the caller's statement
+            # produced. Naming a model table here would be worse than useless — an unresolved
+            # reference has no model name to give, and a resolved one is already listed above.
+            #
+            # A reference counts as unaccounted only when EVERY one of its declared filters came
+            # back `undetermined`. One applied and one undetermined is partly established, the item
+            # says exactly which is which, and repeating it here would report the same reference
+            # twice under a sentence that reads as though nothing about it was settled.
+            "undetermined": " ".join(clause for clause in (
+                (f"{unaccounted_refs} of the listed reference(s) could not be accounted for "
+                 "against the model's declared filters." if unaccounted_refs else ""),
+                # The cap clause is unchanged in wording and behaviour: the overflow is COUNTED,
+                # never listed, the same device the refusal receipt uses.
+                (f"{dropped_refs} further reference(s) are not listed." if dropped_refs else ""),
+            ) if clause) or None,
         },
         "joins": {"items": join_items, "undetermined": UNDETERMINED_JOINS},
         # The four analyses that used to REFUSE. They describe now, and this is where they land.

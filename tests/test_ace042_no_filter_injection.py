@@ -10,11 +10,13 @@ Getting one wrong produces a wrong answer, not a leak.
 It **injected**: Agami never authors or alters SQL, and the one carve-out that permitted this
 transform rested on the misclassification above.
 
-And it was **broken**. `_tables_in_scope` is `tree.find_all(exp.Table)`, which descends into CTEs
-and subqueries, so an alias bound INSIDE a CTE was collected and its filter ANDed onto the OUTER
-`WHERE`, where that alias does not exist. The database rejected the statement and the receipt
-claimed the filter had been applied — Agami's own edit manufacturing a database failure.
-`test_the_cte_case_reaches_the_driver_unchanged` is that defect, pinned.
+And it was **broken**. The scope it injected against was one flat `tree.find_all(exp.Table)` walk of
+the whole statement, which descends into CTEs and subqueries, so an alias bound INSIDE a CTE was
+collected and its filter ANDed onto the OUTER `WHERE`, where that alias does not exist. The database
+rejected the statement and the receipt claimed the filter had been applied — Agami's own edit
+manufacturing a database failure. `test_the_cte_case_reaches_the_driver_unchanged` is that defect,
+pinned. The walk now resolves each reference to the query scope that wrote it, which is what lets
+the same fact be REPORTED per reference instead of injected across all of them.
 
 **The window.** Between this and ACE-099 a declared filter is neither applied nor reported:
 `SELECT COUNT(*) FROM orders` returns every row where it previously returned the undeleted ones.

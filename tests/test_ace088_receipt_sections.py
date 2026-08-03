@@ -47,11 +47,25 @@ from semantic_model import runtime as rt  # noqa: E402
 
 ROWS_AS_OF = "2026-01-01T00:00:00Z"
 ROW_ESTIMATE = 1200
+# The one declared filter on `orders`. `{alias}` binds per REFERENCE, to that reference's own alias
+# when it has one and its bare name otherwise, so the same declaration reads `o.…` under `SQL` and
+# `orders.…` under the CTE arm of `CTE_SQL`. Deliberately carries no number: the section's items are
+# asserted below to introduce no integer leaf beyond the model's own row estimate.
+DECLARED_FILTER = "{alias}.customer_id IS NOT NULL"
 
 
 def _write_rich_model(tmp_path):
     """A model with an UNREVIEWED metric + an UNREVIEWED join, the trust signals the
-    receipt must surface. Returns the profile root."""
+    receipt must surface, and ONE declared filter. Returns the profile root.
+
+    The filter is on `orders.customer_id`, which is also the column `SQL` joins on, and that is the
+    point of it: the statement plainly talks about the column but never writes the declared
+    predicate, so the honest verdict is `undetermined` rather than `omitted`. It is what keeps
+    `tables` the file's "partly established" section now that the section's marker is null whenever
+    the accounting IS complete — a model declaring no filters at all makes that section genuinely
+    finished, and `test_an_unchecked_section_is_not_equal_to_a_clean_one` needs a section that is
+    genuinely not.
+    """
     yaml = __import__("yaml")
     p = tmp_path / "p"
     (p / "datasources" / "c").mkdir(parents=True)
@@ -68,6 +82,7 @@ def _write_rich_model(tmp_path):
                                 {"storage_connection": "c", "schema": "public", "table": "customers"}]}))
     (p / "subject_areas" / "s" / "tables" / "orders.yaml").write_text(yaml.safe_dump({
         "name": "orders", "schema": "public", "storage_connection": "c", "grain": ["id"], "description": "o",
+        "default_filters": [DECLARED_FILTER],
         "performance_hints": {"estimated_row_count": ROW_ESTIMATE, "estimated_row_count_at": ROWS_AS_OF},
         "columns": [{"name": "id", "type": "integer", "primary_key": True},
                     {"name": "customer_id", "type": "integer"},
@@ -150,7 +165,7 @@ def test_columns_section_says_metric_attribution_is_not_per_column(org):
     assert "matched against the whole statement" in section["undetermined"]
 
 
-# --- tables (ACE-042 owns the gap) ------------------------------------------
+# --- tables (the declared-filter gap is closed; the marker is now composed) ---
 
 
 def test_tables_section_is_one_entry_per_reference_not_per_table(org):
@@ -199,10 +214,80 @@ def test_tables_section_carries_the_models_row_estimate_not_a_count(org):
     assert orders["freshness"] == "hourly"
 
 
-def test_tables_section_says_declared_filters_are_not_accounted_for(org):
+def test_tables_section_accounts_each_reference_against_its_declared_filters(org):
+    """The section used to ship a fixed sentence saying this accounting was not done; it is done
+    now, per REFERENCE, and it lands on the item beside the reference it is about.
+
+    `orders` declares a filter on `customer_id` and `SQL` joins on that column without ever writing
+    the declared predicate, so the verdict is `undetermined`: the statement plainly talks about the
+    column, and calling that `omitted` would be a definite claim about what the statement left out
+    that we cannot stand behind.
+
+    `customers` declares nothing, so its list is empty. That is a different fact from "declared and
+    not established" — the marker counts only the second kind, which is why the count is 1 and not
+    2 with two references listed.
+    """
     section = _sections(org)["tables"]
-    assert section["undetermined"] == rt.UNDETERMINED_TABLES
-    assert "declared filters" in section["undetermined"]
+    by_ref = {i["ref"]: i for i in section["items"]}
+
+    assert by_ref["orders"]["filters"] == [
+        {"expr": "o.customer_id IS NOT NULL", "status": "undetermined"}]
+    assert by_ref["customers"]["filters"] == []
+    assert section["undetermined"] == (
+        "1 of the listed reference(s) could not be accounted for against the model's declared "
+        "filters."
+    )
+
+
+def test_the_tables_marker_is_null_once_every_listed_reference_is_accounted_for(org):
+    """The other half of the four-state contract, and the reason the marker is not simply always
+    set: null is the positive claim "nothing is missing here", and a section that settled every
+    filter it was given has earned it. Same shape as `assumptions`, which is the file's precedent.
+
+    Two ways to earn it, both pinned, because a marker that only ever went null on the empty case
+    would still be describing the model rather than the statement: a reference whose declared filter
+    the statement WROTE, and a reference the model declares nothing about.
+    """
+    applied = _sections(org, "SELECT id FROM orders o WHERE o.customer_id IS NOT NULL")["tables"]
+    assert applied["items"][0]["filters"] == [
+        {"expr": "o.customer_id IS NOT NULL", "status": "applied"}]
+    assert applied["undetermined"] is None
+
+    nothing_declared = _sections(org, "SELECT id FROM customers")["tables"]
+    assert nothing_declared["items"] and nothing_declared["items"][0]["filters"] == []
+    assert nothing_declared["undetermined"] is None
+
+
+def test_the_tables_marker_counts_a_reference_only_when_nothing_about_it_was_settled(tmp_path):
+    """A reference with one filter settled and one not is PARTLY established, the item says which
+    is which, and the marker does not count it. Counting it would report the same reference twice —
+    once accurately on the item, once under a sentence reading as though nothing about it was
+    established — which is the double-reporting the per-item list exists to make unnecessary.
+
+    The statement below applies `is_deleted = false` verbatim and mentions `customer_id` only in
+    the join it cannot be read out of, so the two filters land on opposite verdicts.
+    """
+    org = L.load_datasource(_write_two_declared_filters_model(tmp_path))
+    sections = _sections(
+        org,
+        "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id "
+        "WHERE o.is_deleted = false",
+    )
+    orders = next(i for i in sections["tables"]["items"] if i["ref"] == "orders")
+
+    assert [f["status"] for f in orders["filters"]] == ["applied", "undetermined"]
+    assert sections["tables"]["undetermined"] is None
+
+
+def test_the_tables_section_names_the_query_scope_each_reference_was_written_in(org):
+    """A filter satisfied inside a CTE body is not satisfied for the statement that READS that CTE,
+    so a `filters` list is only readable beside the scope its reference lives in. Without it the two
+    `public.orders` entries of `CTE_SQL` are told apart only by an alias neither of them needs to
+    have."""
+    items = _sections(org, CTE_SQL)["tables"]["items"]
+    assert {(i["ref"], i["scope"]) for i in items} == {
+        ("public.orders", "cte:big"), ("orders", "main"), ("big", "main"),
+    }
 
 
 # --- joins (ACE-059 owns the gap) -------------------------------------------
@@ -253,16 +338,26 @@ def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
     """This repo is public and these sentences surface next to the answer. An "ACE-NNN" resolves only
     in a private portfolio repo, so to the reader it is an unresolvable reference and to everyone
     else it is a list of work that has not shipped. Which spec owns each gap is a code comment beside
-    the constant; the behavioural half is what a user can act on and is the half that ships."""
+    the constant; the behavioural half is what a user can act on and is the half that ships.
+
+    `UNDETERMINED_TABLES` was the sixth name in this list and there is no constant to name any more:
+    that section's marker is composed per receipt from what the statement left unestablished, so
+    the live-receipt loop below is the only place it can be checked — which is exactly why that
+    loop was written to catch a marker the list above cannot reach.
+    """
     markers = [
-        rt.UNDETERMINED_COLUMNS, rt.UNDETERMINED_TABLES, rt.UNDETERMINED_JOINS,
+        rt.UNDETERMINED_COLUMNS, rt.UNDETERMINED_JOINS,
         rt.UNDETERMINED_AGGREGATES, rt.UNDETERMINED_NO_PARSER, rt.UNDETERMINED_UNPARSEABLE,
         rt.UNDETERMINED_REFUSED, rt.UNDETERMINED_REFUSED_TABLES,
     ]
     for marker in markers:
         assert not re.search(r"\b[A-Z]{2,}-\d+\b", marker), marker
     # And every section of a real receipt, so a marker added later cannot dodge the list above.
-    for name, section in _sections(org).items():
+    # `tables` is not merely covered here, it is only covered here — and the fixture's declared
+    # filter is what keeps that coverage real, since a section with a null marker proves nothing.
+    sections = _sections(org)
+    assert sections["tables"]["undetermined"] is not None
+    for name, section in sections.items():
         assert not re.search(r"\b[A-Z]{2,}-\d+\b", section["undetermined"] or ""), name
 
 
@@ -403,12 +498,28 @@ def test_sections_carry_metadata_and_structure_only_never_values(org):
     Pinned two ways, because a prose rule does not survive an extension: the item shapes are closed
     (a field carrying values cannot appear unnoticed), and the only number anywhere in the sections
     is the row estimate the model itself declares.
+
+    A declared filter's `expr` is the extension this had to survive, and it survives it unweakened.
+    The text is the MODEL author's, so a literal inside one (`status != 'test'`) is a model fact and
+    would be fine — but it is a STRING leaf either way, so a filter carrying a number cannot widen
+    the set of integers below, and nothing in `expr` comes off the caller's statement except this
+    reference's own identifier bound into `{alias}`. The literal assertion is the one that would
+    catch it if that ever stopped being true: `CTE_SQL` writes `4242` in a CTE the filter
+    accounting reads, and it reaches the receipt nowhere.
     """
     sections = _sections(org, CTE_SQL, freshness="hourly")
 
     assert {frozenset(i) for i in sections["columns"]["items"]} == {frozenset({"column", "metric"})}
     assert {frozenset(i) for i in sections["tables"]["items"]} == {
-        frozenset({"ref", "alias", "qname", "declared", "rows", "rows_as_of", "freshness"})}
+        frozenset({"ref", "alias", "qname", "declared", "rows", "rows_as_of", "freshness",
+                   # The two the declared-filter accounting added. `scope` is a label from a closed
+                   # set (`main` / `cte:<name>` / `subquery`) and `filters` is a list of
+                   # `{expr, status}` whose `expr` is the MODEL author's own declaration with this
+                   # reference's identifier bound into it — model metadata and statement structure,
+                   # the same two things every other field here is made of. Neither can carry a
+                   # sampled value, and the two assertions below are what says so rather than this
+                   # sentence.
+                   "scope", "filters"})}
 
     numbers = [v for v in _leaves(sections) if isinstance(v, int) and not isinstance(v, bool)]
     assert set(numbers) <= {ROW_ESTIMATE}
@@ -504,10 +615,12 @@ def test_a_resolved_column_label_is_unchanged_by_the_bound(org):
 
 
 def test_a_cte_shadowing_a_table_does_not_credit_that_tables_relationships(org):
-    """`used` came from `_tables_in_scope`, which does not subtract CTE names — so a statement that
-    defines `orders` for itself and never reads the declared `orders` still put it "in scope", and
-    the relationship walk then reported a declared join between `orders` and `customers` that this
-    statement could not possibly have made.
+    """`used` is the values of the alias map, which is every `exp.Table` the walk finds and subtracts
+    no CTE name — so a statement that defines `orders` for itself and never reads the declared
+    `orders` still put it "in scope", and the relationship walk then reported a declared join between
+    `orders` and `customers` that this statement could not possibly have made. The subtraction is
+    made by the assembler at the point of use (`_declared_table`, and `used` here), because the map
+    itself has other callers that need the reference either way.
 
     Not an admitted gap: the joins marker says the PREDICATE was not read out of the SQL, not that
     the endpoints might not be there. `check_table_scope` and the `tables` section both subtract
@@ -574,6 +687,26 @@ def test_one_column_is_spelled_one_way_in_the_two_sections_that_carry_it(org):
 
 
 # --- determinism across processes -------------------------------------------
+
+
+def _write_two_declared_filters_model(tmp_path):
+    """`_write_rich_model` with a SECOND declared filter on `orders`, plus the column it names.
+
+    Two filters on ONE reference is the only shape that can distinguish "partly established" from
+    "nothing established" at the item level, and the section marker's count turns on exactly that
+    distinction. Written as an edit to the shared fixture rather than a second model from scratch,
+    so the only difference between this receipt and the file's usual one is the fact under test.
+    """
+    yaml = __import__("yaml")
+    p = _write_rich_model(tmp_path)
+    orders = p / "subject_areas" / "s" / "tables" / "orders.yaml"
+    doc = yaml.safe_load(orders.read_text())
+    # The soft-delete filter FIRST, so the two statuses below are asserted in declaration order and
+    # a reordering of the model's own list cannot pass as a change of verdict.
+    doc["default_filters"] = ["{alias}.is_deleted = false", DECLARED_FILTER]
+    doc["columns"].append({"name": "is_deleted", "type": "boolean"})
+    orders.write_text(yaml.safe_dump(doc))
+    return p
 
 
 def _write_many_ai_columns_model(tmp_path):
