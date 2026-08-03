@@ -12,6 +12,31 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Removed
+
+- **Agami no longer rewrites your SQL to fix a fan-out join (ACE-093).** A query that aggregated a
+  measure across a one-to-many join, touching the many side nowhere but the `ON` clause, used to
+  have that join silently dropped and the rewritten statement executed in place of yours. It is
+  **refused** now, with the reason and a suggested restructuring, and your statement is what runs or
+  nothing does.
+
+  This is a deliberate narrowing and it is the point of the change. Whether a multiplied total is
+  wrong depends on the question, which the guard never sees: the same statement is wrong for order
+  revenue and right for line-item exposure. Choosing for you meant returning a different number than
+  the one your SQL asked for, disclosed only on stderr, and on the subprocess path the receipt was
+  built from the statement you sent rather than the one that ran. The `/agami-query` skill handles
+  the refusal by restructuring and **saying so in the answer**, which is the same correction made
+  where the question is actually available.
+
+  With the last rewrite gone, the statement handed to the database is now the statement received,
+  byte for byte — comments, whitespace and quoting included — and that is asserted rather than
+  assumed.
+
+  **Contract changes.** `sm prepare` no longer emits `rewritten`, and returns your statement
+  unchanged or exits 1. `sm preflight` no longer emits `original_sql` or `rewritten_sql`. The
+  receipt from `sm receipt` no longer carries a `pre_flight` key; it is `model_version` plus the
+  five sections, always. No MCP or REST surface changes.
+
 ### Changed
 
 - **The trust receipt is five sections, and each one says what it did NOT establish (ACE-088).**

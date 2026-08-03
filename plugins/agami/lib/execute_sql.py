@@ -30,11 +30,12 @@ Drivers (install only what you need):
 Exit codes:
     0  — success, CSV on stdout
     1  — refused by a guard. `main` always writes the contract `{"refusal": {…}}` as a single JSON
-         object on stderr. The four unconverted semantic-model branches (fan/chasm pre-flight,
-         auto-rewrite notice, sensitive columns, default-filter notice) additionally write their own
-         `{"error": {…}}` / plain-text diagnostic line BEFORE it, so for those the stream is two
-         lines rather than one. Parsers key off the `"refusal"` KEY, not the code and not the line
-         count; the extra line goes away when those branches are subtracted.
+         object on stderr. The two unconverted semantic-model branches (fan/chasm pre-flight,
+         sensitive columns) additionally write their own `{"error": {…}}` diagnostic line BEFORE it,
+         so for those the stream is two lines rather than one. Parsers key off the `"refusal"` KEY,
+         not the code and not the line count; the extra line goes away when those branches are
+         subtracted. Two of the original four already have: the default-filter notice and the
+         auto-rewrite notice went with the rewrites they announced.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
@@ -1647,10 +1648,11 @@ def _write_refusal(refusal: Refusal) -> None:
     shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on the parent
     side of the process boundary. Nothing else may be written alongside it: several callers (and the
     fail-closed suite) parse the WHOLE stderr stream as a single object, so a second line of
-    diagnostics would not merely be noisy, it would make the refusal unreadable. The four
+    diagnostics would not merely be noisy, it would make the refusal unreadable. The two
     unconverted ``_model_safety`` branches still write such a line before this one — for those the
     stream is two lines and only the line-scanning parser can read it, which is one more reason they
-    are being subtracted.
+    are being subtracted. There were four; the default-filter and auto-rewrite notices went with the
+    rewrites they announced.
     """
     json.dump({"refusal": asdict(refusal)}, sys.stderr)
     sys.stderr.write("\n")
@@ -1665,7 +1667,7 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     the report. Until then a declared filter is descriptive only.
 
     Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue, a ``Refusal`` from one of
-    the five converted branches, or — from the three unconverted ones — today's bare exit code, which
+    the five converted branches, or — from the two unconverted ones — today's bare exit code, which
     the caller wraps in the interim ``model_safety`` rule. Inert (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
@@ -1754,10 +1756,12 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
                              "triggering_joins": pf.triggering_joins}}, sys.stderr)
         sys.stderr.write("\n")
         return sql, 1
-    if pf.risk and pf.action == "auto_rewrite" and pf.rewritten_sql:
-        sys.stderr.write(f"[agami] auto-corrected {pf.risk}: ran rewritten SQL. {pf.reason}\n")
-        sql = pf.rewritten_sql
-        ctx = RT.build_guard_context(sql, org)  # SQL changed -> refresh the shared context
+
+    # No branch rebinds `sql` after this point, and none has since the fan-join auto-rewrite was
+    # deleted — the one that used to swap in a rewritten statement here, announce it on stderr, and
+    # rebuild `ctx` around the new string. So this function now provably returns the statement it was
+    # given, on every path, and the guards below all run against what the caller actually sent.
+    # tests/test_ace093_byte_identity.py asserts that end to end at the driver hand-off.
 
     # Sensitive-column (PII) guard — refuse to PROJECT raw sensitive values. Same
     # deterministic chokepoint as the fan/chasm pre-flight, so the agami-query skill,
@@ -2191,16 +2195,19 @@ def execute_guarded(
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)
-    # The statement the CALLER sent, captured before `_model_safety` can rebind the local below. Every
-    # NON-OK receipt is built from this one. Whatever the safety pass rewrites a statement INTO is the
-    # guard's own text, so the rebound string can name a table the caller never wrote — and a refusal
-    # built from it then describes a statement nobody sent, in model-authored text, which is precisely
-    # the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent. The reproduction came
-    # through `apply_default_filters`, which pulled the name straight out of the model's YAML; ACE-042
-    # has since deleted that injector and the fan-join `auto_rewrite` is the one rewrite still
-    # standing, but the rule is about the rebinding rather than about either mechanism. The `ok`
-    # receipt is the one exception and keeps using the rebound value, because SC-6 asks it to describe
-    # what actually ran.
+    # The statement the CALLER sent. Every NON-OK receipt is built from this one, and the rule is
+    # about the REBINDING rather than about any particular mechanism: whatever a safety pass rewrites
+    # a statement INTO is the guard's own text, so a rebound string can name a table the caller never
+    # wrote, and a refusal built from it then describes a statement nobody sent, in model-authored
+    # text — precisely the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent.
+    # The reproduction came through `apply_default_filters`, which pulled the name straight out of
+    # the model's YAML.
+    #
+    # No pass rewrites anything today: that injector went, then the fan-join auto-rewrite, and
+    # `_model_safety` now returns the statement it was given on every path. So this equals the
+    # executed statement rather than merely guarding against it, and the capture is kept as the thing
+    # that keeps it that way — a future rewrite would have to reintroduce the divergence past a name
+    # that says what it is for.
     received_sql = sql
     try:
         import sql_guard
@@ -2218,16 +2225,18 @@ def execute_guarded(
             return _envelope("refused", refusal=refusal,
                              receipt=_refusal_receipt(refusal, received_sql, profile))
         if not no_safety:
-            # `sql` is REBOUND here: `_model_safety` returns the statement it will actually run,
-            # which the auto-rewrite branch changes. Every receipt built below therefore describes
-            # the rewritten statement rather than the one the caller sent, which is the only version
-            # of it that is true.
+            # `_model_safety` returns the statement it will actually run. It returns the one it was
+            # given, on every path, since the fan-join auto-rewrite was the last branch that changed
+            # it — so this rebinding is now a no-op and the `ok` receipt built below describes the
+            # caller's own statement. The assignment stays because the CONTRACT is "run what this
+            # returns": reading the return value is what makes a reintroduced rewrite a receipt bug
+            # rather than an executed-statement bug.
             sql, verdict = _model_safety(sql, profile, area)
             if isinstance(verdict, Refusal):
                 return _envelope("refused", refusal=verdict,
                                  receipt=_refusal_receipt(verdict, received_sql, profile))
             if verdict is not None:
-                # One of the four unconverted branches: it wrote its own diagnostic to the server
+                # One of the two unconverted branches: it wrote its own diagnostic to the server
                 # log and handed back only an exit code, so this is the most we can say without
                 # inventing a rule for it. The interim RULE_MODEL_SAFETY exists precisely so this
                 # path still returns an Envelope — without it the signature would have to be

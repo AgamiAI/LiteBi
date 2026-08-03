@@ -425,12 +425,22 @@ def test_the_receipt_is_the_sections_and_the_version_pin(org):
     assert not (set(receipt) & DELETED_FLAT_KEYS)
 
 
-def test_the_two_rewrite_keys_are_the_only_conditional_ones(org):
-    """`default_filters_applied` and `pre_flight` describe a REWRITE this layer performed on the
-    caller's statement, so neither is a fact about what the caller sent and neither has a section
-    home. Both are conditional — absent when nothing was rewritten — and both disappear rather than
-    move when the rewrites they describe are subtracted."""
+def test_the_one_rewrite_key_is_the_only_conditional_one(org):
+    """`default_filters_applied` describes a REWRITE this layer performed on the caller's statement,
+    so it is not a fact about what the caller sent and it has no section home. It is conditional —
+    absent when nothing was rewritten — and it disappears rather than moves when the rewrite it
+    describes is subtracted.
+
+    There were two. `pre_flight` carried the fan/chasm verdict including the `auto_rewrite` action,
+    and it went with the rewrite it reported, exactly as this docstring predicted it would. The
+    analysis survived the subtraction; the verdict and its key did not. `default_filters_applied` is
+    the one left, and only because `sm receipt --applied-filters` still lets a caller hand a list in
+    until ACE-099 becomes its producer.
+
+    The absence assertion below is the load-bearing half: a future slice that reintroduces a receipt
+    key without a section home fails here rather than shipping it."""
     plain = rt.assemble_receipt(org, SQL)
+    assert set(plain) == {"model_version", *guardrail.Receipt.SECTIONS}
     assert "default_filters_applied" not in plain and "pre_flight" not in plain
 
     rewritten = rt.assemble_receipt(org, SQL, applied_filters=["o.x IS NULL"])

@@ -33,13 +33,23 @@ def _sales_org():
 # --- pre-flight ---
 
 
-def test_fan_trap_auto_rewrite():
+def test_the_aggregation_only_fan_trap_is_refused_not_rewritten():
+    """The shape that used to be auto-rewritten: an aggregate over the ONE side, with the many side
+    touched nowhere but the ON clause. It was rewritten by dropping the join, on the grounds that the
+    transform was result-preserving. It refuses now, and the statement comes back untouched.
+
+    The reason is asserted for what it does NOT say. It used to end "Rewrite would change result
+    shape", which offered a transform that no longer exists; nothing replaced that sentence, because
+    the caller's way forward already lives in `suggestion`."""
     org = _sales_org()
-    pf = rt.pre_flight_check(
-        "SELECT SUM(orders.total_amount) FROM orders JOIN order_items ON order_items.order_id = orders.id",
-        org)
-    assert pf.risk == "fan_trap" and pf.action == "auto_rewrite"
-    assert "order_items" not in pf.rewritten_sql
+    sql = ("SELECT SUM(orders.total_amount) FROM orders "
+           "JOIN order_items ON order_items.order_id = orders.id")
+    pf = rt.pre_flight_check(sql, org)
+
+    assert pf.risk == "fan_trap" and pf.action == "refuse"
+    assert "rewrite" not in pf.reason.lower(), pf.reason
+    assert pf.suggestion and "pre-aggregate" in pf.suggestion
+    assert "order_items" in pf.reason  # it names the many side rather than removing it
 
 
 def test_chasm_trap_refuse_with_suggestion():
@@ -70,8 +80,13 @@ def test_explicit_cross_product_allowed():
 def test_fan_trap_in_a_set_operation_arm_is_refused():
     """A fan/chasm trap in ANY set-operation arm refuses the whole query. The set
     operation parses to exp.SetOperation, so gating on isinstance(tree, exp.Select) would
-    skip every arm. Arms are not auto-rewritten, so a would-be auto_rewrite fan trap
-    (see test_fan_trap_auto_rewrite) becomes a refuse when it sits inside a UNION arm."""
+    skip every arm.
+
+    An arm and a top-level SELECT used to be analyzed differently: `allow_rewrite` was True for one
+    and False for the other, so the aggregation-only fan trap below was rewritten at the top level
+    and refused inside a UNION. They are analyzed identically now, and this asserts the arm walk
+    itself rather than that asymmetry — the refusal has to come from visiting the arm, since the
+    statement as a whole is not a SELECT."""
     org = _sales_org()
     fan = ("SELECT SUM(orders.total_amount) FROM orders "
            "JOIN order_items ON order_items.order_id = orders.id")
