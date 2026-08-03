@@ -33,73 +33,85 @@ def _sales_org():
 # --- pre-flight ---
 
 
-def test_the_aggregation_only_fan_trap_is_refused_not_rewritten():
-    """The shape that used to be auto-rewritten: an aggregate over the ONE side, with the many side
-    touched nowhere but the ON clause. It was rewritten by dropping the join, on the grounds that the
-    transform was result-preserving. It refuses now, and the statement comes back untouched.
+def test_the_aggregation_only_fan_trap_is_reported_not_rewritten_and_not_refused():
+    """The shape with the longest history here. It was auto-rewritten by dropping the join, on the
+    grounds that the transform was result-preserving; ACE-093 deleted that and left it refusing;
+    this reports it and runs the statement.
 
-    The reason is asserted for what it does NOT say. It used to end "Rewrite would change result
-    shape", which offered a transform that no longer exists; nothing replaced that sentence, because
-    the caller's way forward already lives in `suggestion`."""
+    Both subtractions came from the same place. The transform WAS result-preserving, and the
+    refusal WAS well-founded, and neither was ours to decide: whether a multiplied total is wrong
+    depends on the question, and this layer has the statement and the model and never the question.
+
+    The finding is asserted for what it does not carry. There is no `suggestion` — that field gave
+    a refused caller a way forward, and naming one on an answer that came back presumes intent."""
     org = _sales_org()
     sql = ("SELECT SUM(orders.total_amount) FROM orders "
            "JOIN order_items ON order_items.order_id = orders.id")
     pf = rt.pre_flight_check(sql, org)
 
-    assert pf.risk == "fan_trap" and pf.action == "refuse"
-    assert "rewrite" not in pf.reason.lower(), pf.reason
-    assert pf.suggestion and "pre-aggregate" in pf.suggestion
-    assert "order_items" in pf.reason  # it names the many side rather than removing it
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
+    assert "rewrite" not in pf.findings[0].reason.lower(), pf.findings[0].reason
+    assert not hasattr(pf.findings[0], "suggestion")
+    assert "order_items" in pf.findings[0].reason  # names the many side rather than removing it
+    assert pf.findings[0].triggering_joins == ["orders (1) <- order_items (N)"]
 
 
-def test_chasm_trap_refuse_with_suggestion():
+def test_chasm_trap_is_reported():
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
         "LEFT JOIN orders o ON o.customer_id=c.id LEFT JOIN tickets t ON t.customer_id=c.id "
         "GROUP BY c.id", org)
-    assert pf.risk == "chasm_trap" and pf.action == "refuse" and pf.suggestion
+    assert [f.risk for f in pf.findings] == ["chasm_trap"]
 
 
-def test_fan_trap_mixed_raw_and_aggregate_refuse():
+def test_fan_trap_mixed_raw_and_aggregate_is_reported():
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT orders.id, orders.created_at, SUM(orders.total_amount) FROM orders "
         "JOIN order_items ON order_items.order_id=orders.id GROUP BY orders.id, orders.created_at",
         org)
-    assert pf.risk == "fan_trap" and pf.action == "refuse"
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
 
 
-def test_explicit_cross_product_allowed():
+def test_explicit_cross_product_is_not_a_trap():
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT * FROM orders, tickets WHERE orders.customer_id = tickets.customer_id", org)
-    assert pf.action == "allow" and pf.risk is None
+    assert pf.findings == []
 
 
-def test_fan_trap_in_a_set_operation_arm_is_refused():
-    """A fan/chasm trap in ANY set-operation arm refuses the whole query. The set
-    operation parses to exp.SetOperation, so gating on isinstance(tree, exp.Select) would
-    skip every arm.
+def test_fan_trap_in_a_set_operation_arm_is_reported():
+    """A trap in ANY set-operation arm is reported. The set operation parses to exp.SetOperation,
+    so gating on isinstance(tree, exp.Select) would skip every arm, and the finding has to come
+    from visiting the arm since the statement as a whole is not a SELECT.
 
-    An arm and a top-level SELECT used to be analyzed differently: `allow_rewrite` was True for one
-    and False for the other, so the aggregation-only fan trap below was rewritten at the top level
-    and refused inside a UNION. They are analyzed identically now, and this asserts the arm walk
-    itself rather than that asymmetry — the refusal has to come from visiting the arm, since the
-    statement as a whole is not a SELECT."""
+    The walk used to stop at the first arm that would have refused, which is right for a verdict
+    and wrong for a description: the second arm's trap is not made false by the first one's. It
+    accumulates now, and `test_every_trapped_arm_is_reported` pins that."""
     org = _sales_org()
     fan = ("SELECT SUM(orders.total_amount) FROM orders "
            "JOIN order_items ON order_items.order_id = orders.id")
     pf = rt.pre_flight_check(f"SELECT 1 AS n UNION ALL {fan}", org)
-    assert pf.risk == "fan_trap" and pf.action == "refuse"
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
+
+
+def test_every_trapped_arm_is_reported():
+    """Two trapped arms, two findings. The old walk returned on the first, so the caller was told
+    one arm's aggregate was inflated and never that the other one's was too."""
+    org = _sales_org()
+    fan = ("SELECT SUM(orders.total_amount) FROM orders "
+           "JOIN order_items ON order_items.order_id = orders.id")
+    pf = rt.pre_flight_check(f"{fan} UNION ALL {fan}", org)
+    assert [f.risk for f in pf.findings] == ["fan_trap", "fan_trap"]
 
 
 def test_clean_set_operation_passes_preflight():
-    """A set operation with no trapped arm still passes — arm-walking must not over-refuse."""
+    """A set operation with no trapped arm reports nothing — arm-walking must not over-report."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT id FROM orders UNION SELECT id FROM customers", org)
-    assert pf.action == "allow" and pf.risk is None
+    assert pf.findings == []
 
 
 def test_aggregating_many_side_is_allowed():
@@ -108,7 +120,7 @@ def test_aggregating_many_side_is_allowed():
     pf = rt.pre_flight_check(
         "SELECT SUM(order_items.quantity) FROM orders JOIN order_items ON order_items.order_id=orders.id",
         org)
-    assert pf.action == "allow"
+    assert pf.findings == []
 
 
 # --- examples-first ---

@@ -203,13 +203,29 @@ def cmd_preflight(args) -> int:
 def cmd_prepare(args) -> int:
     """Tier-independent safety pass: run the fan/chasm pre-flight and return the SQL to
     actually execute. The query skill calls this on EVERY tier before handing SQL to
-    psql/mysql/etc., so the safety guarantees don't depend on going through execute_sql.py.
+    psql/mysql/etc.
+
+    **This is not a gate and never was.** It runs the fan/chasm and aggregation-semantics
+    checks, which describe; it does NOT run table scope, the `SELECT *` ban or column scope,
+    which refuse. Those live in `execute_sql` alone. A tier that runs its own SQL after
+    calling this has had the checks, not the gates, and `--no-safety` is therefore never the
+    right flag to pair with it.
 
     Because the caller RUNS what comes back, this command echoes the statement it was given and
     never a statement of ours. It used to answer an aggregation-only fan trap with a rewritten
     string plus a `rewritten: true` flag, which made every non-`execute_sql` tier execute something
-    the caller never wrote; that trap refuses now, and the only two outcomes are the caller's own
-    statement or a non-zero exit.
+    the caller never wrote.
+
+    **It is now total: exit 0, always.** It refused a fan or chasm trap until ACE-094, which was the
+    last non-zero exit here. Correctness is not a refusal — whether a multiplied total is a bug
+    depends on the question, and this command has the statement but not the question. So it reports
+    what it found and lets the caller, who has both, decide.
+
+    `findings` is that report, and **an empty list is not by itself a clean bill of health.** The
+    analysis does not run when sqlglot is missing, when the statement does not parse, or when there
+    is no SELECT, and each of those yields the same empty list a genuinely clean statement does.
+    `unchecked` is what separates them: null when the checks ran, a sentence when they could not.
+    Read both or read neither.
 
     A table's declared `default_filters` are NOT applied here (ACE-042 deleted the injection)
     and are not yet reported (ACE-099 adds the report), so no `applied_filters` key is emitted.
@@ -220,18 +236,14 @@ def cmd_prepare(args) -> int:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
     pf = RT.pre_flight_check(sql, org)
-    if pf.risk and pf.action == "refuse":
-        _print_json({"action": "refuse", "risk": pf.risk, "reason": pf.reason,
-                     "suggestion": pf.suggestion, "sql": sql})
-        return 1
     _print_json({
-        "action": pf.action,
-        "risk": pf.risk,
         "sql": sql,
+        "findings": [f.as_dict() for f in pf.findings],
+        # Null when the checks ran. A caller that ignores this reads "skipped" as "clean".
+        "unchecked": pf.unchecked,
         # {output_column: unit}, traced through the caller's own statement — feed straight to
         # `format-table --units` so summed/aliased currency formats correctly.
         "units": RT.resolve_result_units(org, sql),
-        "reason": pf.reason if pf.risk else None,
     })
     return 0
 

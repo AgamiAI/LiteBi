@@ -30,7 +30,11 @@ Because agami writes SQL *with* an LLM, your AI client passes the model what it 
 
 This is how every AI coding or analysis assistant works; agami neither adds nor removes it. What agami *does* do is keep that surface as small and controlled as possible:
 
-- **You decide what the model can see.** The semantic model is the only schema the LLM works from — never a live connection to your database. Exclude any table or column you don't want queried, and mark columns `sensitive` so their raw values are never projected (they can still be counted or filtered).
+- **You decide what the model can see.** The semantic model is the only schema the LLM works from — never a live connection to your database. **Excluding a column is the control.** A column you leave out of the model is out of scope: any statement that names it is refused before it runs, and that is enforced rather than advisory.
+
+  Marking a column `sensitive` is a *description*, not a gate. It is the model author saying "handle this carefully": the answer's receipt reports when a statement projected it, so you can see that it did. It does not stop the projection. Agami holds no access policy of its own and reads exactly as the connecting database role reads, so what a query can return is decided by that role's grants and by your warehouse's own masking policies — not by us. If a value must not come back, either leave the column out of the model or make sure the role cannot read it.
+
+  One thing worth stating plainly, because it is the reason the flag is not a gate: excluding a column does not prevent *inference* about it through predicates or aggregates over the columns that remain. A filter on a column can answer a question about it one bit at a time. Only the warehouse's own controls, or not landing the data, close that.
 - **Execution stays on your machine.** agami runs the generated SQL against your database locally. Your **database credentials and connection never go to the model** — only the model context above and the rows you'd see anyway.
 - **Want nothing to leave at all?** Point your client — or a [self-hosted deploy](open-vs-hosted.md) — at a local or self-hosted model, and even the question and model context stay on your own infrastructure.
 

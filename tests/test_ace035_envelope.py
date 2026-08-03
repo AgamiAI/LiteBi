@@ -79,12 +79,15 @@ def _sqlite_creds(p, org_id="local"):
 
 
 def test_every_outcome_of_execute_guarded_is_an_envelope(monkeypatch):
-    """All five outcomes, asserted to be `Envelope`s of the right status in one place.
+    """All four outcomes, asserted to be `Envelope`s of the right status in one place.
 
     Asserting the TYPE (not just the fields) is the point: the signature is `-> Envelope` with no
     union, so a future branch that returns an exit code, a tuple, or None to save a line is caught
     here rather than at whichever caller happens to unpack it first.
-    """
+
+    There were five. The fifth was a `_model_safety` returning a bare exit code, answered with the
+    interim `model_safety` rule; ACE-094 deleted the two branches that could return one, so the
+    verdict type is `Refusal | None` and there is no int for this to exercise."""
     monkeypatch.setattr(execute_sql, "_load_credentials", _sqlite_creds)
 
     def _guarded(sql="SELECT 1", **kw):
@@ -101,11 +104,7 @@ def test_every_outcome_of_execute_guarded_is_an_envelope(monkeypatch):
     monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, scope_refusal))
     scoped = _guarded()
 
-    # 3. an unconverted branch returns a bare exit code
-    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, 1))
-    interim = _guarded()
-
-    # 4. the executor raises
+    # 3. the executor raises
     monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, None))
 
     class _Boom:
@@ -114,13 +113,12 @@ def test_every_outcome_of_execute_guarded_is_an_envelope(monkeypatch):
 
     failed = execute_sql.execute_guarded("SELECT 1", "acme", None, executor=_Boom())
 
-    # 5. the statement ran
+    # 4. the statement ran
     ok = _guarded()
 
     outcomes = {
         "read_only": (read_only, "refused"),
         "scope_gate": (scoped, "refused"),
-        "interim_int": (interim, "refused"),
         "executor_error": (failed, "failed"),
         "success": (ok, "ok"),
     }
@@ -391,9 +389,10 @@ def test_in_process_and_forked_refusals_are_the_same_refusal(tmp_path, monkeypat
     # The reason and the detail travel too, so the whole contract object is identical — not just
     # the two fields named above.
     assert in_process["refusal"] == forked["refusal"]
-    # And it is the GATE's rule, not a generic stand-in. Without this the assertions above would
-    # still pass if both paths regressed to the same useless answer.
-    assert in_process["refusal"]["rule"] != guardrail.RULE_MODEL_SAFETY
+    # This used to also assert the rule was not the interim `model_safety` stand-in — the guard
+    # against both paths regressing to the same useless answer. That constant is gone: ACE-094
+    # deleted the two branches it stood in for, so there is no generic rule left to regress to.
+    assert in_process["refusal"]["rule"] in guardrail.REASON_FOR_RULE
     # The receipt is the second half of the same property (ACE-088), and the harder half: the two
     # paths build it in two different PROCESSES. The child's Envelope is destroyed at the process
     # boundary, so the parent assembles the fork's receipt from the same model and the same version
@@ -405,9 +404,8 @@ def test_in_process_and_forked_refusals_are_the_same_refusal(tmp_path, monkeypat
 def _write_sensitive_model(root: Path) -> None:
     """A one-table model whose `email` column is flagged `sensitive`.
 
-    Projecting it trips `check_sensitive_projection` — one of the four branches NOT converted in
-    this slice, so it is the live example of the interim path rather than a hypothetical one.
-    """
+    Projecting it used to trip `check_sensitive_projection` and refuse. ACE-094 deleted that gate,
+    so the flag is a description the receipt reports and the statement runs."""
     import yaml
 
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
@@ -432,17 +430,19 @@ def _write_sensitive_model(root: Path) -> None:
     )
 
 
-def test_an_unconverted_branch_also_refuses_identically_on_both_paths(tmp_path, monkeypatch):
-    """The four not-yet-converted branches converge too — on the interim rule.
+def test_a_sensitive_projection_is_no_longer_refused_on_either_path(tmp_path, monkeypatch):
+    """The sensitive-column branch does not refuse, and the two paths still agree.
 
-    They still write their own `{"error": …}` diagnostic and hand back a bare exit code, so neither
-    path can name the gate. What both paths CAN do is say the same thing: a `model_safety` refusal
-    pointing at the server log, which is what the in-process path has always said. That is the
-    convergence this slice buys even where the underlying branch is unchanged.
+    This was `test_an_unconverted_branch_also_refuses_identically_on_both_paths`, and it measured
+    the convergence of the two branches that handed back a bare exit code with no rule attached:
+    both paths said `model_safety`, pointing at a server log the caller could not read. ACE-094
+    deleted both branches, so there is no unconverted branch left to converge and no interim rule.
 
-    It also documents the one place the wire is not a single JSON object: on the fork the child's
-    diagnostic line precedes `main`'s refusal line, so the stream is two lines and only the
-    line-scanning parser can read it. That extra line disappears with those branches.
+    What is worth measuring now is the opposite property with the same parity. This fixture wires no
+    warehouse, so both paths get as far as loading credentials and fail there — which is the
+    evidence: a refusal returns long before credentials are touched, so reaching a `dsn` failure
+    proves nothing refused the statement. That the two paths agree on it is the property this file
+    exists for.
     """
     pytest.importorskip("pydantic")
     pytest.importorskip("sqlglot")
@@ -453,33 +453,23 @@ def test_an_unconverted_branch_also_refuses_identically_on_both_paths(tmp_path, 
     monkeypatch.setattr(tools, "resolve_profile", lambda ds: "acme")
     sql = "SELECT email FROM customers"
 
-    spy = _SpyExecutor()
-    tools.set_injected_executor(spy)
+    tools.set_injected_executor(_SpyExecutor())
     in_process = _tool_out(sql)
-    assert spy.calls == []
-
     tools.set_injected_executor(None)
     forked = _tool_out(sql)
 
-    assert in_process["status"] == forked["status"] == "refused"
-    assert in_process["refusal"] == forked["refusal"]
-    assert in_process["refusal"]["rule"] == guardrail.RULE_MODEL_SAFETY
-    assert "server log" in in_process["refusal"]["remediation"]
-    # Value-free: the sensitive column's name never rides out to the caller on either path.
-    assert "email" not in json.dumps(in_process["refusal"])
+    assert in_process["status"] == forked["status"] == "failed", (in_process, forked)
+    assert in_process["failure"]["kind"] == forked["failure"]["kind"] == "dsn"
+    assert "refusal" not in in_process and "refusal" not in forked
 
-    # The child's own diagnostic still goes to the server log, byte-for-byte as before — the branch
-    # itself was not touched, only what the envelope does with its exit code.
+    # And the forked stream is one JSON object again: the `{"error": {"kind": "sensitive_columns"}}`
+    # diagnostic that used to precede the refusal line is gone with the branch that wrote it.
     proc = subprocess.run(
         [sys.executable, "-m", "execute_sql", "--profile", "acme", "--sql", sql],
         capture_output=True, text=True, timeout=60,
         env={**os.environ, "AGAMI_ARTIFACTS_DIR": str(artifacts)},
     )
-    lines = proc.stderr.strip().splitlines()
-    assert proc.returncode == 1
-    assert len(lines) == 2, proc.stderr
-    assert json.loads(lines[0])["error"]["kind"] == "sensitive_columns"
-    assert json.loads(lines[1])["refusal"]["rule"] == guardrail.RULE_MODEL_SAFETY
+    assert "sensitive_columns" not in proc.stderr, proc.stderr
 
 
 def test_the_forked_child_keeps_its_audit_id_off_the_wire(tmp_path):

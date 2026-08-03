@@ -29,13 +29,13 @@ Drivers (install only what you need):
 
 Exit codes:
     0  — success, CSV on stdout
-    1  — refused by a guard. `main` always writes the contract `{"refusal": {…}}` as a single JSON
-         object on stderr. The two unconverted semantic-model branches (fan/chasm pre-flight,
-         sensitive columns) additionally write their own `{"error": {…}}` diagnostic line BEFORE it,
-         so for those the stream is two lines rather than one. Parsers key off the `"refusal"` KEY,
-         not the code and not the line count; the extra line goes away when those branches are
-         subtracted. Two of the original four already have: the default-filter notice and the
-         auto-rewrite notice went with the rewrites they announced.
+    1  — refused by a guard. `main` writes the contract `{"refusal": {…}}` as a single JSON object
+         on stderr, and nothing else — every branch is converted now. Four once wrote their own
+         `{"error": {…}}` or plain-text diagnostic line BEFORE it, which made the stream two lines
+         and readable only by a line-scanning parser: the default-filter and auto-rewrite notices
+         went with the rewrites they announced, and the fan/chasm and sensitive-column
+         diagnostics went with the refusals they explained. Parsers should still key off the
+         `"refusal"` KEY rather than the code or the line count.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
@@ -86,7 +86,6 @@ from guardrail import (
     RECEIPT_BUILD_FAILED,
     RECEIPT_NO_MODEL,
     RECEIPT_NO_RUNTIME,
-    RULE_MODEL_SAFETY,
     RULE_MODEL_UNAVAILABLE,
     RULE_RESOURCE_LIMIT,
     Envelope,
@@ -1648,36 +1647,39 @@ def _write_refusal(refusal: Refusal) -> None:
     shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on the parent
     side of the process boundary. Nothing else may be written alongside it: several callers (and the
     fail-closed suite) parse the WHOLE stderr stream as a single object, so a second line of
-    diagnostics would not merely be noisy, it would make the refusal unreadable. The two
-    unconverted ``_model_safety`` branches still write such a line before this one — for those the
-    stream is two lines and only the line-scanning parser can read it, which is one more reason they
-    are being subtracted. There were four; the default-filter and auto-rewrite notices went with the
-    rewrites they announced.
+    diagnostics would not merely be noisy, it would make the refusal unreadable. Nothing writes one
+    now: four branches once did, and all four are gone — the default-filter and auto-rewrite
+    notices with the rewrites they announced, the fan/chasm and sensitive-column diagnostics with
+    the refusals they explained. The stream is a single object on every path.
     """
     json.dump({"refusal": asdict(refusal)}, sys.stderr)
     sys.stderr.write("\n")
 
 
-def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusal | int | None]:
-    """Semantic-model safety pass before execution: fan-trap / chasm-trap pre-flight, scope gates
-    and the sensitive-column gate, over a model resolved from the DB (hosted) or disk (local).
+def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusal | None]:
+    """Semantic-model safety pass before execution: the scope gates, over a model resolved from the
+    DB (hosted) or disk (local).
+
+    Every branch now returns a `Refusal` or nothing. The bare `int` this used to be able to return
+    existed for two branches that wrote their own diagnostic to stderr and handed back an exit code
+    with no rule attached — the fan/chasm pre-flight and the sensitive-column gate. Both are gone,
+    so the interim `RULE_MODEL_SAFETY` that let `execute_guarded` turn that int into an Envelope is
+    gone too, and "exactly one Envelope per path" holds without a placeholder rule standing in.
 
     A table's declared ``default_filters`` are NOT applied here, and are not yet reported either —
     ACE-042 deleted the injection (it authored SQL, and mis-scoped it on any CTE), and ACE-099 adds
     the report. Until then a declared filter is descriptive only.
 
-    Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue, a ``Refusal`` from one of
-    the five converted branches, or — from the two unconverted ones — today's bare exit code, which
-    the caller wraps in the interim ``model_safety`` rule. Inert (returns the SQL unchanged) when the
+    Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue or a ``Refusal`` from
+    whichever gate chose it — there is no third thing, so every refusal names its own rule. Inert
+    (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
 
-    The five converted branches — both ``model_unavailable`` sites and the three scope gates — write
-    NOTHING: they hand the contract object back and ``execute_guarded`` puts it in the Envelope, so
-    the in-process caller sees the same rule the forked one does. The fan/chasm pre-flight and
-    sensitive-column branches below still write today's ``{"error": …}`` / plain text and return
-    today's int, because those become receipt facts rather than refusals and converting them here
-    would pre-empt that decision.
+    Every branch writes NOTHING: it hands the contract object back and ``execute_guarded`` puts it
+    in the Envelope, so the in-process caller sees the same rule the forked one does. The fan/chasm
+    pre-flight and the sensitive-column check were the two exceptions, writing their own diagnostic
+    and returning a bare int. Both became receipt facts, so neither is here at all now.
     """
     try:
         from semantic_model import runtime as RT
@@ -1749,31 +1751,24 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     if cs is not None:
         return sql, cs
 
-    pf = RT.pre_flight_check(sql, org, ctx=ctx)
-    if pf.risk and pf.action == "refuse":
-        json.dump({"error": {"kind": "preflight_refused", "risk": pf.risk,
-                             "reason": pf.reason, "suggestion": pf.suggestion,
-                             "triggering_joins": pf.triggering_joins}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
+    # The fan/chasm pre-flight and the sensitive-projection check used to sit here and REFUSE. Both
+    # are gone from this function, and neither analysis is: they run in `RT.assemble_receipt`, where
+    # what they find rides on the answer as a fact.
+    #
+    # Correctness cannot be a refusal. Whether a join multiplies the rows an aggregate is computed
+    # from is derivable from the statement and the model, but whether that multiplication is a BUG
+    # depends on the question, and the question never reaches this frame — the same statement is
+    # wrong for order revenue and right for line-item exposure. Refusing it here made a judgement on
+    # the caller's behalf, in the one place least equipped to make it.
+    #
+    # The sensitive-projection refusal went for a different reason: it was an access policy, and we
+    # hold none of our own. A column that must not be readable is not declared, and the two scope
+    # gates above already refuse any statement reaching it — that is 4b, and it needs no help.
+    #
+    # What is left here is 4a and 4b, which is the whole of what principle 4 permits.
 
-    # No branch rebinds `sql` after this point, and none has since the fan-join auto-rewrite was
-    # deleted — the one that used to swap in a rewritten statement here, announce it on stderr, and
-    # rebuild `ctx` around the new string. So this function now provably returns the statement it was
-    # given, on every path, and the guards below all run against what the caller actually sent.
-    # tests/test_ace093_byte_identity.py asserts that end to end at the driver hand-off.
-
-    # Sensitive-column (PII) guard — refuse to PROJECT raw sensitive values. Same
-    # deterministic chokepoint as the fan/chasm pre-flight, so the agami-query skill,
-    # the local MCP server, and cron all protect PII identically (not just whichever
-    # path happened to read a prose rule). Aggregates / filters / joins are allowed.
-    sens = RT.check_sensitive_projection(sql, org, ctx=ctx)
-    if sens.action == "refuse":
-        json.dump({"error": {"kind": "sensitive_columns", "columns": sens.columns,
-                             "reason": sens.reason, "suggestion": sens.suggestion}}, sys.stderr)
-        sys.stderr.write("\n")
-        return sql, 1
-
+    # No branch rebinds `sql` anywhere in this function, and the guards above all run against what
+    # the caller actually sent. tests/test_ace093_byte_identity.py asserts that at the driver.
     return sql, None
 
 
@@ -2152,18 +2147,17 @@ def execute_guarded(
 
     In fixed order: read-only / dangerous-SQL guard (the hard security gate — NOT bypassable via
     ``no_safety``, which skips only the semantic-model pass, never write/RCE/DoS protection) ->
-    semantic-model safety pass (fan/chasm pre-flight + scope + PII; declared ``default_filters``
-    are no longer applied here — ACE-042) ->
+    semantic-model safety pass (the scope gates; the fan/chasm and PII checks became receipt facts
+    and declared ``default_filters`` are no longer applied here) ->
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
     SQL both guards have passed.
 
     **Every path returns exactly one ``Envelope``, and this function is TOTAL** — nothing is raised
     out of here for a caller to interpret, so the subprocess ``main`` and the in-process MCP handler
-    cannot disagree about what happened. The seven outcomes:
+    cannot disagree about what happened. The six outcomes:
 
       * the read-only gate refuses            -> ``refused`` carrying that gate's ``Refusal``
       * ``_model_safety`` returns a Refusal   -> ``refused`` carrying it verbatim
-      * ``_model_safety`` returns an int      -> ``refused`` carrying the interim ``model_safety``
       * either time bound fired               -> ``refused`` carrying ``resource_limit``
       * ``executor.execute`` raises           -> ``failed`` carrying a classified ``Failure``
       * anything else raises                  -> ``failed``/``other``, generic message, raw to the log
@@ -2235,24 +2229,6 @@ def execute_guarded(
             if isinstance(verdict, Refusal):
                 return _envelope("refused", refusal=verdict,
                                  receipt=_refusal_receipt(verdict, received_sql, profile))
-            if verdict is not None:
-                # One of the two unconverted branches: it wrote its own diagnostic to the server
-                # log and handed back only an exit code, so this is the most we can say without
-                # inventing a rule for it. The interim RULE_MODEL_SAFETY exists precisely so this
-                # path still returns an Envelope — without it the signature would have to be
-                # `Envelope | int` and the "exactly one Envelope per path" property would be
-                # literally false. Both this constant and this branch go away when those branches
-                # are subtracted.
-                return _envelope(
-                    "refused",
-                    refusal=refuse(
-                        RULE_MODEL_SAFETY,
-                        detail="the semantic-model safety pass refused this statement",
-                        remediation="Check the server log for the rule that fired, then adjust the "
-                                    "query.",
-                    ),
-                    receipt=_receipt_for(received_sql, profile, bounded=True),
-                )
         creds = _load_credentials(profile, org_id or "local")
         # Bounded at the CHOKEPOINT, so the limit reaches every executor rather than only the
         # built-in one whose engines carry the inner watchdog. See `_execute_bounded` for the

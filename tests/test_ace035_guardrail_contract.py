@@ -219,18 +219,20 @@ CONTRACT_RULES = frozenset({
     "engine_mismatch",
 })
 
-# Rules this module declares that the contract does NOT name. Exactly one, and it is interim:
-# `model_safety` is what the four unconverted `_model_safety` branches carry so that every path out
-# of `execute_guarded` can still return an Envelope. It is deleted with those branches. Anything
-# else appearing here is a rule someone invented, which is the drift this test exists to catch.
-LOCAL_ADDITIONS = frozenset({"model_safety"})
+# Rules this module declares that the contract does NOT name. There are NONE, and that is the
+# stronger form of this check. There was exactly one: `model_safety`, carried by the unconverted
+# `_model_safety` branches so that every path out of `execute_guarded` could still return an
+# Envelope. ACE-094 deleted those branches and the rule went with them, so every rule this module
+# declares is now one the contract names. Anything appearing here again is a rule someone
+# invented, which is the drift this test exists to catch.
+LOCAL_ADDITIONS: frozenset[str] = frozenset()
 
 
 def _declared_rules() -> set[str]:
     return {v for k, v in vars(guardrail).items() if k.startswith("RULE_") and isinstance(v, str)}
 
 
-def test_the_declared_rules_are_exactly_the_contract_plus_the_named_interim_one():
+def test_the_declared_rules_are_exactly_the_contract():
     declared = _declared_rules()
     # Split into the two directions so a failure says which one happened rather than printing two
     # sets and leaving the reader to diff them.

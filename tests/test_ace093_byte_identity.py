@@ -251,13 +251,20 @@ def test_the_rewriter_is_gone_not_wrapped():
 def test_the_result_carries_no_statement_and_no_rewrite_action():
     """`PreFlightResult` described a rewrite in three places: the action value, the statement it had
     authored, and the statement it started from. All three are gone, and `as_dict` is what `sm
-    preflight` serialises, so this pins that command's JSON contract too."""
+    preflight` serialises, so this pins that command's JSON contract too.
+
+    `action` outlived the rewrite by one slice: ACE-093 removed `auto_rewrite` and left
+    `refuse | allow`, then ACE-094 removed `refuse`, and a field with one value is not a field."""
     fields = set(rt.PreFlightResult.__dataclass_fields__)
     assert "rewritten_sql" not in fields
     assert "original_sql" not in fields
+    assert "action" not in fields
 
-    result = rt.PreFlightResult(None, "allow", reason="x")
-    assert set(result.as_dict()) == {"risk", "action", "reason", "suggestion", "triggering_joins"}
+    # `unchecked` is null when the analysis ran and a sentence when it could not — without it an
+    # empty `findings` would mean both "clean" and "not checked", and silence would read as clean.
+    assert set(rt.PreFlightResult().as_dict()) == {"findings", "unchecked"}
+    assert set(rt.Finding("fan_trap", "why").as_dict()) == {
+        "risk", "reason", "triggering_joins"}
 
 
 def test_the_preflight_signature_has_no_rewrite_switch():
@@ -369,30 +376,34 @@ def test_nothing_re_serialises_a_parsed_statement():
 FAN_SQL = "SELECT SUM(o.total) FROM orders o JOIN order_items i ON i.order_id = o.id"
 
 
-def test_the_aggregation_only_fan_trap_is_refused_end_to_end(shop):
-    """The shape that used to be rewritten, driven through the whole chokepoint rather than through
-    `pre_flight_check` alone.
+def test_the_aggregation_only_fan_trap_runs_byte_identical_end_to_end(shop):
+    """The shape with the longest history in this file, driven through the whole chokepoint.
 
-    It is the aggregation-only case: the many side is touched nowhere but the ON clause, which is
-    precisely what made it look safe to rewrite. The caller now gets a refusal and a way forward
-    instead of a silently different statement.
+    It was auto-rewritten, so the driver received a statement the caller never sent. ACE-093
+    deleted the rewrite, which left it REFUSED — a window that spec opened deliberately and named
+    ACE-094 as the thing that would close it. This is that closure, and it lands in this file
+    rather than ACE-094's because what it now proves is byte-identity: the trapped statement
+    reaches the driver exactly as written, which is the property ACE-093 pinned and which a
+    refusal could never demonstrate.
     """
     spy = _SpyExecutor()
     env = execute_sql.execute_guarded(FAN_SQL, PROFILE, AREA, executor=spy)
 
-    assert env.status == "refused", env
-    assert spy.calls == []
+    assert env.status == "ok", env
+    assert len(spy.calls) == 1
+    assert spy.calls[0][0] == FAN_SQL
 
 
-def test_the_refusal_no_longer_offers_a_rewrite(shop):
+def test_the_finding_no_longer_offers_a_rewrite(shop):
     """The `reason` used to end "Rewrite would change result shape", which offered a transform that
-    no longer exists. Nothing replaced that sentence: the caller's way forward lives in
-    `suggestion`, which this slice does not touch, so the reason is free to state only the fact."""
+    no longer exists. Nothing replaced that sentence, and the `suggestion` that used to carry the
+    way forward went with the refusal it was written for: naming an alternative on an answer that
+    came back presumes an intent principle 6 forbids us to presume."""
     from semantic_model import loader as L
 
     org = L.load_datasource(shop.artifacts / PROFILE)
     pf = rt.pre_flight_check(FAN_SQL, org)
 
-    assert pf.risk == "fan_trap" and pf.action == "refuse"
-    assert "rewrite" not in pf.reason.lower(), pf.reason
-    assert pf.suggestion and "pre-aggregate" in pf.suggestion
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
+    assert "rewrite" not in pf.findings[0].reason.lower(), pf.findings[0].reason
+    assert not hasattr(pf.findings[0], "suggestion")

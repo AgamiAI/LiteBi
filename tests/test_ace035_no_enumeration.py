@@ -747,16 +747,12 @@ _NO_VECTOR = {
         "into a refusal is the unparseable-statement slice's job, and the refusal it introduces "
         "will be reachable and will need a vector here."
     ),
-    guardrail.RULE_MODEL_SAFETY: (
-        "Reachable, but its detail is authored as static prose at a single construction site in "
-        "`execute_sql.execute_guarded` — the unconverted `_model_safety` branches hand back a bare "
-        "exit code, so there is no model-derived text for a vector to catch. THIS IS THE ENTRY TO "
-        "DELETE FIRST: the branch it stands in for includes the sensitive-column refusal, whose "
-        "`sens.columns` today lists every sensitive column of a `SELECT *`-ed table — declared names "
-        "the caller never sent. The moment that branch returns a Refusal carrying them, this rule "
-        "needs a vector and this entry has to go, or the sentinel stays green through exactly the "
-        "leak it exists to catch."
-    ),
+    # `RULE_MODEL_SAFETY` sat here and its note said THIS IS THE ENTRY TO DELETE FIRST, because the
+    # branch it stood in for included the sensitive-column refusal, whose `sens.columns` listed every
+    # sensitive column of a `SELECT *`-ed table — declared names the caller never sent. The entry has
+    # gone, and it went the way the note wanted rather than the way it feared: the refusal was
+    # deleted, so nothing constructs that list for a caller at all, and the rule that stood in for it
+    # is gone from the contract. There is no exemption here to keep honest.
 }
 
 

@@ -101,12 +101,6 @@ A gate added above the model pass belongs here in the same diff that adds it. Le
 crash: it is a receipt that quietly claims no model could be resolved, which is a different fact and
 an untrue one."""
 
-# Interim. `_model_safety`'s fan/chasm pre-flight and sensitive-column branches are not converted in
-# this slice (they become receipt facts when the mutation branches are subtracted), but every path
-# out of `execute_guarded` must still return an Envelope. This is the rule those two branches carry
-# until then. Delete it — and this comment — with them.
-RULE_MODEL_SAFETY = "model_safety"
-
 REASON_FOR_RULE: dict[str, RefusalReason] = {
     RULE_READ_ONLY: "unsafe",
     RULE_TABLE_SCOPE: "out_of_scope",
@@ -121,7 +115,6 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     # gate that imposes the per-statement timeout filled a constant rather than inventing one.
     RULE_RESOURCE_LIMIT: "undetermined",
     RULE_UNPARSEABLE: "undetermined",
-    RULE_MODEL_SAFETY: "undetermined",
 }
 
 

@@ -14,8 +14,8 @@ Design constraints (match the rest of agami):
     `semantic_model` package (Pydantic) lazily and surface a clear "install the model deps" error
     if it's absent — so execution still works on a bare install.
   - **No data leaves the machine.** SQL is executed locally by shelling out to `execute_sql` (the
-    same executor the skills use), which runs the fan/chasm pre-flight, the scope gates and the
-    sensitive-column gate; the semantic model is read from `<artifacts_dir>/<profile>/`.
+    same executor the skills use), which runs the scope gates and reports the fan/chasm and
+    aggregation findings on the receipt; the model is read from `<artifacts_dir>/<profile>/`.
 """
 
 from __future__ import annotations
@@ -111,10 +111,13 @@ SERVER_INSTRUCTIONS = (
     "an empty `items` with a marker means NOT CHECKED while an empty `items` with a null marker "
     "means checked and clean. Reporting only `items` turns 'not checked' back into 'nothing "
     "wrong', which is the one reading the receipt exists to prevent.\n"
-    "PII: a column marked `sensitive: true` restricts OUTPUT, not the query — you MAY "
-    "COUNT/COUNT(DISTINCT)/filter/GROUP BY/JOIN on it, but never SELECT its raw per-row values. "
-    "'unique emails' → COUNT(DISTINCT email). To disambiguate identical labels, project the "
-    "non-sensitive id. (execute_sql enforces this and errors on a raw sensitive projection.)\n"
+    "PII: a column marked `sensitive: true` is the model author asking you to handle it with care. "
+    "Prefer COUNT/COUNT(DISTINCT)/filter/GROUP BY/JOIN over projecting raw per-row values — "
+    "'unique emails' → COUNT(DISTINCT email) — and to disambiguate identical labels, project the "
+    "non-sensitive id. Nothing stops you: this is judgement, not a gate, and the receipt reports "
+    "which sensitive columns an answer projected. Project them when the question genuinely needs "
+    "them and say that you did. A column that must not be readable at all is not in the model, and "
+    "a statement naming it is refused as out-of-scope.\n"
     "Activity log: on EVERY tool call (not just execute_sql), pass a `thread_id` (one per conversation, "
     "reused across all its calls) and a `correlation_id` (one per user question/turn, reused across the "
     "calls answering it, fresh when they ask something new), plus `user_question` (the user's question "
@@ -1204,10 +1207,11 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     the in-process path returned the clean sentence. (That notice is gone: ACE-042 deleted the
     injection it announced, and the `[agami] auto-corrected …` notice that replaced it as the
     example went the same way with the rewrite it announced. What still writes to the child's stderr
-    is the two surviving diagnostic lines — the pre-flight refusal, carrying model-derived table
-    names, and the sensitive-columns refusal, carrying model-derived column names — plus anything a
-    library logs. All of them have the same reach, so the reconstruction below is what keeps them
-    out; the traceback guard only ever caught the two `exc_info=True` sites.)
+    is anything a library logs: both surviving diagnostic lines went too, when ACE-094 deleted the
+    refusals that wrote them. The reconstruction below is not thereby unnecessary — a library
+    writing to the shared stream has exactly the same reach, and it is the mechanism rather than
+    any one notice that keeps the caller's answer clean. The traceback guard only ever caught the
+    two `exc_info=True` sites.)
     """
     from execute_sql import (
         _AUTHORED_EXIT_CODES,

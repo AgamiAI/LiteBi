@@ -14,28 +14,55 @@ below corresponds to one such version.
 
 ### Removed
 
-- **Agami no longer rewrites your SQL to fix a fan-out join (ACE-093).** A query that aggregated a
-  measure across a one-to-many join, touching the many side nowhere but the `ON` clause, used to
-  have that join silently dropped and the rewritten statement executed in place of yours. It is
-  **refused** now, with the reason and a suggested restructuring, and your statement is what runs or
-  nothing does.
+- **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
+  across a one-to-many join, touching the many side nowhere but the `ON` clause, used to have that
+  join silently dropped and the rewritten statement executed in place of yours. Your statement is
+  what runs now, byte for byte — comments, whitespace and quoting included — and that is asserted
+  rather than assumed.
 
-  This is a deliberate narrowing and it is the point of the change. Whether a multiplied total is
-  wrong depends on the question, which the guard never sees: the same statement is wrong for order
-  revenue and right for line-item exposure. Choosing for you meant returning a different number than
-  the one your SQL asked for, disclosed only on stderr, and on the subprocess path the receipt was
-  built from the statement you sent rather than the one that ran. The `/agami-query` skill handles
-  the refusal by restructuring and **saying so in the answer**, which is the same correction made
-  where the question is actually available.
+- **Four correctness checks stopped refusing.** A fan trap, a chasm trap, a `SUM` of a rate or an
+  identifier, and a `SUM` of a balance across time were all refused. They **return a result** now,
+  and what the check found rides on the answer's receipt, under `aggregates`.
 
-  With the last rewrite gone, the statement handed to the database is now the statement received,
-  byte for byte — comments, whitespace and quoting included — and that is asserted rather than
-  assumed.
+  This is the point of the change rather than a relaxation of it. Whether a multiplied total is
+  *wrong* depends on what you asked: the same statement is wrong for order revenue and right for
+  line-item exposure. The check has your SQL and your model and never your question, so it describes
+  what it found and leaves the judgement to you — or to the assistant, which does have the question
+  and is asked to say out loud when it restructures a query because of a finding.
 
-  **Contract changes.** `sm prepare` no longer emits `rewritten`, and returns your statement
-  unchanged or exits 1. `sm preflight` no longer emits `original_sql` or `rewritten_sql`. The
-  receipt from `sm receipt` no longer carries a `pre_flight` key; it is `model_version` plus the
-  five sections, always. No MCP or REST surface changes.
+  A statement that trips two conditions now reports both. The old code stopped at the first, so a
+  query that both fanned out *and* summed a rate was reported as having one problem.
+
+- **`sensitive` is a description, not a gate.** Marking a column `sensitive` no longer blocks
+  projecting it. The answer's receipt reports which sensitive columns it projected, under
+  `columns`, and the authoring guidance asks the assistant to prefer aggregates and to say when it
+  did project them.
+
+  **If you relied on this to keep values from coming back, read this.** The gate was never a
+  boundary: it inspected the projection list and nothing else, so `WHERE email LIKE …` always
+  answered the same question one bit at a time. What it bounded was the *rate* of that, which is an
+  access policy, and Agami holds none of its own — it reads exactly as the connecting database role
+  reads. Two things do enforce, and neither changed: a column left out of the model is out of scope
+  and any statement naming it is refused, and the connecting role's grants and your warehouse's
+  masking policies apply as they always did. If a value must not come back, exclude the column from
+  the model or make sure the role cannot read it.
+
+- **The `model_safety` refusal rule is gone.** It stood in for two branches that refused without
+  naming a rule. Both branches went, so every refusal now names the gate that chose it. A consumer
+  keying on `refusal.rule == "model_safety"` will stop matching, which is the point.
+
+### Contract changes
+
+- `sm prepare` returns `{sql, findings, units}` and **always exits 0**. It previously returned
+  `{action, risk, sql, units, reason}`, or exited 1 with a refusal. It runs the reporting checks,
+  not the refusing gates — do not pair it with `--no-safety`.
+- `sm preflight` returns `{findings: [...]}`, replacing the single
+  `{risk, action, reason, suggestion, triggering_joins}` verdict.
+- The receipt's `aggregates` section can now be non-empty, and its `undetermined` sentence changed:
+  it says the checks ran and names what they still do not reach, rather than saying the check does
+  not happen. `columns` items may carry `sensitive: true`.
+- The `{"error": {"kind": "preflight_refused"}}` and `{"kind": "sensitive_columns"}` diagnostics no
+  longer appear on stderr. Every refusal is a single JSON object on every path.
 
 ### Changed
 

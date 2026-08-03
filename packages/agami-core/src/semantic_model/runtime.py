@@ -400,53 +400,87 @@ def resolve_entity_instance(
 
 
 @dataclass
-class PreFlightResult:
-    """What the pre-flight found. It carries no statement of any kind.
+class Finding:
+    """One thing the pre-flight established about a statement, against the model.
 
-    It used to carry two: `original_sql`, and `rewritten_sql` for the fan-join rewrite to hand back
-    the statement it had authored. Both went with that rewrite. `original_sql` names a distinction
-    that stopped existing along with it — there is no non-original version left to contrast against,
-    so the field would have meant "the statement", stored on a result whose caller already holds it.
+    A finding is a FACT, not a verdict. Whether a join multiplies the rows an aggregate is computed
+    from is derivable from the SQL and the model alone; whether that multiplication is a *bug*
+    depends on the question, which this layer never sees — the same statement is wrong for order
+    revenue and right for line-item exposure. So this describes and stops, and the caller, who has
+    the question, decides.
+
+    It carries no `suggestion`. That field existed to give a refusal a way forward, and a
+    disclosure naming an alternative presumes an intent principle 6 forbids us to presume.
     """
 
-    risk: Optional[str]  # "fan_trap" | "chasm_trap" | "bad_aggregation" | "semi_additive" | None
-    action: str  # "refuse" | "allow"
-    reason: str = ""
-    suggestion: Optional[str] = None
+    risk: str  # "fan_trap" | "chasm_trap" | "bad_aggregation" | "semi_additive"
+    reason: str
     triggering_joins: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "risk": self.risk,
-            "action": self.action,
             "reason": self.reason,
-            "suggestion": self.suggestion,
             "triggering_joins": self.triggering_joins,
         }
 
 
-# ---------------------------------------------------------------------------
-# Sensitive-column projection guard (PII)
-#
-# Enforced in the SAME shared safety pass as the fan/chasm pre-flight
-# (execute_sql.py:_model_safety), so EVERY entry point that runs SQL through the
-# engine — the agami-query skill, the local MCP server, cron — protects PII
-# identically, by construction rather than by each LLM obeying prose. `sensitive`
-# restricts the OUTPUT: a sensitive column may appear in COUNT/COUNT(DISTINCT),
-# WHERE, GROUP BY, and JOIN, but its raw per-row value must never be projected.
-# ---------------------------------------------------------------------------
+# Why the checks did not run, when they did not. `None` means they DID — the analysis reached the
+# statement and an empty `findings` is then a real "nothing found". These sentences are the same
+# device the receipt's section markers are, for the same reason: an empty list and an unchecked list
+# read identically to a consumer, so silence reads as clean unless something says otherwise.
+UNCHECKED_NO_PARSER = (
+    "sqlglot is not installed here, so the statement was not parsed and no aggregate was checked."
+)
+UNCHECKED_UNPARSEABLE = (
+    "The statement could not be parsed, so no aggregate in it was checked."
+)
+UNCHECKED_NO_SELECT = (
+    "The statement contains no SELECT, so there was no aggregate to check."
+)
 
 
 @dataclass
-class SensitiveCheckResult:
-    action: str  # "allow" | "refuse"
-    columns: list[str] = field(default_factory=list)  # offending "table.column" / "column"
-    reason: str = ""
-    suggestion: Optional[str] = None
+class PreFlightResult:
+    """Every finding the pre-flight made, in the order the walk made them.
+
+    Plural, and the plurality is the point. This carried one `risk` and one `action`, and every path
+    returned on the first hit — which is right for a verdict, because the first reason to refuse is
+    reason enough, and wrong for a description, because the second fact is not made false by the
+    first. A channel that can hold one fact is a verdict with the name changed.
+
+    It carries no statement of any kind, and no action: `auto_rewrite` went with the fan-join
+    rewrite, and `refuse` went when correctness stopped being a refusal, which left one value and
+    therefore no field.
+    """
+
+    findings: list[Finding] = field(default_factory=list)
+    # Null when the checks ran. A sentence when they could not, so that `findings == []` is never
+    # asked to mean two different things at once.
+    unchecked: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"action": self.action, "columns": self.columns,
-                "reason": self.reason, "suggestion": self.suggestion}
+        return {"findings": [f.as_dict() for f in self.findings], "unchecked": self.unchecked}
+
+
+# ---------------------------------------------------------------------------
+# Sensitive-column projection — REPORTED, not enforced
+#
+# `sensitive` is the model author's statement that a column holds values people should be careful
+# with. It is a description, and this reports it: which sensitive columns a statement projects raw
+# is a fact, and it rides on the receipt beside the answer.
+#
+# It used to be a gate, refusing the projection. That gate is gone and its absence is deliberate.
+# It was the last remnant of a masking programme already cancelled — ACE-041 (mask-else-refuse),
+# ACE-062 and ACE-080 were all abandoned on principle 5 on 2026-07-30, and nothing that masks or
+# redacts ever shipped. Agami holds no access policy of its own and reads as the connection reads,
+# so disclosure control lives in exactly two places: the MODEL, where a column that must not be
+# readable is simply not declared and 4b refuses any statement reaching it, and the CONNECTION,
+# whose grants and warehouse masking policies apply per role.
+#
+# `SensitiveCheckResult` went with the gate: an `action` field on a describer is a verdict with the
+# name changed.
+# ---------------------------------------------------------------------------
 
 
 def _sensitive_by_table(org: Datasource) -> tuple[dict[str, set[str]], set[str]]:
@@ -510,31 +544,48 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     return []
 
 
-def check_sensitive_projection(sql: str, org: Datasource,
-                               ctx: "GuardContext | None" = None) -> SensitiveCheckResult:
-    """Refuse a query that PROJECTS a `sensitive` column's raw values; allow the
-    column in COUNT, filters, GROUP BY, and joins. Degrades to allow when sqlglot
-    is unavailable or the SQL doesn't parse (same posture as the fan/chasm pass).
+def projected_sensitive_columns(sql: str, org: Datasource,
+                                ctx: "GuardContext | None" = None) -> list[str]:
+    """Which `sensitive` columns this statement projects raw, as declared names. It REFUSES
+    nothing; the answer is a fact for the receipt.
 
-    `ctx` (ACE-045): reuse the once-parsed tree + once-built sensitive index instead of
-    redoing both; `ctx=None` keeps the standalone path byte-identical."""
+    It used to be the gate. What it gated was never a boundary: it walks `sel.expressions` and
+    nothing else, so `WHERE`, `JOIN … ON`, `GROUP BY` and `HAVING` were never inspected, and a
+    caller who can filter on a sensitive column has a one-bit-per-query oracle over it either way.
+    That residual is one REQ-021 states and declines to solve — only the warehouse's controls, or
+    not landing the data, close it. What the gate added over it was a limit on the RATE of that
+    oracle, which is an access policy, and principle 5 says we hold none of our own: either the
+    column is not declared, and 4b refuses any statement reaching it with no new machinery, or the
+    connection's grants and the warehouse's masking decide.
+
+    This is the parse half; `_projected_sensitive(tree, org, ctx)` is the analysis half and takes a
+    tree, so `assemble_receipt` — which has already parsed — runs it without parsing twice.
+
+    Degrades to "nothing found" when sqlglot is unavailable or the SQL doesn't parse. `ctx`
+    (ACE-045): reuse the once-parsed tree + once-built sensitive index instead of redoing both."""
     if not _HAVE_SQLGLOT:
-        return SensitiveCheckResult("allow")
-    by_table, allnames = ctx.sensitive_by_table if ctx is not None else _sensitive_by_table(org)
-    if not allnames:
-        return SensitiveCheckResult("allow")
+        return []
     if ctx is not None:
         tree = ctx.tree
     else:
         try:
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
-            return SensitiveCheckResult("allow")
+            return []
+    return _projected_sensitive(tree, org, ctx=ctx)
+
+
+def _projected_sensitive(tree, org: Datasource,
+                         ctx: "GuardContext | None" = None) -> list[str]:
+    """The analysis half, on an already-parsed tree."""
+    by_table, allnames = ctx.sensitive_by_table if ctx is not None else _sensitive_by_table(org)
+    if not allnames:
+        return []
     # A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not
     # exp.Select — gate on "contains a SELECT" and scan every OUTPUT-bearing arm, else
     # `… UNION SELECT ssn FROM customers` would project a sensitive column past this gate.
     if tree is None or tree.find(exp.Select) is None:
-        return SensitiveCheckResult("allow")
+        return []
 
     offending: set[str] = set()
     for sel in _output_selects(tree):
@@ -560,17 +611,7 @@ def check_sensitive_projection(sql: str, org: Datasource,
                     for c in sorted(by_table.get(tbl, set())):
                         offending.add(f"{tbl}.{c}")
 
-    if not offending:
-        return SensitiveCheckResult("allow")
-    cols = sorted(offending)
-    return SensitiveCheckResult(
-        "refuse",
-        columns=cols,
-        reason="query projects raw values of sensitive column(s): " + ", ".join(cols)
-               + " — sensitive columns may be counted or filtered, not output raw.",
-        suggestion="Aggregate it (e.g. COUNT(DISTINCT <col>)) for a count, or omit it and "
-                   "select the entity's non-sensitive key (e.g. id) instead.",
-    )
+    return sorted(offending)
 
 
 # ---------------------------------------------------------------------------
@@ -673,13 +714,19 @@ def _cte_names(tree: "exp.Expression") -> set[str]:
 # ---------------------------------------------------------------------------
 # Table-scope guard
 #
-# Enforced in the SAME shared safety pass as the fan/chasm pre-flight and the
-# sensitive-column guard (execute_sql.py:_model_safety), so EVERY entry point
-# that runs SQL through the engine only ever touches tables the semantic model
-# declares — a query referencing any other table in the connected database is
-# refused, by construction rather than by each LLM obeying a prose rule. This is
-# table-level scoping only; which columns of a modeled table may be projected is
-# the sensitive-projection guard's job.
+# Enforced in the shared safety pass (execute_sql.py:_model_safety), so EVERY
+# entry point that runs SQL through the engine only ever touches tables the
+# semantic model declares — a query referencing any other table in the connected
+# database is refused, by construction rather than by each LLM obeying a prose
+# rule.
+#
+# This and `check_column_scope` are now the WHOLE of disclosure control, and that
+# is deliberate rather than a gap. The sensitive-projection gate that used to sit
+# beside them was an access policy of our own, which principle 5 forbids; it is a
+# receipt fact now. So the rule is simple and enforceable: a column or table whose
+# values must not be readable is not declared, and these two refuse anything that
+# reaches for it. What a declared column's values are worth protecting from is the
+# connecting role's grants to decide, not ours.
 # ---------------------------------------------------------------------------
 
 
@@ -981,41 +1028,53 @@ def _many_side_facing_one(rels: list[Relationship], table: str, dim: str) -> boo
 
 def pre_flight_check(sql: str, org: Datasource,
                      ctx: "GuardContext | None" = None) -> PreFlightResult:
-    """Detect fan-trap / chasm-trap and decide refuse-vs-allow.
+    """Every fan/chasm and aggregation-semantics finding for `sql`, against the model.
 
-    A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not exp.Select;
-    each arm is analyzed on its own and a trap in ANY arm refuses the whole query. An arm
-    and a top-level SELECT are treated identically — they used to differ only in whether a
-    fan trap was rewrite-eligible, and nothing is. Degrades to allow when sqlglot is
-    unavailable, the SQL doesn't parse, or it contains no SELECT.
+    This is the parse half; `_collect_findings` is the analysis half and takes a tree, so a caller
+    that has already parsed — `assemble_receipt` has — runs the same analysis without parsing twice.
 
-    `sql` is read once, to parse. Nothing below this frame receives it and the result carries no
-    statement, so there is no path on which a statement of ours could be handed back."""
+    **An empty `findings` does not mean "clean" on its own.** The analysis cannot run at all when
+    sqlglot is missing, when the statement does not parse, or when there is no SELECT in it, and
+    each of those produces the same empty list a genuinely clean statement does. `unchecked` is what
+    tells them apart: null when the checks ran, a sentence when they could not. A caller that reads
+    `findings` without reading `unchecked` will treat a skipped analysis as a clean bill of health,
+    which is the one reading this whole layer exists to prevent."""
     if not _HAVE_SQLGLOT:
-        return PreFlightResult(None, "allow", reason="sqlglot unavailable; skipped")
+        return PreFlightResult(unchecked=UNCHECKED_NO_PARSER)
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
     # call are byte-identical: _parse_sql swallows an unparseable statement to None exactly as a
-    # prebuilt ctx.tree would be None, and both then report the one "no SELECT; skipped" reason.
+    # prebuilt ctx.tree would be None.
     tree = ctx.tree if ctx is not None else _parse_sql(sql)
+    if tree is None:
+        return PreFlightResult(unchecked=UNCHECKED_UNPARSEABLE)
+    if tree.find(exp.Select) is None:
+        return PreFlightResult(unchecked=UNCHECKED_NO_SELECT)
+    return PreFlightResult(_collect_findings(tree, org, ctx=ctx))
+
+
+def _collect_findings(tree, org: Datasource,
+                      ctx: "GuardContext | None" = None) -> list[Finding]:
+    """The analysis half, on an already-parsed tree.
+
+    A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not exp.Select, so gating
+    on `isinstance(tree, exp.Select)` alone would skip every arm. Each arm is analyzed on its own
+    and its findings are the whole statement's findings: a trap in one arm inflates that arm's
+    aggregate, and the answer the caller reads contains it.
+
+    The arm is passed as a TREE and never re-serialized back to text — ACE-093 pinned that no
+    parsed statement is regenerated anywhere, and this walk is where the last one lived."""
     if tree is None or tree.find(exp.Select) is None:
-        return PreFlightResult(None, "allow", reason="no SELECT; skipped")
+        return []
     if isinstance(tree, exp.Select):
         return _preflight_select(tree, org, ctx=ctx)
-    # Set operation: analyze each arm; a trap in any arm inflates that arm's aggregate.
-    # The arm is passed as a TREE, never re-serialized back to text. It used to be handed
-    # `arm.sql()` as well, to become the `original_sql` of the arm's own result; with that field
-    # gone the analysis reads the tree and nothing below this needs a statement at all.
+    findings: list[Finding] = []
     for arm in _output_selects(tree):
-        res = _preflight_select(arm, org, ctx=ctx)
-        if res.risk and res.action == "refuse":
-            # tie the arm's diagnosis back to the full set-operation query
-            return PreFlightResult(res.risk, "refuse", reason=res.reason,
-                                   suggestion=res.suggestion, triggering_joins=res.triggering_joins)
-    return PreFlightResult(None, "allow", reason="no fan/chasm or aggregation issue in any arm")
+        findings.extend(_preflight_select(arm, org, ctx=ctx))
+    return findings
 
 
 def _preflight_select(tree: "exp.Select", org: Datasource,
-                      ctx: "GuardContext | None" = None) -> PreFlightResult:
+                      ctx: "GuardContext | None" = None) -> list[Finding]:
     """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT, read entirely off the tree.
     A top-level SELECT and a set-operation arm are analyzed identically; there is no longer a
     rewrite for one to be eligible for, and no statement text for either to carry.
@@ -1025,75 +1084,66 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     rels = ctx.cardinality_index if ctx is not None else _cardinality_index(org)
     tables_in_scope = _tables_in_scope(tree)  # alias -> table
     table_set = set(tables_in_scope.values())
+    findings: list[Finding] = []
 
     # aggregates: list of (table, is_aggregate)
     agg_sources = _aggregate_source_tables(tree, tables_in_scope)
-    has_aggregate = bool(agg_sources)
-    no_aggregation = not has_aggregate
 
-    # explicit cross-product (no aggregation) -> allow with caveat
-    if no_aggregation:
-        return PreFlightResult(
-            None,
-            "allow",
-            reason="no aggregation present; join is not a fan/chasm trap",
-        )
+    # No aggregate means no fan or chasm trap: both are statements about the rows an aggregate is
+    # computed from. An explicit cross-product with no aggregation is not one.
+    if agg_sources:
+        # CHASM: two distinct aggregate source tables both 'many' to a shared dim
+        if len(agg_sources) >= 2:
+            shared = _shared_dimension(agg_sources, table_set, rels)
+            if shared:
+                srcs = [_echo_name(s) for s in sorted(agg_sources)]
+                shared = _echo_name(shared)
+                findings.append(Finding(
+                    "chasm_trap",
+                    reason=(
+                        f"chasm trap: independent measures from {srcs} both join shared "
+                        f"dimension {shared!r}; cross-product inflates both aggregates."
+                    ),
+                    triggering_joins=[f"{s} -> {shared}" for s in srcs],
+                ))
 
-    # CHASM: two distinct aggregate source tables both 'many' to a shared dim
-    if len(agg_sources) >= 2:
-        shared = _shared_dimension(agg_sources, table_set, rels)
-        if shared:
-            srcs = sorted(agg_sources)
-            return PreFlightResult(
-                "chasm_trap",
-                "refuse",  # documented: CTE synthesis is the planner follow-on
+        # FAN: an aggregate over a measure on the ONE side of a one-to-many in scope
+        # SORTED, and that matters here in a way it did not before. `agg_sources` is a set, and
+        # this loop used to `return` on the first hit, so iteration order chose only WHICH single
+        # refusal fired and a refusal is a refusal. It now chooses the ORDER of findings in the
+        # receipt, and which ones survive the cap — and on the forked path the child and the
+        # parent build that receipt in two processes with two hash seeds. Same statement, two
+        # different receipts.
+        for measure_table in sorted(agg_sources):
+            others = table_set - {measure_table}
+            fan_rels = _one_side_facing_many(rels, measure_table, others)
+            if not fan_rels:
+                continue
+            many_tables = {
+                _bare(r.from_table) if _bare(r.to_table) == measure_table else _bare(r.to_table)
+                for r in fan_rels
+            }
+            measure = _echo_name(measure_table)
+            many = [_echo_name(mt) for mt in sorted(many_tables)]
+            findings.append(Finding(
+                "fan_trap",
                 reason=(
-                    f"chasm trap: independent measures from {srcs} both join shared "
-                    f"dimension {shared!r}; cross-product inflates both aggregates."
+                    f"fan trap: aggregating {measure!r} (one side) across a join to "
+                    f"{many} (many side)."
                 ),
-                suggestion=(
-                    "Compute each measure in its own CTE pre-aggregated by "
-                    f"{shared!r}, then outer-join the CTEs on {shared!r}."
-                ),
-                triggering_joins=[f"{s} -> {shared}" for s in srcs],
-            )
+                triggering_joins=[f"{measure} (1) <- {mt} (N)" for mt in many],
+            ))
 
-    # FAN: an aggregate over a measure on the ONE side of a one-to-many in scope
-    for measure_table in agg_sources:
-        others = table_set - {measure_table}
-        fan_rels = _one_side_facing_many(rels, measure_table, others)
-        if not fan_rels:
-            continue
-        many_tables = {
-            _bare(r.from_table) if _bare(r.to_table) == measure_table else _bare(r.to_table)
-            for r in fan_rels
-        }
-        # Every fan trap refuses. There is no aggregation-only case that gets rewritten
-        # instead: dropping a join the caller wrote is authoring their statement for them,
-        # and whether the multiplied total is even wrong depends on the question, which
-        # this layer does not have.
-        return PreFlightResult(
-            "fan_trap",
-            "refuse",
-            reason=(
-                f"fan trap: aggregating {measure_table!r} (one side) across a join to "
-                f"{sorted(many_tables)} (many side)."
-            ),
-            suggestion=(
-                "Either pre-aggregate the one-side measure in a CTE before joining, "
-                "or move the aggregate into a window function to keep the raw rows."
-            ),
-            triggering_joins=[f"{measure_table} (1) <- {mt} (N)" for mt in sorted(many_tables)],
-        )
-
-    # No structural (join) trap. Now the SEMANTIC checks the fan/chasm detector is
-    # blind to (scorecard #4): aggregation-class violations (#2) and semi-additive
-    # rollups over time (#3) — these need NO join, so cardinality analysis can't see them.
-    semantic = _check_aggregation_semantics(tree, org, tables_in_scope, ctx=ctx)
-    if semantic is not None:
-        return semantic
-
-    return PreFlightResult(None, "allow", reason="no fan/chasm or aggregation issue")
+    # The SEMANTIC checks the fan/chasm detector is blind to: aggregation-class violations and
+    # semi-additive rollups over time. These need NO join, so cardinality analysis cannot see them.
+    #
+    # They used to run only when no structural trap had fired, which was an artifact of returning a
+    # verdict: once you have a reason to refuse, a second one changes nothing. It changes a great
+    # deal for a description — a fan-trapped query can also be summing a rate, and a reader told
+    # only the first of those has been told the statement's problem is smaller than it is. So both
+    # run, always, and a statement that trips one of each carries both.
+    findings.extend(_check_aggregation_semantics(tree, org, tables_in_scope, ctx=ctx))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -1185,8 +1235,9 @@ def _groups_by_time(tree: "exp.Select", scope: dict[str, str],
 def _check_aggregation_semantics(
     tree: "exp.Select", org: Datasource, scope: dict[str, str],
     ctx: "GuardContext | None" = None,
-) -> Optional[PreFlightResult]:
+) -> list[Finding]:
     colidx = ctx.column_index if ctx is not None else _column_index(org)
+    findings: list[Finding] = []
 
     # --- #2: aggregation-class violations (SUM of a rate/id, AVG of an id) ---
     for select_expr in tree.expressions:
@@ -1204,22 +1255,18 @@ def _check_aggregation_semantics(
             bad = (is_sum and cls in ("averageable", "dimension")) or (is_avg and cls == "dimension")
             if bad:
                 verb = "SUM" if is_sum else "AVG"
-                return PreFlightResult(
-                    "bad_aggregation", "refuse",
+                cname = _echo_name(col.name)
+                findings.append(Finding(
+                    "bad_aggregation",
                     reason=(
-                        f"{verb}({col.name}) is meaningless: {col.name!r} is classified "
+                        f"{verb}({cname}) is meaningless: {cname!r} is classified "
                         f"`{cls}` ("
                         + ("a rate/ratio/price — summing it has no meaning"
                            if cls == "averageable"
                            else "an identifier/code, not a measure")
                         + ")."
                     ),
-                    suggestion=(
-                        "Average it instead of summing"
-                        if cls == "averageable"
-                        else f"{col.name!r} is a dimension — GROUP BY it or COUNT it, don't aggregate its value"
-                    ),
-                )
+                ))
 
     # --- #3: semi-additive measure summed over time ---
     semi = _semi_additive_columns(org)
@@ -1235,20 +1282,17 @@ def _check_aggregation_semantics(
                 ctable = _resolve_col_table(col, scope)
                 mm = semi.get((ctable, col.name)) if ctable else None
                 if mm is not None:
-                    how = mm.semi_additive_agg or "last"
-                    return PreFlightResult(
-                        "semi_additive", "refuse",
+                    cname = _echo_name(col.name)
+                    findings.append(Finding(
+                        "semi_additive",
                         reason=(
-                            f"SUM({col.name}) across time is wrong: {col.name!r} backs the "
-                            f"semi-additive metric {mm.name!r} ({mm.non_additive_dimensions}) — "
+                            f"SUM({cname}) across time is wrong: {cname!r} backs the "
+                            f"semi-additive metric {_echo_name(mm.name)!r} "
+                            f"({[_echo_name(d) for d in mm.non_additive_dimensions]}) — "
                             "summing a stock over a date grain multiplies it."
                         ),
-                        suggestion=(
-                            f"Take the period-end value ({how}) per entity over time "
-                            f"(e.g. window function), then sum across entities — or drop the time grouping."
-                        ),
-                    )
-    return None
+                    ))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -1312,8 +1356,13 @@ UNDETERMINED_JOINS = (
 )
 # ACE-060 owns aggregate fan-out.
 UNDETERMINED_AGGREGATES = (
-    "Whether a join multiplies the rows an aggregate is computed from is not checked, so this "
-    "section is declared and empty rather than clean."
+    "Aggregates were checked against the model for fan-out, chasm cross-products, aggregation "
+    "class and semi-additivity, and anything found is listed above. Three things are still not "
+    "established: only aggregates in the SELECT list are read, so one in HAVING or ORDER BY is "
+    "not reported, and neither is one inside a CTE or a subquery; MIN, MAX and COUNT(DISTINCT) "
+    "are counted as fan-out risks although a fan-out cannot change what they return; and "
+    "whether a listed finding is a problem depends on the question, which this answer does "
+    "not have."
 )
 # The two early returns are two different facts and a reader has to be able to tell them apart: one
 # is a deployment that never installed the parser (every statement gets this receipt, forever, and
@@ -1545,6 +1594,9 @@ def assemble_receipt(
     # whoever asked for it. The overflow is COUNTED on the marker below, never listed, and the count
     # is the caller's own number so stating it discloses nothing.
     dropped_cols = max(0, len(column_refs) - _RECEIPT_MAX_REFS)
+    # Which sensitive columns this statement projects RAW — the same analysis that used to refuse
+    # it, on the tree already parsed above rather than a second parse of the same statement.
+    projected_sensitive = set(_projected_sensitive(tree, org, ctx=None))
     column_items: list[dict[str, Any]] = []
     for bare, cname in column_refs[:_RECEIPT_MAX_REFS]:
         info = _declared_table(bare)
@@ -1568,7 +1620,19 @@ def assemble_receipt(
             label = f"{qualified}.{_echo_name(cname)}"
         else:
             label = f"{_echo_name(bare)}.{_echo_name(cname)}"
-        column_items.append({"column": label, "metric": None})
+        # `sensitive` used to be a gate that refused this projection. It is a description now, and
+        # this is where the description lands: a fact about a COLUMN, in the column section, rather
+        # than in `aggregates` beside the four aggregate findings. The flag is only ever True — the
+        # key is absent otherwise — because a receipt that marked every ordinary column
+        # `sensitive: false` would bury the handful that are.
+        item: dict[str, Any] = {"column": label, "metric": None}
+        # `_projected_sensitive` keys a resolved reference as "table.column" and an ambiguous one
+        # by bare name, so both forms are checked. It means PROJECTED, not merely referenced: a
+        # sensitive column used only in a WHERE is not flagged, because the value did not come
+        # back and saying otherwise would cry wolf on the filters that are the normal safe use.
+        if f"{bare}.{cname}" in projected_sensitive or cname in projected_sensitive:
+            item["sensitive"] = True
+        column_items.append(item)
     # A matched metric is a statement-level fact today, so it gets its own entry with no owning
     # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
     # Deliberately NOT subject to the cap above: there is one entry per metric the MODEL declares
@@ -1608,6 +1672,26 @@ def assemble_receipt(
             "freshness": freshness if t else None,
         })
 
+    # The four analyses that used to refuse, run on the tree THIS function already parsed rather
+    # than on a second parse of the same statement — `_collect_findings` takes a tree for exactly
+    # that reason, and ACE-045's one-parse property is what makes it worth the split.
+    #
+    # A finding's text interpolates table and column names that came off the caller's own statement,
+    # so every one of them is bounded by `_echo_name` where the finding is BUILT rather than here —
+    # the bound is a per-identifier one, and running it over a finished sentence would truncate the
+    # sentence instead of the name inside it. A receipt is tool output the calling model weights as
+    # server-authored, so an unbounded name out of a quoted identifier is the injection vector
+    # ACE-088 closed everywhere else, and this section is not an exception to it.
+    #
+    # Capped like the reference sections, with the overflow COUNTED on the marker rather than
+    # listed: a truncated list under a silent marker is a positive claim of completeness.
+    all_findings = _collect_findings(tree, org, ctx=None)
+    dropped_findings = max(0, len(all_findings) - _RECEIPT_MAX_REFS)
+    aggregate_items: list[dict[str, Any]] = [
+        {"name": f.risk, "detail": f.reason, "joins": list(f.triggering_joins)}
+        for f in all_findings[:_RECEIPT_MAX_REFS]
+    ]
+
     receipt: dict[str, Any] = {
         "model_version": model_version,
         "columns": {
@@ -1629,9 +1713,16 @@ def assemble_receipt(
             ),
         },
         "joins": {"items": join_items, "undetermined": UNDETERMINED_JOINS},
-        # Empty AND declared, on purpose: no aggregate fan-out analysis has run, and a consumer
-        # must never have to tell "no aggregates" apart from "aggregates not checked".
-        "aggregates": {"items": [], "undetermined": UNDETERMINED_AGGREGATES},
+        # The four analyses that used to REFUSE. They describe now, and this is where they land.
+        # The marker still stands beside them, because "checked and found three things" and
+        # "checked completely" are different claims and only the first one is true.
+        "aggregates": {
+            "items": aggregate_items,
+            "undetermined": UNDETERMINED_AGGREGATES + (
+                f" {dropped_findings} further finding(s) are not listed."
+                if dropped_findings else ""
+            ),
+        },
         "assumptions": {
             "items": assumption_items,
             # Null ONLY when nothing was dropped, because null is the positive claim "this section
