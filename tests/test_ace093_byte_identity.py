@@ -152,12 +152,16 @@ BYTE_IDENTICAL = {
     "trailing newline": "SELECT id FROM orders\n",
     "lowercase keywords": "select id from orders",
     "double-quoted identifiers": 'SELECT "id" FROM "orders"',
-    # A quoting style the default sqlglot dialect does not read as an identifier. It still reaches
-    # the executor, so the property has to hold for it too — arguably most of all, since this is
-    # exactly the statement a re-serialiser would mangle beyond recognition.
-    "bracket-quoted identifiers": "SELECT id FROM [orders]",
     "joined, no aggregate": "SELECT o.total, i.qty FROM orders o JOIN order_items i ON i.order_id = o.id",
 }
+
+# Bracket quoting is deliberately NOT in the battery above, and the reason is worth writing down.
+# It reaches the executor today only because the default sqlglot dialect parses `[orders]` as an
+# array literal rather than a table, so the scope gate finds no table to object to — a fail-open
+# this slice reports and does not own. A byte-identity case resting on that would be a contract test
+# coupled to a bug: dialect-aware parsing lands and the statement starts being refused, and this
+# file fails for a reason that has nothing to do with re-serialisation.
+BRACKET_QUOTED = "SELECT id FROM [orders]"
 
 
 @pytest.mark.parametrize("sql", BYTE_IDENTICAL.values(), ids=BYTE_IDENTICAL.keys())
@@ -174,6 +178,26 @@ def test_the_executed_statement_equals_the_received_one(shop, sql):
     assert env.status == "ok", env
     assert len(spy.calls) == 1
     assert spy.calls[0][0] == sql
+
+
+def test_bracket_quoting_is_byte_identical_or_refused_and_never_mangled(shop):
+    """The property holds under BOTH regimes, which is what keeps this test honest across the
+    dialect work it does not own.
+
+    Today `[orders]` clears the scope gate — the default dialect reads it as an array literal, so
+    there is no table to find undeclared — and reaches the driver. Once dialect-aware parsing lands
+    it will be read as a table, found undeclared, and refused. Either is fine here. What must never
+    happen is the third thing: the statement reaching the driver ALTERED, which is the only outcome
+    this file exists to forbid.
+    """
+    spy = _SpyExecutor()
+    env = execute_sql.execute_guarded(BRACKET_QUOTED, PROFILE, AREA, executor=spy)
+
+    if env.status == "refused":
+        assert spy.calls == []          # a refusal executes nothing at all
+    else:
+        assert env.status == "ok", env
+        assert spy.calls[0][0] == BRACKET_QUOTED
 
 
 def test_a_refused_statement_never_reaches_the_executor(shop):
