@@ -1927,6 +1927,27 @@ def _enclosing_select(node: "exp.Expression") -> "exp.Select | None":
     return p
 
 
+def _enclosing_selects(node: "exp.Expression") -> list["exp.Select"]:
+    """Every SELECT a node sits inside, innermost first — `_enclosing_select` plus its ancestors.
+
+    The same walk shape `check_column_scope` uses for alias visibility, and for a related reason:
+    some questions are about the scope a node was WRITTEN in and some are about the statement that
+    encloses it. Which of the two a caller wants decides which of these it calls, so the difference
+    is a call site rather than a flag.
+
+    ANCESTORS only, never the whole tree. A sibling subtree — a CTE body beside the outer query that
+    reads it — is a different scope whose predicates filter a different row set, and folding those
+    in is precisely the defect that made a per-reference determination necessary in the first place.
+    """
+    chain: list["exp.Select"] = []
+    p = node.parent
+    while p is not None:
+        if isinstance(p, exp.Select):
+            chain.append(p)
+        p = p.parent
+    return chain
+
+
 def _cte_body_scopes(root: "exp.Expression") -> dict[int, str]:
     """id(<the SELECT that is a CTE's body>) -> the name that CTE binds.
 
@@ -2347,22 +2368,44 @@ def _all_join_predicates(sel: "exp.Select") -> list["exp.Expression"]:
 def _and_conjuncts(node: "exp.Expression | None") -> list["exp.Expression"]:
     """One predicate flattened over AND into the top-level facts it asserts.
 
-    Recursive because sqlglot parses `a AND b AND c` into a nested tree of `exp.And`: unwrapping a
-    single level would leave `a AND b` standing as one conjunct, and a filter written first in a
-    three-way AND would then never match anything. `exp.Paren` is unwrapped for the same reason —
-    `(a AND b)` asserts both, and the bracket is the author's readability, not a change of meaning.
+    Flattened rather than unwrapped a single level, because sqlglot parses `a AND b AND c` into a
+    nested tree of `exp.And`: one level would leave `a AND b` standing as one conjunct, and a filter
+    written first in a three-way AND would then never match anything. `exp.Paren` is unwrapped for
+    the same reason — `(a AND b)` asserts both, and the bracket is the author's readability, not a
+    change of meaning.
+
+    ITERATIVE, over an explicit stack, and that is a correctness property rather than a style
+    preference. sqlglot builds `a AND b AND c` LEFT-DEEP, so the tree is as deep as the WHERE is
+    wide and a recursive walk costs one Python frame per conjunct. A caller writing a thousand
+    conjuncts — a statement the engine runs without complaint — would raise `RecursionError` out of
+    the receipt assembler, and both surfaces that call it degrade a raising assembler to a receipt
+    that failed to build. That hands the caller a switch: every section of the receipt, including the
+    sensitive-projection and fan/chasm findings, suppressed for a statement that executed and
+    returned rows. A stack has no such ceiling.
+
+    Right is pushed before left so the pops come out left to right, which keeps the conjunct order
+    the statement's own — a receipt has to read the same way twice for the same SQL.
 
     `exp.Or` is deliberately NOT descended into. Its arms are alternatives, not facts: a row can
     satisfy `a = 1 OR b = 2` while failing `a = 1`, so returning the arms here would report a
     filter as applied on a row set that never had it applied.
     """
-    if node is None:
-        return []
-    if isinstance(node, exp.And):
-        return _and_conjuncts(node.left) + _and_conjuncts(node.right)
-    if isinstance(node, exp.Paren):
-        return _and_conjuncts(node.this)
-    return [node]
+    conjuncts: list["exp.Expression"] = []
+    stack: list["exp.Expression | None"] = [node]
+    while stack:
+        current = stack.pop()
+        # None is the base case a malformed parse reaches: an `And` missing an arm, a `Paren` with
+        # nothing inside it, or the caller's own `None` for a clause the statement never wrote.
+        if current is None:
+            continue
+        if isinstance(current, exp.And):
+            stack.append(current.right)
+            stack.append(current.left)
+        elif isinstance(current, exp.Paren):
+            stack.append(current.this)
+        else:
+            conjuncts.append(current)
+    return conjuncts
 
 
 def _filtering_conjuncts(sel: "exp.Select") -> list["exp.Expression"]:
@@ -2379,17 +2422,32 @@ def _filtering_conjuncts(sel: "exp.Select") -> list["exp.Expression"]:
 
 
 def _mentioned_predicates(sel: "exp.Select") -> list["exp.Expression"]:
-    """Every predicate tree this select writes, whether or not it filters: WHERE plus ALL join ONs.
+    """Every predicate tree this select writes, whether or not it filters: WHERE, ALL join ONs,
+    HAVING and QUALIFY.
 
     Whole trees, not conjuncts, because the question this answers is "does the statement talk about
     this column anywhere in its predicates" — a column buried under an OR or inside a LEFT join's
     ON is still talked about, and that is enough to disqualify a claim that the filter is absent.
+
+    HAVING and QUALIFY are here and deliberately NOT in `_filtering_conjuncts`, and the asymmetry is
+    the whole reason both functions exist. A HAVING drops GROUPS, not base rows: `GROUP BY customer
+    HAVING is_deleted = false` never removes a deleted row from the input the aggregate read, so
+    crediting it as the declared filter applied would report a row set as filtered that is not.
+    QUALIFY is the same shape over window results. But a statement that writes the declared
+    predicate verbatim in its HAVING is plainly not one that left the filter out, and calling that
+    an outright absence is the confident error `omitted` exists to avoid.
     """
     predicates: list["exp.Expression"] = []
     where = _where_predicate(sel)
     if where is not None:
         predicates.append(where)
     predicates.extend(_all_join_predicates(sel))
+    # Both clause nodes wrap their predicate in `.this`, exactly as `exp.Where` does, and both are
+    # absent from `args` rather than None-valued when the statement writes neither.
+    for clause in ("having", "qualify"):
+        node = sel.args.get(clause)
+        if node is not None and node.this is not None:
+            predicates.append(node.this)
     return predicates
 
 
@@ -2437,7 +2495,44 @@ def _mentions_any_column(predicates: list["exp.Expression"], names: set[str]) ->
     )
 
 
-def _declared_filter_status(declared: str, site: _RefSite) -> dict[str, str]:
+def _folded_conjuncts(
+    sel: "exp.Select", memo: dict[int, set["exp.Expression"]]
+) -> set["exp.Expression"]:
+    """This SELECT's filtering conjuncts, folded once and remembered — the set a target is looked
+    up in.
+
+    Both halves of that sentence are about cost. `_fold_unquoted_identifiers` copies the node it is
+    handed, so folding a WHERE's conjuncts is a deep copy per conjunct; the conjunct set is a
+    property of the SELECT and nothing about which reference or which declared filter is being
+    judged changes it, so folding it again per reference is the same work repeated. A wide statement
+    makes that quadratic — fifty references against eight hundred conjuncts is forty thousand copies
+    — and this assembler runs synchronously on the hosted server's async worker, where seconds of
+    CPU are seconds nothing else is served.
+
+    A SET rather than a list, so the comparison is one hash lookup instead of a scan: sqlglot
+    expressions hash by structure and compare by that hash, which is exactly the equality the scan
+    was performing. Memoized on `id(sel)` and not on the node, for the reason `_cte_body_scopes`
+    gives — expressions hash by STRUCTURE, so two identically-written set-operation arms would
+    collide and the second would read the first's conjuncts. The memo lives for one
+    `check_declared_filters` call, which is the span the tree it keys is guaranteed to outlive.
+    """
+    key = id(sel)
+    cached = memo.get(key)
+    if cached is None:
+        cached = {_fold_unquoted_identifiers(c) for c in _filtering_conjuncts(sel)}
+        memo[key] = cached
+    return cached
+
+
+# What an identifier may contain once the text holding it is going to be RE-PARSED. Deliberately
+# narrower than `_ECHO_UNSAFE`: see `_declared_filter_status` for the two-hyphen case that makes the
+# difference load-bearing rather than tidy.
+_PLAIN_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+
+def _declared_filter_status(
+    declared: str, site: _RefSite, memo: dict[int, set["exp.Expression"]]
+) -> dict[str, str]:
     """One declared filter, judged against the scope the reference was written in.
 
     `{alias}` binds to THIS reference's own identifier — its alias when it has one, else its bare
@@ -2450,12 +2545,27 @@ def _declared_filter_status(declared: str, site: _RefSite) -> dict[str, str]:
     statement.
 
     Degrades to `undetermined` at every uncertain step and never raises: an unbound `:param`, an
-    unparseable filter, a reference with no enclosing SELECT. The declared text is reported either
-    way, because a reader who cannot be told the status is still owed the filter it is about.
+    unparseable filter, an alias that will not survive re-parsing, a reference with no enclosing
+    SELECT. The declared text is reported either way, because a reader who cannot be told the status
+    is still owed the filter it is about.
+
+    `applied` is judged against the reference's OWN select and the absence against every select
+    enclosing it, and the asymmetry is deliberate — see the two comments where each is decided.
     """
     ref = site.ref
-    bound = declared.replace("{alias}", _echo_name(ref.alias or ref.bare))
+    safe = _echo_name(ref.alias or ref.bare)
+    bound = declared.replace("{alias}", safe)
     entry = {"expr": bound, "status": "undetermined"}
+    # A bound that is safe to PRINT is not automatically safe to RE-PARSE, and this whole predicate
+    # is about to be parsed. `_ECHO_UNSAFE` is an echo-safety alphabet: it keeps `-`, `.` and `*`
+    # because a printed name legitimately carries them. Two hyphens open a SQL line comment, so an
+    # alias written `is_deleted--` binds to a predicate whose text ENDS at the comment, and the stump
+    # that survives is what gets compared — a stump that can match a conjunct the statement really
+    # wrote and report `applied` for a statement that applied nothing. That is the one direction this
+    # determination must never fail in, so an alias that is not a plain identifier is not compared at
+    # all. The declared text still rides on the entry: the status is what we lost, not the filter.
+    if _PLAIN_IDENTIFIER.fullmatch(safe) is None:
+        return entry
     # A surviving bind marker means the predicate is incomplete — whatever the executor would have
     # bound decides what it selects, and comparing the unbound text would compare a different
     # predicate than the one the author declared.
@@ -2464,21 +2574,39 @@ def _declared_filter_status(declared: str, site: _RefSite) -> dict[str, str]:
     declared_predicate = _parse_declared_predicate(bound)
     if declared_predicate is None:
         return entry
-    sel = _enclosing_select(site.node)
-    if sel is None:
+    # Innermost first, so `chain[0]` is the reference's own select and the rest are the statement it
+    # sits inside.
+    chain = _enclosing_selects(site.node)
+    if not chain:
         return entry
 
     target = _fold_unquoted_identifiers(declared_predicate)
+    # `applied` is the reference's OWN scope and nothing wider. A filter satisfied in a CTE body
+    # filters that body's rows, not the rows of the query that reads the CTE, so crediting a caller
+    # with a sibling scope's predicate is the exact error the per-reference answer exists to prevent.
     # An extra conjunct beside the declared one never weakens the answer: `WHERE is_deleted = false
     # AND amount > 100` still applied the declared filter, it just also applied something else.
-    if any(_fold_unquoted_identifiers(c) == target for c in _filtering_conjuncts(sel)):
+    if target in _folded_conjuncts(chain[0], memo):
         entry["status"] = "applied"
         return entry
     # Not applied. `omitted` is the strong claim, so it is reserved for a statement whose predicates
     # never mention the columns at all. Everything else — the same column under a different
     # comparison, the predicate reachable only through an OR, the predicate sitting in an outer
-    # join's ON — is a statement we cannot read confidently, and it says so.
-    if _mentions_any_column(_mentioned_predicates(sel), _predicate_columns(declared_predicate)):
+    # join's ON, the predicate in a HAVING — is a statement we cannot read confidently, and it says
+    # so.
+    #
+    # Absence is a claim about the STATEMENT, which is why this half reads the whole enclosing chain
+    # while the half above reads one select. A pass-through CTE or derived table puts the filter one
+    # level up — `WITH base AS (SELECT id, is_deleted FROM orders) SELECT … WHERE base.is_deleted =
+    # false` — and nothing in the reference's own scope mentions the column, so scoping the absence
+    # test the way the `applied` test is scoped calls that statement an outright omission. Ancestors
+    # only, never the whole tree: a sibling CTE's WHERE is a different scope's business, and reading
+    # it here would silence the headline case this determination was written for. Widening this test
+    # can only ever turn a false `omitted` into `undetermined`, never the reverse.
+    mentioned: list["exp.Expression"] = []
+    for enclosing in chain:
+        mentioned.extend(_mentioned_predicates(enclosing))
+    if _mentions_any_column(mentioned, _predicate_columns(declared_predicate)):
         return entry
     entry["status"] = "omitted"
     return entry
@@ -2524,6 +2652,12 @@ def check_declared_filters(
     # `WITH orders AS (…)` names a result the statement defined for itself, so reporting the real
     # `orders` table's declared filters against it would be an accounting of a table nothing read.
     cte_names = _cte_names(node)
+    # id(select) -> that select's folded filtering conjuncts, built lazily and shared across every
+    # reference judged inside it. Two references to the same table in one WHERE ask the same question
+    # of the same conjunct list, and folding is a deep copy per conjunct; without this the cost is
+    # references × conjuncts rather than references + conjuncts. Scoped to this call because the ids
+    # it keys are only meaningful while `node` is alive.
+    folded: dict[int, set["exp.Expression"]] = {}
     out: list[tuple[TableRef, list[dict[str, str]]]] = []
     for site in sites:
         key = _tkey(site.ref.bare)
@@ -2534,7 +2668,10 @@ def check_declared_filters(
         # per-reference answer this function exists to give — an aliased reference would be judged
         # against an identifier it never wrote, and two references to the same table would collapse
         # into one entry that cannot say a filter was applied on one of them and not the other.
-        filters = [_declared_filter_status(f, site) for f in table.default_filters] if table else []
+        filters = (
+            [_declared_filter_status(f, site, folded) for f in table.default_filters]
+            if table else []
+        )
         out.append((site.ref, filters))
     return out
 

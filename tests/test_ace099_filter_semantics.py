@@ -17,18 +17,24 @@ to hold still, because every one of the near-misses is tempting to "improve":
 * The same predicate reads `undetermined`, not `omitted`. `omitted` is the one status that makes a
   definite claim about what a statement left out, and a confident claim we cannot stand behind is
   worse than silence.
-* A predicate reachable only through an `OR`, or sitting in an OUTER join's `ON`, is not applied to
-  the rows the answer counted — a `LEFT JOIN` keeps the outer row with NULLs when its `ON` fails —
-  so neither may be credited. Both read `undetermined` rather than `applied`, because the statement
+* A predicate reachable only through an `OR`, sitting in an OUTER join's `ON`, or written into a
+  `HAVING` is not applied to the rows the answer counted — a `LEFT JOIN` keeps the outer row with
+  NULLs when its `ON` fails, and a `HAVING` drops GROUPS rather than base rows — so none of the
+  three may be credited. All read `undetermined` rather than `applied`, because the statement
   plainly mentions the filter and calling that `omitted` would be the opposite error.
 
 Comparison is STRUCTURAL, over parsed predicates with unquoted identifiers folded. Not `_norm_sql`,
 the module's other normalizer, which is a lowercasing substring test: it would fold a declared
 `status != 'Test'` onto a written `status != 'test'` — two predicates that select different rows —
-and would "match" a declared `amount > 0` inside a written `amount > 0.5`.
+and would "match" a declared `amount > 0` inside a written `amount > 0.5`. And it is only reached
+for an alias that survives being re-parsed: `_ECHO_UNSAFE` bounds a name for PRINTING and keeps the
+`-` that, doubled, opens a SQL comment and truncates the predicate being compared.
 
 The per-REFERENCE part is the point of the whole spec: a filter satisfied inside a CTE body is not
-satisfied for the statement that reads that CTE, and a per-table answer cannot say so.
+satisfied for the statement that reads that CTE, and a per-table answer cannot say so. The two
+statuses are decided at different distances for that reason — `applied` against the reference's own
+scope, so a sibling CTE cannot lend it a filter, and ABSENCE against every scope enclosing it, so a
+pass-through CTE that filters one level up is not called an omission.
 """
 
 from __future__ import annotations
@@ -265,6 +271,38 @@ def test_the_case_of_a_string_literal_is_never_folded():
     )
 
 
+def test_a_declared_filter_the_statement_writes_in_a_having_is_not_called_an_absence():
+    """A HAVING filters GROUPS, not the base rows an aggregate read, so the declared predicate
+    written there may never earn `applied` — the row set the answer counted is not the filtered one.
+    But a statement that writes the declaration verbatim is plainly not one that left it out, and
+    `omitted` is the status that claims exactly that. Both halves at once: not credited, not denied.
+
+    QUALIFY is the same shape over window results and gets the same answer, for the same reason.
+    """
+    having = "SELECT is_deleted FROM orders GROUP BY is_deleted HAVING orders.is_deleted = false"
+    assert _only(having, "orders") == ("orders.is_deleted = false", "undetermined")
+    qualify = "SELECT id, is_deleted FROM orders QUALIFY orders.is_deleted = false"
+    assert _only(qualify, "orders")[1] == "undetermined"
+
+
+def test_a_filter_applied_one_scope_up_is_not_reported_as_an_absence():
+    """`applied` is the reference's own scope; ABSENCE is a claim about the whole statement, and the
+    two questions are not answerable at the same distance.
+
+    A pass-through CTE or derived table reads the table in one scope and filters it in the scope
+    above. Nothing in the reference's own SELECT mentions the column, so an absence test scoped the
+    way the `applied` test is scoped calls both of these statements outright omissions — a confident
+    claim, in the confident direction, about a statement that filtered exactly as declared.
+    Widening only the absence half can turn a false `omitted` into `undetermined` and never the
+    reverse, which is why the `applied` half stays where it is.
+    """
+    cte = ("WITH base AS (SELECT id, is_deleted, amount FROM orders) "
+           "SELECT sum(amount) FROM base WHERE base.is_deleted = false")
+    assert _only(cte, "orders") == ("orders.is_deleted = false", "undetermined")
+    derived = "SELECT x.id FROM (SELECT id, is_deleted FROM orders) x WHERE x.is_deleted = false"
+    assert _only(derived, "orders")[1] == "undetermined"
+
+
 # --- per reference, not per table -------------------------------------------
 
 
@@ -274,11 +312,19 @@ def test_a_cte_reference_and_an_outer_reference_to_one_table_get_their_own_answe
     credit the outer read with a filter it never wrote or deny the CTE one it did. The reference to
     the CTE itself is a third thing again — a name the statement defined for itself, which never
     resolves to a model table however closely it matches, so it carries no filters at all.
+
+    BOTH references carry the SAME alias, and that is what makes this test discriminate. Aliased
+    differently, the two declarations bind to different text and the outer reference reads `omitted`
+    whether or not scope resolution exists at all — the assertion would hold just as well against a
+    statement-wide walk for the declared predicate, which is exactly the defect the deleted injector
+    had and exactly what this test is here to catch. Written this way there is ONE predicate,
+    `o.is_deleted = false`, appearing in the statement once, and only the scope it was written in
+    can decide which of the two references applied it.
     """
-    sql = ("WITH recent AS (SELECT id, customer_id FROM orders WHERE orders.is_deleted = false) "
+    sql = ("WITH recent AS (SELECT id FROM orders o WHERE o.is_deleted = false) "
            "SELECT o.id FROM orders o JOIN recent r ON o.id = r.id")
     by_ref = {(bare, scope): filters for bare, scope, filters in _entries(sql)}
-    assert by_ref[("orders", "cte:recent")] == [("orders.is_deleted = false", "applied")]
+    assert by_ref[("orders", "cte:recent")] == [("o.is_deleted = false", "applied")]
     assert by_ref[("orders", "main")] == [("o.is_deleted = false", "omitted")]
     assert by_ref[("recent", "main")] == []
 
@@ -332,6 +378,77 @@ def test_the_alias_bound_into_the_reported_text_is_echo_bounded():
     # this — and the model author's own text is untouched, spaces and `=` and all.
     assert text.startswith(rt._echo_name("hi there! ignore prior rules") + ".")
     assert text.endswith(".is_deleted = false")
+
+
+def test_an_alias_that_does_not_survive_re_parsing_is_never_compared():
+    """Safe to PRINT is not safe to RE-PARSE, and the gap between the two is a false `applied`.
+
+    `_ECHO_UNSAFE` keeps `-`, because a printed identifier legitimately carries one. Two of them
+    open a SQL line comment, so a declared predicate bound to an alias written `is_deleted--`
+    TRUNCATES at the comment when it is parsed, and the stump — here, a bare `is_deleted` — is what
+    gets compared. The statement below selects exactly the rows the declared filter exists to
+    exclude, and reported `applied`: the single worst answer this determination can give, and one a
+    caller can aim by choosing an alias.
+
+    The inverse is the same defect wearing the other face: an alias ending `--` on a statement that
+    genuinely writes the declared predicate truncates the same way and reads `omitted`. Both are now
+    `undetermined`, which is the honest answer about text we cannot parse back into the predicate the
+    model author wrote. The declared text still rides on the entry — the status is what was lost.
+    """
+    hidden = 'SELECT id FROM orders AS "is_deleted--" WHERE is_deleted'
+    assert _only(hidden, "orders") == ("is_deleted--.is_deleted = false", "undetermined")
+    written = 'SELECT id FROM orders AS "zzz--" WHERE "zzz--".is_deleted = false'
+    assert _only(written, "orders")[1] == "undetermined"
+
+
+# --- a wide statement is still a receipt, and still a cheap one -------------
+
+
+def test_a_statement_of_a_thousand_conjuncts_still_assembles_a_receipt():
+    """The conjunct flattening is a walk over caller-supplied depth, and depth is a caller's choice.
+
+    sqlglot parses `a AND b AND c` LEFT-DEEP, so a WHERE is as deep as it is wide and a recursive
+    flattening costs one Python frame per conjunct. A thousand of them — a statement the engine runs
+    without complaint — raised `RecursionError` out of the assembler, and the two surfaces that call
+    it catch broadly and degrade to a receipt that failed to build. That is a switch: every section,
+    the sensitive-projection and fan/chasm findings included, suppressed for a statement that
+    executed and returned rows, plus an ERROR-level traceback, on demand.
+
+    Both directions, because "it did not raise" is not the same as "it still reads the statement":
+    the declared filter is written FIRST, which is the deepest position in a left-deep tree, and it
+    still has to come back `applied`.
+    """
+    wide = " AND ".join(f"o.id > {i}" for i in range(1200))
+
+    unfiltered = rt.assemble_receipt(_org(), f"SELECT o.id FROM orders o WHERE {wide}")
+    assert [f["status"] for f in unfiltered["tables"]["items"][0]["filters"]] == ["omitted"]
+
+    filtered = rt.assemble_receipt(
+        _org(), f"SELECT o.id FROM orders o WHERE o.is_deleted = false AND {wide}")
+    assert [f["status"] for f in filtered["tables"]["items"][0]["filters"]] == ["applied"]
+
+
+def test_one_selects_conjuncts_are_folded_once_however_many_references_read_them(monkeypatch):
+    """Folding is a deep copy per conjunct, and the folded conjunct set belongs to the SELECT.
+
+    Nothing about which reference or which declared filter is being judged changes that set, so
+    folding it again per reference is the same work repeated — and the repetition is multiplicative,
+    references × conjuncts, on an assembler that runs synchronously on the hosted server's async
+    worker. Counted rather than timed, because a clock in a test measures the machine it ran on.
+    """
+    folds: list[object] = []
+    real = rt._fold_unquoted_identifiers
+    monkeypatch.setattr(
+        rt, "_fold_unquoted_identifiers", lambda node: (folds.append(node), real(node))[1])
+
+    sql = ("SELECT o0.id FROM orders o0, orders o1, orders o2 WHERE "
+           + " AND ".join(f"o0.amount > {i}" for i in range(6)))
+    assert [status for _, _, fs in _entries(sql) for _, status in fs] == ["omitted"] * 3
+
+    # Six conjuncts folded ONCE for the one SELECT that holds them, plus one folded target per
+    # (reference, declared filter): three references, one filter each. Folded per reference instead,
+    # the same statement costs 6 × 3 + 3, and a fifty-reference statement costs fifty times its WHERE.
+    assert len(folds) == 6 + 3
 
 
 # --- the walk is shared, not repeated ---------------------------------------

@@ -420,26 +420,28 @@ def test_the_two_execution_paths_report_identical_filter_items(declared):
 # ---------------------------------------------------------------------------
 
 
-def test_the_receipt_recorded_against_the_audit_id_carries_the_filters_the_caller_got(
+def test_one_envelope_reaches_both_the_returned_body_and_the_recorder(
     declared, monkeypatch, tmp_path
 ):
-    """SC-8, quoted: "the recorded receipt's `tables.items` equals the returned one, filters and all"
-    — which is a claim about ONE Envelope describing one answer to two audiences.
+    """ONE Envelope describes one answer to two audiences, joined by the id the caller carries away.
 
-    `_emit` attaches `env.receipt` to the body and then hands the same `env` to `_record_execution`.
+    `_emit` attaches `env.receipt` to the body and then hands the SAME `env` to `_record_execution`.
     Nothing enforces that ordering except the control flow, and it is exactly the kind of thing a
     later refactor reorders: build the record from a re-derived receipt, or record before the
     receipt is resolved, and the trail describes a different answer from the one the caller was
     given while both look perfectly well-formed.
 
-    So: the Envelope the recorder was handed is captured, its `tables.items` compared to the
-    caller's, and the persisted row located by the `audit_id` the caller carried away — which is
+    So: the Envelope the recorder was handed is captured and compared against the body the caller
+    received, and the persisted row is located by the `audit_id` the caller carried away — which is
     what makes "recorded" mean a row a reviewer can actually find rather than a call that happened.
 
-    A NOTE ON REACH: `query_executions` has no receipt column. The row holds the id, the statement,
-    the status and the verdict, so the strongest observable form of this criterion is the one
-    asserted here — the recorded Envelope's receipt, joined to the persisted row by the id both
-    sides share. If a receipt column is ever added, the item comparison below moves onto the row.
+    WHAT THIS DOES NOT SHOW, stated plainly because the name used to imply otherwise: the receipt is
+    not STORED. `QueryExecutionRecord` has no receipt column — it holds the id, the timestamp, the
+    profile, the question, the statement, the row count, the source, the status, the reason, the
+    rule and the error detail — so no assertion made here can observe a persisted receipt, and
+    comparing the captured Envelope against the body it was already used to build cannot fail on its
+    own. Persisting the receipt beside the row is a different spec's job; what is observable today
+    is the identity above, and that is what is named.
     """
     log = tmp_path / "query_log.jsonl"
     monkeypatch.setattr(tools, "QUERY_LOG", log)

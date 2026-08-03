@@ -196,6 +196,12 @@ def test_a_cte_that_shadows_a_declared_table_is_not_declared(org):
 
     It matters more from this slice on than it did before it: `declared` becomes user-facing on the
     refusal path, where it is the ONE model fact a refused caller is told.
+
+    `filters` is asserted beside the rest because the determination resolves the model row through a
+    SECOND lookup of its own, and that lookup subtracts the CTE names separately. Left unpinned, the
+    subtraction could be deleted there while every other assertion on this reference stayed green,
+    and the section would report the real table's declared filters — its columns, its literals —
+    against a name the statement invented and nothing read.
     """
     shadowing = ("WITH orders AS (SELECT 1 AS id) SELECT id FROM orders")
     items = rt.assemble_receipt(org, shadowing)["tables"]["items"]
@@ -204,6 +210,7 @@ def test_a_cte_that_shadows_a_declared_table_is_not_declared(org):
     assert items[0]["declared"] is False
     assert items[0]["qname"] is None
     assert (items[0]["rows"], items[0]["rows_as_of"]) == (None, None)
+    assert items[0]["filters"] == []
 
 
 def test_tables_section_carries_the_models_row_estimate_not_a_count(org):
