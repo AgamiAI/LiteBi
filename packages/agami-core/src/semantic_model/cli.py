@@ -205,6 +205,12 @@ def cmd_prepare(args) -> int:
     actually execute. The query skill calls this on EVERY tier before handing SQL to
     psql/mysql/etc., so the safety guarantees don't depend on going through execute_sql.py.
 
+    Because the caller RUNS what comes back, this command echoes the statement it was given and
+    never a statement of ours. It used to answer an aggregation-only fan trap with a rewritten
+    string plus a `rewritten: true` flag, which made every non-`execute_sql` tier execute something
+    the caller never wrote; that trap refuses now, and the only two outcomes are the caller's own
+    statement or a non-zero exit.
+
     A table's declared `default_filters` are NOT applied here (ACE-042 deleted the injection)
     and are not yet reported (ACE-099 adds the report), so no `applied_filters` key is emitted.
     An always-empty list would read as "we checked, none applied", which is the silence that
@@ -218,15 +224,13 @@ def cmd_prepare(args) -> int:
         _print_json({"action": "refuse", "risk": pf.risk, "reason": pf.reason,
                      "suggestion": pf.suggestion, "sql": sql})
         return 1
-    run_sql = pf.rewritten_sql if (pf.action == "auto_rewrite" and pf.rewritten_sql) else sql
     _print_json({
         "action": pf.action,
         "risk": pf.risk,
-        "sql": run_sql,
-        "rewritten": bool(pf.action == "auto_rewrite"),
-        # {output_column: unit}, traced through the final SQL — feed straight to
+        "sql": sql,
+        # {output_column: unit}, traced through the caller's own statement — feed straight to
         # `format-table --units` so summed/aliased currency formats correctly.
-        "units": RT.resolve_result_units(org, run_sql),
+        "units": RT.resolve_result_units(org, sql),
         "reason": pf.reason if pf.risk else None,
     })
     return 0

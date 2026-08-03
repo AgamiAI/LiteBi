@@ -201,12 +201,24 @@ def test_the_sanitized_band_is_rebuilt_not_relayed(code: int) -> None:
     failure line — so relaying it handed the caller text it never sent. Since the child derives its
     message from the kind, the exit code alone is enough to rebuild the identical sentence, which
     makes the stream irrelevant to the answer rather than merely filtered.
+
+    Seeded with the pre-flight refusal line, which is the notice `_model_safety` still writes. It
+    was seeded with the `[agami] auto-corrected …` line until ACE-093 deleted the rewrite that
+    announced it, and with `[agami] applied default_filters: …` before ACE-042 deleted that one. The
+    seed has to be a notice that actually occurs, or this stops measuring anything; what it must
+    carry is a name drawn from the MODEL rather than from the caller's statement, which is the
+    disclosure relaying would leak. `tenant_shard` is that name here.
     """
     import execute_sql
 
     kind = execute_sql.EXIT_TO_FAILURE_KIND[code]
-    noisy = (f"[agami] auto-corrected fan_out: ran rewritten SQL. joined t on tenant_shard\n"
-             f"{execute_sql._ERROR_MESSAGES[kind]}")
+    notice = json.dumps({"error": {
+        "kind": "preflight_refused", "risk": "fan_trap",
+        "reason": "fan trap: aggregating 'orders' (one side) across a join to "
+                  "['tenant_shard'] (many side).",
+        "suggestion": "Either pre-aggregate the one-side measure in a CTE before joining.",
+        "triggering_joins": ["orders (1) <- tenant_shard (N)"]}})
+    noisy = f"{notice}\n{execute_sql._ERROR_MESSAGES[kind]}"
     assert tools._child_failure_message(code, noisy) == execute_sql._ERROR_MESSAGES[kind]
     assert "tenant" not in tools._child_failure_message(code, noisy)
 

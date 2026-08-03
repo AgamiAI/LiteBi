@@ -1754,10 +1754,12 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
                              "triggering_joins": pf.triggering_joins}}, sys.stderr)
         sys.stderr.write("\n")
         return sql, 1
-    if pf.risk and pf.action == "auto_rewrite" and pf.rewritten_sql:
-        sys.stderr.write(f"[agami] auto-corrected {pf.risk}: ran rewritten SQL. {pf.reason}\n")
-        sql = pf.rewritten_sql
-        ctx = RT.build_guard_context(sql, org)  # SQL changed -> refresh the shared context
+
+    # No branch rebinds `sql` after this point, and none has since the fan-join auto-rewrite was
+    # deleted — the one that used to swap in a rewritten statement here, announce it on stderr, and
+    # rebuild `ctx` around the new string. So this function now provably returns the statement it was
+    # given, on every path, and the guards below all run against what the caller actually sent.
+    # tests/test_ace093_byte_identity.py asserts that end to end at the driver hand-off.
 
     # Sensitive-column (PII) guard — refuse to PROJECT raw sensitive values. Same
     # deterministic chokepoint as the fan/chasm pre-flight, so the agami-query skill,

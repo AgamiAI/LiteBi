@@ -271,15 +271,23 @@ def test_bigquery_bounds_and_flags_like_the_sink(monkeypatch, capsys):
 
 
 def test_executor_truncated_parses_the_stderr_flag():
+    """The scan reads stderr line by line and only the truncation flag counts. Whatever else the
+    child or a library wrote to the shared stream must not be mistaken for it, and must not stop it
+    being found on a later line."""
     import tools
 
+    # A non-JSON line stands in for anything sharing the stream. It was the `[agami] auto-corrected`
+    # notice until ACE-093 deleted the rewrite that wrote it; nothing about this scan depended on
+    # which notice it was, so it is synthetic now rather than borrowed from another slice.
+    other = "[agami] some notice on the shared stream"
+
     assert tools._executor_truncated('{"truncated": {"row_cap": 1000}}') is True
-    # mixed with other notices on stderr
-    assert tools._executor_truncated('[agami] auto-corrected fan_out: ran rewritten SQL.\n{"truncated": {"row_cap": 5}}') is True
-    assert tools._executor_truncated('[agami] auto-corrected fan_out: ran rewritten SQL.') is False
+    assert tools._executor_truncated(f'{other}\n{{"truncated": {{"row_cap": 5}}}}') is True
+    assert tools._executor_truncated(other) is False
     assert tools._executor_truncated("") is False
     assert tools._executor_truncated(None) is False
     assert tools._executor_truncated('{"error": {"kind": "permission"}}') is False  # not a truncation
+    assert tools._executor_truncated('{"truncated": not json}') is False  # a `{` line that won't parse
 
 
 def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
