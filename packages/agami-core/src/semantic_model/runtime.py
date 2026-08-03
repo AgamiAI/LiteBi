@@ -425,6 +425,21 @@ class Finding:
         }
 
 
+# Why the checks did not run, when they did not. `None` means they DID — the analysis reached the
+# statement and an empty `findings` is then a real "nothing found". These sentences are the same
+# device the receipt's section markers are, for the same reason: an empty list and an unchecked list
+# read identically to a consumer, so silence reads as clean unless something says otherwise.
+UNCHECKED_NO_PARSER = (
+    "sqlglot is not installed here, so the statement was not parsed and no aggregate was checked."
+)
+UNCHECKED_UNPARSEABLE = (
+    "The statement could not be parsed, so no aggregate in it was checked."
+)
+UNCHECKED_NO_SELECT = (
+    "The statement contains no SELECT, so there was no aggregate to check."
+)
+
+
 @dataclass
 class PreFlightResult:
     """Every finding the pre-flight made, in the order the walk made them.
@@ -440,9 +455,12 @@ class PreFlightResult:
     """
 
     findings: list[Finding] = field(default_factory=list)
+    # Null when the checks ran. A sentence when they could not, so that `findings == []` is never
+    # asked to mean two different things at once.
+    unchecked: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"findings": [f.as_dict() for f in self.findings]}
+        return {"findings": [f.as_dict() for f in self.findings], "unchecked": self.unchecked}
 
 
 # ---------------------------------------------------------------------------
@@ -1015,15 +1033,22 @@ def pre_flight_check(sql: str, org: Datasource,
     This is the parse half; `_collect_findings` is the analysis half and takes a tree, so a caller
     that has already parsed — `assemble_receipt` has — runs the same analysis without parsing twice.
 
-    Degrades to NO findings when sqlglot is unavailable, the SQL doesn't parse, or it contains no
-    SELECT. Silence here means "nothing was established", which is why the receipt states that in
-    its own marker rather than letting an empty list read as clean."""
+    **An empty `findings` does not mean "clean" on its own.** The analysis cannot run at all when
+    sqlglot is missing, when the statement does not parse, or when there is no SELECT in it, and
+    each of those produces the same empty list a genuinely clean statement does. `unchecked` is what
+    tells them apart: null when the checks ran, a sentence when they could not. A caller that reads
+    `findings` without reading `unchecked` will treat a skipped analysis as a clean bill of health,
+    which is the one reading this whole layer exists to prevent."""
     if not _HAVE_SQLGLOT:
-        return PreFlightResult()
+        return PreFlightResult(unchecked=UNCHECKED_NO_PARSER)
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
     # call are byte-identical: _parse_sql swallows an unparseable statement to None exactly as a
     # prebuilt ctx.tree would be None.
     tree = ctx.tree if ctx is not None else _parse_sql(sql)
+    if tree is None:
+        return PreFlightResult(unchecked=UNCHECKED_UNPARSEABLE)
+    if tree.find(exp.Select) is None:
+        return PreFlightResult(unchecked=UNCHECKED_NO_SELECT)
     return PreFlightResult(_collect_findings(tree, org, ctx=ctx))
 
 

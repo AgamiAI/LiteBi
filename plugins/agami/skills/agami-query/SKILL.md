@@ -385,7 +385,9 @@ It returns JSON: `{sql, findings, units}`, and it **always exits 0**. The return
 
 Either way the finding rides on the answer's receipt, in the `aggregates` section, so a user reading the result can see what was found without taking your word for it.
 
-Empty `findings` means the checks ran and found nothing — not that nothing ran. The receipt's `aggregates` marker states what those checks still do not reach (an aggregate inside a CTE, for one), and you should surface that marker rather than presenting an empty section as clean.
+**An empty `findings` is not by itself a clean bill of health.** Check `unchecked` alongside it: it is `null` when the checks ran, and a sentence when they could not — sqlglot missing, the statement unparseable, or no SELECT in it. All three yield the same empty list a genuinely clean statement does, so a non-null `unchecked` means you have learned nothing about this statement's aggregates and should say so rather than implying it passed.
+
+Even when `unchecked` is null, "found nothing" is bounded. The receipt's `aggregates` marker states what the checks do not reach — an aggregate inside a CTE or a subquery, one in `HAVING` or `ORDER BY` — and you should surface that marker rather than presenting an empty section as clean.
 
 **Step 2 — execute the returned `sql`** via the tier's tool from [`shared/connection-reference.md → CLI Connection Commands`](../../shared/connection-reference.md#cli-connection-commands) — psql / mysql / snowsql / sqlite3 / DuckDB, or the Python driver. (If you use `python -m execute_sql`, do **NOT** pass `--no-safety`. `sm prepare` runs the fan/chasm and aggregation checks, which report; it does **not** run the table-scope, `SELECT *` or column-scope gates, which refuse. Those are the enforcement, they live only in `execute_sql`, and skipping them lets a hallucinated table or column reach the warehouse. The checks that would be doubled are cheap; the gates that would be skipped are not optional.) Wrap in a high-resolution timer; capture stdout (CSV rows), stderr (errors), exit code. Route a non-zero exit through the error classifier (Phase 3b).
 

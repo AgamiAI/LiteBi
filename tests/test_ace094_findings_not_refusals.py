@@ -437,6 +437,55 @@ def test_the_findings_are_ordered_deterministically(shop):
     assert all(j == sorted(j) for j in joins), joins
 
 
+# sqlglot with `error_level="ignore"` is extremely permissive — `NOT SQL AT ALL ;;;` comes back as a
+# `Block` and `((((` as a `Paren` — so the unparseable case is reached with input that yields no tree
+# at all, and the no-SELECT case with something that parses to a non-SELECT node.
+UNCHECKABLE = {
+    "unparseable": ";;;",
+    "no SELECT": "VALUES (1), (2)",
+}
+
+
+@pytest.mark.parametrize("sql", UNCHECKABLE.values(), ids=UNCHECKABLE.keys())
+def test_a_statement_the_checks_cannot_read_says_so_rather_than_looking_clean(shop, sql):
+    """An empty `findings` has to be able to mean two different things, and it cannot mean both
+    silently.
+
+    The analysis does not run at all when sqlglot is missing, when the statement will not parse, or
+    when there is no SELECT in it — and every one of those produces the same empty list a genuinely
+    clean statement does. Without a second field, a caller reading `findings` alone treats a skipped
+    analysis as a clean bill of health, which is precisely the reading this whole layer exists to
+    prevent: silence reads as clean.
+
+    `unchecked` is null when the checks ran and a sentence when they could not. This is the same
+    device the receipt's section markers are, applied to the one surface that had no marker."""
+    result = rt.pre_flight_check(sql, shop.org)
+
+    assert result.findings == []
+    assert result.unchecked, "an unrunnable analysis must not look like a clean one"
+    assert "check" in result.unchecked
+
+
+def test_a_deployment_without_the_parser_says_so_on_every_statement(shop, monkeypatch):
+    """The third way the checks do not run, and the only one no input can reach: sqlglot is not
+    installed, so nothing is ever parsed and no statement is ever checked. A deployment in that
+    state would otherwise report a clean `aggregates` section forever."""
+    monkeypatch.setattr(rt, "_HAVE_SQLGLOT", False)
+    result = rt.pre_flight_check("SELECT o.id FROM orders o", shop.org)
+
+    assert result.findings == []
+    assert result.unchecked and "not installed" in result.unchecked
+
+
+def test_a_clean_statement_says_the_checks_ran(shop):
+    """The other half, and the one that makes the field mean anything: `unchecked` is null when the
+    analysis actually reached the statement, so a reader can tell the two empty lists apart."""
+    result = rt.pre_flight_check("SELECT o.id FROM orders o", shop.org)
+
+    assert result.findings == []
+    assert result.unchecked is None
+
+
 def test_a_trap_inside_a_cte_is_the_gap_the_marker_admits(shop):
     """The marker's claim, made true rather than asserted in prose. A fan trap wrapped in a `WITH`
     produces no finding, which is precisely why the section cannot say it is complete."""

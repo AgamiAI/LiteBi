@@ -219,9 +219,13 @@ def cmd_prepare(args) -> int:
     **It is now total: exit 0, always.** It refused a fan or chasm trap until ACE-094, which was the
     last non-zero exit here. Correctness is not a refusal — whether a multiplied total is a bug
     depends on the question, and this command has the statement but not the question. So it reports
-    what it found and lets the caller, who has both, decide. `findings` is that report, and an empty
-    list means the checks ran and found nothing rather than that nothing ran; the receipt's
-    `aggregates` marker is where the limits of "found nothing" are stated.
+    what it found and lets the caller, who has both, decide.
+
+    `findings` is that report, and **an empty list is not by itself a clean bill of health.** The
+    analysis does not run when sqlglot is missing, when the statement does not parse, or when there
+    is no SELECT, and each of those yields the same empty list a genuinely clean statement does.
+    `unchecked` is what separates them: null when the checks ran, a sentence when they could not.
+    Read both or read neither.
 
     A table's declared `default_filters` are NOT applied here (ACE-042 deleted the injection)
     and are not yet reported (ACE-099 adds the report), so no `applied_filters` key is emitted.
@@ -231,9 +235,12 @@ def cmd_prepare(args) -> int:
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
+    pf = RT.pre_flight_check(sql, org)
     _print_json({
         "sql": sql,
-        "findings": [f.as_dict() for f in RT.pre_flight_check(sql, org).findings],
+        "findings": [f.as_dict() for f in pf.findings],
+        # Null when the checks ran. A caller that ignores this reads "skipped" as "clean".
+        "unchecked": pf.unchecked,
         # {output_column: unit}, traced through the caller's own statement — feed straight to
         # `format-table --units` so summed/aliased currency formats correctly.
         "units": RT.resolve_result_units(org, sql),

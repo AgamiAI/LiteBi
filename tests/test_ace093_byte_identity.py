@@ -260,7 +260,9 @@ def test_the_result_carries_no_statement_and_no_rewrite_action():
     assert "original_sql" not in fields
     assert "action" not in fields
 
-    assert set(rt.PreFlightResult().as_dict()) == {"findings"}
+    # `unchecked` is null when the analysis ran and a sentence when it could not — without it an
+    # empty `findings` would mean both "clean" and "not checked", and silence would read as clean.
+    assert set(rt.PreFlightResult().as_dict()) == {"findings", "unchecked"}
     assert set(rt.Finding("fan_trap", "why").as_dict()) == {
         "risk", "reason", "triggering_joins"}
 
