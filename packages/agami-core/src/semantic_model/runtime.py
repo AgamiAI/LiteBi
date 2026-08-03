@@ -1430,7 +1430,6 @@ def assemble_receipt(
     sql: str,
     *,
     model_version: Optional[str] = None,
-    applied_filters: Optional[list[str]] = None,
     freshness: Optional[str] = None,
 ) -> dict[str, Any]:
     """The FULL trust receipt for a statement that RAN, assembled from the model + the SQL.
@@ -1848,26 +1847,21 @@ def assemble_receipt(
             ),
         },
     }
-    # One key left that is neither a section nor the version pin, and it is here on sufferance. It
-    # describes a REWRITE this layer performed on the caller's statement, so it is not a fact about
-    # what the caller sent, and it disappears rather than moves once the rewrite it describes is
-    # subtracted. Inventing a section home for it would outlive the thing it describes.
+    # Nothing beside the sections and the version pin, and no conditional key at all. Two keys once
+    # sat out here, and both described a REWRITE this layer performed on the caller's statement
+    # rather than a fact about what the caller sent, which is why neither could be given a section
+    # home: a section home would outlive the thing the key described.
     #
-    # `pre_flight` was the other one and it is gone. It carried the fan/chasm verdict, including the
-    # `auto_rewrite` action, and the rewrite it reported no longer exists. What survives the
-    # subtraction is the ANALYSIS, not the verdict: a fan trap is now a refusal, and a refusal never
-    # reaches this assembler because there is no result to describe. Routing the finding into a
-    # section, for a statement that ran and carries a trap, is ACE-094's job and needs a section
-    # home this key never had.
+    # `pre_flight` carried the fan/chasm verdict, including the `auto_rewrite` action, and it went
+    # with the rewrite it reported. What survives that subtraction is the ANALYSIS, not the verdict:
+    # a fan trap is now a finding on the `aggregates` section, and the receipt reports it there.
     #
-    # `applied_filters` survives for exactly one reason: ACE-042 deleted the default-filter injector,
-    # so nothing in this tree ANDs a declared filter into a statement or computes this list, but `sm
-    # receipt --applied-filters` lets a caller hand one in, and this assembler must not be the thing
-    # that makes that impossible before ACE-099 becomes the next producer. It stays CONDITIONAL, so a
-    # statement no one made a claim about carries no key at all rather than an empty list, which
-    # would read as "we checked, none applied".
-    if applied_filters:
-        receipt["default_filters_applied"] = applied_filters
+    # `default_filters_applied` was the other, and it outlived its producer: the default-filter
+    # injector was deleted, so nothing in this tree ANDs a declared filter into a statement, and the
+    # key survived only because the `sm receipt` CLI let a caller hand a list in. That fact now has a
+    # real home — `tables.items[].filters`, per table reference, computed here from the model and the
+    # statement — so keeping the flat key would hold one fact in two shapes that are free to
+    # disagree. Both the key and the parameter that fed it are gone.
     return receipt
 
 

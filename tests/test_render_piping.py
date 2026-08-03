@@ -115,7 +115,7 @@ def test_receipt_from_sql(tmp_path, capsys):
     I.introspect("shop", "postgres", runner=runner, artifacts_dir=tmp_path)
 
     args = types.SimpleNamespace(
-        root=str(tmp_path / "shop"), sql_file=None, applied_filters=None, freshness=None,
+        root=str(tmp_path / "shop"), sql_file=None, freshness=None,
         sql="SELECT c.id, COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id")
     cli.cmd_receipt(args)
     receipt = json.loads(capsys.readouterr().out)

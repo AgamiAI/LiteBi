@@ -1666,9 +1666,12 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     so the interim `RULE_MODEL_SAFETY` that let `execute_guarded` turn that int into an Envelope is
     gone too, and "exactly one Envelope per path" holds without a placeholder rule standing in.
 
-    A table's declared ``default_filters`` are NOT applied here, and are not yet reported either —
-    ACE-042 deleted the injection (it authored SQL, and mis-scoped it on any CTE), and ACE-099 adds
-    the report. Until then a declared filter is descriptive only.
+    A table's declared ``default_filters`` are NOT applied here: ACE-042 deleted the injection,
+    because it authored SQL and mis-scoped it on any CTE. What replaced it is a REPORT rather than
+    an edit — ``runtime.assemble_receipt`` decides, per table reference, which of that reference's
+    declared filters the statement applied and which it omitted, and puts the answer on
+    ``tables.items[].filters``. So a declared filter still never changes the statement this pass
+    hands on, and the caller is no longer left to infer whether it was satisfied.
 
     Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue or a ``Refusal`` from
     whichever gate chose it — there is no third thing, so every refusal names its own rule. Inert
@@ -2147,8 +2150,9 @@ def execute_guarded(
 
     In fixed order: read-only / dangerous-SQL guard (the hard security gate — NOT bypassable via
     ``no_safety``, which skips only the semantic-model pass, never write/RCE/DoS protection) ->
-    semantic-model safety pass (the scope gates; the fan/chasm and PII checks became receipt facts
-    and declared ``default_filters`` are no longer applied here) ->
+    semantic-model safety pass (the scope gates; the fan/chasm and PII checks became receipt facts,
+    and declared ``default_filters`` are not applied here either — which of them the statement
+    satisfied became a receipt fact too, per table reference) ->
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
     SQL both guards have passed.
 

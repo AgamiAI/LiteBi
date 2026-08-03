@@ -591,27 +591,37 @@ def test_the_receipt_is_the_sections_and_the_version_pin(org):
     assert not (set(receipt) & DELETED_FLAT_KEYS)
 
 
-def test_the_one_rewrite_key_is_the_only_conditional_one(org):
-    """`default_filters_applied` describes a REWRITE this layer performed on the caller's statement,
-    so it is not a fact about what the caller sent and it has no section home. It is conditional —
-    absent when nothing was rewritten — and it disappears rather than moves when the rewrite it
-    describes is subtracted.
+def test_there_is_no_conditional_key_left_and_no_way_to_ask_for_one(org):
+    """There are no conditional keys. The receipt is the five sections and the version pin on every
+    call, whatever the statement was and whatever the caller passed.
 
-    There were two. `pre_flight` carried the fan/chasm verdict including the `auto_rewrite` action,
-    and it went with the rewrite it reported, exactly as this docstring predicted it would. The
-    analysis survived the subtraction; the verdict and its key did not. `default_filters_applied` is
-    the one left, and only because `sm receipt --applied-filters` still lets a caller hand a list in
-    until ACE-099 becomes its producer.
+    Two keys once sat out here, and both described a REWRITE this layer performed on the caller's
+    statement rather than a fact about what the caller sent — which is why neither could be given a
+    section home, and why each was expected to disappear rather than move. `pre_flight` carried the
+    fan/chasm verdict including the `auto_rewrite` action, and it went with the rewrite it reported.
+    `default_filters_applied` is the second, and it outlived its producer by a whole spec: the
+    injector that computed it was deleted, and the key survived only because the `sm receipt` CLI
+    let a caller hand a list in.
 
-    The absence assertion below is the load-bearing half: a future slice that reintroduces a receipt
-    key without a section home fails here rather than shipping it."""
+    That fact has a real home now — `tables.items[].filters`, per table REFERENCE, computed from the
+    model and the statement — so keeping the flat key would hold one fact in two shapes free to
+    disagree. The parameter is asserted GONE rather than merely unused: a surviving keyword would
+    let a caller put an unverified claim about the org's own filters onto a receipt, which is the
+    one thing a trust receipt must not carry.
+
+    The absence assertions are the load-bearing half: a future slice that reintroduces a receipt key
+    without a section home fails here rather than shipping it."""
+    import inspect
+
     plain = rt.assemble_receipt(org, SQL)
     assert set(plain) == {"model_version", *guardrail.Receipt.SECTIONS}
     assert "default_filters_applied" not in plain and "pre_flight" not in plain
 
-    rewritten = rt.assemble_receipt(org, SQL, applied_filters=["o.x IS NULL"])
-    assert set(rewritten) - set(plain) == {"default_filters_applied"}
-    assert rewritten["default_filters_applied"] == ["o.x IS NULL"]
+    # Same shape for a statement that DOES omit a declared filter — the fact lands per reference,
+    # inside `tables`, and never as a sixth top-level key.
+    assert set(rt.assemble_receipt(org, SQL, model_version="v1", freshness="2026-05-09")) == set(plain)
+
+    assert "applied_filters" not in inspect.signature(rt.assemble_receipt).parameters
 
 
 # --- the caller's own text never lands raw ----------------------------------
