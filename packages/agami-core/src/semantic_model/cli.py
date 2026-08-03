@@ -203,7 +203,13 @@ def cmd_preflight(args) -> int:
 def cmd_prepare(args) -> int:
     """Tier-independent safety pass: run the fan/chasm pre-flight and return the SQL to
     actually execute. The query skill calls this on EVERY tier before handing SQL to
-    psql/mysql/etc., so the safety guarantees don't depend on going through execute_sql.py.
+    psql/mysql/etc.
+
+    **This is not a gate and never was.** It runs the fan/chasm and aggregation-semantics
+    checks, which describe; it does NOT run table scope, the `SELECT *` ban or column scope,
+    which refuse. Those live in `execute_sql` alone. A tier that runs its own SQL after
+    calling this has had the checks, not the gates, and `--no-safety` is therefore never the
+    right flag to pair with it.
 
     Because the caller RUNS what comes back, this command echoes the statement it was given and
     never a statement of ours. It used to answer an aggregation-only fan trap with a rewritten

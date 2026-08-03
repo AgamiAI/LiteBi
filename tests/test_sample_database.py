@@ -211,8 +211,9 @@ def test_correct_revenue_by_category(db):
 
 
 # ---------------------------------------------------------------------------
-# Sensitive-column (PII) projection guard — enforced in execute_sql's shared
-# safety pass, so the skill, the MCP server, and cron all protect PII identically.
+# Sensitive-column (PII) projection — REPORTED, not enforced. It was a gate in
+# execute_sql's shared safety pass until ACE-094; what refuses now is the scope
+# gates, and a column that must not be readable is one the model does not declare.
 # ---------------------------------------------------------------------------
 
 def test_sensitive_projection_is_reported_raw():

@@ -540,12 +540,12 @@ def projected_sensitive_columns(sql: str, org: Datasource,
     column is not declared, and 4b refuses any statement reaching it with no new machinery, or the
     connection's grants and the warehouse's masking decide.
 
+    This is the parse half; `_projected_sensitive(tree, org, ctx)` is the analysis half and takes a
+    tree, so `assemble_receipt` — which has already parsed — runs it without parsing twice.
+
     Degrades to "nothing found" when sqlglot is unavailable or the SQL doesn't parse. `ctx`
     (ACE-045): reuse the once-parsed tree + once-built sensitive index instead of redoing both."""
     if not _HAVE_SQLGLOT:
-        return []
-    by_table, allnames = ctx.sensitive_by_table if ctx is not None else _sensitive_by_table(org)
-    if not allnames:
         return []
     if ctx is not None:
         tree = ctx.tree
@@ -554,6 +554,15 @@ def projected_sensitive_columns(sql: str, org: Datasource,
             tree = sqlglot.parse_one(sql, error_level="ignore")
         except Exception:
             return []
+    return _projected_sensitive(tree, org, ctx=ctx)
+
+
+def _projected_sensitive(tree, org: Datasource,
+                         ctx: "GuardContext | None" = None) -> list[str]:
+    """The analysis half, on an already-parsed tree."""
+    by_table, allnames = ctx.sensitive_by_table if ctx is not None else _sensitive_by_table(org)
+    if not allnames:
+        return []
     # A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not
     # exp.Select — gate on "contains a SELECT" and scan every OUTPUT-bearing arm, else
     # `… UNION SELECT ssn FROM customers` would project a sensitive column past this gate.
@@ -687,13 +696,19 @@ def _cte_names(tree: "exp.Expression") -> set[str]:
 # ---------------------------------------------------------------------------
 # Table-scope guard
 #
-# Enforced in the SAME shared safety pass as the fan/chasm pre-flight and the
-# sensitive-column guard (execute_sql.py:_model_safety), so EVERY entry point
-# that runs SQL through the engine only ever touches tables the semantic model
-# declares — a query referencing any other table in the connected database is
-# refused, by construction rather than by each LLM obeying a prose rule. This is
-# table-level scoping only; which columns of a modeled table may be projected is
-# the sensitive-projection guard's job.
+# Enforced in the shared safety pass (execute_sql.py:_model_safety), so EVERY
+# entry point that runs SQL through the engine only ever touches tables the
+# semantic model declares — a query referencing any other table in the connected
+# database is refused, by construction rather than by each LLM obeying a prose
+# rule.
+#
+# This and `check_column_scope` are now the WHOLE of disclosure control, and that
+# is deliberate rather than a gap. The sensitive-projection gate that used to sit
+# beside them was an access policy of our own, which principle 5 forbids; it is a
+# receipt fact now. So the rule is simple and enforceable: a column or table whose
+# values must not be readable is not declared, and these two refuse anything that
+# reaches for it. What a declared column's values are worth protecting from is the
+# connecting role's grants to decide, not ours.
 # ---------------------------------------------------------------------------
 
 
@@ -1068,7 +1083,13 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
                 ))
 
         # FAN: an aggregate over a measure on the ONE side of a one-to-many in scope
-        for measure_table in agg_sources:
+        # SORTED, and that matters here in a way it did not before. `agg_sources` is a set, and
+        # this loop used to `return` on the first hit, so iteration order chose only WHICH single
+        # refusal fired and a refusal is a refusal. It now chooses the ORDER of findings in the
+        # receipt, and which ones survive the cap — and on the forked path the child and the
+        # parent build that receipt in two processes with two hash seeds. Same statement, two
+        # different receipts.
+        for measure_table in sorted(agg_sources):
             others = table_set - {measure_table}
             fan_rels = _one_side_facing_many(rels, measure_table, others)
             if not fan_rels:
@@ -1241,7 +1262,8 @@ def _check_aggregation_semantics(
                         "semi_additive",
                         reason=(
                             f"SUM({cname}) across time is wrong: {cname!r} backs the "
-                            f"semi-additive metric {mm.name!r} ({mm.non_additive_dimensions}) — "
+                            f"semi-additive metric {_echo_name(mm.name)!r} "
+                            f"({[_echo_name(d) for d in mm.non_additive_dimensions]}) — "
                             "summing a stock over a date grain multiplies it."
                         ),
                     ))
@@ -1311,10 +1333,11 @@ UNDETERMINED_JOINS = (
 UNDETERMINED_AGGREGATES = (
     "Aggregates were checked against the model for fan-out, chasm cross-products, aggregation "
     "class and semi-additivity, and anything found is listed above. Three things are still not "
-    "established: an aggregate inside a CTE or a subquery is not reached, so a trap there is not "
-    "reported; MIN, MAX and COUNT(DISTINCT) are counted as fan-out risks although a fan-out cannot "
-    "change what they return; and whether a listed finding is a problem depends on the question, "
-    "which this answer does not have."
+    "established: only aggregates in the SELECT list are read, so one in HAVING or ORDER BY is "
+    "not reported, and neither is one inside a CTE or a subquery; MIN, MAX and COUNT(DISTINCT) "
+    "are counted as fan-out risks although a fan-out cannot change what they return; and "
+    "whether a listed finding is a problem depends on the question, which this answer does "
+    "not have."
 )
 # The two early returns are two different facts and a reader has to be able to tell them apart: one
 # is a deployment that never installed the parser (every statement gets this receipt, forever, and
@@ -1546,6 +1569,9 @@ def assemble_receipt(
     # whoever asked for it. The overflow is COUNTED on the marker below, never listed, and the count
     # is the caller's own number so stating it discloses nothing.
     dropped_cols = max(0, len(column_refs) - _RECEIPT_MAX_REFS)
+    # Which sensitive columns this statement projects RAW — the same analysis that used to refuse
+    # it, on the tree already parsed above rather than a second parse of the same statement.
+    projected_sensitive = set(_projected_sensitive(tree, org, ctx=None))
     column_items: list[dict[str, Any]] = []
     for bare, cname in column_refs[:_RECEIPT_MAX_REFS]:
         info = _declared_table(bare)
@@ -1569,7 +1595,19 @@ def assemble_receipt(
             label = f"{qualified}.{_echo_name(cname)}"
         else:
             label = f"{_echo_name(bare)}.{_echo_name(cname)}"
-        column_items.append({"column": label, "metric": None})
+        # `sensitive` used to be a gate that refused this projection. It is a description now, and
+        # this is where the description lands: a fact about a COLUMN, in the column section, rather
+        # than in `aggregates` beside the four aggregate findings. The flag is only ever True — the
+        # key is absent otherwise — because a receipt that marked every ordinary column
+        # `sensitive: false` would bury the handful that are.
+        item: dict[str, Any] = {"column": label, "metric": None}
+        # `_projected_sensitive` keys a resolved reference as "table.column" and an ambiguous one
+        # by bare name, so both forms are checked. It means PROJECTED, not merely referenced: a
+        # sensitive column used only in a WHERE is not flagged, because the value did not come
+        # back and saying otherwise would cry wolf on the filters that are the normal safe use.
+        if f"{bare}.{cname}" in projected_sensitive or cname in projected_sensitive:
+            item["sensitive"] = True
+        column_items.append(item)
     # A matched metric is a statement-level fact today, so it gets its own entry with no owning
     # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
     # Deliberately NOT subject to the cap above: there is one entry per metric the MODEL declares

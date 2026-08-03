@@ -1647,11 +1647,10 @@ def _write_refusal(refusal: Refusal) -> None:
     shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on the parent
     side of the process boundary. Nothing else may be written alongside it: several callers (and the
     fail-closed suite) parse the WHOLE stderr stream as a single object, so a second line of
-    diagnostics would not merely be noisy, it would make the refusal unreadable. The two
-    unconverted ``_model_safety`` branches still write such a line before this one — for those the
-    stream is two lines and only the line-scanning parser can read it, which is one more reason they
-    are being subtracted. There were four; the default-filter and auto-rewrite notices went with the
-    rewrites they announced.
+    diagnostics would not merely be noisy, it would make the refusal unreadable. Nothing writes one
+    now: four branches once did, and all four are gone — the default-filter and auto-rewrite
+    notices with the rewrites they announced, the fan/chasm and sensitive-column diagnostics with
+    the refusals they explained. The stream is a single object on every path.
     """
     json.dump({"refusal": asdict(refusal)}, sys.stderr)
     sys.stderr.write("\n")
@@ -1671,16 +1670,16 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     ACE-042 deleted the injection (it authored SQL, and mis-scoped it on any CTE), and ACE-099 adds
     the report. Until then a declared filter is descriptive only.
 
-    Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue, a ``Refusal`` from one of
-    the five converted branches, or — from the two unconverted ones — today's bare exit code, which
-    the caller wraps in the interim ``model_safety`` rule. Inert (returns the SQL unchanged) when the
+    Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue or a ``Refusal`` from
+    whichever gate chose it — there is no third thing, so every refusal names its own rule. Inert
+    (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
 
     Every branch writes NOTHING: it hands the contract object back and ``execute_guarded`` puts it
     in the Envelope, so the in-process caller sees the same rule the forked one does. The fan/chasm
-    pre-flight and sensitive-column branches were the two exceptions, writing their own diagnostic
-    and returning a bare int; they did become receipt facts, so they are not here to be converted.
+    pre-flight and the sensitive-column check were the two exceptions, writing their own diagnostic
+    and returning a bare int. Both became receipt facts, so neither is here at all now.
     """
     try:
         from semantic_model import runtime as RT
@@ -2148,18 +2147,17 @@ def execute_guarded(
 
     In fixed order: read-only / dangerous-SQL guard (the hard security gate — NOT bypassable via
     ``no_safety``, which skips only the semantic-model pass, never write/RCE/DoS protection) ->
-    semantic-model safety pass (fan/chasm pre-flight + scope + PII; declared ``default_filters``
-    are no longer applied here — ACE-042) ->
+    semantic-model safety pass (the scope gates; the fan/chasm and PII checks became receipt facts
+    and declared ``default_filters`` are no longer applied here) ->
     resolve the datasource -> ``executor.execute(vetted_sql, …)``. The executor only ever receives
     SQL both guards have passed.
 
     **Every path returns exactly one ``Envelope``, and this function is TOTAL** — nothing is raised
     out of here for a caller to interpret, so the subprocess ``main`` and the in-process MCP handler
-    cannot disagree about what happened. The seven outcomes:
+    cannot disagree about what happened. The six outcomes:
 
       * the read-only gate refuses            -> ``refused`` carrying that gate's ``Refusal``
       * ``_model_safety`` returns a Refusal   -> ``refused`` carrying it verbatim
-      * ``_model_safety`` returns an int      -> ``refused`` carrying the interim ``model_safety``
       * either time bound fired               -> ``refused`` carrying ``resource_limit``
       * ``executor.execute`` raises           -> ``failed`` carrying a classified ``Failure``
       * anything else raises                  -> ``failed``/``other``, generic message, raw to the log

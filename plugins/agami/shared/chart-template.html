@@ -1476,7 +1476,7 @@
           li.appendChild(el('strong', { text: (a.name || 'finding').replace(/_/g, ' ') }));
           if (a.detail) li.appendChild(el('span', { text: ' — ' + a.detail }));
           if (a.joins && a.joins.length) {
-            li.appendChild(el('div', { class: 'sub', text: a.joins.join(', ') }));
+            li.appendChild(el('div', { class: 'receipt-meta', text: a.joins.join(', ') }));
           }
           ul.appendChild(li);
         });
