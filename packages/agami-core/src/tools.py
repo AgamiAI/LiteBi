@@ -1204,9 +1204,10 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     the in-process path returned the clean sentence. (That notice is gone: ACE-042 deleted the
     injection it announced, and the `[agami] auto-corrected …` notice that replaced it as the
     example went the same way with the rewrite it announced. What still writes to the child's stderr
-    is the pre-flight refusal line — which carries model-derived table names — plus anything a
-    library logs. Both have the same reach, so the reconstruction below is what keeps them out; the
-    traceback guard only ever caught the two `exc_info=True` sites.)
+    is the two surviving diagnostic lines — the pre-flight refusal, carrying model-derived table
+    names, and the sensitive-columns refusal, carrying model-derived column names — plus anything a
+    library logs. All of them have the same reach, so the reconstruction below is what keeps them
+    out; the traceback guard only ever caught the two `exc_info=True` sites.)
     """
     from execute_sql import (
         _AUTHORED_EXIT_CODES,

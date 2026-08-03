@@ -1648,10 +1648,11 @@ def _write_refusal(refusal: Refusal) -> None:
     shape S2 established, which ``tools._stderr_refusal`` rebuilds through ``Refusal`` on the parent
     side of the process boundary. Nothing else may be written alongside it: several callers (and the
     fail-closed suite) parse the WHOLE stderr stream as a single object, so a second line of
-    diagnostics would not merely be noisy, it would make the refusal unreadable. The four
+    diagnostics would not merely be noisy, it would make the refusal unreadable. The two
     unconverted ``_model_safety`` branches still write such a line before this one — for those the
     stream is two lines and only the line-scanning parser can read it, which is one more reason they
-    are being subtracted.
+    are being subtracted. There were four; the default-filter and auto-rewrite notices went with the
+    rewrites they announced.
     """
     json.dump({"refusal": asdict(refusal)}, sys.stderr)
     sys.stderr.write("\n")
@@ -1666,7 +1667,7 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     the report. Until then a declared filter is descriptive only.
 
     Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue, a ``Refusal`` from one of
-    the five converted branches, or — from the three unconverted ones — today's bare exit code, which
+    the five converted branches, or — from the two unconverted ones — today's bare exit code, which
     the caller wraps in the interim ``model_safety`` rule. Inert (returns the SQL unchanged) when the
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
@@ -2235,7 +2236,7 @@ def execute_guarded(
                 return _envelope("refused", refusal=verdict,
                                  receipt=_refusal_receipt(verdict, received_sql, profile))
             if verdict is not None:
-                # One of the four unconverted branches: it wrote its own diagnostic to the server
+                # One of the two unconverted branches: it wrote its own diagnostic to the server
                 # log and handed back only an exit code, so this is the most we can say without
                 # inventing a rule for it. The interim RULE_MODEL_SAFETY exists precisely so this
                 # path still returns an Envelope — without it the signature would have to be

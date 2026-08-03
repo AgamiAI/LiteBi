@@ -989,7 +989,8 @@ def pre_flight_check(sql: str, org: Datasource,
     fan trap was rewrite-eligible, and nothing is. Degrades to allow when sqlglot is
     unavailable, the SQL doesn't parse, or it contains no SELECT.
 
-    The statement returned is always the caller's own `sql`, on every path."""
+    `sql` is read once, to parse. Nothing below this frame receives it and the result carries no
+    statement, so there is no path on which a statement of ours could be handed back."""
     if not _HAVE_SQLGLOT:
         return PreFlightResult(None, "allow", reason="sqlglot unavailable; skipped")
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
@@ -999,12 +1000,13 @@ def pre_flight_check(sql: str, org: Datasource,
     if tree is None or tree.find(exp.Select) is None:
         return PreFlightResult(None, "allow", reason="no SELECT; skipped")
     if isinstance(tree, exp.Select):
-        return _preflight_select(tree, org, sql, ctx=ctx)
+        return _preflight_select(tree, org, ctx=ctx)
     # Set operation: analyze each arm; a trap in any arm inflates that arm's aggregate.
-    # `arm.sql()` re-serializes, but only to carry the arm's own text into a message —
-    # it is never executed, and the statement returned below is always the caller's `sql`.
+    # The arm is passed as a TREE, never re-serialized back to text. It used to be handed
+    # `arm.sql()` as well, to become the `original_sql` of the arm's own result; with that field
+    # gone the analysis reads the tree and nothing below this needs a statement at all.
     for arm in _output_selects(tree):
-        res = _preflight_select(arm, org, arm.sql(), ctx=ctx)
+        res = _preflight_select(arm, org, ctx=ctx)
         if res.risk and res.action == "refuse":
             # tie the arm's diagnosis back to the full set-operation query
             return PreFlightResult(res.risk, "refuse", reason=res.reason,
@@ -1012,11 +1014,11 @@ def pre_flight_check(sql: str, org: Datasource,
     return PreFlightResult(None, "allow", reason="no fan/chasm or aggregation issue in any arm")
 
 
-def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
+def _preflight_select(tree: "exp.Select", org: Datasource,
                       ctx: "GuardContext | None" = None) -> PreFlightResult:
-    """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT. `sql` is that
-    select's own text, used for messages only. A top-level SELECT and a set-operation
-    arm are analyzed identically; there is no longer a rewrite for one to be eligible for.
+    """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT, read entirely off the tree.
+    A top-level SELECT and a set-operation arm are analyzed identically; there is no longer a
+    rewrite for one to be eligible for, and no statement text for either to carry.
 
     `ctx` supplies the shared cardinality/column indices (ACE-045); `tree` is always the
     caller's own SELECT (a set-op arm ≠ `ctx.tree`), so only the indices come from `ctx`."""
@@ -1087,7 +1089,7 @@ def _preflight_select(tree: "exp.Select", org: Datasource, sql: str,
     # No structural (join) trap. Now the SEMANTIC checks the fan/chasm detector is
     # blind to (scorecard #4): aggregation-class violations (#2) and semi-additive
     # rollups over time (#3) — these need NO join, so cardinality analysis can't see them.
-    semantic = _check_aggregation_semantics(tree, org, tables_in_scope, sql, ctx=ctx)
+    semantic = _check_aggregation_semantics(tree, org, tables_in_scope, ctx=ctx)
     if semantic is not None:
         return semantic
 
@@ -1181,7 +1183,7 @@ def _groups_by_time(tree: "exp.Select", scope: dict[str, str],
 
 
 def _check_aggregation_semantics(
-    tree: "exp.Select", org: Datasource, scope: dict[str, str], sql: str,
+    tree: "exp.Select", org: Datasource, scope: dict[str, str],
     ctx: "GuardContext | None" = None,
 ) -> Optional[PreFlightResult]:
     colidx = ctx.column_index if ctx is not None else _column_index(org)

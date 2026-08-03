@@ -313,35 +313,29 @@ def test_no_shipped_prose_promises_a_rewrite():
 # --- SC-4: nothing re-serialises a parsed statement onto the execution path --
 
 
-def test_no_parsed_statement_is_re_serialised_onto_the_execution_path():
+def test_nothing_re_serialises_a_parsed_statement():
     """`.sql()` regenerates a statement from a parsed tree. Doing that anywhere a statement can
     reach the driver is what made byte-identity unassertable, whether or not the regeneration
     changed anything meaningful.
 
-    One call survives, and it is allowlisted by LOCATION rather than by count so that a second one
-    appearing in the same function still fails. `pre_flight_check` walks each arm of a set operation
-    and passes `arm.sql()` down as the arm's own text — it reaches a `reason` string and nothing
-    else, and the statement `pre_flight_check` returns is always the caller's own.
+    There is NO allowlist, which is the strong form of the claim and it took one more deletion to
+    earn. `pre_flight_check` walked each arm of a set operation and handed `arm.sql()` down to
+    become that arm's `original_sql`; with the field gone the parameter had no reader, so the
+    re-serialisation was pure waste and went too. The analysis reads trees.
+
+    Scanned at module level as well as inside functions: a re-serialiser hoisted to a module
+    constant would reach the driver the same way one inside a function does. Calls WITH arguments
+    (`.sql(dialect=...)`) count too — a dialect-qualified regeneration is still a regeneration.
     """
-    allowed = {("runtime.py", "pre_flight_check")}
     offenders: list[str] = []
 
     for path in _python_sources():
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for inner in ast.walk(node):
-                if (isinstance(inner, ast.Call)
-                        and isinstance(inner.func, ast.Attribute)
-                        and inner.func.attr == "sql"
-                        and not inner.args):
-                    if (path.name, node.name) in allowed:
-                        continue
-                    offenders.append(
-                        f"{path.relative_to(REPO_ROOT)}:{inner.lineno}: "
-                        f"re-serialisation inside {node.name}()"
-                    )
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "sql"):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
     assert not offenders, f"a parsed statement is re-serialised: {offenders}"
 
 
