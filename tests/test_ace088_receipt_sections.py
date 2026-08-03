@@ -213,6 +213,33 @@ def test_a_cte_that_shadows_a_declared_table_is_not_declared(org):
     assert items[0]["filters"] == []
 
 
+def test_a_reference_a_shadowing_cte_zeroed_is_counted_rather_than_called_complete(org):
+    """The CTE subtraction is statement-GLOBAL, so a WITH-bound name collides with every reference
+    to the declared table of that name — including a genuine read of the real table.
+
+    The statement below reads `public.orders` for real and applies none of its declared filters, and
+    the subtraction hands that reference `filters: []` anyway. `[]` is the same list a table
+    declaring nothing gets, so the item cannot say which of the two happened, and the marker used to
+    go null beside it: a real read of a declared table, no accounting at all, under the positive
+    claim that nothing is missing. The fixed sentence this section shipped before covered both
+    meanings of `[]`; nothing does now except the marker.
+
+    Scope-aware CTE resolution is what would let the item answer properly, and it is not this
+    section's to build. What is fixed here is the marker: the accounting for such a reference is
+    genuinely undetermined, so it is counted and said out loud. `declared` and `filters` are asserted
+    unchanged beside it, because the counting is not licence to restate the item.
+    """
+    shadowing = "WITH orders AS (SELECT 1 AS id) SELECT count(*) FROM public.orders"
+    section = rt.assemble_receipt(org, shadowing)["tables"]
+
+    assert [i["ref"] for i in section["items"]] == ["public.orders"]
+    assert section["items"][0]["declared"] is False
+    assert section["items"][0]["filters"] == []
+    assert section["undetermined"] == (
+        "1 of the listed reference(s) could not be resolved to a model table."
+    )
+
+
 def test_tables_section_carries_the_models_row_estimate_not_a_count(org):
     orders = next(i for i in _sections(org, freshness="hourly")["tables"]["items"]
                   if i["qname"] == "public.orders")
@@ -241,8 +268,8 @@ def test_tables_section_accounts_each_reference_against_its_declared_filters(org
         {"expr": "o.customer_id IS NOT NULL", "status": "undetermined"}]
     assert by_ref["customers"]["filters"] == []
     assert section["undetermined"] == (
-        "1 of the listed reference(s) could not be accounted for against the model's declared "
-        "filters."
+        "1 of the listed reference(s) have at least one declared filter that could not be "
+        "accounted for."
     )
 
 
@@ -265,11 +292,19 @@ def test_the_tables_marker_is_null_once_every_listed_reference_is_accounted_for(
     assert nothing_declared["undetermined"] is None
 
 
-def test_the_tables_marker_counts_a_reference_only_when_nothing_about_it_was_settled(tmp_path):
-    """A reference with one filter settled and one not is PARTLY established, the item says which
-    is which, and the marker does not count it. Counting it would report the same reference twice —
-    once accurately on the item, once under a sentence reading as though nothing about it was
-    established — which is the double-reporting the per-item list exists to make unnecessary.
+def test_the_tables_marker_counts_a_reference_with_any_filter_left_unaccounted_for(tmp_path):
+    """A reference with one filter settled and one not is PARTLY established, and the marker counts
+    it. This is a deliberate reversal: the rule used to be that EVERY one of a reference's filters
+    had to come back `undetermined` before the marker noticed it, on the argument that counting a
+    partly-settled reference would report it twice.
+
+    That argument conflates listing with counting. The marker is a bare count and names nothing —
+    the same reason the cap clause is allowed to sit beside it — so it cannot report a reference at
+    all, twice or once. What it can do is decide the section's state, and the receipt's four states
+    are explicit: items set with a NULL marker is the positive claim "established, here it is", and
+    items set with a marker is "partly established, and here is what is missing". A receipt with an
+    unaccounted-for declared filter is the second, and it used to report as the first, so a surface
+    drawing its incomplete flag from a non-null marker drew nothing.
 
     The statement below applies `is_deleted = false` verbatim and mentions `customer_id` only in
     the join it cannot be read out of, so the two filters land on opposite verdicts.
@@ -283,7 +318,10 @@ def test_the_tables_marker_counts_a_reference_only_when_nothing_about_it_was_set
     orders = next(i for i in sections["tables"]["items"] if i["ref"] == "orders")
 
     assert [f["status"] for f in orders["filters"]] == ["applied", "undetermined"]
-    assert sections["tables"]["undetermined"] is None
+    assert sections["tables"]["undetermined"] == (
+        "1 of the listed reference(s) have at least one declared filter that could not be "
+        "accounted for."
+    )
 
 
 def test_the_tables_section_names_the_query_scope_each_reference_was_written_in(org):

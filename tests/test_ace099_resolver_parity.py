@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("pydantic")
 pytest.importorskip("sqlglot")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +35,7 @@ if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
 import sqlglot  # noqa: E402
+from semantic_model import models as m  # noqa: E402
 from semantic_model import runtime as rt  # noqa: E402
 from sqlglot import expressions as exp  # noqa: E402
 
@@ -102,6 +104,85 @@ def test_the_derivation_is_per_output_select_and_never_per_tree():
     # And the whole-tree map is genuinely the union of the two, so the assertion above is a real
     # distinction rather than two spellings of the same thing.
     assert rt._alias_map(tree) == {"orders": "orders", "payments": "payments"}
+
+
+# --- and the same property asserted of the two CALLERS -----------------------
+#
+# The test above says the function respects its argument, which is true of any function: hand
+# `_alias_map` an arm and it maps that arm. It cannot fail if a caller stops handing it an arm, and
+# that is where the risk this file's docstring names actually lives. Both mutations below passed the
+# entire suite before these two tests existed:
+#
+#   * `_projected_sensitive`'s `_alias_map(sel)` -> `_alias_map(sel.root())`
+#   * `_preflight_select`'s  `_alias_map(tree)` -> `_alias_map(tree.root())`
+#
+# So each caller gets one behavioural test, on a UNION whose arms bind DIFFERENT aliases: with the
+# map derived per arm the answer is empty, and with one hoisted map each arm resolves a qualifier
+# the other arm bound and the answer is not.
+
+
+def _two_arm_org() -> "m.Datasource":
+    """One sensitive column and one one-to-many, the two facts the callers below turn into findings.
+
+    Deliberately arranged so NEITHER fires per arm: `people.ssn` is sensitive but no arm both binds
+    `people` and projects `ssn`, and `orders` is the ONE side of a one-to-many but no arm has both
+    ends of that join in scope. Every finding either statement can produce is therefore a finding
+    produced by cross-arm resolution.
+    """
+    tables = [
+        m.Table(name="orders", schema="public", storage_connection="c", grain=["id"],
+                description="orders",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="amount", type="decimal")]),
+        m.Table(name="line_items", schema="public", storage_connection="c", grain=["id"],
+                description="line items",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="order_id", type="integer"),
+                         m.Column(name="qty", type="integer")]),
+        m.Table(name="people", schema="public", storage_connection="c", grain=["id"],
+                description="people",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="ssn", type="string", sensitive=True)]),
+    ]
+    return m.Datasource(
+        datasource="Shop",
+        subject_areas=[m.SubjectArea(
+            name="sales",
+            tables_defined=tables,
+            relationships=[m.Relationship(
+                from_table="orders", from_column="id",
+                to_table="line_items", to_column="order_id",
+                relationship="one_to_many")],
+        )],
+    )
+
+
+def test_the_sensitive_projection_caller_reads_one_arms_qualifier_in_that_arm_only():
+    """Arm 1 projects `s.ssn` and binds no `s`; arm 2 binds `s` to `people` and projects `id`.
+
+    Neither arm projects a sensitive column, so the honest answer is nothing. Resolve `s` through a
+    whole-tree map and arm 1's `s.ssn` becomes `people.ssn` — a raw projection of a sensitive column
+    reported against a statement whose arm reads `orders` and returns one column of it. The receipt
+    would carry `sensitive: true` on a column the answer never contained.
+    """
+    sql = "SELECT s.ssn FROM orders o UNION SELECT id FROM people s"
+    assert rt.projected_sensitive_columns(sql, _two_arm_org()) == []
+
+
+def test_the_fan_chasm_caller_reads_one_arms_tables_in_that_arm_only():
+    """Arm 1 aggregates `orders`, arm 2 aggregates `line_items`, and neither joins the other.
+
+    A fan trap is an aggregate on the ONE side of a one-to-many that is IN SCOPE, so with each arm
+    scoped to its own tables there is no fan trap in either. Flatten the two arms into one map and
+    arm 1 aggregates `orders` "across a join to" `line_items` it never joined — a correctness
+    finding about a join no arm of the statement makes.
+    """
+    sql = ("SELECT SUM(o.amount) FROM orders o "
+           "UNION SELECT SUM(li.qty) FROM line_items li")
+    result = rt.pre_flight_check(sql, _two_arm_org())
+    # Both halves: `unchecked` is what says the analysis RAN, since an empty `findings` is also what
+    # an unparseable statement returns and an assertion on findings alone would pass for it.
+    assert (result.findings, result.unchecked) == ([], None)
 
 
 def _scopes(sql: str) -> dict[str, str]:

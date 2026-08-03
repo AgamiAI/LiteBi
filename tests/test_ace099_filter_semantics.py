@@ -78,6 +78,11 @@ DECLARED = {
     # Not SQL at all. `default_filters` is free text on the model and nothing validates it, so an
     # unparseable one is a thing that happens and it must degrade rather than raise.
     "ledger": ["{alias}. ) not sql (("],
+    # A declaration that binds NO alias. The format permits it — `docs/format-spec.md` writes
+    # `t.deleted_at IS NULL` and the validator's own fixtures write `"t.ghost IS NULL"` — and it is
+    # the shape that separates "the alias is unsafe" from "the alias is irrelevant": nothing about
+    # the reference is interpolated into this text, so no alias can have corrupted it.
+    "shipments": ["is_archived = false"],
     # Declared, with nothing declared about its rows.
     "customers": [],
 }
@@ -89,6 +94,7 @@ COLUMNS = {
     "visits": {"id": "integer", "status": "string"},
     "events": {"id": "integer", "occurred_at": "timestamp"},
     "ledger": {"id": "integer", "amount": "decimal"},
+    "shipments": {"id": "integer", "is_archived": "boolean"},
     "customers": {"id": "integer"},
 }
 
@@ -401,6 +407,25 @@ def test_an_alias_that_does_not_survive_re_parsing_is_never_compared():
     assert _only(written, "orders")[1] == "undetermined"
 
 
+def test_a_declaration_that_binds_no_alias_is_compared_however_the_alias_is_written():
+    """The other side of that guard, and the side it over-fired on.
+
+    An unsafe alias is only a hazard for a declaration that INTERPOLATES it. `shipments` declares
+    `is_archived = false` with no `{alias}` in it, so the text compared is the model author's own
+    from end to end and the alias below never reaches it — refusing to compare there reports
+    `undetermined` about a filter we can read perfectly well, which is a knowable false
+    `undetermined` on the one marker a surface uses to decide whether anything is missing.
+
+    Both verdicts, because "it did not return `undetermined`" is not the same as "it read the
+    statement": the first statement writes the declared predicate and the second writes no predicate
+    at all, so a comparison that genuinely ran has to separate them.
+    """
+    applied = 'SELECT id FROM shipments AS "is_archived--" WHERE is_archived = false'
+    assert _only(applied, "shipments") == ("is_archived = false", "applied")
+    omitted = 'SELECT id FROM shipments AS "is_archived--"'
+    assert _only(omitted, "shipments") == ("is_archived = false", "omitted")
+
+
 # --- a wide statement is still a receipt, and still a cheap one -------------
 
 
@@ -466,13 +491,11 @@ def test_handing_in_an_already_walked_reference_list_gives_the_same_answer():
     assert walked == handed
 
 
-def test_the_determination_is_reachable_the_way_the_other_checks_are():
-    """A module-level entry point on `runtime`, exactly like `check_table_scope` and
-    `check_column_scope`, which is how `execute_sql` and the receipt reach all of them. Named
-    rather than assumed, because a later extension of this symbol is the point of it existing."""
-    assert callable(rt.check_declared_filters)
-    for sibling in ("check_table_scope", "check_column_scope"):
-        assert callable(getattr(rt, sibling))
+# `test_the_determination_is_reachable_the_way_the_other_checks_are` stood here and is gone. It
+# asserted `callable(rt.check_declared_filters)` and survived deleting the determination outright,
+# because every other test in this file imports the symbol and CALLS it — so the reachability it
+# claimed to pin was already pinned by every assertion above, and what it added was a green test
+# that could not go red. Do not re-add a test whose subject is that a name exists.
 
 
 # --- and a refusal is told none of it ---------------------------------------
@@ -504,5 +527,5 @@ def test_a_refusal_receipt_carries_no_declared_filter_at_all():
     for declared in (d for filters in DECLARED.values() for d in filters):
         assert declared.replace("{alias}", "") not in body
     # And the columns those filters name, which is the half a caller could act on.
-    for column in ("is_deleted", "status", "occurred_at", "amount"):
+    for column in ("is_deleted", "status", "occurred_at", "amount", "is_archived"):
         assert column not in body

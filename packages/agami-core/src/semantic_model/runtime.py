@@ -1677,9 +1677,12 @@ def assemble_receipt(
     sites = _reference_sites(tree)
     dropped_refs = max(0, len(sites) - _RECEIPT_MAX_REFS)
     # How many of the LISTED references the accounting could not settle, for the marker below. A
-    # reference counts here only when it has declared filters and every one of them came back
-    # `undetermined`; see the marker for why a partial answer is not counted.
+    # reference counts here when it has declared filters and ANY one of them came back
+    # `undetermined`; see the marker for why one unsettled filter is enough.
     unaccounted_refs = 0
+    # And how many could not be resolved to a model table at all, which is a different failure and
+    # gets its own clause. See where it is incremented for the shape that produces it.
+    unresolved_refs = 0
     # The determination is computed for the references that SURVIVE the cap and no others: a filter
     # verdict about a reference this section does not list has no item to land on, and the walk is
     # per-reference work we would be paying for to throw away.
@@ -1736,8 +1739,23 @@ def assemble_receipt(
         })
         # Counted from the same list that was just written onto the item, so the marker below cannot
         # disagree with what a reader sees beside it.
-        if ref_filters and all(f["status"] == "undetermined" for f in ref_filters):
+        if ref_filters and any(f["status"] == "undetermined" for f in ref_filters):
             unaccounted_refs += 1
+        # A name bound by a WITH suppresses the model row for EVERY reference to that bare name in
+        # the statement, because the subtraction both `_declared_table` and `check_declared_filters`
+        # perform is statement-global rather than scope-aware. So
+        # `WITH orders AS (…) SELECT … FROM public.orders` reads the real table, applies none of its
+        # declared filters, and is handed `filters: []` — the same empty list a table declaring no
+        # filters gets. The item cannot tell those two apart, and the fixed sentence that used to
+        # cover both meanings of `[]` is gone, so without this the section would report a genuine
+        # unfiltered read of a declared table under a marker claiming nothing is missing.
+        #
+        # Resolving the reference by SCOPE is the real answer and is more than this section is
+        # allowed to build. Counting is what is affordable, and it errs the safe way: a genuine read
+        # of the CTE in the same statement is counted too, which overstates what was not established
+        # rather than understating it.
+        if _tkey(r.bare) in cte_names and _tkey(r.bare) in tidx:
+            unresolved_refs += 1
 
     # The four analyses that used to refuse, run on the tree THIS function already parsed rather
     # than on a second parse of the same statement — `_collect_findings` takes a tree for exactly
@@ -1778,19 +1796,29 @@ def assemble_receipt(
             # moment `filters` landed on the items — and a report shipped underneath a marker
             # denying the report exists is the one way this section could contradict itself.
             #
-            # What remains is composed from what THIS statement left unestablished, in at most two
-            # clauses. Both are COUNTS of the caller's OWN references and neither names anything, so
-            # stating either discloses nothing: it hands back a number the caller's statement
-            # produced. Naming a model table here would be worse than useless — an unresolved
-            # reference has no model name to give, and a resolved one is already listed above.
+            # What remains is composed from what THIS statement left unestablished, in at most three
+            # clauses. All three are COUNTS of the caller's OWN references and none names anything,
+            # so stating any of them discloses nothing: each hands back a number the caller's
+            # statement produced. Naming a model table here would be worse than useless — an
+            # unresolved reference has no model name to give, and a resolved one is already listed
+            # above.
             #
-            # A reference counts as unaccounted only when EVERY one of its declared filters came
-            # back `undetermined`. One applied and one undetermined is partly established, the item
-            # says exactly which is which, and repeating it here would report the same reference
-            # twice under a sentence that reads as though nothing about it was settled.
+            # A reference counts as unaccounted when ANY one of its declared filters came back
+            # `undetermined`, and that is a deliberate reversal of the rule this clause shipped
+            # with. Requiring EVERY filter to be unsettled was argued from double-reporting: the
+            # item already says which filter is which, so counting a partly-settled reference would
+            # say it twice. But this marker is a bare count that names nothing — the same property
+            # that lets the cap clause stand beside it — so it cannot report a reference at all. It
+            # reports the SECTION's state, and by the four-state contract a section with items and a
+            # null marker is the positive claim "established, here it is". A receipt carrying a
+            # declared filter nobody could account for is "partly established", and it used to
+            # report as the first, so a surface drawing its incomplete flag from a non-null marker
+            # drew nothing.
             "undetermined": " ".join(clause for clause in (
-                (f"{unaccounted_refs} of the listed reference(s) could not be accounted for "
-                 "against the model's declared filters." if unaccounted_refs else ""),
+                (f"{unaccounted_refs} of the listed reference(s) have at least one declared filter "
+                 "that could not be accounted for." if unaccounted_refs else ""),
+                (f"{unresolved_refs} of the listed reference(s) could not be resolved to a model "
+                 "table." if unresolved_refs else ""),
                 # The cap clause is unchanged in wording and behaviour: the overflow is COUNTED,
                 # never listed, the same device the refusal receipt uses.
                 (f"{dropped_refs} further reference(s) are not listed." if dropped_refs else ""),
@@ -2564,7 +2592,14 @@ def _declared_filter_status(
     # wrote and report `applied` for a statement that applied nothing. That is the one direction this
     # determination must never fail in, so an alias that is not a plain identifier is not compared at
     # all. The declared text still rides on the entry: the status is what we lost, not the filter.
-    if _PLAIN_IDENTIFIER.fullmatch(safe) is None:
+    #
+    # Conditional on the declaration actually CONTAINING `{alias}`, because a declaration that binds
+    # nothing cannot have been corrupted by what it did not bind. An already-qualified filter
+    # (`t.deleted_at IS NULL`, the form `docs/format-spec.md` writes) and an unqualified one are both
+    # legal, and for either of them `bound` is the model author's own text end to end — the alias
+    # never appears in it, however it is spelled. Refusing to compare there is a knowable false
+    # `undetermined`, and false `undetermined`s are what the section's marker is counted from.
+    if "{alias}" in declared and _PLAIN_IDENTIFIER.fullmatch(safe) is None:
         return entry
     # A surviving bind marker means the predicate is incomplete — whatever the executor would have
     # bound decides what it selects, and comparing the unbound text would compare a different
