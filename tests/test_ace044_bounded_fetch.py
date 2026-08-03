@@ -21,14 +21,6 @@ import execute_sql  # noqa: E402
 import guardrail  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def _reset_override():
-    # _max_rows_override is a request-scoped ContextVar (ACE-028); isolate every test from it.
-    execute_sql._max_rows_override.set(None)
-    yield
-    execute_sql._max_rows_override.set(None)
-
-
 class _FakeCur:
     """A cursor that would return `nrows` rows; records how the sink pulls them."""
 
@@ -120,15 +112,16 @@ def test_sink_empty_result_writes_header_only_no_flag(monkeypatch, capsys):
     assert out.err.strip() == ""  # no rows → no truncation flag
 
 
-def test_effective_cap_is_min_of_env_and_per_call(monkeypatch):
+def test_the_cap_comes_from_the_deployment_env_alone(monkeypatch):
+    """The per-call half of this test went with `--max-rows` (ACE-087). What it asserted — that a
+    caller could lower the cap for one call — is no longer a behaviour: the one thing a caller might
+    know better than the operator is that it wants MORE rows, which a lowering-only override could
+    never express. The env assertions below are ACE-038's and are unchanged."""
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "1000")
     assert execute_sql._resolve_row_cap() == 1000  # env only
-    execute_sql._max_rows_override.set(50)
-    assert execute_sql._resolve_row_cap() == 50  # per-call is smaller → wins
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "20")
-    assert execute_sql._resolve_row_cap() == 20  # env smaller than per-call → wins
+    assert execute_sql._resolve_row_cap() == 20
     monkeypatch.delenv("AGAMI_SQL_MAX_ROWS", raising=False)
-    execute_sql._max_rows_override.set(None)
     assert execute_sql._resolve_row_cap() == 1000  # missing env → default
     # The env is the operator's DEPLOYMENT cap, not a hard 1000 ceiling — it may raise the default.
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "5000")
@@ -290,7 +283,12 @@ def test_executor_truncated_parses_the_stderr_flag():
     assert tools._executor_truncated('{"truncated": not json}') is False  # a `{` line that won't parse
 
 
-def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
+def test_the_fork_command_carries_no_per_call_cap(monkeypatch):
+    """The inverse of the assertion this replaces (ACE-087).
+
+    It used to pin that a caller's `max_rows` reached the child as `--max-rows N`. Both ends of that
+    are gone: the tool takes no such argument and the child's argparser has no such flag, so a
+    parent that still appended one would make every forked call die on an unrecognized argument."""
     import tools
 
     captured: dict = {}
@@ -298,7 +296,7 @@ def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
     class FakeProc:
         returncode = 0
         stdout = "n\n0\n1\n"
-        stderr = '{"truncated": {"row_cap": 2}}'
+        stderr = ""
 
     def fake_run(cmd, **kw):
         captured["cmd"] = cmd
@@ -306,15 +304,14 @@ def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "_resolve_units", lambda *a: {})
-    # There is no model behind this fake fork, and this test is about the row cap, so the receipt
-    # builder is stubbed out. It may not return `None` (ACE-088 SC-5 — a receipt that could not be
-    # built is an `undetermined` receipt, not an absence).
+    # There is no model behind this fake fork, so the receipt builder is stubbed. It may not return
+    # `None` (ACE-088 SC-5 — a receipt that could not be built is an `undetermined` receipt, not an
+    # absence).
     monkeypatch.setattr(
         tools, "_resolve_receipt",
         lambda *a, **kw: guardrail.undetermined_receipt("stubbed by the test"),
     )
 
-    resp = json.loads(tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme", "max_rows": 2}))
-    cmd = captured["cmd"]
-    assert "--max-rows" in cmd and cmd[cmd.index("--max-rows") + 1] == "2"  # capped at the source
-    assert resp["truncated"] is True  # executor's flag surfaced into the response
+    tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme"})
+
+    assert "--max-rows" not in captured["cmd"]

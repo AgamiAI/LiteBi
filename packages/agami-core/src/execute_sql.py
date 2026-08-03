@@ -1268,13 +1268,7 @@ def _run_duckdb(creds: dict[str, str], sql: str) -> ExecResult:
     return result
 
 
-_DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation
-# Per-call cap from --max-rows (ACE-044). A ContextVar, not a plain global, so it is REQUEST-SCOPED
-# once the HTTP server runs execution in-process (ACE-028): concurrent handlers run in worker threads
-# (`run_blocking` copies the context per call, like `_current_org_ctx`), so each request's cap is
-# isolated and can't stomp another's. In the subprocess/CLI (one process, one thread) it behaves
-# exactly as the old module global did.
-_max_rows_override: ContextVar[int | None] = ContextVar("_max_rows_override", default=None)
+_DEFAULT_MAX_ROWS = 1000  # rows a result may hold before the transfer bound refuses it
 
 # The raw driver text of the failure this call classified, for the audit row only (ACE-039). A
 # ContextVar for the same reason as the cap above: request-scoped, so concurrent in-process handlers
@@ -1317,15 +1311,18 @@ _guard_shape: ContextVar[str | None] = ContextVar("_guard_shape", default=None)
 def _resolve_row_cap() -> int:
     """Effective result-row cap. `AGAMI_SQL_MAX_ROWS` is the operator-configurable DEPLOYMENT cap
     (default 1000 when unset) — an operator owns their availability tradeoff and may set it higher OR
-    lower than 1000; it is NOT a hard 1000 ceiling. A per-call `--max-rows` can only LOWER it for a
-    single call (cap = min(env, --max-rows)). A missing/invalid/zero env value falls back to 1000."""
+    lower than 1000; it is NOT a hard 1000 ceiling. A missing/invalid/zero env value falls back to
+    1000.
+
+    The operator is the only voice here. A per-call override used to be able to lower it, and it went
+    with the trim (ACE-087): the one thing a caller might know better than the deployment — that it
+    wants MORE rows — is the thing a lowering-only override structurally could not express, and a
+    caller that wants 200 rows says so in the statement, where the intent is legible to everything
+    downstream."""
     raw = os.environ.get("AGAMI_SQL_MAX_ROWS", "").strip()
     cap = int(raw) if raw.isdigit() else _DEFAULT_MAX_ROWS
     if cap <= 0:
         cap = _DEFAULT_MAX_ROWS  # "0" / "00" → the default, never an empty result
-    override = _max_rows_override.get()
-    if override is not None and override > 0:
-        cap = min(cap, override)
     return cap
 
 
@@ -2142,9 +2139,14 @@ def _execute_bounded(
     which ``tools._run_in_process`` nets one layer up, and swallowing it in a worker thread would
     turn that fail-closed answer into a silent hang until the bound expired.
 
-    The call runs inside a copy of the CALLER's context. A new thread starts with an empty one, so
-    without this the request-scoped ``_max_rows_override`` would read as unset inside the worker and
-    every in-process call would silently fall back to the deployment default.
+    The call runs inside a copy of the CALLER's context, and what that is FOR changed when the
+    per-call row cap went (ACE-087). It used to carry ``_max_rows_override`` to ``_resolve_row_cap``
+    inside the worker; the cap is the deployment's environment now and needs no carrier. What it
+    still carries is the *caller's* request scope — ``tools._current_org_ctx``, the resolve-once
+    request cache, the actor and session on the served path — into the one place a consumer's own
+    code runs. That is the point of the ``Executor`` seam: a pooled / per-user-RBAC executor picks
+    its connection from exactly that context, and a new thread starts with an empty one, so dropping
+    the copy would hand every injected executor a blank request to serve.
     """
     global _abandoned_workers
 
@@ -2245,8 +2247,8 @@ def execute_guarded(
 
     ``_load_credentials`` sits INSIDE the try deliberately, so a bad profile / missing DSN becomes a
     ``failed``/``dsn`` Envelope carrying its detailed message rather than escaping as an exception
-    the two callers would each have to translate. The row cap rides the request-scoped
-    ``_max_rows_override`` ContextVar the caller sets."""
+    the two callers would each have to translate. The row cap is the deployment's alone
+    (``AGAMI_SQL_MAX_ROWS``); no caller can lower it for one call."""
     # Clear before anything can set it, so a detail from a PREVIOUS call in this context can never
     # be attributed to this one. The recorder reads it unconditionally; a stale value would put the
     # wrong error text on a row that succeeded.
@@ -2391,15 +2393,7 @@ def main() -> int:
                    help="Subject area for the semantic-model safety pass (pre-flight + scope + PII).")
     p.add_argument("--no-safety", action="store_true",
                    help="Skip the semantic-model safety pass.")
-    p.add_argument("--max-rows", type=int, default=None,
-                   help="Lower the row cap for this call (never raises it). Effective cap = "
-                        "min(this, AGAMI_SQL_MAX_ROWS) — the env is the deployment cap, default 1000.")
     args = p.parse_args()
-
-    # Per-call cap (ACE-044); the sink reads it via _resolve_row_cap. No token/reset kept: main() is
-    # the one-shot subprocess/CLI entry (one process, one thread), so there's no sibling request to
-    # isolate from — unlike the in-process server path, which resets the token in tools._run_in_process.
-    _max_rows_override.set(args.max_rows)
 
     # Silence the raw-detail logger for the whole CLI/child lifetime. Without this it falls through
     # to `logging.lastResort`, which writes to stderr — and the parent relays the child's stderr into

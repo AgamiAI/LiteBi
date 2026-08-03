@@ -67,13 +67,14 @@ _TINY = 0.05
 
 
 @pytest.fixture(autouse=True)
-def _reset_row_cap():
-    # The row cap is a request-scoped ContextVar; isolate every test from it. It matters more than it
-    # used to because the outer bound copies the caller's whole context into its worker, so a cap
-    # left set by one test is now visible to the next test's executor as well.
-    execute_sql._max_rows_override.set(None)
+def _reset_carriers():
+    # `_guard_shape` is request-scoped; isolate every test from it. It matters more than it looks,
+    # because the outer bound copies the caller's whole context into its worker, so a value left set
+    # by one test is visible to the next test's executor as well. (The row cap used to need the same
+    # treatment; it is the deployment's env var alone now — ACE-087.)
+    execute_sql._guard_shape.set(None)
     yield
-    execute_sql._max_rows_override.set(None)
+    execute_sql._guard_shape.set(None)
 
 
 @pytest.fixture(autouse=True)
@@ -216,7 +217,7 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # cleared at entry beside `_guard_model`. It is read only to choose the WORDING of a refusal
     # that has already been decided — never to compute a bound, and never before one is spent.
     context_vars -= {"_last_error_detail", "_guard_model", "_guard_shape"}
-    assert context_vars == {"_max_rows_override"}, (
+    assert context_vars == set(), (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"
     )
@@ -1134,29 +1135,26 @@ class _ContextProbeExecutor:
     def __init__(self) -> None:
         self.thread: threading.Thread | None = None
         self.seen_timeout: object = "not read"
-        self.seen_rows: object = "not read"
 
     def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> execute_sql.ExecResult:
         self.thread = threading.current_thread()
         self.seen_timeout = execute_sql._resolve_timeout_s()
-        self.seen_rows = execute_sql._max_rows_override.get()
         return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
 
 
-def test_the_request_scoped_row_cap_is_visible_inside_the_worker(warehouse, monkeypatch):
-    """A new thread starts with an EMPTY context, so without an explicit copy the caller's per-call
-    row cap would read as unset inside the worker and every in-process call would quietly fall back
-    to the deployment default — a bug with no symptom other than the wrong numbers.
+def test_the_executor_really_runs_off_thread_and_reads_the_same_budget(warehouse, monkeypatch):
+    """The budget rides the environment, which a new thread inherits for free, and it must resolve
+    to the same number inside the worker as outside it.
 
-    The budget is asserted alongside it for the opposite reason: it rides the environment, which a
-    new thread inherits for free, and the two must agree inside the worker as well as outside it.
+    The thread identity is asserted first, because it is what makes the rest mean anything: if the
+    call ever stopped running off-thread, the budget assertion would pass trivially.
 
-    The thread identity is asserted first, because it is what makes the rest of this test mean
-    anything: if the call ever stopped running off-thread, the ContextVar assertion would pass
-    trivially and the copy could be deleted with the suite still green.
+    This test used to also assert the per-call row cap reached the worker through `copy_context()`.
+    That cap is gone (ACE-087) and, with it, the last thing OF OURS that is read inside the worker.
+    The copy is still load-bearing and is witnessed by
+    `test_the_callers_request_context_reaches_the_executor` below, at the layer that performs it.
     """
     monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "7")
-    execute_sql._max_rows_override.set(5)
     probe = _ContextProbeExecutor()
 
     env = execute_sql.execute_guarded(
@@ -1166,7 +1164,32 @@ def test_the_request_scoped_row_cap_is_visible_inside_the_worker(warehouse, monk
     assert env.status == "ok"
     assert probe.thread is not threading.current_thread()  # it really ran on a worker
     assert probe.seen_timeout == 7
-    assert probe.seen_rows == 5
+
+
+def test_the_callers_request_context_reaches_the_executor(monkeypatch):
+    """`_execute_bounded` runs the executor on a worker thread, and a new thread starts with an
+    EMPTY context. The copy is what lets a consumer's injected executor — the pooled /
+    per-user-RBAC seam — pick its connection from the request it is actually serving.
+
+    Asserted on `_execute_bounded` directly rather than through `execute_guarded`, because the
+    chokepoint deliberately clears our own carriers on entry: any var set before calling it reads
+    as None inside by design, so the copy could be deleted with an end-to-end test still green.
+    """
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "30")
+    probe_var: ContextVar[str | None] = ContextVar("probe_request_scope", default=None)
+    probe_var.set("this-request")
+    seen: dict[str, object] = {}
+
+    class _Reader:
+        def execute(self, vetted_sql, creds, *, profile):
+            seen["thread"] = threading.current_thread()
+            seen["value"] = probe_var.get()
+            return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
+
+    execute_sql._execute_bounded(_Reader(), "SELECT 1", {}, profile="acme")
+
+    assert seen["thread"] is not threading.current_thread()  # it really ran off-thread
+    assert seen["value"] == "this-request"  # ...and still saw the caller's context
 
 
 # --------------------------------------------------------------------------------------------

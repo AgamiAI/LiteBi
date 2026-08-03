@@ -63,12 +63,10 @@ QUESTION = "how many orders"
 
 @pytest.fixture(autouse=True)
 def _isolate():
-    """`_INJECTED_EXECUTOR` is a process global and `_max_rows_override` a ContextVar; a test that
-    injects an executor (or that `create_app` injects one for) must not leak it into the next."""
-    execute_sql._max_rows_override.set(None)
+    """`_INJECTED_EXECUTOR` is a process global; a test that injects an executor (or that
+    `create_app` injects one for) must not leak it into the next."""
     tools.set_injected_executor(None)
     yield
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
 
 

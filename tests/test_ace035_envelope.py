@@ -57,15 +57,12 @@ class _SpyExecutor:
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
-    # `_max_rows_override` is a request-scoped ContextVar and `_INJECTED_EXECUTOR` a process global;
-    # isolate both, and make sure a stray inherited AGAMI_DB_URL can't flip a test onto the hosted
-    # branch.
-    execute_sql._max_rows_override.set(None)
+    # `_INJECTED_EXECUTOR` is a process global; isolate it, and make sure a stray inherited
+    # AGAMI_DB_URL can't flip a test onto the hosted branch.
     tools.set_injected_executor(None)
     monkeypatch.delenv("AGAMI_DB_URL", raising=False)
     monkeypatch.delenv("APP_DATABASE_URL", raising=False)
     yield
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
 
 

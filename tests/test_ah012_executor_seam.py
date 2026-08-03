@@ -42,11 +42,11 @@ def _refusal(rule: str = guardrail.RULE_TABLE_SCOPE) -> guardrail.Refusal:
 
 
 @pytest.fixture(autouse=True)
-def _reset_override():
-    # _max_rows_override is a request-scoped ContextVar (ACE-028); isolate every test from it.
-    execute_sql._max_rows_override.set(None)
+def _reset_shape():
+    # `_guard_shape` is request-scoped (it words a result-bound refusal); isolate every test from it.
+    execute_sql._guard_shape.set(None)
     yield
-    execute_sql._max_rows_override.set(None)
+    execute_sql._guard_shape.set(None)
 
 
 class _SpyExecutor:
@@ -482,7 +482,15 @@ def test_injected_executor_textualizes_null_as_empty_at_the_tool_edge(monkeypatc
     assert out["rows"] == [["1", ""]]  # int -> "1", NULL -> "" (never "None")
 
 
-def test_injected_executor_backstop_trims_to_max_rows(monkeypatch):
+def test_an_injected_executor_reporting_overflow_refuses_end_to_end(monkeypatch):
+    """Replaces `test_injected_executor_backstop_trims_to_max_rows` (ACE-087).
+
+    That test asserted the tool edge trimmed a too-large result from an injected executor to the
+    caller's `max_rows` and marked it truncated. Both halves are gone: there is no per-call cap to
+    trim to, and a result over the ceiling is refused rather than trimmed. What replaces it is the
+    same seam asserted for the new outcome, end to end through `tool_execute_sql` — an injected
+    executor never reaches `_collect_cursor`, so this is the path a chokepoint-side check exists
+    to cover."""
     import tools
 
     monkeypatch.setattr(tools, "resolve_profile", lambda ds: "acme")
@@ -493,15 +501,15 @@ def test_injected_executor_backstop_trims_to_max_rows(monkeypatch):
     )
     monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, None))
     fake = _SpyExecutor(
-        result=execute_sql.ExecResult(columns=["n"], rows=[(1,), (2,), (3,)], truncated=False)
+        result=execute_sql.ExecResult(columns=["n"], rows=[(1,), (2,), (3,)], truncated=True)
     )
     tools.set_injected_executor(fake)
 
-    out = json.loads(
-        tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme", "max_rows": 2})
-    )
+    out = json.loads(tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme"}))
 
-    assert out["rows"] == [["1"], ["2"]] and out["truncated"] is True
+    assert out["status"] == "refused"
+    assert out["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
+    assert "rows" not in out  # the rows the executor was holding do not reach the caller
 
 
 # --- main() (the subprocess CLI entry) translates the envelope's outcomes byte-identically --------

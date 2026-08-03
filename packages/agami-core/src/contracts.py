@@ -57,7 +57,6 @@ class ExecuteSqlRequest(_Contract):
     datasource: str | None = None
     area: str | None = None
     raw_query: str | None = None
-    max_rows: int | None = None
 
 
 # ---------------------------------------------------------------------------

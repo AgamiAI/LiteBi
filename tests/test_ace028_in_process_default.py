@@ -1,11 +1,13 @@
-"""ACE-028 — in-process execution is the HTTP server's default (no fork), and the per-call row cap is
-request-scoped so concurrent in-process queries can't stomp each other's cap.
+"""ACE-028 — in-process execution is the HTTP server's default (no fork), and per-request state is
+context-scoped so concurrent in-process queries can't stomp each other.
 
 Two things this pins:
   1. `default_adapters()` carries `BUILTIN_EXECUTOR`, so `create_app()` runs execution in-process; the
      stdio/CLI path (no injected executor) still forks.
-  2. `_max_rows_override` is a `ContextVar` — set in one context does not leak into another, which is
-     what makes it safe once concurrent requests share the server process.
+  2. Request-scoped state travels by `ContextVar` — set in one context does not leak into another,
+     which is what makes it safe once concurrent requests share the server process. Asserted below
+     on `_guard_shape`; it was asserted on `_max_rows_override` until that cap became the
+     deployment's environment alone (ACE-087), and the isolation property is unchanged.
 """
 
 from __future__ import annotations
@@ -29,57 +31,57 @@ import execute_sql  # noqa: E402
 def _reset_state():
     import tools
 
-    execute_sql._max_rows_override.set(None)
+    execute_sql._guard_shape.set(None)
     tools.set_injected_executor(None)
     yield
-    execute_sql._max_rows_override.set(None)
+    execute_sql._guard_shape.set(None)
     tools.set_injected_executor(None)
 
 
-# --- the row cap is request-scoped (ContextVar), not a shared global -----------------------------
+# --- request state is context-scoped (ContextVar), not a shared global ---------------------------
 
 
-def test_row_cap_is_isolated_per_context(monkeypatch):
-    # Two independent contexts set different caps; neither sees the other's. This is the property that
-    # makes in-process serving safe under concurrent requests (each runs in its own copied context).
-    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "1000")
-
-    def _cap_with_override(n: int | None) -> int:
-        execute_sql._max_rows_override.set(n)
-        return execute_sql._resolve_row_cap()
+def test_request_state_is_isolated_per_context():
+    # Two independent contexts set different values; neither sees the other's. This is the property
+    # that makes in-process serving safe under concurrent requests (each runs in its own copied
+    # context). Asserted on `_guard_shape`, which words a result-bound refusal — a value leaking in
+    # from another request would give this one advice for a statement nobody sent.
+    def _set_and_read(value: str) -> str | None:
+        execute_sql._guard_shape.set(value)
+        return execute_sql._guard_shape.get()
 
     ctx_a = contextvars.copy_context()
     ctx_b = contextvars.copy_context()
-    cap_a = ctx_a.run(_cap_with_override, 10)
-    cap_b = ctx_b.run(_cap_with_override, 500)
+    seen_a = ctx_a.run(_set_and_read, "listing")
+    seen_b = ctx_b.run(_set_and_read, "aggregate")
 
-    assert cap_a == 10 and cap_b == 500  # each context kept its own cap
-    assert execute_sql._max_rows_override.get() is None  # the outer context is untouched by either
+    assert seen_a == "listing" and seen_b == "aggregate"  # each context kept its own
+    assert execute_sql._guard_shape.get() is None  # the outer context is untouched by either
 
 
-def test_run_blocking_isolates_the_cap_across_worker_threads(monkeypatch):
+def test_run_blocking_isolates_request_state_across_worker_threads():
     # The real offload path: two `run_blocking` calls (worker threads, each a copied context) set
-    # different caps concurrently and must not see each other's. Guards the ACE-028 concurrency claim.
+    # different values concurrently and must not see each other's. Guards the ACE-028 concurrency
+    # claim.
     anyio = pytest.importorskip("anyio")
     from async_offload import run_blocking
 
-    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "1000")
-    seen: dict[str, int] = {}
+    seen: dict[str, str | None] = {}
 
-    def _work(key: str, cap: int):
-        execute_sql._max_rows_override.set(cap)
+    def _work(key: str, shape: str):
+        execute_sql._guard_shape.set(shape)
         # a tiny bit of work so the two overlap; the ContextVar must stay this call's value throughout
         for _ in range(1000):
             pass
-        seen[key] = execute_sql._resolve_row_cap()
+        seen[key] = execute_sql._guard_shape.get()
 
     async def _call():
         async with anyio.create_task_group() as tg:
-            tg.start_soon(run_blocking, _work, "a", 10)
-            tg.start_soon(run_blocking, _work, "b", 500)
+            tg.start_soon(run_blocking, _work, "a", "listing")
+            tg.start_soon(run_blocking, _work, "b", "aggregate")
 
     anyio.run(_call)
-    assert seen == {"a": 10, "b": 500}  # no cross-request stomp
+    assert seen == {"a": "listing", "b": "aggregate"}  # no cross-request stomp
 
 
 # --- the HTTP server defaults to in-process; stdio/CLI still forks --------------------------------
