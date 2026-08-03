@@ -12,6 +12,29 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **A `#` comment is no longer mistaken for the SQL it hides.** `SELECT a FROM t # DROP TABLE t`
+  came back as *"keyword 'DROP' is not allowed"*, and `... # note; more` as *"multiple statements
+  are not allowed"* — both refusals of valid MySQL, and both naming a fix that would not have
+  helped, because neither the `DROP` nor the second statement was ever going to run.
+
+  A `#` outside a string is now refused for what it actually is: a construct whose meaning depends
+  on the engine. It opens a comment in MySQL and MariaDB, and is an operator character in
+  PostgreSQL, so the same bytes are a comment on one and live SQL on another. The guard reads every
+  statement with one grammar and no engine, so it declines to pick a reading and says so —
+  the same call it already makes for a bare `--x`. Use `-- ` or `/* … */` instead.
+
+  This also refuses a PostgreSQL statement that uses `#` as an operator, which used to run. That is
+  the accepted cost of one grammar: the other direction would let a `;DROP` ride through inside
+  something the guard had decided to ignore.
+
+- **`SELECT *` is refused as undetermined, not as out of scope.** The refusal itself is unchanged
+  and every column must still be named. What changes is the reason it reports: a star is not a
+  reach outside your model, it is a projection the guard cannot resolve without the catalog, so it
+  cannot tell whether it reaches outside your model. Anything reading `reason` to route or count
+  refusals will see `undetermined` here now.
+
 ### Removed
 
 - **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
