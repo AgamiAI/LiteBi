@@ -134,30 +134,35 @@ def test_prepare_does_not_apply_default_filters(tmp_path):
     sql = "SELECT SUM(total) FROM orders"
     rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql", sql])
     d = json.loads(out)
-    assert rc == 0 and d["action"] == "allow"
+    assert rc == 0 and d["findings"] == []
     assert d["sql"] == sql
     assert "deleted_at" not in d["sql"]
     assert "applied_filters" not in d
 
 
-def test_prepare_refuses_the_fan_trap_it_used_to_rewrite(tmp_path):
+def test_prepare_reports_the_fan_trap_it_used_to_rewrite_then_refuse(tmp_path):
     """`sm prepare` is a second execution path, not a reporter: the query skill calls it on every
-    tier and runs whatever `sql` comes back. It used to answer a fan trap with a rewritten statement,
-    which meant the non-`execute_sql` tiers ran something the caller never wrote. It refuses now, and
-    the refusal is an exit code the caller cannot mistake for a statement to run.
+    tier and runs whatever `sql` comes back.
 
-    The echoed `sql` is the caller's own, byte for byte, on the refuse path too."""
+    Three behaviours, in order. It answered a fan trap with a REWRITTEN statement, so the
+    non-`execute_sql` tiers ran something the caller never wrote; ACE-093 deleted that and it
+    REFUSED; ACE-094 reports it and hands the statement back. The command is total now — this was
+    its last non-zero exit — because whether a multiplied total is wrong depends on the question,
+    and the tier running this has the question while this command does not.
+
+    The echoed `sql` is the caller's own, byte for byte."""
     _model(tmp_path)
     sql = "SELECT SUM(orders.total) FROM orders JOIN order_items ON order_items.order_id=orders.id"
     rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql", sql])
     d = json.loads(out)
 
-    assert rc == 1
-    assert d["action"] == "refuse" and d["risk"] == "fan_trap"
+    assert rc == 0
+    assert [f["risk"] for f in d["findings"]] == ["fan_trap"]
+    assert d["findings"][0]["triggering_joins"] == ["orders (1) <- order_items (N)"]
+    assert "suggestion" not in d["findings"][0]      # a way forward presumes intent
     assert d["sql"] == sql                            # echoed, not rewritten
     assert "order_items" in d["sql"]                  # the join is still there
     assert "deleted_at" not in d["sql"]               # and nothing injected (ACE-042)
-    assert d["suggestion"]                            # the caller gets a way forward
 
 
 def test_add_writes_metrics_and_skips_invalid(tmp_path):
@@ -456,14 +461,18 @@ def test_no_model_root_exits_3_cleanly(tmp_path):
     assert json.loads(out)["error"] == "no_model"
 
 
-def test_prepare_refuses_shape_changing_trap(tmp_path):
+def test_prepare_reports_the_mixed_raw_and_aggregate_trap(tmp_path):
+    """The mixed-shape case: raw columns beside the aggregate. It was refused for a different
+    reason than the aggregation-only one — no rewrite could preserve its shape — and both are
+    reported now, because the distinction was about what a rewrite could do and nothing rewrites."""
     _model(tmp_path)
     rc, out = _run(["prepare", str(tmp_path), "--area", "s", "--sql",
                     "SELECT orders.id, orders.deleted_at, SUM(orders.total) FROM orders "
                     "JOIN order_items ON order_items.order_id=orders.id "
                     "GROUP BY orders.id, orders.deleted_at"])
     d = json.loads(out)
-    assert rc == 1 and d["action"] == "refuse" and d["suggestion"]
+    assert rc == 0
+    assert [f["risk"] for f in d["findings"]] == ["fan_trap"]
 
 
 # --- sm wrapper ---

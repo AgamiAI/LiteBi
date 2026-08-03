@@ -100,20 +100,30 @@ def test_model_safety_refusal_short_circuits_before_the_executor(monkeypatch):
     assert spy.calls == []
 
 
-def test_unconverted_model_safety_branch_still_yields_a_refusal_envelope(monkeypatch):
-    # The four branches NOT converted in this slice still return a bare exit code after writing
-    # their own diagnostic to the server log. They must still produce an Envelope — that is the
-    # whole reason the interim `model_safety` rule exists — carrying a remediation that points at
-    # the log rather than inventing a rule the gate never chose.
-    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, 1))
+def test_every_model_safety_verdict_is_a_refusal_or_nothing(monkeypatch):
+    """`_model_safety` returns a `Refusal` or `None`, and there is no third thing.
+
+    It could return a bare exit code until ACE-094: two branches wrote their own diagnostic to
+    the server log and handed back `1` with no rule attached, and `execute_guarded` turned that
+    into an Envelope carrying the interim `model_safety` rule and a remediation pointing at a log
+    the caller could not read. Both branches are gone, so the int channel and the placeholder rule
+    went with them. This pins the narrowed type, which is what makes every refusal name the gate
+    that chose it.
+
+    The test it replaces was `test_unconverted_model_safety_branch_still_yields_a_refusal_envelope`.
+    """
+    import inspect
+
+    assert "int" not in str(inspect.signature(execute_sql._model_safety).return_annotation)
+
+    refusal = _refusal(guardrail.RULE_TABLE_SCOPE)
+    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, refusal))
     spy = _SpyExecutor()
 
     env = execute_sql.execute_guarded("SELECT 1", "acme", None, executor=spy)
 
     assert env.status == "refused"
-    assert env.refusal.rule == guardrail.RULE_MODEL_SAFETY
-    assert env.refusal.reason == "undetermined"
-    assert "server log" in env.refusal.remediation
+    assert env.refusal.rule == guardrail.RULE_TABLE_SCOPE  # the gate's own, never a stand-in
     assert spy.calls == []
 
 
@@ -421,10 +431,11 @@ def test_default_no_injected_executor_forks_the_subprocess(monkeypatch):
         # slice the in-process path collapsed every one of these to `{"kind": "permission"}`.
         (_refusal(guardrail.RULE_TABLE_SCOPE), guardrail.RULE_TABLE_SCOPE),
         (_refusal(guardrail.RULE_COLUMN_SCOPE), guardrail.RULE_COLUMN_SCOPE),
-        # An UNCONVERTED branch: still a bare exit code, so the interim rule is the honest answer.
-        (1, guardrail.RULE_MODEL_SAFETY),
+        # The third case was an UNCONVERTED branch handing back a bare exit code `1`, answered
+        # with the interim `model_safety` rule. ACE-094 deleted both branches that could return
+        # an int, so `_model_safety` returns a Refusal or nothing and there is no int to map.
     ],
-    ids=["table_scope", "column_scope", "unconverted_int"],
+    ids=["table_scope", "column_scope"],
 )
 def test_injected_executor_model_safety_refusal_carries_the_rule(
     monkeypatch, verdict, expected_rule

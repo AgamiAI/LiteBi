@@ -230,13 +230,23 @@ def test_joins_section_says_the_actual_predicate_was_not_read(org):
 # --- aggregates (ACE-060 owns the gap) --------------------------------------
 
 
-def test_aggregates_section_is_empty_but_declared(org):
-    """`SUM(amount)` is aggregated over a joined statement, exactly the shape a fan-out would
-    corrupt. Nothing checked it, and the section says so instead of looking clean."""
+def test_the_aggregates_section_carries_findings_and_still_states_its_limits(org):
+    """`SUM(amount)` over a joined statement is exactly the shape a fan-out corrupts, and the
+    section reports what the check found.
+
+    It was declared and EMPTY until ACE-094, with a marker saying the check did not happen —
+    ACE-088 built the container and left the content to a later slice. This is that slice, and the
+    marker changes with it: it now says the check ran and names what it still misses. Both halves
+    matter. Dropping the marker would claim a completeness the detector does not have, because an
+    aggregate inside a CTE is not reached at all; keeping the old one would have the section report
+    a finding under a sentence saying nothing was checked."""
     section = _sections(org)["aggregates"]
-    assert section["items"] == []
     assert section["undetermined"] == rt.UNDETERMINED_AGGREGATES
-    assert "is not checked" in section["undetermined"]
+    assert "is not checked" not in section["undetermined"]
+    assert "checked" in section["undetermined"]
+    # A CTE hides a trap from the walk, and the marker has to admit that rather than imply
+    # the section is complete.
+    assert "CTE" in section["undetermined"] or "subquery" in section["undetermined"]
 
 
 def test_no_marker_ships_an_internal_spec_id_to_a_user(org):

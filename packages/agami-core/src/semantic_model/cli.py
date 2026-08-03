@@ -208,8 +208,14 @@ def cmd_prepare(args) -> int:
     Because the caller RUNS what comes back, this command echoes the statement it was given and
     never a statement of ours. It used to answer an aggregation-only fan trap with a rewritten
     string plus a `rewritten: true` flag, which made every non-`execute_sql` tier execute something
-    the caller never wrote; that trap refuses now, and the only two outcomes are the caller's own
-    statement or a non-zero exit.
+    the caller never wrote.
+
+    **It is now total: exit 0, always.** It refused a fan or chasm trap until ACE-094, which was the
+    last non-zero exit here. Correctness is not a refusal — whether a multiplied total is a bug
+    depends on the question, and this command has the statement but not the question. So it reports
+    what it found and lets the caller, who has both, decide. `findings` is that report, and an empty
+    list means the checks ran and found nothing rather than that nothing ran; the receipt's
+    `aggregates` marker is where the limits of "found nothing" are stated.
 
     A table's declared `default_filters` are NOT applied here (ACE-042 deleted the injection)
     and are not yet reported (ACE-099 adds the report), so no `applied_filters` key is emitted.
@@ -219,19 +225,12 @@ def cmd_prepare(args) -> int:
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
-    pf = RT.pre_flight_check(sql, org)
-    if pf.risk and pf.action == "refuse":
-        _print_json({"action": "refuse", "risk": pf.risk, "reason": pf.reason,
-                     "suggestion": pf.suggestion, "sql": sql})
-        return 1
     _print_json({
-        "action": pf.action,
-        "risk": pf.risk,
         "sql": sql,
+        "findings": [f.as_dict() for f in RT.pre_flight_check(sql, org).findings],
         # {output_column: unit}, traced through the caller's own statement — feed straight to
         # `format-table --units` so summed/aliased currency formats correctly.
         "units": RT.resolve_result_units(org, sql),
-        "reason": pf.reason if pf.risk else None,
     })
     return 0
 
