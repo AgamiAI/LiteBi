@@ -35,7 +35,7 @@ from typing import Any
 
 import pytest
 from guardrail import RULE_READ_ONLY
-from sql_guard import _MAX_SQL_CHARS, _neutralize, check_read_only
+from sql_guard import _MAX_SQL_CHARS, _REMEDIATION, _neutralize, check_read_only
 
 # ---------------------------------------------------------------------------
 # Accept — valid single read-only statements
@@ -178,6 +178,57 @@ REJECT_COMMENT_IN_STRING = [
 @pytest.mark.parametrize("sql", REJECT_COMMENT_IN_STRING)
 def test_rejects_comment_in_string_bypass(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Comment-in-string bypass not caught: {sql!r}"
+
+
+REJECT_HASH_COMMENT = [
+    # `#` starts a line comment in MySQL/MariaDB and is an operator character in PostgreSQL
+    # (bit-string XOR, geometric intersection), so the same bytes are a comment on one engine
+    # and live SQL on another. This lexer has no dialect, so the form is refused rather than
+    # read one of the two ways — the same call the bare `--x` case makes.
+    "SELECT a FROM t # DROP TABLE t",       # comment body reads as DML on the non-comment engines
+    "SELECT a FROM t # note; more",         # comment body hides a statement separator
+    "SELECT a FROM t #no space",            # MySQL needs no space after `#`
+    "SELECT a FROM t # trailing note",      # inert on both readings, still ambiguous
+    "SELECT a # b FROM t",                  # the PostgreSQL operator reading — refused too
+    "SELECT a FROM t\n# DROP TABLE t",      # comment on its own line
+]
+
+
+@pytest.mark.parametrize("sql", REJECT_HASH_COMMENT)
+def test_rejects_hash_comment_as_dialect_ambiguous(sql: str) -> None:
+    """Every `#` outside a literal is refused, and always for the ambiguity rather than for
+    whatever its body happened to spell.
+
+    The bug this closes: `#` was not a comment to the neutralizer, so the body reached the
+    deny-list and the statement-separator check. `# DROP TABLE t` came back as "keyword 'DROP' is
+    not allowed" and `# note; more` as "multiple statements are not allowed" — both refusals of
+    valid MySQL, and both naming a fix that would not have helped, since neither the DROP nor the
+    second statement was ever going to run.
+    """
+    refusal = check_read_only(sql)
+    assert refusal is not None, f"ambiguous `#` form not caught: {sql!r}"
+    assert refusal.rule == RULE_READ_ONLY
+    assert refusal.detail == (
+        "'#' is a comment in MySQL but an operator in PostgreSQL, so the text after it "
+        "cannot be read the same way on both"
+    )
+    assert refusal.remediation == _REMEDIATION["hash_line_comment"]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A `#` inside a literal is data, not syntax. The scan consumes the literal in its own
+        # branch before the `#` branch can see it, so this must keep passing — the fix above must
+        # not become a ban on the character.
+        "SELECT '#' AS h FROM t",
+        "SELECT a FROM t WHERE b = '# not a comment; really'",
+        "SELECT a FROM t WHERE b = 'DROP TABLE t # nope'",
+        'SELECT "col#name" FROM t',  # and inside a quoted identifier
+    ],
+)
+def test_hash_inside_a_literal_is_still_data(sql: str) -> None:
+    assert check_read_only(sql) is None, f"`#` in a literal must not be refused: {sql!r}"
 
 
 REJECT_DATA_MODIFYING_CTES = [

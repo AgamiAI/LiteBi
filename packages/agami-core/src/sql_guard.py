@@ -46,6 +46,7 @@ _REMEDIATION: dict[str, str] = {
         "and analytics SQL fits well under it."
     ),
     "bare_line_comment": "Put a space after `--`, or use a `/* … */` block comment.",
+    "hash_line_comment": "Remove the `#` comment, or rewrite it as a `-- ` or `/* … */` comment.",
     "mysql_exec_comment": (
         "Remove the `/*! … */` executable comment; a plain `/* … */` comment is fine."
     ),
@@ -195,6 +196,25 @@ def _neutralize(sql: str) -> _Neutralized:
             end = sql.find("*/", i + 2)
             i = n if end == -1 else end + 2
             emit(" ")
+        elif sql[i] == "#":  # MySQL line comment, and nothing of the sort elsewhere
+            # MySQL/MariaDB end a `#` comment at the newline. PostgreSQL has no `#` comment at
+            # all — there it is an operator character (bit-string XOR, geometric intersection) —
+            # so the same bytes are a comment on one engine and live SQL on the other. Blanking
+            # to end-of-line would hide a trailing `;DROP` everywhere `#` is not a comment;
+            # leaving it would read a MySQL comment body as SQL, which is the over-refusal this
+            # branch exists to cure. The two dialects genuinely disagree and this lexer has no
+            # dialect, so refuse the ambiguous form rather than pick one — exactly as the bare
+            # `--x` case above does, for exactly the same reason.
+            #
+            # This refuses a PostgreSQL statement that uses `#` as an operator, which executes
+            # today. Accepted: no governed read-only query has been seen to use it, and a
+            # dialect-blind lexer cannot tell that use from a comment. The cost of the other
+            # direction is a bypass.
+            raise _GuardReject(
+                "'#' is a comment in MySQL but an operator in PostgreSQL, so the text "
+                "after it cannot be read the same way on both",
+                _REMEDIATION["hash_line_comment"],
+            )
         elif sql[i] == "'":  # single-quoted string literal
             j = i + 1
             while j < n:
