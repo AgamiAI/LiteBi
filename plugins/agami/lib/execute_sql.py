@@ -29,13 +29,13 @@ Drivers (install only what you need):
 
 Exit codes:
     0  — success, CSV on stdout
-    1  — refused by a guard. `main` always writes the contract `{"refusal": {…}}` as a single JSON
-         object on stderr. The two unconverted semantic-model branches (fan/chasm pre-flight,
-         sensitive columns) additionally write their own `{"error": {…}}` diagnostic line BEFORE it,
-         so for those the stream is two lines rather than one. Parsers key off the `"refusal"` KEY,
-         not the code and not the line count; the extra line goes away when those branches are
-         subtracted. Two of the original four already have: the default-filter notice and the
-         auto-rewrite notice went with the rewrites they announced.
+    1  — refused by a guard. `main` writes the contract `{"refusal": {…}}` as a single JSON object
+         on stderr, and nothing else — every branch is converted now. Four once wrote their own
+         `{"error": {…}}` or plain-text diagnostic line BEFORE it, which made the stream two lines
+         and readable only by a line-scanning parser: the default-filter and auto-rewrite notices
+         went with the rewrites they announced, and the fan/chasm and sensitive-column
+         diagnostics went with the refusals they explained. Parsers should still key off the
+         `"refusal"` KEY rather than the code or the line count.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
@@ -1677,12 +1677,10 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
     HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
 
-    The five converted branches — both ``model_unavailable`` sites and the three scope gates — write
-    NOTHING: they hand the contract object back and ``execute_guarded`` puts it in the Envelope, so
-    the in-process caller sees the same rule the forked one does. The fan/chasm pre-flight and
-    sensitive-column branches below still write today's ``{"error": …}`` / plain text and return
-    today's int, because those become receipt facts rather than refusals and converting them here
-    would pre-empt that decision.
+    Every branch writes NOTHING: it hands the contract object back and ``execute_guarded`` puts it
+    in the Envelope, so the in-process caller sees the same rule the forked one does. The fan/chasm
+    pre-flight and sensitive-column branches were the two exceptions, writing their own diagnostic
+    and returning a bare int; they did become receipt facts, so they are not here to be converted.
     """
     try:
         from semantic_model import runtime as RT

@@ -361,7 +361,7 @@ def build_server(
 
     `extra_instructions` is APPENDED to `SERVER_INSTRUCTIONS` (never replaces it) and surfaced to the
     model in the MCP `initialize` result — append-only so a consumer can add guidance but can't drop
-    the base protocol's safety directives (e.g. the sensitive-column output rule). None = no-op.
+    the base protocol's safety directives (e.g. the receipt-reporting rules). None = no-op.
 
     `visibility(tool_name) -> bool` narrows the surface PER REQUEST. None (the default) is exactly
     today's behaviour: the whole registry, listed and callable. It exists because a registry assembled

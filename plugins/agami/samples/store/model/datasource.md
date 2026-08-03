@@ -43,7 +43,12 @@ subscription health (active subscriptions, MRR, paid-invoice revenue).
 
 ## A note on privacy
 
-Customer `email` and `phone` are flagged **sensitive**: agami will use them to
-count, filter, and join, but won't print raw values in a result. Use
-`customer_id` (or the non-sensitive `full_name` label) to identify a customer in
-output.
+Customer `email` and `phone` are flagged **sensitive**. That is a note to whoever
+writes the query, not a lock: prefer counting, filtering and joining on them over
+printing raw values, and use `customer_id` (or the non-sensitive `full_name`
+label) to identify a customer in output. When an answer does project them, the
+receipt beside it says so.
+
+A column whose values must never come back is left out of the model entirely —
+any statement naming it is refused as out of scope — or is blocked by the grants
+on the connecting database role.

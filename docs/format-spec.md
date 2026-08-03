@@ -81,7 +81,7 @@ Datasource (datasource.yaml)
 └─ cross_subject_area_relationships[]   (org-level edges spanning areas)
 ```
 
-The Pydantic models in [`packages/agami-core/src/semantic_model/models.py`](../packages/agami-core/src/semantic_model/models.py) **are** the spec (they `forbid` unknown keys). Provider-portable declarative fields — `value_transform`, `caveats`, `value_pattern`, `sensitive`, `default_time_window`, join `cardinality` — are applied generically by the MCP/runtime, so behavior is identical across LLMs. `default_filters` is declarative only: it is not AND-ed into a statement, and it is not yet reported.
+The Pydantic models in [`packages/agami-core/src/semantic_model/models.py`](../packages/agami-core/src/semantic_model/models.py) **are** the spec (they `forbid` unknown keys). Provider-portable declarative fields — `value_transform`, `caveats`, `value_pattern`, `default_time_window`, join `cardinality` — are applied generically by the MCP/runtime, so behavior is identical across LLMs. Two are declarative only. `default_filters` is not AND-ed into a statement and is not yet reported. `sensitive` does not gate anything: it marks a column the author wants handled carefully, the receipt reports when an answer projected one, and the authoring guidance asks the assistant to prefer aggregates — but nothing refuses. A column whose values must not be returned is left out of the model, which puts it out of scope, or is blocked by the connecting role's grants.
 
 Every write is gated by the validator at [`packages/agami-core/src/semantic_model/validator.py`](../packages/agami-core/src/semantic_model/validator.py) (driven via `python3 -m semantic_model.cli validate <root>`). **No model that fails validation is ever persisted.**
 

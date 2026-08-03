@@ -1464,11 +1464,22 @@
         }
       });
 
-      // Declared and empty on purpose: no fan-out analysis has run, so this section exists to say
-      // so. A reader must never have to tell "no aggregates" apart from "aggregates not checked".
+      // Findings about the aggregates in this statement: fan-out, chasm cross-products, and
+      // aggregation-class problems. Each is a FACT, never a verdict — whether it is a bug depends on
+      // the question, which the checks do not have. The section was declared and empty until the
+      // checks stopped refusing and started reporting; its marker still renders beneath, because
+      // "checked and found two things" and "checked completely" are different claims.
       renderSection('aggregates', 'Aggregates', null, list => {
         const ul = el('ul');
-        list.forEach(a => ul.appendChild(el('li', { text: a.name || JSON.stringify(a) })));
+        list.forEach(a => {
+          const li = el('li');
+          li.appendChild(el('strong', { text: (a.name || 'finding').replace(/_/g, ' ') }));
+          if (a.detail) li.appendChild(el('span', { text: ' — ' + a.detail }));
+          if (a.joins && a.joins.length) {
+            li.appendChild(el('div', { class: 'sub', text: a.joins.join(', ') }));
+          }
+          ul.appendChild(li);
+        });
         rb.appendChild(ul);
       });
 
