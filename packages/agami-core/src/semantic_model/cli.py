@@ -227,10 +227,12 @@ def cmd_prepare(args) -> int:
     `unchecked` is what separates them: null when the checks ran, a sentence when they could not.
     Read both or read neither.
 
-    A table's declared `default_filters` are NOT applied here (ACE-042 deleted the injection)
-    and are not yet reported (ACE-099 adds the report), so no `applied_filters` key is emitted.
-    An always-empty list would read as "we checked, none applied", which is the silence that
-    reads as clean."""
+    A table's declared `default_filters` are NOT applied here — ACE-042 deleted the injection, and
+    nothing has replaced it — so this command emits no `applied_filters` key. An always-empty list
+    would read as "we checked, none applied", which is the silence that reads as clean. Which
+    declared filters a statement DID satisfy is reported per table reference by `sm receipt`, on
+    `tables.items[].filters`; it is a fact about the finished statement, so it is assembled where
+    the receipt is and not here."""
     sql = args.sql
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
@@ -259,11 +261,9 @@ def cmd_receipt(args) -> int:
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
-    applied = json.loads(args.applied_filters) if args.applied_filters else None
     receipt = RT.assemble_receipt(
         org, sql,
         model_version=SN.newest_version(args.root),
-        applied_filters=applied,
         freshness=args.freshness,
     )
     _print_json(receipt)
@@ -1178,10 +1178,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.add_argument("--sql", default=None)
     sp.add_argument("--sql-file", default=None, dest="sql_file")
-    sp.add_argument("--applied-filters", default=None, dest="applied_filters",
-                    # ACE-042 removed the only producer; ACE-099 becomes the next one.
-                    help="JSON list of default_filters applied. Nothing currently produces this "
-                         "list — `sm prepare` no longer reports applied filters.")
     sp.add_argument("--freshness", default=None,
                     help="optional freshness timestamp for the receipt's tables section")
     sp.set_defaults(func=cmd_receipt)

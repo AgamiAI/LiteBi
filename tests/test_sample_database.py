@@ -335,3 +335,59 @@ def test_customer_spend_is_skewed(db):
     spends = [r[0] for r in rows]
     assert len(set(spends)) == 5, f"top-5 spends should be distinct, got {spends}"
     assert spends[0] >= 2 * spends[4], f"expected a clear long tail, got {spends}"
+
+
+# ---------------------------------------------------------------------------
+# The sample declares one row filter, so the shipped sample exercises the
+# declared-filter report rather than leaving every `filters` list empty. Without
+# a declared filter anywhere, a user trying the sample sees the feature's absence
+# and cannot tell it from the feature working and finding nothing to say.
+# ---------------------------------------------------------------------------
+
+def test_the_sample_declares_a_row_filter_the_receipt_can_report_on():
+    """`orders` declares one, and it names a column and a value the data actually contains.
+
+    A declared filter that matched nothing would still produce a report, so it would pass a
+    shape assertion while demonstrating nothing — hence the check that `cancelled` is a status
+    the sample really carries."""
+    org = L.load_datasource(MODEL_DIR)
+    orders = next(t for a in org.subject_areas for t in a.tables_defined if t.name == "orders")
+    assert orders.default_filters == ["{alias}.status != 'cancelled'"]
+    # `tables_defined`, not `tables`: the latter holds `models.TableRef` pointers, which carry no
+    # `default_filters`. Worth the extra word — the same name also exists in `runtime` as the
+    # receipt's per-reference record, so a reader grepping `TableRef` meets two unrelated types.
+
+
+def test_the_sample_filter_reads_applied_or_omitted_from_the_statement():
+    """The two verdicts a user meets first, on the shipped model.
+
+    Omitting the filter is not an error and is not refused — it is reported, which is the whole
+    point: the caller asked a question the filter would have changed the answer to, and now they
+    can see that."""
+    org = L.load_datasource(MODEL_DIR)
+
+    omitted = RT.assemble_receipt(org, "SELECT status, COUNT(*) FROM orders GROUP BY status")
+    assert [(i["ref"], i["filters"]) for i in omitted["tables"]["items"]] == [
+        ("orders", [{"expr": "orders.status != 'cancelled'", "status": "omitted"}])
+    ]
+
+    applied = RT.assemble_receipt(
+        org, "SELECT COUNT(*) FROM orders o WHERE o.status != 'cancelled'")
+    assert [(i["ref"], i["filters"]) for i in applied["tables"]["items"]] == [
+        ("orders", [{"expr": "o.status != 'cancelled'", "status": "applied"}])
+    ]
+
+
+def test_the_sample_reports_a_cte_and_an_outer_reference_separately():
+    """The determination the deleted injector got wrong, on the shipped sample.
+
+    Same table, same alias, two references: the CTE satisfies the filter and the outer query
+    does not. Crediting the statement for the inner one is what made the old injection unsafe,
+    so this is the case worth being able to show a user without building a model first."""
+    org = L.load_datasource(MODEL_DIR)
+    receipt = RT.assemble_receipt(org, (
+        "WITH recent AS (SELECT id FROM orders o WHERE o.status != 'cancelled') "
+        "SELECT o.id FROM orders o JOIN recent r ON o.id = r.id"))
+    by_scope = {i["scope"]: i["filters"] for i in receipt["tables"]["items"] if i["ref"] == "orders"}
+    assert by_scope["cte:recent"] == [{"expr": "o.status != 'cancelled'", "status": "applied"}]
+    assert by_scope["main"] == [{"expr": "o.status != 'cancelled'", "status": "omitted"}]

@@ -99,14 +99,20 @@ SERVER_INSTRUCTIONS = (
     "touches (it sizes itself — pass a `query` to focus metrics, `dataset_names` for full table "
     "detail). (2) Examples-first — call get_prompt_examples and mirror the closest match; use "
     "metric `calculation`/`bindings` verbatim. (3) execute_sql (the safety pass runs inside it; "
-    # ACE-042 -> ACE-099: the declared-filter window; delete this clause with the one above.
     "a table's declared `default_filters` are NOT applied — write one into the SQL yourself if "
     "the question needs it). (4) Read the returned `receipt`. It is on EVERY status, and it is "
     "five sections — columns, tables, joins, aggregates, assumptions — each `{items, "
     "undetermined}`. SHOW the user: any join in `receipt.joins.items` whose review_state != "
     "'approved', and any metric in `receipt.columns.items[].metric` (the entries whose `column` is "
     "null) whose review_state != 'approved' — joins/metrics they haven't signed off; never hide "
-    "them. Don't refuse on an unreviewed metric — answer and warn. ALSO surface each section's "
+    "them. Don't refuse on an unreviewed metric — answer and warn. ALSO read "
+    "`receipt.tables.items[].filters`: one entry per declared `default_filters` of that table "
+    "reference, each `{expr, status}` with status applied / omitted / undetermined, scoped by the "
+    "sibling `scope` field ('main', 'cte:<name>', 'subquery') because a filter satisfied inside a "
+    "CTE body is not satisfied for the statement reading it. Nothing applied them for you, so an "
+    "`omitted` or `undetermined` one is a real gap between what the org means by that table and "
+    "what the answer counted — tell the user, and re-run with the filter written in if the "
+    "question wanted it. ALSO surface each section's "
     "`undetermined` sentence when it is non-null: it says what that section did NOT establish, so "
     "an empty `items` with a marker means NOT CHECKED while an empty `items` with a null marker "
     "means checked and clean. Reporting only `items` turns 'not checked' back into 'nothing "
@@ -2087,12 +2093,13 @@ TOOLS: dict[str, dict[str, Any]] = {
             "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
             "Runs entirely locally via execute_sql.py — no data leaves the machine. "
-            # ACE-042 -> ACE-099: the declared-filter window. Delete this sentence when the
-            # adherence report lands. Spec ids stay in the comment — this string ships to every
-            # client, and an id only resolves inside the spec repo.
-            "A table's declared `default_filters` are NOT applied to your SQL, and are not yet "
-            "reported either — if a filter matters to the question, write it into the "
-            "statement yourself."
+            # The declared-filter clause. Spec ids stay in comments like this one — this string
+            # ships to every client, and an id only resolves inside the spec repo.
+            "A table's declared `default_filters` are NOT applied to your SQL — if a filter "
+            "matters to the question, write it into the statement yourself. The receipt then "
+            "reports which ones you did: `receipt.tables.items[].filters` carries one "
+            "`{expr, status}` per declared filter of that reference, status applied / omitted / "
+            "undetermined, per REFERENCE and scoped by the sibling `scope` field."
         ),
         "inputSchema": {
             "type": "object",
