@@ -46,10 +46,14 @@ def _scope_org():
 
 def _assert_star_refused(refusal) -> None:
     """The star ban's refusal, in full. It names no identifier at all — the offending token is
-    `*` — so the whole text is static and can be pinned exactly."""
+    `*` — so the whole text is static and can be pinned exactly.
+
+    `undetermined`, not `out_of_scope`: the ban is a determinability refusal. Resolving `*` needs
+    the catalog, so the guard cannot decide whether the projection leaves the declared surface.
+    """
     assert refusal is not None
     assert refusal.rule == guardrail.RULE_SELECT_STAR
-    assert refusal.reason == "out_of_scope"
+    assert refusal.reason == "undetermined"
     assert refusal.detail == ("query uses SELECT * — every column must be named so it can be "
                               "checked against the semantic model.")
     assert refusal.remediation == "List the columns explicitly instead of '*'."

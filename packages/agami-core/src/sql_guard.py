@@ -46,6 +46,11 @@ _REMEDIATION: dict[str, str] = {
         "and analytics SQL fits well under it."
     ),
     "bare_line_comment": "Put a space after `--`, or use a `/* … */` block comment.",
+    "hash_ambiguous": (
+        "Rewrite a `#` comment as `-- ` or `/* … */`. A statement that needs `#` inside a NAME "
+        "(a SQL Server temp table, a backtick-quoted identifier) cannot be read unambiguously "
+        "here and has to be reworked without it."
+    ),
     "mysql_exec_comment": (
         "Remove the `/*! … */` executable comment; a plain `/* … */` comment is fine."
     ),
@@ -127,8 +132,17 @@ def _neutralize(sql: str) -> _Neutralized:
     `$$` inside a `-- ...` comment, desyncs it and can smuggle an injected
     `; DROP ...` past the multi-statement check. The scan below never desyncs
     because at each position it commits to whatever opens there and skips to that
-    construct's own close. Under-matching (an unterminated literal running to EOF)
-    only ever fails *safe* — a stray `;` stays visible and trips the guard.
+    construct's own close.
+
+    Under-matching (a construct running unterminated to EOF) fails *safe*, but by two
+    different routes and it is worth being exact, because the `#` branch below cites this
+    paragraph as its reason for refusing rather than blanking. An unterminated `"` or `$`
+    emits what it swallowed, so a stray `;` stays visible and trips the guard. An
+    unterminated `'` or `/*` instead swallows to EOF and the tail becomes invisible here —
+    safe not because the guard still sees it, but because the ENGINE reads that tail the
+    same way (an unterminated literal or block comment is a syntax error on every engine we
+    speak, so nothing executes). That second route is the one a `#` would NOT have: there,
+    the guard and the engine genuinely disagree about where the statement ends.
 
     Only this analysis copy is transformed; the ORIGINAL sql is what executes.
     Neutralized spans collapse to a single space (never empty — welding tokens like
@@ -195,6 +209,38 @@ def _neutralize(sql: str) -> _Neutralized:
             end = sql.find("*/", i + 2)
             i = n if end == -1 else end + 2
             emit(" ")
+        elif sql[i] == "#":  # MySQL line comment, and nothing of the sort elsewhere
+            # MySQL/MariaDB end a `#` comment at the newline. PostgreSQL has no `#` comment at
+            # all — there it is an operator character (bit-string XOR, geometric intersection) —
+            # so the same bytes are a comment on one engine and live SQL on the other. Blanking
+            # to end-of-line would hide a trailing `;DROP` everywhere `#` is not a comment;
+            # leaving it would read a MySQL comment body as SQL, which is the over-refusal this
+            # branch exists to cure. The two dialects genuinely disagree and this lexer has no
+            # dialect, so refuse the ambiguous form rather than pick one — exactly as the bare
+            # `--x` case above does, for exactly the same reason.
+            #
+            # THE WIDENING, MEASURED RATHER THAN GUESSED. `#` outside a literal has four
+            # meanings across the engines the executor speaks, and this refuses all of them:
+            #   - a line comment                     (MySQL, MariaDB) — the case being cured
+            #   - `#` / `#>` / `#>>` operators       (PostgreSQL: bit XOR, geometric
+            #                                         intersection, and the jsonb path
+            #                                         operators, which are ordinary analytics SQL)
+            #   - a temp-table prefix                (SQL Server: `#local`, `##global`)
+            #   - a character inside a backtick or bracket quoted identifier, since this scan
+            #     consumes neither quoting form (that gap is ACE-079's, not fixed here)
+            # Only the first is a comment, which is why neither this refusal's detail nor its
+            # remediation calls it one. All four were allowed before this branch and are refused
+            # now; a repo-wide grep found no golden query using any of them.
+            #
+            # Accepted, because the alternative is worse in the direction that matters: reading
+            # `#` as a comment and blanking to end-of-line hides a trailing `;DROP` on all three
+            # of the non-MySQL readings, and this lexer has no dialect with which to choose.
+            raise _GuardReject(
+                "'#' means different things on different engines (a line comment in MySQL, "
+                "an operator in PostgreSQL, a temp-table prefix in SQL Server), so a statement "
+                "carrying one outside a string literal cannot be read the same way on all of them",
+                _REMEDIATION["hash_ambiguous"],
+            )
         elif sql[i] == "'":  # single-quoted string literal
             j = i + 1
             while j < n:
@@ -380,8 +426,11 @@ def check_read_only(sql: str | None) -> Refusal | None:
     correct — see `_REMEDIATION` for why one shared fix would not do):
       0. Empty SQL
       1. SQL longer than `_MAX_SQL_CHARS`
-      1b. Dialect-ambiguous comment form (bare `--x`, MySQL `/*! ... */`) — raised
-          from `_neutralize` because it can't be neutralized safely with one lexer
+      1b. Dialect-ambiguous form (bare `--x`, MySQL `/*! ... */`, any `#` outside a
+          literal) — raised from `_neutralize` because it can't be neutralized safely
+          with one lexer. Note the third is not only a comment form: `#` is also a
+          PostgreSQL operator and a SQL Server temp-table prefix, which is why the
+          step is "ambiguous form" rather than "ambiguous comment"
       2. Multi-statement (any `;` outside literals/comments, except one trailing `;`)
       3. Doesn't open with SELECT or WITH (leading `(` tolerated)
       4. Contains a forbidden keyword (DML/DDL/TCL/session/pub-sub/lock/prepared/INTO)

@@ -343,19 +343,24 @@ def _write_disk_model(root: Path) -> None:
         )
 
 
-# Each vector is an out-of-scope statement the model above refuses, paired with the rule that must
-# reach the caller. Three gates rather than one, so a path that happened to relay ONE rule correctly
-# (or hard-coded it) does not pass.
-_OUT_OF_SCOPE = [
+# Each vector is a statement the model above refuses at the model-safety pass, paired with the rule
+# that must reach the caller. Three gates rather than one, so a path that happened to relay ONE rule
+# correctly (or hard-coded it) does not pass.
+#
+# Named for the PASS rather than for one reason: two of the three are `out_of_scope` (4b) and the
+# star ban is `undetermined` (4c), so calling the list out-of-scope would be untrue of a third of
+# it. The parity these vectors prove is about the rule surviving the fork, not about the reason.
+_MODEL_SAFETY_REFUSALS = [
     ("SELECT id FROM sqlite_master", guardrail.RULE_TABLE_SCOPE),
     ("SELECT * FROM orders", guardrail.RULE_SELECT_STAR),
     ("SELECT nope FROM orders", guardrail.RULE_COLUMN_SCOPE),
 ]
 
 
-@pytest.mark.parametrize(("sql", "rule"), _OUT_OF_SCOPE, ids=[r for _, r in _OUT_OF_SCOPE])
+@pytest.mark.parametrize(("sql", "rule"), _MODEL_SAFETY_REFUSALS,
+                         ids=[r for _, r in _MODEL_SAFETY_REFUSALS])
 def test_in_process_and_forked_refusals_are_the_same_refusal(tmp_path, monkeypatch, sql, rule):
-    """The same out-of-scope statement, run both ways, yields the same rule and the same fix.
+    """The same refused statement, run both ways, yields the same rule and the same fix.
 
     This is the test the slice exists for. Before it, the in-process branch replaced whatever the
     gate decided with one generic string, so these two assertions could not both hold — and the

@@ -105,9 +105,12 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     RULE_READ_ONLY: "unsafe",
     RULE_TABLE_SCOPE: "out_of_scope",
     RULE_COLUMN_SCOPE: "out_of_scope",
-    # Deliberately NOT `undetermined`: the `SELECT *` ban is reclassified as a determinability
-    # refusal in a later slice, and emitting `undetermined` now would silently pre-empt it.
-    RULE_SELECT_STAR: "out_of_scope",
+    # `undetermined`, not `out_of_scope`: a star projection is not a reach, it is an inability to
+    # decide whether there is one. Resolving `*` to a column list needs the catalog, which the guard
+    # does not have, so whether the statement stays inside the declared surface cannot be decided —
+    # which is what `undetermined` means. Filing it beside the two scope rules made the refusal
+    # wrong about its own reason.
+    RULE_SELECT_STAR: "undetermined",
     RULE_MODEL_UNAVAILABLE: "undetermined",
     RULE_RECON: "unsafe",
     # A bound we imposed, not a property of the statement: neither unsafe nor out of scope — we

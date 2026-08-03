@@ -734,6 +734,13 @@ def check_table_scope(sql: str, org: Datasource,
                       ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
     """Refuse a query that references a table not declared in the semantic model.
 
+    **The boundary, stated: this is a 4b gate.** It refuses for exactly one reason — the SQL names
+    a physical table the model does not declare — and for nothing else. It does not judge what the
+    statement does with a declared table, which is faithfulness and is never a refusal; it does not
+    judge whether the statement is safe, which is 4a and runs above it; and it decides nothing when
+    it cannot see (see the degrades below), which is 4c's territory and is why the fail-closed work
+    is a separate slice rather than a condition bolted on here.
+
     Only *physical* table references count: CTE names (defined by WITH) and
     derived/subquery aliases are not tables and are never treated as undeclared.
     Matching is on the bare table name, case-insensitively (unquoted identifiers
@@ -798,13 +805,19 @@ def check_table_scope(sql: str, org: Datasource,
 
 
 # ---------------------------------------------------------------------------
-# SELECT * ban + column-scope guard
+# SELECT * ban (4c) + column-scope guard (4b)
 #
-# Companions to the table-scope guard, enforced in the same _model_safety pass.
-# The star ban forces every projected column to be named; the column-scope guard
-# then refuses any column that binds to a declared table but is not one that table
-# declares (a hallucinated column, or a physical column the model excluded). Both
-# run AFTER check_table_scope, so every physical table in scope is known-declared.
+# Enforced in the same _model_safety pass as the table-scope gate, and both run
+# AFTER it, so every physical table in scope is known-declared.
+#
+# They are NOT two gates of one kind, and the pairing here is sequence rather than
+# reason. Column scope is a 4b reach: the SQL names a column the declaring table
+# does not declare (a hallucinated column, or a physical column the model excluded).
+# The star ban is a 4c determinability refusal: resolving `*` to a column list needs
+# the catalog, which this guard does not have, so it cannot decide whether 4b holds
+# and refuses rather than guess. That is why the star ban runs first — not because a
+# star is a worse reach, but because column scope cannot do its job until every
+# projected column is named.
 # ---------------------------------------------------------------------------
 
 
@@ -812,7 +825,12 @@ def check_no_select_star(sql: str,
                          ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
     """Refuse a query whose projection list contains `*` or `t.*`.
 
-    A star defeats column-level scoping (an undeclared column hides behind it) and
+    **The boundary, stated: this is a 4c gate, not a 4b one.** A star is not a reach — it may well
+    resolve to nothing but declared columns. It is an *inability to decide whether there is one*:
+    the column list behind `*` lives in the catalog, the guard judges against the model alone, so
+    the question "does this projection stay inside the declared surface" has no answer here. The
+    refusal says we could not determine, which is why the reason is `undetermined` and not
+    `out_of_scope`. A star defeats column-level scoping (an undeclared column hides behind it) and
     stops `check_column_scope` from validating what is actually returned, so every
     projected column must be named. Applies to EVERY select in the tree — outer
     query, subqueries, CTE bodies, and set-operation (UNION/…) arms — so a star
@@ -853,6 +871,20 @@ def check_no_select_star(sql: str,
 def check_column_scope(sql: str, org: Datasource,
                        ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
     """Refuse a query that references a column not declared on the table it binds to.
+
+    **The boundary, stated: this is a 4b gate**, and its unit of exposure is the COLUMN. A column
+    the model declares is reachable; one it does not is refused. Nothing finer is expressible: a
+    field inside a declared VARIANT / JSON column (`payload:ssn`) reaches `payload`, which is
+    declared, so this gate allows it and is correct to. That residual is bounded by the modelling
+    rule REQ-021 states — a column carrying values that must not be readable is not declared — not
+    by a check here, because making the unit finer than a column amends principle 4b rather than
+    fixing a gate. See `tests/test_column_scope_adversarial.py` for both directions of the bound.
+
+    **The bound is on what this gate JUDGES, and a NESTED path is not judged at all.** Under the
+    generic parse `payload:cust.ssn` is not a construct, so the statement is silently truncated
+    to something with no FROM clause and every gate sees an empty scope. Undeclaring the root
+    does not close that one, so it is not a residual of this gate's unit — it is a hole in the
+    parse, tracked in `tests/test_parse_fidelity_gaps.py` and owned by the fail-closed work.
 
     Strict where a column visibly binds to a declared physical table — qualified by
     that table (or its alias), or the single in-scope declared table for a bare

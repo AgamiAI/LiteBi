@@ -715,7 +715,7 @@ def test_echoing_the_callers_own_identifier_is_allowed():
     body = {
         "status": "refused",
         "refusal": {
-            "reason": "out_of_scope", "rule": "select_star",
+            "reason": "undetermined", "rule": "select_star",
             "detail": "query uses SELECT * on orders — every column must be named",
             "remediation": "List the columns of orders explicitly instead of '*'.",
         },

@@ -37,13 +37,18 @@ from semantic_model import runtime as rt  # noqa: E402
 
 
 def _scope_org():
-    """Org declaring orders(id, amount, customer_id, status) + customers(id, name, region)."""
+    """Org declaring orders(id, amount, customer_id, status, payload) + customers(id, name, region).
+
+    `payload` is typed `json` because the semi-structured residual below needs a declared column
+    whose contents the model cannot describe. Every other test here ignores it.
+    """
     def _t(name, cols):
         return m.Table(name=name, schema="public", storage_connection="c", grain=["id"],
                        description=name,
                        columns=[m.Column(name=c, type=typ) for c, typ in cols])
     orders = _t("orders", [("id", "integer"), ("amount", "decimal"),
-                           ("customer_id", "integer"), ("status", "string")])
+                           ("customer_id", "integer"), ("status", "string"),
+                           ("payload", "json")])
     customers = _t("customers", [("id", "integer"), ("name", "string"), ("region", "string")])
     return m.Datasource(datasource="Shop",
                           subject_areas=[m.SubjectArea(name="sales",
@@ -205,6 +210,58 @@ def test_fail_open_cte_shadowing_table_name():
     res = rt.check_column_scope(
         "WITH orders AS (SELECT 1 AS bogus) SELECT bogus FROM orders", _scope_org())
     assert res is None
+
+
+# ===========================================================================
+# The semi-structured residual -> the gate's unit of exposure is the COLUMN
+#
+# `SELECT payload:ssn` reaches `payload`, which the model declares. Nothing undeclared
+# was reached, so this gate allows it and is right to: principle 4b refuses a reach to a
+# table or column the model does not expose, and a field inside a declared column is
+# neither. Making the unit finer than a column would amend 4b rather than fix a gate.
+#
+# The residual is bounded by the modelling rule REQ-021 states — a column carrying values
+# that must not be readable is not declared — and the second test is that bound holding:
+# undeclare the root and the reach is refused like any other. Both directions are pinned
+# so a future narrowing is a conscious, test-breaking decision rather than a silent one.
+# Affects every engine with path access: Snowflake VARIANT, BigQuery JSON, Postgres jsonb.
+#
+# **The bound holds for the spellings measured here and NOT for the nested one.** A
+# `payload:cust.ssn` does not parse to a tree the statement said, so no gate judges it at
+# all — see tests/test_parse_fidelity_gaps.py, where that is a strict xfail owned by the
+# parse-fidelity work. Do not widen these lists to the nested form to make them pass.
+# ===========================================================================
+
+SEMI_STRUCTURED_INTO_DECLARED = [
+    "SELECT payload:ssn FROM orders",                 # Snowflake colon path
+    "SELECT payload['ssn'] FROM orders",              # bracket subscript
+    "SELECT id FROM orders WHERE payload:ssn = 'x'",  # in a predicate, not a projection
+]
+# NOT here: the NESTED spelling, `payload:cust.ssn`. It is allowed too, but for an unrelated
+# reason — the generic parse of `x:a.b` drops the FROM clause, so the gate judges a statement
+# with no tables in it and fails open. Putting it here would make this section's claim
+# ("allowed because the root is declared") true of a case where the root is irrelevant, and
+# would make the bound below look like it held when it does not. It lives in
+# tests/test_parse_fidelity_gaps.py as a strict xfail instead.
+
+
+@pytest.mark.parametrize("sql", SEMI_STRUCTURED_INTO_DECLARED)
+def test_path_into_a_declared_column_is_allowed(sql):
+    """The residual, stated as a test. This is not the gate failing — it is the gate's unit."""
+    assert rt.check_column_scope(sql, _scope_org()) is None
+
+
+SEMI_STRUCTURED_INTO_UNDECLARED = [
+    "SELECT nope:ssn FROM orders",
+    "SELECT nope['ssn'] FROM orders",
+]
+
+
+@pytest.mark.parametrize("sql", SEMI_STRUCTURED_INTO_UNDECLARED)
+def test_path_into_an_undeclared_column_is_refused(sql):
+    """The bound. Not declaring the root column is what closes the reach, and it closes it
+    through the ordinary column-scope path with no semi-structured machinery at all."""
+    _assert_columns_refused(rt.check_column_scope(sql, _scope_org()), "nope")
 
 
 # ===========================================================================
