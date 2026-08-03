@@ -12,29 +12,6 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
-### Changed
-
-- **A `#` comment is no longer mistaken for the SQL it hides.** `SELECT a FROM t # DROP TABLE t`
-  came back as *"keyword 'DROP' is not allowed"*, and `... # note; more` as *"multiple statements
-  are not allowed"* — both refusals of valid MySQL, and both naming a fix that would not have
-  helped, because neither the `DROP` nor the second statement was ever going to run.
-
-  A `#` outside a string is now refused for what it actually is: a construct whose meaning depends
-  on the engine. It opens a comment in MySQL and MariaDB, and is an operator character in
-  PostgreSQL, so the same bytes are a comment on one and live SQL on another. The guard reads every
-  statement with one grammar and no engine, so it declines to pick a reading and says so —
-  the same call it already makes for a bare `--x`. Use `-- ` or `/* … */` instead.
-
-  This also refuses a PostgreSQL statement that uses `#` as an operator, which used to run. That is
-  the accepted cost of one grammar: the other direction would let a `;DROP` ride through inside
-  something the guard had decided to ignore.
-
-- **`SELECT *` is refused as undetermined, not as out of scope.** The refusal itself is unchanged
-  and every column must still be named. What changes is the reason it reports: a star is not a
-  reach outside your model, it is a projection the guard cannot resolve without the catalog, so it
-  cannot tell whether it reaches outside your model. Anything reading `reason` to route or count
-  refusals will see `undetermined` here now.
-
 ### Removed
 
 - **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
@@ -86,8 +63,30 @@ below corresponds to one such version.
   not happen. `columns` items may carry `sensitive: true`.
 - The `{"error": {"kind": "preflight_refused"}}` and `{"kind": "sensitive_columns"}` diagnostics no
   longer appear on stderr. Every refusal is a single JSON object on every path.
+- A refused `SELECT *` reports `reason: "undetermined"`, not `reason: "out_of_scope"`. The refusal
+  and its message are unchanged; only the reason moves. If you route, count or alert on `reason`,
+  this row changes bucket.
 
 ### Changed
+
+- **A `#` is no longer mistaken for the SQL it hides, and is now refused wherever it appears
+  outside a string (ACE-096).** `SELECT a FROM t # DROP TABLE t` came back as *"keyword 'DROP' is
+  not allowed"*, and `... # note; more` as *"multiple statements are not allowed"* — both refusals
+  of valid MySQL, and both naming a fix that would not have helped, because neither the `DROP` nor
+  the second statement was ever going to run.
+
+  The guard reads every statement with one grammar and no engine, and `#` means four different
+  things across the engines it speaks: a line comment in MySQL and MariaDB, the `#` / `#>` / `#>>`
+  operators in PostgreSQL, a temp-table prefix in SQL Server (`#tmp`, `##global`), and an ordinary
+  character inside a backtick- or bracket-quoted identifier. It cannot tell them apart, so it now
+  declines to pick a reading and says which ambiguity it hit — the same call it already makes for
+  a bare `--x`.
+
+  **This is a widening: all four shapes ran before and are refused now**, not just the comment.
+  If you use jsonb path operators, SQL Server temp tables, or a `#` inside a quoted identifier,
+  those statements will start coming back refused. It is the accepted cost of one grammar; the
+  other direction lets a trailing `;DROP` ride through inside text the guard decided to ignore.
+  Rewrite a `#` comment as `-- ` or `/* … */`; a `#` inside a name has to be spelled another way.
 
 - **The trust receipt is five sections, and each one says what it did NOT establish (ACE-088).**
   Every answer's receipt now carries `columns`, `tables`, `joins`, `aggregates` and `assumptions`,

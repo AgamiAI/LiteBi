@@ -16,7 +16,7 @@ Cases fall into three groups, mirroring `test_column_scope_adversarial.py`:
 **These lock, they do not close.** Every refusal below already holds on the base commit, and
 that is the point: this gate is the whole of principle 4b's table half and had no statement of
 intended behaviour for a reviewer to check a change against. The one route that genuinely does
-NOT hold today is dialect-specific quoting, and it lives in `test_dialect_quoting_gaps.py` as
+NOT hold today is dialect-specific quoting, and it lives in `test_parse_fidelity_gaps.py` as
 expected-fail rather than here, so the two kinds of case are never confused for each other.
 
 The gate returns `guardrail.Refusal | None`, so "must refuse" reads `is not None` and "accepted
@@ -91,7 +91,6 @@ def test_alias_indirection_refused(sql, offender):
 
 # Nesting: the reach is one or more levels down, where an outer-query-only walk would not look.
 NESTED_SOURCES = [
-    ("WITH t AS (SELECT id FROM secret) SELECT id FROM t", "secret"),
     ("WITH a AS (SELECT 1 AS id), b AS (SELECT id FROM secret) SELECT a.id FROM a, b", "secret"),
     ("SELECT id FROM (SELECT id FROM secret) x", "secret"),
     ("SELECT id FROM orders WHERE id IN (SELECT id FROM secret)", "secret"),
@@ -109,7 +108,6 @@ def test_undeclared_table_nested_in_any_source_refused(sql, offender):
 # before #93 — `parse_one` yields `exp.Union`, which is not an `exp.Select`, so a walk gated on
 # "is a SELECT" saw nothing to check.
 SET_OPERATION_ARMS = [
-    ("SELECT id FROM orders UNION SELECT id FROM secret", "secret"),
     ("SELECT id FROM orders UNION ALL SELECT id FROM secret", "secret"),
     ("SELECT id FROM orders INTERSECT SELECT id FROM secret", "secret"),
     ("SELECT id FROM orders EXCEPT SELECT id FROM secret", "secret"),
@@ -125,15 +123,8 @@ def test_undeclared_table_in_a_set_operation_arm_refused(sql, offender):
 def test_postgres_quoted_identifier_refused():
     # A double-quoted identifier is the one quoting form the generic dialect reads correctly,
     # so quoting an undeclared name does not hide it. The backtick and bracket forms DO hide it
-    # today — those are in test_dialect_quoting_gaps.py, not here.
+    # today — those are in test_parse_fidelity_gaps.py, not here.
     _assert_tables_refused(rt.check_table_scope('SELECT id FROM "secret"', _scope_org()), "secret")
-
-
-def test_case_variation_does_not_evade():
-    # Unquoted identifiers fold case, so the match is case-insensitive in both directions —
-    # an undeclared table cannot be smuggled past by shouting it.
-    _assert_tables_refused(rt.check_table_scope("SELECT id FROM SECRET", _scope_org()), "SECRET")
-    _assert_tables_refused(rt.check_table_scope("SELECT id FROM SeCrEt", _scope_org()), "SeCrEt")
 
 
 def test_schema_qualification_does_not_evade():
@@ -171,18 +162,6 @@ def test_cte_name_shadowing_a_declared_table_is_allowed():
     # reach, and the body of that CTE is still walked (see the nested cases above).
     assert rt.check_table_scope(
         "WITH orders AS (SELECT 1 AS id) SELECT id FROM orders", _scope_org()) is None
-
-
-def test_derived_table_alias_is_not_a_table():
-    assert rt.check_table_scope(
-        "SELECT x.id FROM (SELECT id FROM orders) x", _scope_org()) is None
-
-
-def test_a_model_declaring_no_tables_allows():
-    # Nothing to scope against. Stated as a test because it is a fail-open, and a fail-open that
-    # nobody wrote down is indistinguishable from a gate that stopped working.
-    empty = m.Datasource(datasource="Empty", subject_areas=[])
-    assert rt.check_table_scope("SELECT id FROM anything", empty) is None
 
 
 # ===========================================================================

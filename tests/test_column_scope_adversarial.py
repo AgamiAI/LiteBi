@@ -225,14 +225,24 @@ def test_fail_open_cte_shadowing_table_name():
 # undeclare the root and the reach is refused like any other. Both directions are pinned
 # so a future narrowing is a conscious, test-breaking decision rather than a silent one.
 # Affects every engine with path access: Snowflake VARIANT, BigQuery JSON, Postgres jsonb.
+#
+# **The bound holds for the spellings measured here and NOT for the nested one.** A
+# `payload:cust.ssn` does not parse to a tree the statement said, so no gate judges it at
+# all — see tests/test_parse_fidelity_gaps.py, where that is a strict xfail owned by the
+# parse-fidelity work. Do not widen these lists to the nested form to make them pass.
 # ===========================================================================
 
 SEMI_STRUCTURED_INTO_DECLARED = [
     "SELECT payload:ssn FROM orders",                 # Snowflake colon path
     "SELECT payload['ssn'] FROM orders",              # bracket subscript
-    "SELECT payload:cust.ssn FROM orders",            # nested path
     "SELECT id FROM orders WHERE payload:ssn = 'x'",  # in a predicate, not a projection
 ]
+# NOT here: the NESTED spelling, `payload:cust.ssn`. It is allowed too, but for an unrelated
+# reason — the generic parse of `x:a.b` drops the FROM clause, so the gate judges a statement
+# with no tables in it and fails open. Putting it here would make this section's claim
+# ("allowed because the root is declared") true of a case where the root is irrelevant, and
+# would make the bound below look like it held when it does not. It lives in
+# tests/test_parse_fidelity_gaps.py as a strict xfail instead.
 
 
 @pytest.mark.parametrize("sql", SEMI_STRUCTURED_INTO_DECLARED)

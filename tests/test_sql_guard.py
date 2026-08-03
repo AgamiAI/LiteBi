@@ -180,22 +180,37 @@ def test_rejects_comment_in_string_bypass(sql: str) -> None:
     assert check_read_only(sql) is not None, f"Comment-in-string bypass not caught: {sql!r}"
 
 
-REJECT_HASH_COMMENT = [
-    # `#` starts a line comment in MySQL/MariaDB and is an operator character in PostgreSQL
-    # (bit-string XOR, geometric intersection), so the same bytes are a comment on one engine
-    # and live SQL on another. This lexer has no dialect, so the form is refused rather than
-    # read one of the two ways — the same call the bare `--x` case makes.
-    "SELECT a FROM t # DROP TABLE t",       # comment body reads as DML on the non-comment engines
-    "SELECT a FROM t # note; more",         # comment body hides a statement separator
-    "SELECT a FROM t #no space",            # MySQL needs no space after `#`
-    "SELECT a FROM t # trailing note",      # inert on both readings, still ambiguous
-    "SELECT a # b FROM t",                  # the PostgreSQL operator reading — refused too
-    "SELECT a FROM t\n# DROP TABLE t",      # comment on its own line
+REJECT_HASH_AMBIGUOUS = [
+    # `#` outside a literal has four meanings across the engines the executor speaks, and all
+    # four are refused. This lexer has no dialect, so it declines to pick one — the same call
+    # the bare `--x` case makes. The list is the measured blast radius, not just the case the
+    # fix was written for: a widening nobody wrote down is a widening nobody can review.
+    #
+    # 1. MySQL / MariaDB line comment — the over-refusal being cured.
+    "SELECT a FROM t # DROP TABLE t",     # body used to be reported as a denied keyword
+    "SELECT a FROM t # note; more",       # body used to be reported as a second statement
+    "SELECT a FROM t #no space",          # MySQL needs no space after `#`
+    "SELECT a FROM t # trailing note",    # inert on both readings, still ambiguous
+    "SELECT a FROM t\n# DROP TABLE t",    # comment on its own line
+    # 2. PostgreSQL operators. `#` is bit-string XOR and geometric intersection; `#>` and `#>>`
+    #    are the jsonb path operators, which are ordinary analytics SQL and the likeliest real
+    #    casualty of this branch. Newly refused, deliberately.
+    "SELECT a # b FROM t",
+    "SELECT payload #>> '{ssn}' FROM orders",
+    "SELECT payload #> '{cust,ssn}' FROM orders",
+    # 3. SQL Server temp tables. Newly refused, and note there is no comment anywhere in these.
+    "SELECT a FROM #temp",
+    "SELECT a FROM ##global_temp",
+    # 4. Backtick and bracket quoted identifiers containing `#`. This scan consumes neither
+    #    quoting form, so the `#` is seen as if bare. Refusing is the safe direction; making
+    #    these parse is the dialect work's job, not this branch's.
+    "SELECT `col#name` FROM t",
+    "SELECT [col#name] FROM t",
 ]
 
 
-@pytest.mark.parametrize("sql", REJECT_HASH_COMMENT)
-def test_rejects_hash_comment_as_dialect_ambiguous(sql: str) -> None:
+@pytest.mark.parametrize("sql", REJECT_HASH_AMBIGUOUS)
+def test_rejects_hash_as_dialect_ambiguous(sql: str) -> None:
     """Every `#` outside a literal is refused, and always for the ambiguity rather than for
     whatever its body happened to spell.
 
@@ -204,31 +219,48 @@ def test_rejects_hash_comment_as_dialect_ambiguous(sql: str) -> None:
     not allowed" and `# note; more` as "multiple statements are not allowed" — both refusals of
     valid MySQL, and both naming a fix that would not have helped, since neither the DROP nor the
     second statement was ever going to run.
+
+    Asserting one exact detail across all twelve vectors is the point rather than a shortcut: the
+    defect was a refusal whose stated reason depended on what the unread text happened to contain,
+    so the fix is only real if every one of these reports the same thing. That is also why the
+    detail does not use the word "comment" — four of these vectors contain no comment at all.
     """
     refusal = check_read_only(sql)
     assert refusal is not None, f"ambiguous `#` form not caught: {sql!r}"
     assert refusal.rule == RULE_READ_ONLY
     assert refusal.detail == (
-        "'#' is a comment in MySQL but an operator in PostgreSQL, so the text after it "
-        "cannot be read the same way on both"
+        "'#' means different things on different engines (a line comment in MySQL, an operator "
+        "in PostgreSQL, a temp-table prefix in SQL Server), so a statement carrying one outside "
+        "a string literal cannot be read the same way on all of them"
     )
-    assert refusal.remediation == _REMEDIATION["hash_line_comment"]
+    assert refusal.remediation == _REMEDIATION["hash_ambiguous"]
 
 
 @pytest.mark.parametrize(
     "sql",
     [
-        # A `#` inside a literal is data, not syntax. The scan consumes the literal in its own
-        # branch before the `#` branch can see it, so this must keep passing — the fix above must
-        # not become a ban on the character.
+        # A `#` inside a span this scan consumes is data, not syntax. Those branches advance
+        # past their own body before the `#` branch can see it, so these must keep passing —
+        # the fix above must not become a ban on the character.
         "SELECT '#' AS h FROM t",
         "SELECT a FROM t WHERE b = '# not a comment; really'",
         "SELECT a FROM t WHERE b = 'DROP TABLE t # nope'",
-        'SELECT "col#name" FROM t',  # and inside a quoted identifier
+        'SELECT "col#name" FROM t',        # DOUBLE-quoted identifier only, see below
+        "SELECT $$ # not a comment $$ AS s FROM t",   # dollar-quoted body
+        "SELECT a FROM t -- # inside a line comment\n",
+        "SELECT a FROM t /* # inside a block comment */",
     ],
 )
-def test_hash_inside_a_literal_is_still_data(sql: str) -> None:
-    assert check_read_only(sql) is None, f"`#` in a literal must not be refused: {sql!r}"
+def test_hash_inside_a_consumed_span_is_still_data(sql: str) -> None:
+    """Scoped deliberately to the spans `_neutralize` actually consumes: single quotes, double
+    quotes, dollar quotes, and the two comment forms.
+
+    It is NOT true of every quoted identifier. There is no backtick or bracket branch in this
+    scan, so `` `col#name` `` and `[col#name]` are refused — they are in `REJECT_HASH_AMBIGUOUS`
+    above rather than here. That is the safe direction and it is recorded rather than implied,
+    because backtick is the quoting form of the one engine where `#` really is a comment.
+    """
+    assert check_read_only(sql) is None, f"`#` in a consumed span must not be refused: {sql!r}"
 
 
 REJECT_DATA_MODIFYING_CTES = [

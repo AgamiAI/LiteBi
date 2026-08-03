@@ -880,6 +880,12 @@ def check_column_scope(sql: str, org: Datasource,
     by a check here, because making the unit finer than a column amends principle 4b rather than
     fixing a gate. See `tests/test_column_scope_adversarial.py` for both directions of the bound.
 
+    **The bound is on what this gate JUDGES, and a NESTED path is not judged at all.** Under the
+    generic parse `payload:cust.ssn` is not a construct, so the statement is silently truncated
+    to something with no FROM clause and every gate sees an empty scope. Undeclaring the root
+    does not close that one, so it is not a residual of this gate's unit — it is a hole in the
+    parse, tracked in `tests/test_parse_fidelity_gaps.py` and owned by the fail-closed work.
+
     Strict where a column visibly binds to a declared physical table — qualified by
     that table (or its alias), or the single in-scope declared table for a bare
     column; fail-open where the column comes from a CTE/subquery output or a
