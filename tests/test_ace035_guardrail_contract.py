@@ -276,9 +276,10 @@ def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
         ("read_only", "unsafe"),
         ("table_scope", "out_of_scope"),
         ("column_scope", "out_of_scope"),
-        # Deliberately out_of_scope, not undetermined — a later slice reclassifies the SELECT * ban
-        # as a determinability refusal, and emitting `undetermined` now would pre-empt it.
-        ("select_star", "out_of_scope"),
+        # `undetermined`, not out_of_scope: resolving `*` to a column list needs the catalog, so
+        # whether the projection stays inside the declared surface is not decidable from the SQL
+        # and the model alone. The ban is a determinability refusal, not a reach.
+        ("select_star", "undetermined"),
         ("model_unavailable", "undetermined"),
         ("resource_limit", "undetermined"),
         ("unparseable", "undetermined"),
