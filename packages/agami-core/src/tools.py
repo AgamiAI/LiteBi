@@ -572,16 +572,19 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
     on the default fork path would otherwise never see the actionable one, which is this spec's own
     defect one layer down.
 
-    KNOWN GAP, and this is where it lives. `sql` here is the statement the CALLER sent, which is the
-    only one this side of the fork has: `_model_safety` runs in the child, and its surviving rewrite
-    (the fan/chasm `auto_rewrite` branch) rebinds the child's local before it executes. So after a
-    rewrite the child runs one statement and this describes another. It is narrowed to `ok` alone now
-    that every non-ok receipt is built from the RECEIVED statement on both paths deliberately, and it
-    is measured rather than left as prose by a `strict=True` xfail in
-    tests/test_ace088_executed_statement.py. It closes by subtraction, not by plumbing the rewritten
-    statement back across the wire: ACE-042 has already deleted the default-filter injection and
-    ACE-093 deletes the fan-join rewrite, after which executed and received are the same string and
-    this is describing it. That is the slice that deletes the marker.
+    CLOSED GAP, and this is where it lived. `sql` here is the statement the CALLER sent, which is the
+    only one this side of the fork has: `_model_safety` runs in the child, so anything it rewrote
+    rebound the child's local before it executed and this described a statement that did not run.
+
+    It closed by subtraction rather than by plumbing the rewritten statement back across the wire.
+    The default-filter injection went first, then the fan/chasm auto-rewrite, and nothing rewrites a
+    statement now — the string below is the one the child executes, byte for byte, and
+    tests/test_ace093_byte_identity.py asserts that at the driver hand-off. The parity this depended
+    on is measured in tests/test_ace088_executed_statement.py, which carried it as a `strict=True`
+    xfail until the last rewrite went.
+
+    Keep the invariant in mind before adding one back: a rewrite anywhere below the fork makes this
+    receipt describe the wrong statement again, and the fork path has no channel to learn about it.
     """
     try:
         org = get_cached_org(profile)
@@ -1199,8 +1202,10 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     `_model_safety`'s `[agami] applied default_filters: …` notice — it put a declared row-level
     predicate, which the caller never sent, into `failure.message` on the DEFAULT transport, while
     the in-process path returned the clean sentence. (That notice is gone: ACE-042 deleted the
-    injection it announced. The surviving `[agami] auto-corrected …` notice and anything a library
-    logs to stderr have the same reach, so the reconstruction below is what keeps them out; the
+    injection it announced, and the `[agami] auto-corrected …` notice that replaced it as the
+    example went the same way with the rewrite it announced. What still writes to the child's stderr
+    is the pre-flight refusal line — which carries model-derived table names — plus anything a
+    library logs. Both have the same reach, so the reconstruction below is what keeps them out; the
     traceback guard only ever caught the two `exc_info=True` sites.)
     """
     from execute_sql import (

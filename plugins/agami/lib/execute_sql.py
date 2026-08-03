@@ -30,11 +30,12 @@ Drivers (install only what you need):
 Exit codes:
     0  — success, CSV on stdout
     1  — refused by a guard. `main` always writes the contract `{"refusal": {…}}` as a single JSON
-         object on stderr. The four unconverted semantic-model branches (fan/chasm pre-flight,
-         auto-rewrite notice, sensitive columns, default-filter notice) additionally write their own
-         `{"error": {…}}` / plain-text diagnostic line BEFORE it, so for those the stream is two
-         lines rather than one. Parsers key off the `"refusal"` KEY, not the code and not the line
-         count; the extra line goes away when those branches are subtracted.
+         object on stderr. The two unconverted semantic-model branches (fan/chasm pre-flight,
+         sensitive columns) additionally write their own `{"error": {…}}` diagnostic line BEFORE it,
+         so for those the stream is two lines rather than one. Parsers key off the `"refusal"` KEY,
+         not the code and not the line count; the extra line goes away when those branches are
+         subtracted. Two of the original four already have: the default-filter notice and the
+         auto-rewrite notice went with the rewrites they announced.
     2  — usage / config error (missing credentials, bad profile, etc.)
     3  — driver missing for the configured db type
     4  — connection / authentication failed
@@ -2193,16 +2194,19 @@ def execute_guarded(
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)
-    # The statement the CALLER sent, captured before `_model_safety` can rebind the local below. Every
-    # NON-OK receipt is built from this one. Whatever the safety pass rewrites a statement INTO is the
-    # guard's own text, so the rebound string can name a table the caller never wrote — and a refusal
-    # built from it then describes a statement nobody sent, in model-authored text, which is precisely
-    # the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent. The reproduction came
-    # through `apply_default_filters`, which pulled the name straight out of the model's YAML; ACE-042
-    # has since deleted that injector and the fan-join `auto_rewrite` is the one rewrite still
-    # standing, but the rule is about the rebinding rather than about either mechanism. The `ok`
-    # receipt is the one exception and keeps using the rebound value, because SC-6 asks it to describe
-    # what actually ran.
+    # The statement the CALLER sent. Every NON-OK receipt is built from this one, and the rule is
+    # about the REBINDING rather than about any particular mechanism: whatever a safety pass rewrites
+    # a statement INTO is the guard's own text, so a rebound string can name a table the caller never
+    # wrote, and a refusal built from it then describes a statement nobody sent, in model-authored
+    # text — precisely the schema listing `tests/test_ace035_no_enumeration.py` exists to prevent.
+    # The reproduction came through `apply_default_filters`, which pulled the name straight out of
+    # the model's YAML.
+    #
+    # No pass rewrites anything today: that injector went, then the fan-join auto-rewrite, and
+    # `_model_safety` now returns the statement it was given on every path. So this equals the
+    # executed statement rather than merely guarding against it, and the capture is kept as the thing
+    # that keeps it that way — a future rewrite would have to reintroduce the divergence past a name
+    # that says what it is for.
     received_sql = sql
     try:
         import sql_guard
@@ -2220,10 +2224,12 @@ def execute_guarded(
             return _envelope("refused", refusal=refusal,
                              receipt=_refusal_receipt(refusal, received_sql, profile))
         if not no_safety:
-            # `sql` is REBOUND here: `_model_safety` returns the statement it will actually run,
-            # which the auto-rewrite branch changes. Every receipt built below therefore describes
-            # the rewritten statement rather than the one the caller sent, which is the only version
-            # of it that is true.
+            # `_model_safety` returns the statement it will actually run. It returns the one it was
+            # given, on every path, since the fan-join auto-rewrite was the last branch that changed
+            # it — so this rebinding is now a no-op and the `ok` receipt built below describes the
+            # caller's own statement. The assignment stays because the CONTRACT is "run what this
+            # returns": reading the return value is what makes a reintroduced rewrite a receipt bug
+            # rather than an executed-statement bug.
             sql, verdict = _model_safety(sql, profile, area)
             if isinstance(verdict, Refusal):
                 return _envelope("refused", refusal=verdict,
