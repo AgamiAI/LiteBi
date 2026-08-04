@@ -1777,6 +1777,23 @@ def _engine_mismatch(profile: str, creds: dict) -> "Refusal | None":
     )
 
 
+def _disk_model_root(profile: str) -> Path | None:
+    """The on-disk model root for `profile`, or None when no model is declared there.
+
+    Stdlib-only and free of any `semantic_model` import, deliberately: the fail-closed branch in
+    `_model_safety` that calls this runs on the interpreter where that package is absent, and
+    `_resolve_guard_model` below — the other caller — is unreachable there, since its own first
+    statement imports `semantic_model.loader`.
+
+    One definition rather than two copies of the same expression, because the two callers must agree
+    about whether a model exists. If they drifted apart, the package-less path would refuse where the
+    supported path would not have enforced (a false positive that breaks a working install) or stay
+    silent where it would have (the hole ACE-071 closes).
+    """
+    root = Path(os.environ.get("AGAMI_ARTIFACTS_DIR") or (Path.home() / "agami-artifacts")) / profile
+    return root if (root / "datasource.yaml").exists() else None
+
+
 def _resolve_guard_model(profile: str):
     """Resolve the semantic model for the safety pass, mirroring `tools._load_org` (ACE-051): from
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
@@ -1816,8 +1833,8 @@ def _resolve_guard_model(profile: str):
         except Exception:
             pass  # DB unreachable/misconfigured -> fall through to disk
 
-    root = Path(os.environ.get("AGAMI_ARTIFACTS_DIR") or (Path.home() / "agami-artifacts")) / profile
-    if (root / "datasource.yaml").exists():
+    root = _disk_model_root(profile)
+    if root is not None:
         try:
             return L.load_datasource(root)
         except Exception:
@@ -1862,9 +1879,11 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
 
     Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue or a ``Refusal`` from
     whichever gate chose it — there is no third thing, so every refusal names its own rule. Inert
-    (returns the SQL unchanged) when the
-    model package isn't importable, or — on the LOCAL path only — when there is no model yet. On the
-    HOSTED path a model that can't be resolved fails closed (refuses), never runs unguarded (ACE-051).
+    (returns the SQL unchanged) only when no model is DECLARED for the profile: a local install with
+    nothing built yet has no declared surface, so no gate has anything to enforce. Every other
+    "cannot guarantee safety" state refuses — on the HOSTED path when the model cannot be resolved or
+    the package/parser is missing (ACE-051), and on the LOCAL path when the guards cannot be imported
+    while a model does exist on disk (ACE-071).
 
     Every branch writes NOTHING: it hands the contract object back and ``execute_guarded`` puts it
     in the Envelope, so the in-process caller sees the same rule the forked one does. The fan/chasm
@@ -1889,9 +1908,33 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
                        "hosted server",
                 remediation="Install the semantic-model dependencies on the server and retry.",
             )
-        # The non-hosted twin: a bare local install legitimately has no model package, so this is a
-        # silent no-op rather than a refusal. Not a branch to convert — there is nothing to refuse.
-        return sql, None  # local: model package not available -> no-op
+        # The local twin, in two halves (ACE-071). This path is the VENDORED slice — the one
+        # `python3 -m execute_sql` resolves, which ships no `runtime.py` — so table scope, the star
+        # ban and column scope cannot run here at all. `_receipt_for` already concedes exactly that,
+        # returning `undetermined_receipt(RECEIPT_NO_RUNTIME)`, and principle 4c makes undetermined a
+        # refusal. The gap was never missing information: we published the conclusion and then
+        # executed anyway.
+        #
+        # So: refuse when a model is DECLARED for this profile, because the user has a declared
+        # surface and believes it is being enforced, and 4b reach is exactly what is unchecked here.
+        # `_hosted()` is deliberately not consulted — both interpreters in question are local, and
+        # what separates them is which one can import the guards, not where they run.
+        if _disk_model_root(profile) is not None:
+            # Value-free, like its hosted siblings: it names no resolved path, no profile directory,
+            # no DSN. The remediation names the supported invocation, which is the whole actionable
+            # content — the model is fine, the interpreter is the problem.
+            return sql, refuse(
+                RULE_MODEL_UNAVAILABLE,
+                detail="the semantic-model package is not importable on this interpreter, so table "
+                       "and column scope could not run against the model declared for this profile",
+                remediation="Run this through the interpreter that has the semantic-model package "
+                            "installed (the project virtualenv), then retry.",
+            )
+        # And stay inert with no model on disk. A bare install between `pip install` and its first
+        # `agami-connect` has no declared surface, so there is nothing 4b could be exceeded against
+        # and nothing 4c could be undetermined about. Refusing here would break every user in that
+        # window to close a hole that is not open.
+        return sql, None  # local: no model declared -> no-op
 
     org = _resolve_guard_model(profile)
     # Published for the receipt builder before any gate can refuse, so a refusal's receipt is built
