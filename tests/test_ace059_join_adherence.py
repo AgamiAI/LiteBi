@@ -234,6 +234,33 @@ def test_a_self_bound_endpoint_cannot_carry_a_declaration(org, sql):
     assert item["status"] == rt.UNDECLARABLE
 
 
+def test_a_self_join_resolves_to_the_one_table_on_both_sides(org):
+    """Its ON names exactly one relation, because both sides of the join ARE that relation. That is
+    two endpoints resolved, not a failure to resolve them — a model can declare a relationship from
+    a table to itself, so calling this undeclarable would be a settled claim that it cannot."""
+    (item,) = _items(org, "SELECT a.id FROM orders a JOIN orders b ON a.id = b.customer_id")
+    assert item["from_to"] == "orders → orders"
+    assert item["status"] == rt.UNDETERMINED
+
+
+def test_an_on_reaching_over_more_than_two_relations_is_not_reduced_to_a_pair(org):
+    """A join between two relations names the right-hand one and at most one other. An ON that
+    reaches back over several is a shape this layer cannot reduce to a pair, and it says so rather
+    than picking one of the candidates — a `from_to` that names the wrong left endpoint is not a
+    weaker version of the fact, it is a false one, and a reader has no way to tell.
+
+    The label still names the FROM relation, because a reader needs to find the join in their own
+    SQL whatever the status says about it. The status is the claim; the label is the address.
+    """
+    compound = ("SELECT r.name FROM orders o "
+                "JOIN customers c ON o.customer_id = c.id "
+                "JOIN regions r ON c.region_id = r.id AND o.id = r.id")
+    first, second = _items(org, compound)
+    assert first["status"] == rt.UNDETERMINED
+    assert second["status"] == rt.UNDECLARABLE
+    assert second["from_to"] == "orders → regions"
+
+
 def test_the_shadowing_cte_case_still_lists_the_join_it_wrote(org):
     """The old build reported `items == []` here, because neither endpoint survived the model-keyed
     walk. Empty is the wrong answer twice over: the statement plainly wrote a join, and an empty
