@@ -265,27 +265,44 @@ def test_the_record_carries_the_receipt_for_an_executed_call_and_a_refused_one(e
 
 
 def test_the_model_version_is_a_selectable_column(env):
-    """SC-4. It rides inside the receipt JSON too, and that copy cannot be filtered on portably."""
-    _record_one("SELECT id, status FROM orders")
-    version = _rows(env.app_db)[0]["model_version"]
+    """SC-4. It rides inside the receipt JSON too, and that copy cannot be filtered on portably.
+
+    The version is written EXPLICITLY here rather than taken from whatever the fixture happens to
+    resolve. A disk-only deployment pins no version at all — verified against a real Postgres, where
+    every row came back with `model_version` NULL — so a test that read the fixture's own value
+    would have compared NULL to NULL and passed while proving nothing about a version that exists.
+    """
+    receipt = guardrail.Receipt(model_version="v-2026-08-03")
+    tools._emit(
+        execute_sql._envelope(
+            "refused",
+            refusal=guardrail.refuse(guardrail.RULE_READ_ONLY, detail="d", remediation="r"),
+            receipt=receipt,
+        ),
+        sql="DELETE FROM orders",
+        execution_ms=None,
+        profile=PROFILE,
+    )
+
+    row = _rows(env.app_db)[0]
+    assert row["model_version"] == "v-2026-08-03"
+    assert json.loads(row["receipt"])["model_version"] == "v-2026-08-03", (
+        "the column and the receipt must agree; they are two copies of one fact"
+    )
 
     store = Store.connect(env.app_db)
     try:
-        assert (
-            store.query(
-                "SELECT count(*) AS n FROM query_executions WHERE model_version IS ?", (version,)
-            )[0]["n"]
-            == 1
+        hit = store.query(
+            "SELECT count(*) AS n FROM query_executions WHERE model_version = ?",
+            ("v-2026-08-03",),
         )
         # A replay against a DIFFERENT version is detectable rather than silently wrong.
-        assert (
-            store.query(
-                "SELECT count(*) AS n FROM query_executions WHERE model_version IS ?", ("other",)
-            )[0]["n"]
-            == 0
+        miss = store.query(
+            "SELECT count(*) AS n FROM query_executions WHERE model_version = ?", ("v-other",)
         )
     finally:
         store.close()
+    assert (hit[0]["n"], miss[0]["n"]) == (1, 0)
 
 
 def test_the_recorded_statement_is_the_executed_statement_byte_for_byte(env):
