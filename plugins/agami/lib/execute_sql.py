@@ -1288,6 +1288,33 @@ _max_rows_override: ContextVar[int | None] = ContextVar("_max_rows_override", de
 # eventually serializes.
 _last_error_detail: ContextVar[str | None] = ContextVar("_last_error_detail", default=None)
 
+# The classified outcome of THIS call, for the tool-call recorder (ACE-098). `tools.record_tool_call`
+# derived `success` / `error_kind` by `json.loads`-ing the serialized body and reading
+# `refusal["rule"]` out of it — so the tool_calls row's account of WHY a call failed depended on our
+# own wire shape holding still, which is exactly what principle 7's re-derivation bar cannot rest on.
+#
+# It has to travel out-of-band because the tool handler returns a `str`: by the time the transport
+# runs its `finally`, the Envelope is gone and a serialized body is all there is. Same mechanism and
+# same reasoning as `_last_error_detail` directly above, including the clear-on-entry — a verdict
+# left behind by an earlier call must never label this one — and the same reason it is a ContextVar
+# rather than a module global: the in-process path runs tool handlers on worker threads.
+#
+# **Read by the TRANSPORT, out of a context it owns.** That is not a detail — a ContextVar set
+# inside `async_offload.run_blocking`'s worker thread is invisible to the caller and to every other
+# worker, because anyio hands the thread a COPY of the context. Verified rather than assumed: a var
+# set in one `run_blocking` reads back `None` both in the request task and in a second
+# `run_blocking`. So `mcp_http` runs the handler inside its own `contextvars.copy_context()` and
+# reads the result out of that object afterwards. A plain "set here, read there" would silently
+# record nothing on the one surface that records tool calls at all.
+#
+# `(status, rule, row_count)`, not the whole Envelope: the transport needs to say whether the call
+# succeeded, which gate stopped it, and how many rows came back. Putting a contract object in here
+# invites somebody to serialize it from the transport instead of from the one place that owns the
+# wire shape.
+_last_outcome: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar(
+    "_last_outcome", default=None
+)
+
 # The semantic model `_model_safety` resolved for THIS call, so the receipt describes the model the
 # gates actually consulted rather than one re-resolved a moment later — and so the hosted path loads
 # it ONCE per query rather than twice (`_resolve_guard_model` is a full DB or disk load and is not
@@ -2253,6 +2280,10 @@ def execute_guarded(
     # be attributed to this one. The recorder reads it unconditionally; a stale value would put the
     # wrong error text on a row that succeeded.
     _last_error_detail.set(None)
+    # Same reason again: a verdict left behind by an earlier call in this context must never label
+    # this one. The recorder falls back to parsing the body when this is None, so a stale value is
+    # strictly worse than no value — it would be believed.
+    _last_outcome.set(None)
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)

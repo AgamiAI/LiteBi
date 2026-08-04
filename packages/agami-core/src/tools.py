@@ -1436,6 +1436,17 @@ def _emit(
     body["audit_id"] = env.audit_id
 
     _record_execution(env, sql=sql, profile=profile, args=args, row_count=row_count)
+    # Publish the TYPED outcome for the tool-call recorder (ACE-098). It runs later, in the
+    # transport's `finally`, where the Envelope no longer exists and only this serialized string
+    # does — so without this the tool_calls row's account of why a call failed is a `json.loads` of
+    # our own output. Set here rather than in `execute_guarded` because the tool edge is what
+    # decides the final status: the fork path rebuilds the Envelope on the parent side, and the
+    # chokepoint that ran in the child cannot reach this context at all.
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(
+        (env.status, env.refusal.rule if env.refusal is not None else None, row_count)
+    )
     return json.dumps(body, indent=2, default=str)
 
 
@@ -1889,6 +1900,56 @@ def _record_query(rec: dict[str, Any]) -> None:
         # Local: no SQL, no question, no org — the record's own fields are the caller's data, and
         # this line goes to the server log. The exception and the stack say where the write broke.
         _LOG.warning("query-execution audit write failed; the answer is unaffected", exc_info=True)
+
+
+def reset_typed_outcome() -> None:
+    """Clear the published outcome. Run by the transport INSIDE the context it hands the handler.
+
+    Load-bearing, and a test found it: `copy_context()` copies whatever is current, so a verdict
+    published by an earlier `execute_sql` call in this context would be inherited by the next tool's
+    context and read back as that tool's outcome. A tool that never reaches `execute_guarded` — every
+    model-backed one — has nothing to clear it, so a raising `list_datasources` was recorded with the
+    previous query's refusal rule instead of `exception`.
+
+    `execute_guarded` clears it too, on entry, for the calls that do reach it. Both are needed: that
+    one covers a second query in one context, this one covers a different tool after a query.
+    """
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(None)
+
+
+def typed_outcome_overrides(ctx: Any) -> dict[str, Any]:
+    """The `record_tool_call` overrides for a call whose Envelope classified itself (ACE-098).
+
+    The transport runs the tool handler inside a `contextvars.Context` it owns and passes it here.
+    That indirection is load-bearing: a ContextVar set inside `run_blocking`'s worker is invisible
+    to the caller, because anyio gives the thread a copy — so reading the var directly at the
+    recorder would read `None` on the one surface that records tool calls at all.
+
+    Returns `{}` for every other tool. The model-backed tools do not speak the Envelope (they return
+    the older `{"error": {kind, remediation}}` body) and never reach `_emit`, so there is nothing
+    typed to read and the body parse stays their path. `{}` means "derive it the way you always
+    have", which is exactly what `record_tool_call`'s override seam already documents.
+
+    The three come back as a group because that seam forces them to: stating any one replaces all
+    three, so returning a partial dict would silently blank the other two.
+    """
+    from execute_sql import _last_outcome
+
+    outcome = ctx.get(_last_outcome)
+    if outcome is None:
+        return {}
+    status, rule, row_count = outcome
+    success = status == "ok"
+    return {
+        "success": success,
+        # The rule the gate chose, straight off the `Refusal` — strictly more informative than the
+        # status alone, and no longer a `json.loads` of our own output. `status` is the fallback for
+        # a `failed`, which has a kind rather than a rule.
+        "error_kind": None if success else (rule or status),
+        "row_count": row_count,
+    }
 
 
 def record_tool_call(

@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import contextvars
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -51,6 +52,8 @@ from tools import (
     _current_org_ctx,
     bootstrap_paths,
     record_tool_call,
+    reset_typed_outcome,
+    typed_outcome_overrides,
     resolved_org_id,
     server_version,
     set_injected_executor,
@@ -424,6 +427,12 @@ def build_server(
         started = time.monotonic()
         result_text = None
         raised = False
+        handler_ctx = contextvars.copy_context()
+        # Cleared inside the context we own, before the handler can run. `copy_context()`
+        # copies whatever is current, so a verdict published by an earlier call would be
+        # inherited here and read back as THIS tool's outcome — and a tool that never
+        # reaches `execute_guarded` has nothing else to clear it.
+        handler_ctx.run(reset_typed_outcome)
         try:
             # Run the tool handler OFF the event loop. The heavy handlers block for the whole query —
             # execute_sql runs it under the executor's own bounds (the per-statement budget, plus the
@@ -432,7 +441,13 @@ def build_server(
             # off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
             # `run_blocking` (anyio.to_thread) copies the request context into the worker thread, so
             # the org-scoped model cache (ACE-045, read via `_current_org_ctx`) stays tenant-correct.
-            result_text = await run_blocking(meta["handler"], arguments or {})
+            # Run the handler inside a context THIS frame owns, so the classified outcome it
+            # publishes can be read back afterwards (ACE-098). `run_blocking` hands the worker a
+            # copy of the current context, and a `ContextVar.set` inside a copy is invisible here —
+            # verified, not assumed. Giving the handler a `Context` object we hold is what makes the
+            # verdict readable at the audit write below, instead of it having to `json.loads` the
+            # body this call is about to return.
+            result_text = await run_blocking(handler_ctx.run, meta["handler"], arguments or {})
             return [mt.TextContent(type="text", text=result_text)]
         except Exception:
             raised = True
@@ -461,6 +476,10 @@ def build_server(
                 execution_ms=int((time.monotonic() - started) * 1000),
                 actor=_actor_ctx.get(),
                 raised=raised,
+                # The classified outcome, when the handler produced one (ACE-098). Empty for every
+                # tool that does not speak the Envelope, which means "derive it the way you always
+                # have" — so those tools keep the body parse and nothing about them changes.
+                **typed_outcome_overrides(handler_ctx),
             )
 
     return server

@@ -210,7 +210,14 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # the safety pass already resolved ACROSS to the receipt builder a few lines later, inside one
     # call. Nothing reads it to compute a bound, and it is cleared at the entry to every call, so it
     # cannot outlive the call that set it — let alone reach a child.
-    context_vars -= {"_last_error_detail", "_guard_model"}
+    #
+    # `_last_outcome` (ACE-098) is the third, and it is the same kind as the first: an OUTPUT
+    # carrier. It holds the classified verdict of a call that has already finished, so the transport
+    # can record why it failed without re-parsing the body it is about to return. Written after the
+    # budget is resolved and spent, never read to compute a bound, and cleared at the entry to every
+    # call. It also cannot cross the fork, which is the hazard here — and does not need to: the
+    # parent sets it from the Envelope it rebuilds on its own side.
+    context_vars -= {"_last_error_detail", "_guard_model", "_last_outcome"}
     assert context_vars == {"_max_rows_override"}, (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"
