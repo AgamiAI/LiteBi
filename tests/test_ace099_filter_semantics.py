@@ -341,19 +341,23 @@ def test_a_reference_inside_a_set_operation_cte_body_is_labelled_by_that_cte():
     such reference labelled `subquery` — the label that means "a scope we did not recognize" — so a
     filter satisfied in a UNION-ed CTE was reported as satisfied nowhere nameable.
 
-    Each arm still answers for itself: the first filters as declared, the second does not.
+    Each arm still answers for itself: the first filters as declared, the second does not. And
+    since ACE-043 each arm has a LABEL to point at while doing so — `cte:recent#1` and
+    `cte:recent#2`. Both references read the same table under no alias, so before the ordinal the
+    two rows below were identical in every field a reader could see, and a receipt saying one of
+    them omitted the declared filter could not say which.
     """
     sql = ("WITH recent AS ("
            "SELECT id FROM orders WHERE orders.is_deleted = false "
            "UNION SELECT id FROM orders"
            ") SELECT id FROM recent")
     assert [r.scope for r in rt._table_references(_parse(sql))] == [
-        "main", "cte:recent", "cte:recent",
+        "main", "cte:recent#1", "cte:recent#2",
     ]
     assert _entries(sql) == [
         ("recent", "main", []),
-        ("orders", "cte:recent", [("orders.is_deleted = false", "applied")]),
-        ("orders", "cte:recent", [("orders.is_deleted = false", "omitted")]),
+        ("orders", "cte:recent#1", [("orders.is_deleted = false", "applied")]),
+        ("orders", "cte:recent#2", [("orders.is_deleted = false", "omitted")]),
     ]
 
 
