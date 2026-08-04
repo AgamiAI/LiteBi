@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -52,8 +54,19 @@ if str(PKG_SRC) not in sys.path:
 
 import execute_sql  # noqa: E402
 import guardrail  # noqa: E402
+import tools  # noqa: E402
 from semantic_model import loader as L  # noqa: E402
 from semantic_model import runtime as rt  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate():
+    """`_INJECTED_EXECUTOR` is a process global — the in-process route sets it and `create_app()`
+    sets it — so a test that injects one must not leak it into the next."""
+    tools.set_injected_executor(None)
+    yield
+    tools.set_injected_executor(None)
+
 
 # --- fixture ----------------------------------------------------------------
 
@@ -695,14 +708,26 @@ class _SpyExecutor:
 def warehouse(tmp_path, monkeypatch):
     """The same model plus the engine and environment `execute_guarded` reads.
 
-    Only the two tests that assert what a CALLER receives need it; every other test here reads the
+    Only the tests that assert what a CALLER receives need it; every other test here reads the
     receipt straight off the model and takes the lighter `org` above.
+
+    The sqlite file is SEEDED rather than left for sqlite to create empty, because the tool-edge
+    tests below run a real statement through a real executor: an injected spy would let a route that
+    executed nothing still look like one that answered.
     """
     artifacts = tmp_path / "artifacts"
     (artifacts / "p").mkdir(parents=True)
     _write_model(artifacts / "p", storage_type="SQLite")
+    db = tmp_path / "w.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+    con.execute("CREATE TABLE customers (id INTEGER)")
+    con.executemany("INSERT INTO orders (id, customer_id) VALUES (?, ?)", [(1, 1), (2, 1)])
+    con.execute("INSERT INTO customers (id) VALUES (1)")
+    con.commit()
+    con.close()
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
-    monkeypatch.setenv("DATASOURCE_URL__P", f"sqlite:///{tmp_path / 'w.db'}")
+    monkeypatch.setenv("DATASOURCE_URL__P", f"sqlite:///{db}")
     for var in ("AGAMI_DB_URL", "APP_DATABASE_URL", "AGAMI_ORG_ID", "AGAMI_SQL_TIMEOUT_S"):
         monkeypatch.delenv(var, raising=False)
     return artifacts
@@ -727,6 +752,121 @@ def test_a_statement_whose_joins_are_all_undeclared_executes_and_is_never_refuse
     assert env.refusal is None
     assert spy.calls and spy.calls[0][0] == sql  # byte-identical, per ACE-093
     assert [i["status"] for i in env.receipt.joins.items] == [rt.UNDECLARED]
+
+
+# --- SC-8: the finding reaches a caller, on both surfaces -------------------
+#
+# Every assertion above reads the section off `assemble_receipt` or off the Envelope
+# `execute_guarded` built. Neither of those is a SURFACE. What a user is shown is a tool response,
+# and a finding that stops short of one is a finding nobody reads — a receipt dropped, renamed or
+# nested at either tool edge would leave the whole battery above green.
+#
+# So the UNDECLARED case — the end-to-end case this spec is about, and the one a `declared` fixture
+# cannot stand in for, because `declared` is also what the old build produced — is driven through
+# both edges the repo ships: `tools._emit`, the single serializer every stdio / MCP call returns
+# through, and an authenticated HTTP request over `create_app()`'s `/mcp`.
+
+# What both surfaces must return for `WRONG_COLUMN`: the same two declared tables joined on a pair
+# no relationship declares, which the old build reported as the signed-off `orders_to_customers`.
+EXPECTED_UNDECLARED = {
+    "predicate": "o.id = c.id", "scope": "main", "status": rt.UNDECLARED,
+    "from_to": "orders → customers", "name": None, "cardinality": None, "confidence": None,
+    "origin": None, "review_state": None, "signed_off_by": None, "signed_off_role": None,
+    "signed_off_at": None, "cross_schema": None, "on": None,
+}
+
+
+def _assert_undeclared_answer(body: dict) -> None:
+    """What either surface must return for `WRONG_COLUMN`: the answer, and the finding beside it.
+
+    The whole item rather than the fields a caller happens to read, because "the finding survived"
+    and "a sign-off trail did not come with it" are the same assertion here — the item is what would
+    carry a borrowed one.
+    """
+    assert body["status"] == "ok", body
+    assert "refusal" not in body, body
+    assert body["receipt"]["joins"]["items"] == [EXPECTED_UNDECLARED]
+    # `undeclared` is SETTLED, so the section claims completeness rather than flagging a gap.
+    assert body["receipt"]["joins"]["undetermined"] is None
+
+
+def test_the_stdio_surface_returns_the_undeclared_join_on_the_body(warehouse, monkeypatch):
+    """The MCP / stdio edge: `tools.tool_execute_sql`, whose every outcome is serialized by
+    `tools._emit` — the one place `body["receipt"]` is set.
+
+    In-process rather than forked, because the fork's parent re-assembles the receipt from the
+    statement it sent and this asserts the edge, not the builder. The status is asserted with it: a
+    correctness finding that arrived as a refusal would satisfy any assertion about the item alone,
+    and refusing on one is the failure mode SC-8 exists to prevent.
+    """
+    monkeypatch.setattr(tools, "QUERY_LOG", warehouse / "query_log.jsonl")
+    tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
+
+    body = json.loads(tools.tool_execute_sql({"sql": WRONG_COLUMN, "datasource": "p"}))
+
+    _assert_undeclared_answer(body)
+
+
+@pytest.fixture()
+def served(warehouse, tmp_path, monkeypatch):
+    """The same install, SERVED: an app database to audit into, plus the two settings the HTTP
+    transport needs to mint and verify a bearer token.
+
+    Hosted is not a variation on the fixture above, it is a different deployment: recording is
+    mandatory there, so a call whose audit row cannot be written is refused before it runs, and this
+    file's claim is about a call that answers.
+    """
+    from store import Store
+
+    app_db = "sqlite://" + str(tmp_path / "app.db")
+    store = Store.connect(app_db)
+    store.run_migrations()
+    store.close()
+    monkeypatch.setenv("AGAMI_DB_URL", app_db)
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://your-host.example.com")
+    monkeypatch.setenv("AGAMI_SIGNING_SECRET", "x" * 40)
+    return warehouse
+
+
+def test_the_http_surface_returns_the_undeclared_join_on_the_body(served):
+    """The other edge, driven for real: `TestClient` over `create_app()`'s `/mcp`, authenticated,
+    through `initialize` and `tools/call` like any client.
+
+    Not a duplicate of the test above. The two surfaces are the same tool behind different
+    transports and different execution defaults, and "both surfaces stay in sync" is a claim no test
+    of either one alone can make — the receipt travels through a second serializer here, and a
+    section that arrived empty, renamed or nested would be invisible to everything else in this
+    file.
+    """
+    import mcp_http
+    from oauth_server import issue_jwt
+    from starlette.testclient import TestClient
+
+    headers = {
+        "Authorization": f"Bearer {issue_jwt('jordan@example.com')}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(mcp_http.create_app()) as client:
+        assert tools._INJECTED_EXECUTOR is not None, (
+            "create_app() no longer injects an executor, so this surface is now the fork path and "
+            "the in-process edge this test believes it drives is undriven"
+        )
+        init = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        session = init.headers.get("mcp-session-id")
+        headers2 = {**headers, **({"mcp-session-id": session} if session else {})}
+        client.post("/mcp", headers=headers2,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        resp = client.post("/mcp", headers=headers2, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "execute_sql", "arguments": {
+                "sql": WRONG_COLUMN, "datasource": "p"}}})
+
+    assert resp.status_code == 200, resp.text
+    _assert_undeclared_answer(json.loads(resp.json()["result"]["content"][0]["text"]))
 
 
 # --- SC-8: the same section on every run ------------------------------------
