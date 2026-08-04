@@ -13,13 +13,18 @@ proved nothing:
   * the vectors carry MARKERS applied by their parametrizers, so selection is a property of the
     corpus rather than a string a rename can miss. `db_path` is the corpus on the served model and
     the Postgres warehouse; `role_floor` is the database refusing a write with the application out
-    of the path — a separate marker and a separate count, because it is a separate claim and folding
-    it into the vector total would let one shrink while the other grew.
-  * `AGAMI_IT_PG_REQUIRED` declares "this run must carry the DB-backed evidence", and with it set
+    of the path; `http_path` is the corpus on the file-served model over HTTP, the half that runs on
+    every PR. Three markers and three counts, because they are three claims and folding any two
+    together would let one shrink while the other grew — which is exactly what happened to the
+    file-path half: with only the DB counts in place, `--deselect tests/e2e/test_safety_corpus.py`
+    removed the entire per-vector driver and the run still exited 0.
+  * a SENTINEL declares "this run must carry that evidence", and with one set
     `pytest_collection_modifyitems` counts the marked items and ENDS the session unless each count
     is exactly what its constant says. That catches everything that removes items: a module-level
     skip for a missing password or driver, a deleted file, a thinned parametrization, a `-k` or
-    `--deselect` that misses.
+    `--deselect` that misses. Each marker names the sentinel that governs it rather than sharing
+    one, because the DB job and the every-PR job carry different evidence and neither may speak for
+    the other.
   * and `pytest_sessionfinish` counts what actually RAN, because the hook above cannot. Collection
     is not execution: a `@pytest.mark.skip` on the vector, a `pytest.skip()` in its body, or a skip
     raised from the `pg_warehouse` fixture all leave the item collected and the count perfectly
@@ -49,10 +54,11 @@ for _path in (TESTS_ROOT, E2E_DIR):
 
 import itdeps  # noqa: E402
 
-from safety.corpus import EXPECTED_DB_VECTORS  # noqa: E402
+from safety.corpus import EXPECTED_DB_VECTORS, EXPECTED_HTTP_VECTORS  # noqa: E402
 
 DB_PATH_MARKER = "db_path"
 ROLE_FLOOR_MARKER = "role_floor"
+HTTP_PATH_MARKER = "http_path"
 
 # The five ways to change or destroy data that `test_role_floor_pg.py::WRITES` issues at the raw
 # connection. A literal here rather than an import from that file, and deliberately so: the number
@@ -64,10 +70,16 @@ ROLE_FLOOR_MARKER = "role_floor"
 # with a message that names both counts. That is the intended cost, not an oversight.
 EXPECTED_ROLE_FLOOR_VECTORS = 5
 
-# Marker -> how many items carrying it a declared run must collect AND pass.
-_GUARDED = {
-    DB_PATH_MARKER: EXPECTED_DB_VECTORS,
-    ROLE_FLOOR_MARKER: EXPECTED_ROLE_FLOOR_VECTORS,
+# Marker -> (how many items carrying it a declared run must collect AND pass, which sentinel
+# declares it). The sentinel is part of the entry because the two jobs carry different evidence and
+# neither may speak for the other: `AGAMI_IT_PG_REQUIRED` belongs to the job with a database, and
+# `AGAMI_E2E_REQUIRED` to the one that runs on every PR without one. A `http_path` count keyed off
+# the DB sentinel would arm only in the job that is not the every-PR check, which is the half of the
+# problem that mattered.
+_GUARDED: dict[str, tuple[int, str]] = {
+    DB_PATH_MARKER: (EXPECTED_DB_VECTORS, itdeps.REQUIRED),
+    ROLE_FLOOR_MARKER: (EXPECTED_ROLE_FLOOR_VECTORS, itdeps.REQUIRED),
+    HTTP_PATH_MARKER: (EXPECTED_HTTP_VECTORS, itdeps.E2E_REQUIRED),
 }
 
 # Tallied by `pytest_runtest_logreport` below. `passed` counts call-phase passes; `not_run` counts
@@ -106,15 +118,15 @@ def pytest_collection_modifyitems(session, config, items) -> None:
     Collect, not execute — which is why this hook is only the first half. `pytest_sessionfinish`
     below is the other.
     """
-    if not os.environ.get(itdeps.REQUIRED):
-        return
-    for marker, expected in _GUARDED.items():
+    for marker, (expected, sentinel) in _GUARDED.items():
+        if not os.environ.get(sentinel):
+            continue
         collected = [item for item in items if item.get_closest_marker(marker)]
         if len(collected) != expected:
             pytest.exit(
-                f"{itdeps.REQUIRED} is set, so this run must carry the DB-backed safety corpus, "
-                f"but it collected {len(collected)} items marked {marker!r} and {expected} are "
-                f"required. A run that cannot execute the evidence must not report green.",
+                f"{sentinel} is set, so this run must carry the safety corpus, but it collected "
+                f"{len(collected)} items marked {marker!r} and {expected} are required. A run that "
+                f"cannot execute the evidence must not report green.",
                 returncode=1,
             )
 
@@ -171,14 +183,15 @@ def pytest_sessionfinish(session, exitstatus) -> None:
     """
     problems: list[str] = []
 
-    if os.environ.get(itdeps.REQUIRED):
-        for marker, expected in _GUARDED.items():
-            tally = _RAN[marker]
-            if tally["passed"] != expected or tally["not_run"]:
-                problems.append(
-                    f"{expected} items marked {marker!r} must pass; {tally['passed']} passed and "
-                    f"{tally['not_run']} were skipped or xfailed"
-                )
+    for marker, (expected, sentinel) in _GUARDED.items():
+        if not os.environ.get(sentinel):
+            continue
+        tally = _RAN[marker]
+        if tally["passed"] != expected or tally["not_run"]:
+            problems.append(
+                f"{expected} items marked {marker!r} must pass; {tally['passed']} passed and "
+                f"{tally['not_run']} were skipped or xfailed"
+            )
 
     if os.environ.get(itdeps.E2E_REQUIRED):
         if _RAN_ANY["not_run"]:

@@ -68,9 +68,13 @@ if not harness.PG_ENABLED:
         allow_module_level=True,
     )
 
-pytest.importorskip("pydantic")
-pytest.importorskip("sqlglot")
-pytest.importorskip("yaml")
+# The model stack, on the same terms as the other four drivers. These were three
+# `pytest.importorskip` calls, which is the exact hole `importorfail` exists to close and the last
+# one left in this directory: a run that declared it carries this evidence would have lost the model
+# stack and reported green, with every count underneath perfectly satisfied because the items were
+# never collected to be counted. The sentinel is the file-path one, matching the other drivers —
+# `psycopg2` above is the DB half's own prerequisite and keeps the DB sentinel.
+itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
 
 
 def _db_params():

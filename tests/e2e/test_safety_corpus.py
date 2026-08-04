@@ -58,21 +58,34 @@ def file_path(tmp_path, monkeypatch):
 
 
 def _params():
-    """One parameter per vector, carrying its own strict-xfail marker where this branch is red.
+    """One parameter per vector, carrying the `http_path` MARKER and its own strict-xfail marker
+    where this branch is red.
 
-    The marker is applied by the PARAMETRIZER off `Case.red_on_main`, so the red set is a property
-    of the corpus rather than a decoration a later edit can add to a vector that already passes.
-    `strict` cuts both ways on purpose: when the owning gate lands, the vector flips green and this
-    file fails until the marker is removed, so nobody has to re-read a spec to notice.
+    `http_path` is what puts this file inside the collection and session sentinels in `conftest.py`,
+    and it was the one half of the corpus outside them. The DB-path count made a thinned
+    parametrization visible and said nothing at all about a run that kept the DB half and dropped
+    this file: `--deselect tests/e2e/test_safety_corpus.py` removed every vector of the every-PR
+    half and the session still exited 0. Counted off `safety.corpus.EXPECTED_HTTP_VECTORS`, which is
+    derived from `CASES`, so it cannot be edited into agreement with a thinned corpus.
+
+    The xfail marker is applied here off `Case.red_on_main` for the same reason, so the red set is a
+    property of the corpus rather than a decoration a later edit can add to a vector that already
+    passes. `strict` cuts both ways on purpose: when the owning gate lands, the vector flips green
+    and this file fails until the marker is removed, so nobody has to re-read a spec to notice.
     """
     return [
         pytest.param(
             case,
-            marks=pytest.mark.xfail(strict=True, reason="the gate that closes this has not landed"),
+            marks=[
+                pytest.mark.http_path,
+                pytest.mark.xfail(
+                    strict=True, reason="the gate that closes this has not landed"
+                ),
+            ],
             id=case.id,
         )
         if case.red_on_main
-        else pytest.param(case, id=case.id)
+        else pytest.param(case, marks=pytest.mark.http_path, id=case.id)
         for case in CASES
         if case.runs_on(harness.ENGINE)
     ]
