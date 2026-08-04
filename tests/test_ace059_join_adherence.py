@@ -272,6 +272,25 @@ VALUES_NAMED_AS_DECLARED = ("SELECT o.id FROM orders o JOIN (VALUES (1)) AS cust
                             "ON o.customer_id = customers.id")
 DERIVED_NAMED_AS_DECLARED_IN_FROM = ("SELECT o.id FROM (SELECT 1 AS id) AS customers "
                                      "JOIN orders o ON o.customer_id = customers.id")
+# `COMPOUND_ON`'s second join again — the same ON, over the same three relations — with the FROM
+# relation swapped for a derived table. The ON is exactly as unreducible either way, so the status
+# has to be exactly the same either way.
+DERIVED_FROM_COMPOUND_ON = ("SELECT r.name FROM (SELECT * FROM orders) d "
+                            "JOIN customers c ON d.id = c.id "
+                            "JOIN regions r ON r.id = c.region_id AND r.id = d.id")
+# The FROM relation is not party to the third join at all: `t` appears in neither its ON nor its
+# inputs, and labelling the item with it is the only thing that puts the two words in one sentence.
+FROM_OUTSIDE_THE_ON = ("WITH t AS (SELECT 1 AS id) SELECT r.name FROM t, orders o "
+                       "JOIN customers c ON o.customer_id = c.id "
+                       "JOIN regions r ON c.region_id = r.id AND o.id = r.id")
+# No left endpoint at all: the FROM is an unaliased derived table, so there is no name to fall back
+# to. One statement's ON names no relation and the other writes none.
+NO_LEFT_ENDPOINT = "SELECT 1 FROM (SELECT 1 AS id) JOIN customers c ON 1 = 1"
+NO_LEFT_ENDPOINT_NO_ON = "SELECT 1 FROM (SELECT 1 AS id) CROSS JOIN customers c"
+# An unreducible ON whose RIGHT endpoint is a relation the statement computed. The right input comes
+# off the join node itself, so it is established however little the ON says.
+UNPINNED_ON_COMPUTED_RIGHT = ("SELECT c.id FROM orders o JOIN customers c ON o.customer_id = c.id "
+                              "JOIN (SELECT 1 AS id) s ON s.id = c.id AND s.id = o.id")
 
 
 # --- SC-1: one item per join the statement wrote ----------------------------
@@ -615,6 +634,56 @@ def test_an_on_reaching_over_more_than_two_relations_is_not_reduced_to_a_pair(or
     assert first["status"] == rt.DECLARED  # the same statement's other join settles normally
     assert second["status"] == rt.UNDETERMINED
     assert second["from_to"] == "orders → regions"
+
+
+def test_an_unreducible_on_is_unreducible_whatever_the_from_relation_is(org):
+    """The status is a claim about the ON, so the FROM relation must not decide it.
+
+    `COMPOUND_ON` and `DERIVED_FROM_COMPOUND_ON` write the SAME second join over the same three
+    relations, and differ only in what the FROM introduced. When the ON does not pin, `left` holds
+    the FROM fallback — documented as a label and not a resolution — and declarability was read off
+    that same unresolved value, and read BEFORE the question of whether the ON pinned anything. So a
+    derived table in the FROM turned an unreadable ON into the settled `undeclarable`, under a null
+    marker: the section claiming it established something about a join it could not read.
+    """
+    for sql in (COMPOUND_ON, DERIVED_FROM_COMPOUND_ON):
+        section = _section(org, sql)
+        assert section["items"][1]["status"] == rt.UNDETERMINED, sql
+        assert "could not be matched against the model" in (section["undetermined"] or ""), sql
+
+
+def test_a_from_relation_the_on_never_names_settles_nothing(org):
+    """The worse spelling of the same thing: `t` is party to neither side of the third join. Its
+    name reaching the item at all is the label doing its job — a reader has to find the join in
+    their own SQL — and the status reading `undeclarable` off it is a settled claim about a
+    relationship between two tables one of which was picked by position."""
+    section = _section(org, FROM_OUTSIDE_THE_ON)
+    assert section["items"][2]["from_to"] == "t → regions"
+    assert section["items"][2]["status"] == rt.UNDETERMINED
+    assert "could not be matched against the model" in (section["undetermined"] or "")
+
+
+@pytest.mark.parametrize("sql", [NO_LEFT_ENDPOINT, NO_LEFT_ENDPOINT_NO_ON],
+                         ids=["on-names-nothing", "no-on"])
+def test_a_join_with_no_left_endpoint_at_all_settles_nothing(org, sql):
+    """An unaliased derived table has no name, so there is nothing to fall back to and `left` is the
+    empty string. A settled status off it is a claim about a relation the receipt cannot even name,
+    which the label admits by rendering one side blank."""
+    (item,) = _items(org, sql)
+    assert item["from_to"] == " → customers"
+    assert item["status"] == rt.UNDETERMINED
+
+
+def test_a_computed_right_endpoint_stays_settled_even_when_the_on_says_nothing(org):
+    """The other half, and the reason declarability is kept per endpoint rather than reordered whole.
+
+    The right input comes off the join node itself, so it is established however little the ON says.
+    A derived table there can never be what a declaration is about, and that stays settled — routing
+    it to `undetermined` would put a permanently unanswerable question on the marker.
+    """
+    item = _items(org, UNPINNED_ON_COMPUTED_RIGHT)[1]
+    assert item["status"] == rt.UNDECLARABLE
+    assert _section(org, UNPINNED_ON_COMPUTED_RIGHT)["undetermined"] is None
 
 
 def test_an_unreducible_on_keeps_the_marker_honest(org):

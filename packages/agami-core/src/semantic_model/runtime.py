@@ -2253,12 +2253,13 @@ def assemble_receipt(
     join_items: list[dict[str, Any]] = []
     for js in join_sites[:_RECEIPT_MAX_REFS]:
         match: Optional[Relationship] = None
-        if not (js.left_declarable and js.right_declarable):
+        if not js.right_declarable:
             # An endpoint the STATEMENT bound — a CTE name, a derived table, a `VALUES` list, a CTE
             # shadowing a declared table — cannot be what any declaration is about, so this is
-            # settled rather than open. It is asked FIRST because a structural impossibility
-            # outranks a failure to resolve: there is nothing here for a better analysis to
-            # establish later.
+            # settled rather than open: there is nothing here for a better analysis to establish
+            # later. The RIGHT endpoint is asked first because it is the one always established —
+            # it comes off `join.this`, the join's own right input — so a structural impossibility
+            # there outranks everything below however little the ON said.
             status = UNDECLARABLE
         elif not js.pinned:
             # The ON did not reduce to a pair of endpoints. Unlike the branch above this is a fact
@@ -2266,6 +2267,15 @@ def assemble_receipt(
             # `undeclarable` would claim the model cannot declare a join it may well declare, and
             # would let the marker reach null with something genuinely unestablished under it.
             status = UNDETERMINED
+        elif not js.left_declarable:
+            # And only NOW is the left endpoint worth asking about, because only now is it one the
+            # analysis established. Until the ON pins, `left` holds the FROM fallback, which is a
+            # LABEL — the address a reader needs to find the join in their own SQL — and reading a
+            # settled status off it made the FROM decide the question: the same unreadable ON came
+            # back `undetermined` over `FROM orders` and `undeclarable` over `FROM (SELECT …) d`,
+            # the second under a null marker, and the FROM relation need not be party to the join at
+            # all.
+            status = UNDECLARABLE
         elif js.predicate is None and js.node.args.get("kind") == "CROSS":
             # It wrote no predicate, which is a fact about the statement and not a gap in the
             # analysis: there is nothing here for a declaration to match.
@@ -3254,6 +3264,11 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
             pinned = right in names and len(others) <= 1
             if pinned:
                 left = others[0] if others else right
+        # An EMPTY left is no endpoint at all rather than a name we happen to dislike: there was no
+        # enclosing SELECT to read a FROM from, or the FROM introduced an unaliased derived table,
+        # which has no name for a qualifier to use. The item renders one side of the label blank and
+        # says so; a status settled off it would be a claim about a relation the receipt cannot name.
+        pinned = pinned and bool(left)
         sites.append(_JoinSite(
             node=join,
             # The ON is serialized as a FRAGMENT for a label — see `_aggregate_sites` for the whole
