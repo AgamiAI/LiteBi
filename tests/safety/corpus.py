@@ -19,9 +19,14 @@ sets on the server process. Porting the field would have reintroduced a knob tha
 
 `red_on_main` marks a vector whose expected outcome this branch does not produce yet. Those are
 `xfail(strict=True)` at the driver, so they flip green on their own when the owning gate lands and
-a premature "fix" cannot hide in them. Each one was MEASURED — run through the four model gates on
-this branch — rather than assumed by group; the two that are marked are the only two that pass
-through all four unrefused.
+a premature "fix" cannot hide in them. Each one is MEASURED — run through the model gates on this
+branch — rather than assumed by group.
+
+**No vector is currently marked, and that is asserted.** The table function and the comma-joined
+VALUES were both red when this corpus was written; the gate that owns them merged while it was
+being built, and the strict markers failed the suite on the rebase rather than absorbing the change
+in silence. The driver asserts the red set is exactly empty, so a new red vector has to be declared
+rather than blend in.
 """
 
 from __future__ import annotations
