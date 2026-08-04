@@ -25,10 +25,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("pydantic")
-pytest.importorskip("sqlglot")
-pytest.importorskip("yaml")
-
 TESTS_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = TESTS_ROOT.parent
 for _path in (
@@ -38,6 +34,15 @@ for _path in (
 ):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+
+import itdeps  # noqa: E402
+
+# The model stack every vector reads. `importorfail`, not `importorskip`, and the difference is the
+# whole point of the sentinel: with `sqlglot` unimportable, `pytest tests/e2e` came back
+# `4 passed, 6 skipped` and exit 0 — the job that runs on every PR passing having collected
+# almost none of the corpus it exists to run. Under `AGAMI_E2E_REQUIRED` that is now a failure.
+# Without it, still a skip, so a developer without the extras keeps a usable suite.
+itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
 
 import guardrail  # noqa: E402
 import harness  # noqa: E402

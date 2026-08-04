@@ -21,10 +21,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("pydantic")
-pytest.importorskip("sqlglot")
-pytest.importorskip("yaml")
-
 TESTS_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = TESTS_ROOT.parent
 for _path in (
@@ -34,6 +30,12 @@ for _path in (
 ):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+
+import itdeps  # noqa: E402
+
+# The model stack, required rather than skipped when a run declared it carries this half. See
+# `test_safety_corpus.py` for the measured failure this replaces.
+itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
 
 import guardrail  # noqa: E402
 import harness  # noqa: E402

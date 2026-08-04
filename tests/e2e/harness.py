@@ -35,13 +35,22 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 TESTS_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = TESTS_ROOT.parent
-for _path in (TESTS_ROOT, REPO_ROOT / "packages" / "agami-core" / "src"):
+SRC = REPO_ROOT / "packages" / "agami-core" / "src"
+for _path in (TESTS_ROOT, Path(__file__).resolve().parent, SRC):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+
+import itdeps  # noqa: E402
+
+# The HTTP transport's dependencies, declared HERE and at MODULE scope. They used to be three
+# `pytest.importorskip` calls inside `route_http`, which is a call-time gate: with `mcp` or `PyJWT`
+# absent — one edit to an install line away, both live in the `server` extra — every vector on every
+# path raised `Skipped` as it ran. The session reported `53 passed, 297 skipped`, exited 0, and the
+# collection sentinel was perfectly satisfied because the items had still been COLLECTED. At module
+# scope the same absence removes the items instead, which is the only place a count can see it.
+itdeps.importorfail("starlette", "mcp", "jwt", sentinel=itdeps.E2E_REQUIRED)
 
 import execute_sql  # noqa: E402
 import tools  # noqa: E402
@@ -412,10 +421,11 @@ def route_stdio(sql: str, profile: str = PROFILE) -> dict:
 
 
 def route_http(sql: str, profile: str = PROFILE) -> dict:
-    """The HTTP transport, for real: `TestClient` over `create_app()`'s authenticated `/mcp`."""
-    pytest.importorskip("starlette")
-    pytest.importorskip("mcp")
-    pytest.importorskip("jwt")
+    """The HTTP transport, for real: `TestClient` over `create_app()`'s authenticated `/mcp`.
+
+    No dependency guard here: it is at module scope, where a missing transport removes the vectors
+    rather than skipping them one at a time after they have been counted.
+    """
     import mcp_http
     from oauth_server import issue_jwt
     from starlette.testclient import TestClient

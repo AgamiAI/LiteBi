@@ -46,10 +46,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("pydantic")
-pytest.importorskip("sqlglot")
-pytest.importorskip("yaml")
-
 TESTS_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = TESTS_ROOT.parent
 for _path in (
@@ -59,6 +55,12 @@ for _path in (
 ):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+
+import itdeps  # noqa: E402
+
+# The model stack, required rather than skipped when a run declared it carries this half. See
+# `test_safety_corpus.py` for the measured failure this replaces.
+itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
 
 import guardrail  # noqa: E402
 import harness  # noqa: E402
@@ -112,7 +114,14 @@ def marketplace(tmp_path, monkeypatch):
     is written anyway, so the comparison is not quietly arranged in the vendored surface's favour.)
     """
     if not _package_hidden():
-        pytest.skip("cannot simulate a package-less interpreter here (-S does not hide agami-core)")
+        # A skip here drops the ENTIRE vendored-surface dimension — every parity vector, the
+        # import-root proof, the pinned asymmetry — and takes the run's exit code with it, which is
+        # the same shape as every other hole this spec closes. Under `AGAMI_E2E_REQUIRED` an
+        # interpreter that will not hide its site-packages is a broken runner, not a tolerated one.
+        itdeps.skip_or_fail(
+            "cannot simulate a package-less interpreter here (-S does not hide agami-core)",
+            itdeps.E2E_REQUIRED,
+        )
 
     built = harness.build_file_path(tmp_path, monkeypatch)
 
