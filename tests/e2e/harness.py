@@ -498,11 +498,31 @@ def route_http(sql: str, profile: str = PROFILE) -> dict:
     return json.loads(resp.json()["result"]["content"][0]["text"])
 
 
-ROUTES = {
-    "in_process": route_in_process,
-    "stdio": route_stdio,
-    "http": route_http,
-}
+# The keys a tool-edge body carries ONLY when the statement ran and produced a result. A refusal
+# that carried any of them would be handing back a partial answer under a status that says there is
+# none — "refused, and the rows came back anyway" is the highest-consequence failure this corpus can
+# catch, so the list lives here, next to `verdict`, and both the per-vector driver and the
+# availability test read it rather than each keeping its own copy.
+RESULT_KEYS = ("data", "columns", "rows", "row_count", "markdown", "units")
+
+
+def _comparable_rows(body: dict) -> tuple | None:
+    """The row payload, order-independent.
+
+    Left out entirely before, with a fair rationale: pinning row ORDER would pin something no engine
+    promised, and none of these statements carries an `ORDER BY` that makes the order total. But
+    dropping the payload means a path returning DIFFERENT rows of the same shape — same columns,
+    same count — compares equal, and "the two paths agree" is the entire claim two files make with
+    this function. Sorting is what keeps the rationale and closes the hole: each row is serialized
+    to one string and the strings are sorted, so the comparison is over the multiset of rows and
+    over nothing else. `default=str` because a warehouse is free to hand back a `Decimal` or a date
+    where the other hands back a float, and the shape of the comparison is what matters here, not
+    the driver's Python type.
+    """
+    rows = body.get("rows")
+    if rows is None:
+        return None
+    return tuple(sorted(json.dumps(row, default=str, sort_keys=True) for row in rows))
 
 
 def verdict(body: dict) -> tuple:
@@ -514,9 +534,8 @@ def verdict(body: dict) -> tuple:
 
     `audit_id` is per call (two runs are two executions and each writes its own row), `execution_ms`
     is a clock, and `sql` and `markdown` are echoes. What must not differ is the status, the rule and
-    reason when refused, and the answer's shape when not — a run that dropped or truncated rows shows
-    up in `row_count`. The row payload itself is deliberately left out: it would pin an ordering no
-    engine promised, which is flakiness rather than evidence.
+    reason when refused, and the answer itself when not — the columns, the count, and the rows as an
+    unordered multiset (see `_comparable_rows`).
     """
     refusal = body.get("refusal") or {}
     return (
@@ -525,4 +544,5 @@ def verdict(body: dict) -> tuple:
         refusal.get("reason"),
         tuple(body["columns"]) if "columns" in body else None,
         body.get("row_count"),
+        _comparable_rows(body),
     )

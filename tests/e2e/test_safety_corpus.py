@@ -88,7 +88,7 @@ def test_the_chokepoint_gives_each_vector_its_own_rule_over_http(file_path, case
         # more rows than this ceiling by design.
         monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", str(harness.LOW_ROW_CAP))
 
-    body = harness.ROUTES["http"](case.sql)
+    body = harness.route_http(case.sql)
 
     _assert_verdict(body, case)
 
@@ -100,6 +100,10 @@ def _assert_verdict(body: dict, case) -> None:
         # Not "the refusal is empty" — the key is absent. A caller distinguishing the two would be
         # reading a shape the tool edge does not emit.
         assert "refusal" not in body, body
+        # And it returned DATA. Without this the no-false-refusal half is provable against an empty
+        # result set: a gate that let the statement through to a warehouse that answered with
+        # nothing would satisfy every assertion above.
+        assert body["row_count"] > 0, body
         receipt = body["receipt"]
         for section in guardrail.Receipt.SECTIONS:
             assert section in receipt, (section, receipt)
@@ -110,6 +114,39 @@ def _assert_verdict(body: dict, case) -> None:
     refusal = body["refusal"]
     assert refusal["rule"] == case.rule, body
     assert refusal["reason"] == guardrail.REASON_FOR_RULE[case.rule], body
+    # And it handed back NOTHING. This is the highest-consequence failure the corpus could catch —
+    # "refused, and the rows came back anyway" — so it is asserted on every refusal rather than on
+    # the one class that happened to have a test for it. The rule and reason above are the
+    # precondition: without them "the body has no rows" would pass on any refusal at all.
+    for key in harness.RESULT_KEYS:
+        assert key not in body, (key, body)
+
+
+def test_every_receipt_section_says_something_on_some_governed_vector(file_path):
+    """The section assertion above is about SHAPE, and shape is not content.
+
+    `_assert_verdict` compares each section's KEYS to `{"items", "undetermined"}`, which an
+    assembler returning `{"items": [], "undetermined": None}` for all five sections satisfies on
+    every governed vector. That was measured: the fabricated all-empty receipt passed unchanged.
+    `harness.write_model` spends eighty lines building a deliberately rich model — a declared
+    relationship, an unreviewed metric, an AI-written column description, a default filter and a row
+    estimate — for exactly this reason, and nothing enforced that any of the richness arrived.
+
+    So: every section the contract declares carries a non-empty `items` on at least ONE governed
+    vector. Not on every vector, which would be false and should be — a projection has no joins and
+    no aggregates, and a receipt that invented some would be worse than one that reported none. The
+    failure message names the sections that came back empty everywhere AND which vectors populated
+    each of the others, so an assembler that stopped reporting joins says so in one line.
+    """
+    populated: dict[str, list[str]] = {section: [] for section in guardrail.Receipt.SECTIONS}
+    for case in (c for c in CASES if c.rule is None and c.runs_on(harness.ENGINE)):
+        receipt = harness.route_http(case.sql)["receipt"]
+        for section in guardrail.Receipt.SECTIONS:
+            if receipt[section]["items"]:
+                populated[section].append(case.note)
+
+    silent = sorted(section for section, notes in populated.items() if not notes)
+    assert not silent, (silent, populated)
 
 
 # ---------------------------------------------------------------------------

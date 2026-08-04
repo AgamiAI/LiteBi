@@ -79,7 +79,7 @@ def _drive(case, monkeypatch) -> dict:
     """
     if case.rule == guardrail.RULE_RESOURCE_LIMIT:
         monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", str(harness.LOW_ROW_CAP))
-    return harness.ROUTES["http"](case.sql)
+    return harness.route_http(case.sql)
 
 
 def _assert_receipt_is_whole(body: dict) -> None:
@@ -135,7 +135,7 @@ def _failed_body(file_path, monkeypatch) -> dict:
     empty = file_path.warehouse.parent / "empty-warehouse.db"
     sqlite3.connect(empty).close()
     monkeypatch.setenv(f"DATASOURCE_URL__{harness.PROFILE.upper()}", f"sqlite:///{empty}")
-    return harness.ROUTES["http"](_GOVERNED_SQL)
+    return harness.route_http(_GOVERNED_SQL)
 
 
 @pytest.mark.parametrize("case", _vectors())
@@ -148,7 +148,14 @@ def test_every_vector_comes_back_with_an_audit_id(file_path, case, monkeypatch):
     """
     body = _drive(case, monkeypatch)
 
-    assert body["status"] in ("ok", "refused"), body
+    # The status the CORPUS pins, not "either of the two a healthy run produces". `in ("ok",
+    # "refused")` was the line here, and it stayed green for a regression that refused every
+    # governed statement or allowed every refused one — `_vectors()` returns the whole corpus and
+    # the test never read `case.rule`. `failure` is named in the message because this line is also
+    # the one that caught the single observed flake, a governed vector that came back `failed` once
+    # in about thirty runs and never reproduced: `kind` narrows the next occurrence immediately.
+    expected = "refused" if case.rule else "ok"
+    assert body["status"] == expected, (expected, (body.get("failure") or {}).get("kind"), body)
     assert body["audit_id"], body
 
 
@@ -294,6 +301,12 @@ def test_every_other_outcome_writes_exactly_one_row_keyed_by_its_audit_id(
     rows = _audit_rows(served)
     assert [row["id"] for row in rows] == [body["audit_id"]], (case.id, rows, body)
     assert rows[0]["status"] == body["status"], (case.id, rows)
+    # The column the failure above is named after. `_audit_rows` has always SELECTed `rule` and
+    # nothing read it, so the rule-shaped exemption this test guards against — one keyed on a rule,
+    # or one that grew a second — could have written every row under the wrong rule, or under none,
+    # and the count would still have balanced. `None` for a governed vector is the recorded value,
+    # not a missing column.
+    assert rows[0]["rule"] == case.rule, (case.id, rows)
 
 
 def test_a_failed_execution_writes_its_row_too(served, file_path, monkeypatch):
@@ -309,11 +322,6 @@ def test_a_failed_execution_writes_its_row_too(served, file_path, monkeypatch):
 # Availability: refused and empty-handed, never trimmed
 # ---------------------------------------------------------------------------
 
-# The keys a body carries ONLY when the statement ran and produced a result. A refusal that carried
-# any of them would be handing back a partial answer under a status that says there is none.
-_RESULT_KEYS = ("data", "columns", "rows", "row_count", "markdown", "units")
-
-
 @pytest.mark.parametrize("case", _vectors(lambda c: c.rule == guardrail.RULE_RESOURCE_LIMIT))
 def test_an_over_ceiling_result_is_refused_with_no_data_at_all(file_path, case, monkeypatch):
     """The truncate-and-flag arm is gone, and this is what its absence has to look like.
@@ -322,6 +330,12 @@ def test_an_over_ceiling_result_is_refused_with_no_data_at_all(file_path, case, 
     is refused and carries nothing: no rows, no columns, no count, no rendered table. The rule and
     the reason are asserted as the PRECONDITION — without them "the body has no rows" would pass on
     any refusal at all, including one from a gate that never reached the ceiling.
+
+    `harness.RESULT_KEYS` is the same list `test_safety_corpus.py::_assert_verdict` now checks on
+    EVERY refusal. This one stays because it is a different claim: there the absence rides along
+    with a rule assertion made for other reasons, and here it is the point — this is the class where
+    a result genuinely existed and was thrown away, so an implementation that reverted to
+    trim-and-flag would have rows to hand back.
     """
     body = _drive(case, monkeypatch)
 
@@ -329,7 +343,7 @@ def test_an_over_ceiling_result_is_refused_with_no_data_at_all(file_path, case, 
     assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT, body
     expected_reason = guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
     assert body["refusal"]["reason"] == expected_reason, body
-    for key in _RESULT_KEYS:
+    for key in harness.RESULT_KEYS:
         assert key not in body, (key, body)
 
 

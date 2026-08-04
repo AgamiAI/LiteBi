@@ -101,11 +101,11 @@ def test_a_vector_gets_the_same_verdict_on_the_db_path_as_on_the_file_path(
 
     harness.build_file_path(tmp_path, monkeypatch)
     lower_the_ceiling_if_this_vector_needs_it()
-    over_file = harness.ROUTES["http"](case.sql)
+    over_file = harness.route_http(case.sql)
 
     harness.build_db_path(tmp_path, monkeypatch)
     lower_the_ceiling_if_this_vector_needs_it()
-    over_db = harness.ROUTES["http"](case.sql)
+    over_db = harness.route_http(case.sql)
 
     harness.reset_injected_executor()
 
@@ -149,7 +149,7 @@ def test_the_served_path_refuses_when_its_model_is_gone(pg_warehouse, tmp_path, 
     from store import Store
 
     built = harness.build_db_path(tmp_path, monkeypatch)
-    assert harness.ROUTES["http"](_GOVERNED_SQL)["status"] == "ok"
+    assert harness.route_http(_GOVERNED_SQL)["status"] == "ok"
 
     store = Store.connect(built.app_db_url)
     try:
@@ -158,7 +158,7 @@ def test_the_served_path_refuses_when_its_model_is_gone(pg_warehouse, tmp_path, 
     finally:
         store.close()
 
-    body = harness.ROUTES["http"](_GOVERNED_SQL)
+    body = harness.route_http(_GOVERNED_SQL)
 
     assert body["status"] == "refused", body
     assert body["refusal"]["rule"] == guardrail.RULE_MODEL_UNAVAILABLE, body
@@ -179,7 +179,7 @@ def test_the_local_path_does_not_refuse_when_its_model_is_gone(tmp_path, monkeyp
     empty.mkdir()
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(empty))
 
-    body = harness.ROUTES["http"](_GOVERNED_SQL)
+    body = harness.route_http(_GOVERNED_SQL)
 
     assert body["status"] == "ok", body
     # The receipt is where the local path says what the served one refuses over: nothing was

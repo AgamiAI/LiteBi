@@ -72,8 +72,8 @@ def test_a_vector_gets_the_same_verdict_over_stdio_as_it_does_over_http(
         # in-process app directly and the stdio child by inheritance.
         monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", str(harness.LOW_ROW_CAP))
 
-    over_stdio = harness.ROUTES["stdio"](case.sql)
-    over_http = harness.ROUTES["http"](case.sql)
+    over_stdio = harness.route_stdio(case.sql)
+    over_http = harness.route_http(case.sql)
 
     # The assertion this whole dimension exists for. `harness.verdict` is what a decision is compared
     # as, shared with the model/warehouse dimension so the two ask the same question of a body.
