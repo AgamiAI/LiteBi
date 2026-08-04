@@ -464,3 +464,26 @@ ROUTES = {
     "stdio": route_stdio,
     "http": route_http,
 }
+
+
+def verdict(body: dict) -> tuple:
+    """The DECISION, stripped of everything a run is free to differ on.
+
+    Two dimensions compare bodies with this — one transport against another, one model/warehouse
+    path against another — and both want the same answer to the same question: did the chokepoint
+    decide the same thing? So it is defined once here rather than twice in the files that ask.
+
+    `audit_id` is per call (two runs are two executions and each writes its own row), `execution_ms`
+    is a clock, and `sql` and `markdown` are echoes. What must not differ is the status, the rule and
+    reason when refused, and the answer's shape when not — a run that dropped or truncated rows shows
+    up in `row_count`. The row payload itself is deliberately left out: it would pin an ordering no
+    engine promised, which is flakiness rather than evidence.
+    """
+    refusal = body.get("refusal") or {}
+    return (
+        body["status"],
+        refusal.get("rule"),
+        refusal.get("reason"),
+        tuple(body["columns"]) if "columns" in body else None,
+        body.get("row_count"),
+    )

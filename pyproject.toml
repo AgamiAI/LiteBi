@@ -27,3 +27,9 @@ testpaths = ["tests"]
 # No --cov in addopts on purpose: a bare `pytest` then works without pytest-cov installed
 # (IDE runners, quick local runs). The CI gate and `dev.py cover` pass --cov explicitly;
 # a --cov-fail-under floor will be added once the baseline is locked.
+markers = [
+  # Applied by the safety corpus's DB-path parametrizer, and counted by tests/e2e/conftest.py.
+  # Registered so an unknown-mark warning can never be the only sign that it was misspelt — the
+  # marker is how that run selects its work, and a typo there is a run that proves nothing.
+  "db_path: a safety-corpus vector driven against the DB-served model and the Postgres warehouse",
+]

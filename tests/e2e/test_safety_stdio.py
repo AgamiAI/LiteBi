@@ -57,26 +57,6 @@ def file_path(tmp_path, monkeypatch):
     harness.reset_injected_executor()
 
 
-def _verdict(body: dict) -> tuple:
-    """The DECISION, stripped of everything a transport is free to differ on.
-
-    `audit_id` is per call (the two runs are two executions and each writes its own row),
-    `execution_ms` is a clock, and `sql` and `markdown` are echoes. What must not differ is the
-    status, the rule and reason when refused, and the answer's shape when not — a transport that
-    dropped or truncated rows shows up in `row_count`. The row payload itself is deliberately left
-    out: it would pin an ordering the engine never promised, which is flakiness rather than
-    evidence.
-    """
-    refusal = body.get("refusal") or {}
-    return (
-        body["status"],
-        refusal.get("rule"),
-        refusal.get("reason"),
-        tuple(body["columns"]) if "columns" in body else None,
-        body.get("row_count"),
-    )
-
-
 @pytest.mark.parametrize(
     "case",
     [pytest.param(case, id=case.id) for case in STDIO_SUBSET if case.runs_on(harness.ENGINE)],
@@ -93,8 +73,9 @@ def test_a_vector_gets_the_same_verdict_over_stdio_as_it_does_over_http(
     over_stdio = harness.ROUTES["stdio"](case.sql)
     over_http = harness.ROUTES["http"](case.sql)
 
-    # The assertion this whole dimension exists for.
-    assert _verdict(over_stdio) == _verdict(over_http), (over_stdio, over_http)
+    # The assertion this whole dimension exists for. `harness.verdict` is what a decision is compared
+    # as, shared with the model/warehouse dimension so the two ask the same question of a body.
+    assert harness.verdict(over_stdio) == harness.verdict(over_http), (over_stdio, over_http)
 
     # And the shared verdict is the expected one, so two transports cannot pass by agreeing on the
     # wrong answer. Asserted on the rule and its reason, never on `status` alone: a refusal by the
