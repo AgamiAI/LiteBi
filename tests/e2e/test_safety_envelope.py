@@ -296,3 +296,75 @@ def test_a_failed_execution_writes_its_row_too(served, file_path, monkeypatch):
     rows = _audit_rows(served)
     assert [row["id"] for row in rows] == [body["audit_id"]], (rows, body)
     assert rows[0]["status"] == "failed", rows
+
+
+# ---------------------------------------------------------------------------
+# Availability: refused and empty-handed, never trimmed
+# ---------------------------------------------------------------------------
+
+# The keys a body carries ONLY when the statement ran and produced a result. A refusal that carried
+# any of them would be handing back a partial answer under a status that says there is none.
+_RESULT_KEYS = ("data", "columns", "rows", "row_count", "markdown", "units")
+
+
+@pytest.mark.parametrize("case", _vectors(lambda c: c.rule == guardrail.RULE_RESOURCE_LIMIT))
+def test_an_over_ceiling_result_is_refused_with_no_data_at_all(file_path, case, monkeypatch):
+    """The truncate-and-flag arm is gone, and this is what its absence has to look like.
+
+    A partial answer that arrives looking whole is worse than no answer, so an over-ceiling result
+    is refused and carries nothing: no rows, no columns, no count, no rendered table. The rule and
+    the reason are asserted as the PRECONDITION — without them "the body has no rows" would pass on
+    any refusal at all, including one from a gate that never reached the ceiling.
+    """
+    body = _drive(case, monkeypatch)
+
+    assert body["status"] == "refused", body
+    assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT, body
+    assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[
+        guardrail.RULE_RESOURCE_LIMIT
+    ], body
+    for key in _RESULT_KEYS:
+        assert key not in body, (key, body)
+
+
+# ---------------------------------------------------------------------------
+# What the tool does not offer, and what it never says
+# ---------------------------------------------------------------------------
+
+
+def test_the_tool_offers_no_per_call_row_cap():
+    """There is no knob for a caller to raise the ceiling with, so no vector can try to.
+
+    The deployment ceiling is the operator's, read from the environment on the server process. A
+    per-call override would put the bound in the hands of whoever is calling — which is the party
+    the bound exists to hold. `additionalProperties: False` is asserted alongside the absence
+    because the absence alone is only half of "cannot be passed": a schema that ignored unknown
+    keys would let one through to be read by whatever came next.
+    """
+    schema = tools.TOOLS["execute_sql"]["inputSchema"]
+
+    assert "max_rows" not in schema["properties"], schema["properties"]
+    assert schema["additionalProperties"] is False, schema
+
+
+@pytest.mark.parametrize("case", _vectors())
+def test_no_execute_sql_body_ever_says_truncated(file_path, case, monkeypatch):
+    """The internal flag exists and must never reach a caller of THIS tool.
+
+    `ExecResult.truncated` is still how the executor reports that a (cap+1)th row was there, and
+    the ceiling gate reads it to decide whether to refuse. What must not happen is the word
+    arriving in an answer, because a caller reading it would conclude a returned result had been
+    cut — the exact fiction the refuse-don't-trim decision removed.
+
+    Deliberately scoped to `execute_sql` and not to the repository: `get_datasource_schema` sets a
+    `truncated` flag of its own, correctly, on a schema listing that really is a partial view. A
+    repo-wide scan for the word would be asserting something untrue about a different contract.
+    """
+    body = _drive(case, monkeypatch)
+
+    assert "truncated" not in json.dumps(body), body
+
+
+def test_a_failed_body_does_not_say_truncated_either(file_path, monkeypatch):
+    """The third status, closing the scan over all three."""
+    assert "truncated" not in json.dumps(_failed_body(file_path, monkeypatch))
