@@ -24,6 +24,7 @@ Synthetic, generic names only — `customers`, `orders`, `AcmeCorp`.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -266,3 +267,66 @@ def test_a_matching_engine_still_runs(guarded):
     env = guarded("SELECT id FROM customers", _org("PostgreSQL"), spy, creds_type="supabase")
     assert env.status == "ok", env
     assert spy.calls
+
+
+# --- the degradation paths, which are the ones nobody exercises by accident -------
+
+
+def test_no_model_at_all_is_an_undetermined_engine():
+    """`_dialect_of(None)` is reachable from the standalone callers, which may hold no model. It
+    reports rather than guessing, so the caller refuses instead of parsing generically."""
+    dialect, why = rt._dialect_of(None)
+    assert dialect is None
+    assert why and "engine" in why
+
+
+def test_without_sqlglot_the_gate_defers_rather_than_refusing(monkeypatch):
+    """No parser is a different fact from an unreadable statement, and it is not this gate's to
+    report: every other gate short-circuits to allow in the same situation, and the receipt says so
+    in its own words. Refusing here would make a deployment without the optional parser refuse
+    everything, which is a far bigger change than this one."""
+    monkeypatch.setattr(rt, "_HAVE_SQLGLOT", False)
+    assert rt.check_readable("SELECT id FROM customers", _org("PostgreSQL")) is None
+    assert rt._parse_reporting("SELECT id FROM customers", "postgres") == (None, None)
+
+
+def test_an_unexpected_parser_error_is_still_a_reason_not_a_crash(monkeypatch):
+    """`ParseError` and `TokenError` are the two sqlglot documents. Anything else it raises is still
+    a statement we could not read, and must not escape as an exception from a guard."""
+
+    def _boom(*a, **kw):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr(rt.sqlglot, "parse_one", _boom)
+    tree, why = rt._parse_reporting("SELECT id FROM customers", "postgres")
+    assert tree is None
+    assert why == "the statement could not be read"
+
+
+def test_a_tree_that_vanished_without_a_reason_still_refuses():
+    """The belt-and-braces branch. A context carrying no tree and no recorded cause should be
+    unreachable; if it ever happens the safe reading is the one that refuses, because every gate
+    below degrades to allow on a missing tree."""
+    org = _org("PostgreSQL")
+    ctx = rt.build_guard_context("SELECT id FROM customers", org)
+    broken = dataclasses.replace(ctx, tree=None, unreadable=None)
+
+    refusal = rt.check_readable("SELECT id FROM customers", org, ctx=broken)
+    assert refusal is not None
+    assert refusal.rule == guardrail.RULE_UNPARSEABLE
+
+
+def test_the_mismatch_check_degrades_when_the_runtime_predates_it(monkeypatch):
+    """`execute_sql` is vendored into the plugin while `runtime` resolves from the separately
+    versioned package, so a newer plugin can meet an older runtime. It skips the check rather than
+    raising AttributeError — the statement is still governed by every other gate."""
+    monkeypatch.delattr(rt, "engines_disagree", raising=False)
+    monkeypatch.setattr(execute_sql, "_resolve_guard_model", lambda profile: _org("PostgreSQL"))
+    assert execute_sql._engine_mismatch("acme", {"type": "mysql"}) is None
+
+
+def test_the_mismatch_check_is_silent_when_no_model_resolves(monkeypatch):
+    """A missing model is `model_unavailable`'s to report, upstream of here, and reporting it twice
+    with different rules would make the two refusals disagree about the same deployment."""
+    monkeypatch.setattr(execute_sql, "_resolve_guard_model", lambda profile: None)
+    assert execute_sql._engine_mismatch("acme", {"type": "mysql"}) is None
