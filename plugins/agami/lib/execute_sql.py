@@ -1892,7 +1892,7 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     """
     try:
         from semantic_model import runtime as RT
-    except Exception:
+    except Exception as exc:
         # The model package (pydantic) isn't importable, so the guards can't run at all. On the
         # hosted served path that is the same "can't guarantee safety" condition as a missing model
         # — fail closed. Locally it stays a no-op (a bare install legitimately has no model). The
@@ -1920,16 +1920,32 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
         # `_hosted()` is deliberately not consulted — both interpreters in question are local, and
         # what separates them is which one can import the guards, not where they run.
         if _disk_model_root(profile) is not None:
-            # Value-free, like its hosted siblings: it names no resolved path, no profile directory,
-            # no DSN. The remediation names the supported invocation, which is the whole actionable
-            # content — the model is fine, the interpreter is the problem.
-            return sql, refuse(
-                RULE_MODEL_UNAVAILABLE,
-                detail="the semantic-model package is not importable on this interpreter, so table "
-                       "and column scope could not run against the model declared for this profile",
-                remediation="Run this through the interpreter that has the semantic-model package "
-                            "installed (the project virtualenv), then retry.",
-            )
+            # Absent and broken are two different facts, and `_receipt_for` below already refuses to
+            # report them as one — it answers `RECEIPT_NO_RUNTIME` to an ImportError and
+            # `RECEIPT_BUILD_FAILED`, logged, to anything else. This arm catches `Exception`, so the
+            # refusal has to make the same distinction or it states the wrong one with confidence:
+            # a package that IS installed and raised while importing itself would be reported as
+            # missing, sending the user to swap interpreters when the interpreter is not the problem
+            # and leaving the real traceback unlogged.
+            #
+            # Both cases still refuse. Which of them it is changes what we can honestly say, not
+            # whether the guards ran — they did not, either way.
+            if isinstance(exc, ImportError):
+                # Value-free, like its hosted siblings: no resolved path, no profile directory, no
+                # DSN. The remediation names the supported invocation, which is the whole actionable
+                # content — the model is fine, the interpreter is.
+                detail = ("the semantic-model package is not importable on this interpreter, so "
+                          "table and column scope could not run against the model declared for this "
+                          "profile")
+                remediation = ("Run this through the interpreter that has the semantic-model "
+                               "package installed (the project virtualenv), then retry.")
+            else:
+                _LOG.error("the semantic-model runtime failed to import", exc_info=True)
+                detail = ("the semantic-model package failed to load, so table and column scope "
+                          "could not run against the model declared for this profile")
+                remediation = ("Check the server log for the import error, repair the "
+                               "semantic-model installation, then retry.")
+            return sql, refuse(RULE_MODEL_UNAVAILABLE, detail=detail, remediation=remediation)
         # And stay inert with no model on disk. A bare install between `pip install` and its first
         # `agami-connect` has no declared surface, so there is nothing 4b could be exceeded against
         # and nothing 4c could be undetermined about. Refusing here would break every user in that

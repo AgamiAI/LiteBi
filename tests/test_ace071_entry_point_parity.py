@@ -34,6 +34,7 @@ import pytest
 
 pytest.importorskip("pydantic")
 pytest.importorskip("sqlglot")
+pytest.importorskip("yaml")  # `_write_model` builds the fixture model with it
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
@@ -333,3 +334,52 @@ def test_the_supported_interpreter_enforces_what_the_package_less_one_refuses(
     # the statement did rather than what the deployment could not do.
     assert _refusal(refused).rule == guardrail.RULE_TABLE_SCOPE
     _silent(capsys)
+
+
+def test_a_package_that_raises_is_not_reported_as_a_package_that_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Absent and broken are two different facts. `_receipt_for` already refuses to report them as
+    one — `RECEIPT_NO_RUNTIME` for an ImportError, `RECEIPT_BUILD_FAILED` (logged) for anything
+    else. The refusal this spec adds sits under an `except Exception`, so it has to draw the same
+    line: an installed package that raised while importing itself must not be described as missing,
+    which would send the user to swap interpreters when the interpreter is not the problem, and
+    would leave the real traceback unlogged.
+
+    Both cases still refuse. Which one it is changes what we can honestly say, not whether the
+    guards ran."""
+    import builtins
+    import logging
+
+    real_import = builtins.__import__
+
+    def boom(name, _globals=None, _locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+        if name == "semantic_model" and fromlist and "runtime" in fromlist:
+            raise RuntimeError("forced: the package is installed and raised while importing")
+        return real_import(name, _globals, _locals, fromlist, level)
+
+    artifacts = tmp_path / "art"
+    _write_model(artifacts / PROFILE)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    monkeypatch.setattr(builtins, "__import__", boom)
+
+    with caplog.at_level(logging.ERROR):
+        _, verdict = execute_sql._model_safety(IN_SCOPE_SQL, PROFILE, None)
+
+    refusal = _refusal(verdict)
+    # Still fail-closed, and still the same rule: the guards did not run either way.
+    assert refusal.rule == guardrail.RULE_MODEL_UNAVAILABLE
+    assert refusal.reason == guardrail.REASON_FOR_RULE[guardrail.RULE_MODEL_UNAVAILABLE]
+    # But it does not claim the package is missing, and it does not send the user to another
+    # interpreter — that advice is inert when the package is installed and broken.
+    assert "not importable" not in refusal.detail
+    assert "virtualenv" not in refusal.remediation
+    # And the real failure is not swallowed: the traceback reaches the log.
+    assert any(r.levelno >= logging.ERROR for r in caplog.records), caplog.text
+
+    # Still value-free — the same bar the ImportError arm clears.
+    text = json.dumps({"reason": refusal.reason, "rule": refusal.rule,
+                       "detail": refusal.detail, "remediation": refusal.remediation})
+    assert str(tmp_path) not in text
