@@ -1,7 +1,7 @@
 """The tests that check the SUITE rather than the chokepoint.
 
-Everything else in this directory asks what `execute_sql` decided. These two ask whether the run
-asking is capable of finding out — and both close a hole that was open, not a hypothetical one.
+Everything else in this directory asks what `execute_sql` decided. These ask whether the run asking
+is capable of finding out — and each closes a hole that was open, not a hypothetical one.
 
   * **The workflow has to arm the sentinels.** Every other layer of this spec was made structural
     precisely so that coverage could not be dropped by an edit: the markers replaced a `-k`, the
@@ -15,6 +15,12 @@ asking is capable of finding out — and both close a hole that was open, not a 
     `execute_sql` from whatever `agami-core` was pip-installed — on the machine this was found on,
     a different worktree's copy. The transport-parity claim was then comparing two branches rather
     than two transports.
+  * **The role the suite tests has to be the role operators get.**
+    `tests/integration/fixtures/postgres-readonly-grants.sql` is a second copy of the recipe shipped
+    in `plugins/agami/shared/readonly-grants.md`, and its own header says so — but nothing enforced
+    it. The role is the primary, non-bypassable integrity control, so a fixture that drifts turns
+    the whole DB half green on a role no operator has: a false certification of exactly the kind
+    this spec exists to prevent. This diffs the two.
 
 This file must not skip when there is no database, because the required `lint + test` job is where
 it earns its keep: that job runs `pytest tests/`, has no Postgres, and is the check branch
@@ -24,6 +30,7 @@ test that needs a transport.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import subprocess
@@ -50,6 +57,49 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 LINT_AND_TEST = "lint-and-test"
 FILE_PATH_JOB = "safety-corpus-file-path"
 DB_PATH_JOB = "safety-corpus-db-path"
+
+# The two copies of the read-only role: the one operators are handed, and the one the suite runs.
+RECIPE = REPO_ROOT / "plugins" / "agami" / "shared" / "readonly-grants.md"
+GRANTS_FIXTURE = REPO_ROOT / "tests" / "integration" / "fixtures" / "postgres-readonly-grants.sql"
+
+# The heading whose first fenced block is the required baseline. Everything below keys off it rather
+# than off a line number, so reordering the document is not reported as drift.
+POSTGRES_HEADING = "## PostgreSQL / Redshift"
+
+# The recipe's `<…>` placeholders and the concrete values the fixture fills them with for the
+# throwaway container. Applied to the FIXTURE, so the comparison happens in the recipe's own
+# vocabulary and a failure reads as one shipped line against another rather than as a diff the
+# reader has to substitute in their head.
+#
+# Plain string replacement, longest first, and the password matched inside its quotes: `agami_ro_pw`
+# starts with the role name and `agami_test` contains none of the others, but ordering the pairs is
+# cheaper than relying on that staying true.
+FIXTURE_VALUES: tuple[tuple[str, str], ...] = (
+    ("'agami_ro_pw'", "'<password>'"),
+    ("agami_test", "<owner>"),
+    ("corpus", "<db>"),
+    ("public", "<schema>"),
+)
+
+# What the fixture adds that the recipe has no counterpart for: the corpus needs a database of its
+# own (the safety corpus and the CLI smoke scripts both declare `orders`, and one would have to
+# give), and psql has to be told to enter it before the schema-scoped grants mean anything.
+#
+# Named one by one on purpose. "The fixture may carry extra statements" would be a shorter rule and
+# a useless one — it would swallow a deleted `GRANT SELECT` just as happily as it swallows these.
+FIXTURE_SCAFFOLDING = (
+    "CREATE DATABASE corpus OWNER agami_test;",
+    "\\connect corpus",
+)
+
+# The two lines the fixture deliberately does NOT copy, quoted from the recipe verbatim. They live
+# in a blockquote that calls itself optional; the fixture's header explains that running them would
+# prove a floor stronger than the one an operator who follows the recipe actually has.
+OPTIONAL_MARKER = "Optional hardening"
+OPTIONAL_HARDENING = (
+    "REVOKE CREATE ON SCHEMA public FROM PUBLIC;",
+    "REVOKE TEMP ON DATABASE <db> FROM PUBLIC;",
+)
 
 
 def _workflow() -> dict:
@@ -78,6 +128,104 @@ def _armed(env: dict, name: str) -> bool:
     """
     value = _exported(env.get(name))
     return bool(value) and value.lower() not in {"false", "0", "no", "off"}
+
+
+def _strip_sql_comment(line: str) -> str:
+    """`line` up to its first `--`, ignoring one that falls inside a quoted literal.
+
+    The quote tracking is not decoration. The only literal in either file today is the fixture
+    password, so a naive split would be right — until someone picks a password with a `--` in it,
+    which is precisely the character class a password generator reaches for. The test would then
+    silently compare a truncated statement.
+    """
+    quoted = False
+    for index, char in enumerate(line):
+        if char == "'":
+            quoted = not quoted
+        elif not quoted and line.startswith("--", index):
+            return line[:index]
+    return line
+
+
+def _statements(sql: str) -> list[str]:
+    """`sql` as one normalized statement per element: comments gone, whitespace collapsed.
+
+    Accumulated until a `;` rather than assumed to be one statement per line, so reflowing a long
+    `ALTER DEFAULT PRIVILEGES` over two lines is a formatting choice and not drift. psql
+    meta-commands (`\\connect`) carry no terminator and are line-scoped, so they close themselves.
+    """
+    statements: list[str] = []
+    pending = ""
+    for raw in sql.splitlines():
+        line = _strip_sql_comment(raw).strip()
+        if not line:
+            continue
+        if not pending and line.startswith("\\"):
+            statements.append(" ".join(line.split()))
+            continue
+        pending = f"{pending} {line}" if pending else line
+        if pending.endswith(";"):
+            statements.append(" ".join(pending.split()))
+            pending = ""
+    if pending:
+        statements.append(" ".join(pending.split()))
+    return statements
+
+
+def _postgres_section() -> list[str]:
+    """The recipe's lines under `## PostgreSQL / Redshift`, stopping at the next heading.
+
+    Bounded rather than open-ended so that deleting the PostgreSQL block cannot quietly promote
+    MySQL's into its place — the block lookup below would find nothing and say so.
+    """
+    lines = RECIPE.read_text().splitlines()
+    assert POSTGRES_HEADING in lines, f"{RECIPE} no longer has a {POSTGRES_HEADING!r} heading"
+    start = lines.index(POSTGRES_HEADING) + 1
+    for offset, line in enumerate(lines[start:]):
+        if line.startswith("## "):
+            return lines[start : start + offset]
+    return lines[start:]
+
+
+def _required_block(section: list[str]) -> str:
+    """The first UNINDENTED ```sql fence in `section`: the required baseline, and only it.
+
+    Column zero is the whole distinction. The optional-hardening statements are fenced too, but
+    inside a blockquote, so their fence line begins `> ` and is passed over here structurally rather
+    than by matching on the text of the lines this test exists to police.
+    """
+    body: list[str] = []
+    inside = False
+    for line in section:
+        if line.startswith("```"):
+            if inside:
+                return "\n".join(body)
+            assert line.strip() == "```sql", f"expected a ```sql fence, found {line!r}"
+            inside = True
+        elif inside:
+            body.append(line)
+    raise AssertionError(f"no closed ```sql block under {POSTGRES_HEADING!r} in {RECIPE}")
+
+
+def _optional_hardening_quote(section: list[str]) -> list[str]:
+    """The contiguous blockquote that introduces itself as optional hardening.
+
+    Found by its run of `>` lines rather than by searching for the REVOKEs, because what is being
+    asserted is WHERE they live: promoted into the required recipe they would no longer be in this
+    run, and the fixture — which omits them on purpose — would have to be updated to match.
+    """
+    run: list[str] = []
+    for line in [*section, ""]:
+        if line.startswith(">"):
+            run.append(line)
+            continue
+        if any(OPTIONAL_MARKER in quoted for quoted in run):
+            return run
+        run = []
+    raise AssertionError(
+        f"{RECIPE} no longer carries a blockquote introducing itself as {OPTIONAL_MARKER!r} under "
+        f"{POSTGRES_HEADING!r}"
+    )
 
 
 def _steps(job: dict) -> list:
@@ -181,3 +329,74 @@ def test_the_stdio_child_imports_the_checkout_under_test():
     resolved = json.loads(proc.stdout)
     for name, path in resolved.items():
         assert Path(path).resolve().is_relative_to(harness.SRC.resolve()), (name, path)
+
+
+def test_the_grants_fixture_is_the_shipped_postgres_recipe():
+    """The fixture's header says it is a copy of the shipped recipe. This is what makes that true.
+
+    The read-only role is the primary, non-bypassable integrity control — the one that holds when
+    the app-layer guard does not — so every DB-backed claim in this directory is a claim about the
+    role an operator following `readonly-grants.md` ends up with. The fixture is a SECOND copy of
+    that recipe, and until now the only thing keeping the two in step was a comment asking nicely.
+    Widen one `GRANT SELECT` to `GRANT ALL`, or drop the `ALTER DEFAULT PRIVILEGES` line, and the
+    whole safety suite goes green on a role nobody has.
+
+    A pure text comparison with no database anywhere, which is why it belongs in this file: the
+    required `lint + test` job runs it, and that job has no Postgres.
+    """
+    recipe = _statements(_required_block(_postgres_section()))
+    assert recipe, f"the {POSTGRES_HEADING!r} block in {RECIPE} parsed to no statements"
+
+    fixture = _statements(GRANTS_FIXTURE.read_text())
+    for scaffolding in FIXTURE_SCAFFOLDING:
+        assert fixture.count(scaffolding) == 1, (
+            f"{GRANTS_FIXTURE.name} no longer carries {scaffolding!r} exactly once, so the "
+            f"scaffolding exclusion in FIXTURE_SCAFFOLDING is stale and would hide real drift"
+        )
+        fixture.remove(scaffolding)
+
+    for value, placeholder in FIXTURE_VALUES:
+        fixture = [statement.replace(value, placeholder) for statement in fixture]
+
+    diff = "\n".join(
+        difflib.unified_diff(
+            recipe,
+            fixture,
+            fromfile=f"{RECIPE.name} ({POSTGRES_HEADING})",
+            tofile=GRANTS_FIXTURE.name,
+            lineterm="",
+        )
+    )
+    assert fixture == recipe, (
+        "the read-only role the suite tests is no longer the role the recipe ships. Update whichever"
+        " of the two is behind — a fixture that has drifted certifies a role no operator has:\n"
+        f"{diff}"
+    )
+
+
+def test_the_optional_hardening_stays_out_of_the_required_recipe():
+    """The one asymmetry above is deliberate, and this is what keeps it deliberate.
+
+    The fixture omits the recipe's two optional `REVOKE`s because running them would prove a floor
+    STRONGER than the shipped baseline, which is the "proving something about a role no operator
+    has" failure wearing its politest face. That omission is only correct while the doc still
+    presents those lines as optional. Promote them into the required block and this fails here,
+    naming the statement, so the fixture gets updated rather than quietly under-testing the floor.
+    """
+    section = _postgres_section()
+    required = _statements(_required_block(section))
+    quote = _optional_hardening_quote(section)
+
+    for statement in OPTIONAL_HARDENING:
+        assert statement not in required, (
+            f"{statement!r} has been promoted into the required {POSTGRES_HEADING!r} block. "
+            f"{GRANTS_FIXTURE.name} omits it on purpose and must be updated to run it too"
+        )
+        hosts = [line for line in section if statement in line]
+        assert len(hosts) == 1, (
+            f"expected {statement!r} exactly once under {POSTGRES_HEADING!r}, found {hosts}"
+        )
+        assert hosts[0] in quote, (
+            f"{statement!r} has left the {OPTIONAL_MARKER!r} blockquote. If it is now required, "
+            f"{GRANTS_FIXTURE.name} has to run it; if not, put it back where it reads as optional"
+        )
