@@ -134,7 +134,11 @@ all of it:
   is listed twice; each with the name as written, the name the model resolved it
   to, and a row estimate. A reference the model does not declare (a CTE, say) says
   so instead of showing blanks
-- Relationships used, each with its cardinality, confidence + review state
+- Joins this query made — **one row per join the statement wrote**, each with the
+  condition it joined on and whether your model declares a relationship for it. A
+  join that matched one carries that relationship's cardinality, confidence +
+  review state; one that matched none carries no sign-off trail, because there is
+  no declaration for a signature to be about
 - Metric definitions invoked, with author + sign-off date
 - The columns the statement referenced
 - Source-data freshness per table (when the DB exposes it)

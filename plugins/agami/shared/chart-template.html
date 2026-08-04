@@ -1527,28 +1527,73 @@
         rb.appendChild(ul);
       });
 
-      // Relationships used. Same items the trust banner at the top filtered for its warning, so a
-      // join flagged up there is findable down here with its full sign-off trail.
-      renderSection('joins', 'Relationships used', null, list => {
+      // The joins the STATEMENT wrote — one item per written join, not one per declared
+      // relationship, which is why the heading no longer says "relationships": an item is a join
+      // the query made, and whether the model declares a relationship about it is the `status` this
+      // block draws. The declared ones are still findable here with the full sign-off trail the
+      // trust banner at the top filtered for.
+      //
+      // Drawing `status` and `predicate` is the whole point of the section reaching a reader, and
+      // neither was drawn at all. What was drawn instead, on an item whose `status` is anything but
+      // `declared` — where `review_state`, `confidence`, `origin`, `cardinality` and `on` are all
+      // null BY DESIGN — was `approvalPhrase`'s and `badge`'s shared default: "unreviewed, not
+      // signed off" with an `unreviewed` badge, under a heading claiming a relationship. That is
+      // the panel reporting a missing SIGNATURE where what is missing is the declaration itself,
+      // which is the exact confusion this section exists to remove and the same defect the banner
+      // above was fixed for.
+      renderSection('joins', 'Joins this query made', null, list => {
         const ul = el('ul');
+        // The four statuses, on the three badge styles the panel already has rather than four new
+        // ones — the same mapping `FILTER_BADGE` and `AGG_BADGE` make, for the same reason.
+        // `declared` reads like an approved thing; `undeclared` is the amber state a reader has to
+        // act on, because the answer leaned on a join path the model does not describe; the other
+        // two are the grey "we could not say", which is not a failure and is not a softer
+        // `undeclared`. An unrecognised status falls through to grey, because inventing a green for
+        // a word we do not know is the one direction that lies.
+        const JOIN_BADGE = {
+          declared: ['approved', 'declared in your model'],
+          undeclared: ['unreviewed', 'not declared in your model'],
+          undeclarable: ['stale', 'not something your model can declare'],
+          undetermined: ['stale', 'could not be checked'],
+        };
         list.forEach(r => {
           const li = el('li');
           li.appendChild(el('code', { text: r.from_to || r.name || '<unknown>' }));
-          if (r.cardinality) {
-            li.appendChild(el('span', { class: 'receipt-meta', text: ' (' + r.cardinality + ')' }));
-          }
-          li.appendChild(document.createTextNode(' — '));
-          li.appendChild(document.createTextNode(approvalPhrase(r)));
+          const said = JOIN_BADGE[r.status] || ['stale', r.status || 'unknown'];
           li.appendChild(document.createTextNode(' '));
-          li.appendChild(badge(r.review_state));
-          if (r.on) {
-            // LABELLED, and labelled "declared": this is the predicate the MODEL declares, which is
-            // not necessarily the one the statement wrote — the item's own `predicate` field is
-            // that one. Drawn bare, the two sat next to each other and a reader took this string
-            // for the condition that ran.
+          li.appendChild(el('span', { class: 'conf-badge ' + said[0], text: said[1] }));
+          // The ON as the parser read it — the condition that actually ran, and the one fact a
+          // reader can check against their own SQL. Null when the join wrote none, which is a
+          // different thing from a condition we failed to read and says so.
+          li.appendChild(el('br'));
+          if (r.predicate) {
+            li.appendChild(el('span', { class: 'receipt-meta', text: 'joined on: ' }));
+            li.appendChild(el('code', { class: 'receipt-meta', text: r.predicate }));
+          } else {
+            li.appendChild(el('span', { class: 'receipt-meta',
+              text: 'this join wrote no condition of its own' }));
+          }
+          // Everything below is what a MATCHED declaration contributes, so it is drawn only where
+          // one matched. On every other status these fields are null, and a null `review_state`
+          // means "no declaration matched this join" and never "nobody signed it off".
+          if (r.status === 'declared') {
             li.appendChild(el('br'));
-            li.appendChild(el('span', { class: 'receipt-meta', text: 'declared predicate: ' }));
-            li.appendChild(el('code', { class: 'receipt-meta', text: r.on }));
+            if (r.cardinality) {
+              li.appendChild(el('span', { class: 'receipt-meta',
+                text: '(' + r.cardinality + ') ' }));
+            }
+            li.appendChild(document.createTextNode(approvalPhrase(r)));
+            li.appendChild(document.createTextNode(' '));
+            li.appendChild(badge(r.review_state));
+            if (r.on) {
+              // LABELLED, and labelled "declared": this is the predicate the MODEL declares, which
+              // is not necessarily the one the statement wrote — the item's own `predicate` field,
+              // drawn above, is that one. Drawn bare, the two sat next to each other and a reader
+              // took this string for the condition that ran.
+              li.appendChild(el('br'));
+              li.appendChild(el('span', { class: 'receipt-meta', text: 'declared predicate: ' }));
+              li.appendChild(el('code', { class: 'receipt-meta', text: r.on }));
+            }
           }
           ul.appendChild(li);
         });
