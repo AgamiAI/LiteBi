@@ -160,3 +160,65 @@ def test_a_failed_execution_carries_an_audit_id_and_a_receipt_too(file_path, mon
     assert body["status"] == "failed", body
     assert body["audit_id"], body
     _assert_receipt_is_whole(body)
+
+
+# ---------------------------------------------------------------------------
+# The recording pair: refuse when we cannot record, and record everything else
+# ---------------------------------------------------------------------------
+
+# Unsupported on purpose rather than merely unreachable: the store raises on this scheme before it
+# touches a driver or a socket, so "the store cannot be opened" is deterministic and instant. Its
+# presence is also what makes this a SERVED deployment as far as the gate is concerned, which is
+# the state under test.
+BROKEN_DB_URL = "mysql://not-a-supported-scheme/agami"
+
+
+class _SpyExecutor:
+    """An executor that records being reached and then refuses to pretend it was not.
+
+    Raising rather than returning an empty result is the point: if the gate regresses, the failure
+    has to land on the call itself. A spy that returned quietly would let the test fail later, on
+    an assertion about rows, which could be satisfied for an unrelated reason.
+    """
+
+    def __init__(self) -> None:
+        self.called = False
+
+    def execute(self, sql, creds, *, profile=None, **kwargs):
+        self.called = True
+        raise AssertionError("the executor was reached with the audit store unopenable")
+
+
+def _emit_through_the_tool_edge(sql: str, executor) -> dict:
+    """One call through the real tool edge with `executor` behind it.
+
+    The transport routes cannot be used here: `create_app()` injects its own executor, so a spy
+    handed to it never runs. What this exercises is the same serializer either transport reaches,
+    which is where the audit row is written and the receipt attached.
+    """
+    tools.set_injected_executor(executor)
+    return json.loads(tools.tool_execute_sql({"sql": sql, "datasource": harness.PROFILE}))
+
+
+def test_a_deployment_that_cannot_record_refuses_and_never_executes(file_path, monkeypatch):
+    """The half that is load-bearing is the second one.
+
+    A test that only checked the refusal would pass with the statement still running: the audit
+    write happens at the tool edge, AFTER execution, so a gate that merely reported the problem
+    would report it about a statement that had already reached the customer's database. The spy is
+    what makes "did not execute" a fact rather than an inference from the status.
+
+    The statement is a governed one, so the refusal cannot be a gate refusal wearing this rule's
+    clothes — every scope gate allows it, and it comes back refused anyway.
+    """
+    monkeypatch.setenv("AGAMI_DB_URL", BROKEN_DB_URL)
+    spy = _SpyExecutor()
+
+    body = _emit_through_the_tool_edge(_GOVERNED_SQL, spy)
+
+    assert body["status"] == "refused", body
+    assert body["refusal"]["rule"] == guardrail.RULE_AUDIT_UNAVAILABLE, body
+    assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[
+        guardrail.RULE_AUDIT_UNAVAILABLE
+    ], body
+    assert spy.called is False, "the statement ran on a deployment that could not record it"
