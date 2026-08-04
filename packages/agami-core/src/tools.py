@@ -2044,9 +2044,13 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_execute_sql,
         "description": (
             "Execute a single read-only SELECT / WITH...SELECT against the local datasource and "
-            "return {columns, rows, row_count, sql, execution_ms}. SELECT-only is "
+            "return {status:'ok', columns, rows, row_count, units, markdown, sql, execution_ms, "
+            "receipt, audit_id} — `markdown` is the table to display verbatim, exact numbers "
+            "already formatted. SELECT-only is "
             "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
+            "A result larger than the deployment row ceiling is refused the same way rather than "
+            "trimmed, so a partial answer never arrives looking whole. "
             "Runs entirely locally via execute_sql.py — no data leaves the machine. "
             # The declared-filter clause. Spec ids stay in comments like this one — this string
             # ships to every client, and an id only resolves inside the spec repo.

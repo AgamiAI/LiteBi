@@ -14,6 +14,7 @@ only one of them goes through a DB-API cursor.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -409,3 +410,24 @@ def test_the_tool_surface_advertises_neither_max_rows_nor_truncated():
     assert spec["inputSchema"]["additionalProperties"] is False
     assert "truncated" not in spec["description"]
     assert "max_rows" not in spec["description"]
+
+
+def test_the_description_names_every_key_a_successful_body_carries(shop, monkeypatch):
+    """The description is the only schema an agent gets for the RESPONSE — `inputSchema` covers the
+    request and there is no output schema — so a key it does not name is a key the caller has to
+    discover by accident.
+
+    Asserted against a real `ok` body rather than a hardcoded list, because a hardcoded list is the
+    thing that drifted: this description went on advertising `truncated` after the field was gone,
+    and had been silently omitting `units`, `markdown`, `receipt` and `audit_id` for longer than
+    that. Generating the expectation from the payload is what makes the two unable to disagree."""
+    import tools
+
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "50")
+    body = json.loads(tools.tool_execute_sql({"sql": "SELECT id FROM orders LIMIT 2",
+                                              "datasource": _PROFILE, "area": _AREA}))
+    assert body["status"] == "ok", body
+
+    description = tools.TOOLS["execute_sql"]["description"]
+    unnamed = [k for k in body if k not in description]
+    assert not unnamed, f"the ok body carries keys the description never names: {unnamed}"
