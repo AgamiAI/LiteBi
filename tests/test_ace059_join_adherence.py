@@ -679,6 +679,32 @@ def test_the_cap_does_not_bite_a_statement_under_it(org):
     assert "not listed" not in section["undetermined"]
 
 
+def _many_cross_joins(n: int) -> str:
+    """`n` joins that all SETTLE, which is the instrument `_many_comma_joins` cannot be.
+
+    An explicit `CROSS JOIN` wrote no predicate at all, which is a settled fact and reads
+    `undeclared`, so nothing here reaches the marker's first clause and only the cap's own can
+    compose it.
+    """
+    return "SELECT o.id FROM orders o " + " ".join(
+        f"CROSS JOIN customers c{i}" for i in range(n))
+
+
+def test_the_cap_alone_is_enough_to_deny_completeness(org):
+    """The marker's second clause, proven on its own.
+
+    "Null only when every listed join settled AND the cap dropped nothing" was only ever exercised
+    with unsettled joins present, and the first clause alone explains that state — so the section
+    could have been reaching a non-null marker for one reason while the test read it as two. A
+    truncated list under a NULL marker is the section claiming the caller's whole statement is
+    described, which is the exact reading the four-state contract exists to prevent.
+    """
+    section = _section(org, _many_cross_joins(rt._RECEIPT_MAX_REFS + 2))
+    assert len(section["items"]) == rt._RECEIPT_MAX_REFS
+    assert {i["status"] for i in section["items"]} == {rt.UNDECLARED}, "every listed join settled"
+    assert section["undetermined"] == "2 further join(s) are not listed."
+
+
 # --- SC-7: the predicate is bounded -----------------------------------------
 
 

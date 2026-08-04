@@ -377,10 +377,16 @@ def test_joins_section_carries_the_signoff_of_the_relationship_it_matched(org):
 def test_joins_section_reads_the_predicate_out_of_the_sql(org):
     """The marker used to say the predicate was not read out of the SQL and that a relationship was
     listed because the model declares it. Both halves stopped being true, and a section shipping
-    under a marker denying what it now does is the one way it could contradict itself."""
+    under a marker denying what it now does is the one way it could contradict itself.
+
+    Asserted as the marker's VALUE. `"not read out of the SQL" not in (marker or "")` was the first
+    form of this and it was vacuous: `or ""` makes the assertion hold for a null marker, which is
+    the answer here, so it would have passed against a section that established nothing at all.
+    `SQL`'s one join matched a declaration, so null is the positive claim "established, here it is".
+    """
     section = _sections(org)["joins"]
     assert "o.customer_id = c.id" in [i["predicate"] for i in section["items"]]
-    assert "not read out of the SQL" not in (section["undetermined"] or "")
+    assert section["undetermined"] is None
 
 
 # --- aggregates -------------------------------------------------------------
