@@ -357,26 +357,26 @@ def test_joins_section_says_the_actual_predicate_was_not_read(org):
     assert "not read out of the SQL" in section["undetermined"]
 
 
-# --- aggregates (ACE-060 owns the gap) --------------------------------------
+# --- aggregates -------------------------------------------------------------
 
 
-def test_the_aggregates_section_carries_findings_and_still_states_its_limits(org):
+def test_the_aggregates_section_reports_one_item_per_aggregate(org):
     """`SUM(amount)` over a joined statement is exactly the shape a fan-out corrupts, and the
-    section reports what the check found.
+    section reports on that aggregate by name.
 
-    It was declared and EMPTY until ACE-094, with a marker saying the check did not happen —
-    ACE-088 built the container and left the content to a later slice. This is that slice, and the
-    marker changes with it: it now says the check ran and names what it still misses. Both halves
-    matter. Dropping the marker would claim a completeness the detector does not have, because an
-    aggregate inside a CTE is not reached at all; keeping the old one would have the section report
-    a finding under a sentence saying nothing was checked."""
+    It was declared and EMPTY until ACE-094, then carried a list of FINDINGS, and the item is now
+    the aggregate itself — which is what lets it say the thing a finding list cannot, that a number
+    is clean. This one is not: `amount` is unqualified with two tables in scope, so nothing
+    resolves which table's rows it reads, and the item declines to claim either way rather than
+    reporting the silence as a clean bill of health.
+
+    The marker is composed per receipt now, so it states that gap rather than a fixed sentence
+    about the detector. Both halves still matter: dropping it would claim a completeness this
+    statement does not have."""
     section = _sections(org)["aggregates"]
-    assert section["undetermined"] == rt.UNDETERMINED_AGGREGATES
-    assert "is not checked" not in section["undetermined"]
-    assert "checked" in section["undetermined"]
-    # A CTE hides a trap from the walk, and the marker has to admit that rather than imply
-    # the section is complete.
-    assert "CTE" in section["undetermined"] or "subquery" in section["undetermined"]
+    assert [(i["aggregate"], i["status"]) for i in section["items"]] == [
+        ("SUM(amount)", "undetermined")], section
+    assert "could not be resolved" in section["undetermined"]
 
 
 def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
@@ -388,11 +388,12 @@ def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
     `UNDETERMINED_TABLES` was the sixth name in this list and there is no constant to name any more:
     that section's marker is composed per receipt from what the statement left unestablished, so
     the live-receipt loop below is the only place it can be checked — which is exactly why that
-    loop was written to catch a marker the list above cannot reach.
+    loop was written to catch a marker the list above cannot reach. `UNDETERMINED_AGGREGATES` left
+    the list the same way and for the same reason.
     """
     markers = [
         rt.UNDETERMINED_COLUMNS, rt.UNDETERMINED_JOINS,
-        rt.UNDETERMINED_AGGREGATES, rt.UNDETERMINED_NO_PARSER, rt.UNDETERMINED_UNPARSEABLE,
+        rt.UNDETERMINED_NO_PARSER, rt.UNDETERMINED_UNPARSEABLE,
         rt.UNDETERMINED_REFUSED, rt.UNDETERMINED_REFUSED_TABLES,
     ]
     for marker in markers:
@@ -467,8 +468,12 @@ def test_an_unchecked_section_is_not_equal_to_a_clean_one(org):
     checked" were both `[]` and compared equal."""
     sections = _sections(org)
     checked_and_clean = {"items": [], "undetermined": None}
-    assert sections["aggregates"]["items"] == checked_and_clean["items"]
-    assert sections["aggregates"] != checked_and_clean
+    # An aggregate the walk does not reach: the CTE body holds one and the outer SELECT holds none,
+    # so the section is empty AND says why. Every section of `SQL` itself now carries items, which
+    # is the point of the content specs — this state needs a statement that genuinely has a gap.
+    unreached = _sections(org, "WITH x AS (SELECT SUM(o.amount) t FROM orders o) SELECT 1 FROM x")
+    assert unreached["aggregates"]["items"] == checked_and_clean["items"]
+    assert unreached["aggregates"] != checked_and_clean
     # And the other two states are distinct from each other as well.
     established = sections["assumptions"]
     partly_established = sections["tables"]
