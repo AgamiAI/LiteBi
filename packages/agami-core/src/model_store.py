@@ -407,8 +407,9 @@ class DbActivitySink:
         # which made the id unreferenceable the moment it existed.
         self._store.execute(
             "INSERT INTO query_executions (id, ts, org_id, datasource, question, sql, row_count, "
-            "source, status, reason, rule, sql_truncated, error_detail) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source, status, reason, rule, sql_truncated, error_detail, detail, receipt, "
+            "model_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 record.id,
                 record.ts,
@@ -427,6 +428,12 @@ class DbActivitySink:
                 # The raw driver error, operator-only. NULL on the forked surface, where the
                 # chokepoint holding it and this recorder are different processes (ACE-039).
                 getattr(record, "error_detail", None),
+                # The three that make the row re-derivable (ACE-098). `getattr` with a default like
+                # the two above, so a caller still on the older record shape writes NULLs rather
+                # than raising — the same tolerance `error_detail` and `sql_truncated` already have.
+                getattr(record, "detail", None),
+                getattr(record, "receipt", None),
+                getattr(record, "model_version", None),
             ),
         )
         self._store.commit()

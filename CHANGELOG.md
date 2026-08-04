@@ -14,6 +14,24 @@ below corresponds to one such version.
 
 ### Changed
 
+- **The audit row now says what the decision was made against, and what you were told (ACE-098).**
+  A row recorded the verdict — `ok` / `refused` / `failed`, and for a refusal which rule under which
+  reason — but nothing about the basis for it, so nobody could take a row and check the decision
+  again. Three columns close that: `detail` (the refusal's own sentence, which is where "which bound
+  fired and what it was set to" lives, since the statement timeout and the row bound share one rule),
+  `receipt` (everything the trust receipt reported, including its `undetermined` markers), and
+  `model_version` as a column you can filter on.
+
+  A test now takes those rows and **re-derives each refusal with no database connection at all**,
+  matching what was recorded. That is the check that tells whether the fields are sufficient rather
+  than merely present. The two runtime bounds are exempt and stay exempt: whether a statement
+  outruns its budget is a property of the run, not of the SQL, so it is not reproducible offline by
+  anyone.
+
+  Also, the **tool-call log now reads the verdict rather than re-reading the answer**. It used to
+  parse the response body to work out whether a call failed and why, which made the audit trail
+  depend on the wire format; it now takes the classified outcome directly.
+
 - **A self-hosted server that cannot record a query no longer runs it (ACE-097).** Recording was
   best-effort in three places, and two of them were silent, so a deployment could execute SQL
   against your database and keep no record of having done so with nothing anywhere saying the

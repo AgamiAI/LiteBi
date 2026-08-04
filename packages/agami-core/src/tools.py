@@ -1439,6 +1439,17 @@ def _emit(
     body["audit_id"] = env.audit_id
 
     _record_execution(env, sql=sql, profile=profile, args=args, row_count=row_count)
+    # Publish the TYPED outcome for the tool-call recorder (ACE-098). It runs later, in the
+    # transport's `finally`, where the Envelope no longer exists and only this serialized string
+    # does — so without this the tool_calls row's account of why a call failed is a `json.loads` of
+    # our own output. Set here rather than in `execute_guarded` because the tool edge is what
+    # decides the final status: the fork path rebuilds the Envelope on the parent side, and the
+    # chokepoint that ran in the child cannot reach this context at all.
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(
+        (env.status, env.refusal.rule if env.refusal is not None else None, row_count)
+    )
     return json.dumps(body, indent=2, default=str)
 
 
@@ -1457,6 +1468,15 @@ AUDIT_SQL_MAX_CHARS = 8_000
 # couple of thousand characters is the whole of what is worth keeping.
 AUDIT_ERROR_DETAIL_MAX_CHARS = 2_000
 
+# The refusal's own sentence, bounded on 015's argument (ACE-098). `Refusal.detail` is authored by
+# us and value-free by contract, so it is nothing like the unbounded driver text above — but it
+# ECHOES identifiers the caller sent, and an echo is caller-controlled length. 1,000 characters is
+# several times the longest detail any gate writes, so this bites only on something that has already
+# gone wrong. `receipt` needs no bound here: `runtime._RECEIPT_MAX_REFS` caps every section before
+# the receipt is built, so its JSON has a ceiling by construction — and truncating JSON would leave
+# a blob that does not parse, which is worse than the row having no receipt at all.
+AUDIT_DETAIL_MAX_CHARS = 1_000
+
 
 def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     """The statement as it will be stored, plus whether it had to be cut.
@@ -1467,6 +1487,17 @@ def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     if len(sql) <= AUDIT_SQL_MAX_CHARS:
         return sql, False
     return sql[:AUDIT_SQL_MAX_CHARS], True
+
+
+def _bounded_audit_detail(detail: str) -> str:
+    """The refusal's detail as it will be stored (ACE-098).
+
+    No companion truncation flag, unlike `sql`. The flag exists there because a cut statement reads
+    as the whole one and a reviewer would re-run something that does not reproduce the decision. A
+    detail is prose we authored, not something anyone re-runs, and it is bounded well above what any
+    gate writes — so the flag would be a column that is false on every row ever written.
+    """
+    return detail[:AUDIT_DETAIL_MAX_CHARS]
 
 
 def _record_execution(
@@ -1530,6 +1561,23 @@ def _record_execution(
             "status": env.status,
             "reason": refusal.reason if refusal is not None else None,
             "rule": refusal.rule if refusal is not None else None,
+            # The three that make the row re-derivable (ACE-098). All read off the Envelope this
+            # function already holds, for the same reason `reason` and `rule` are: the typed object
+            # is right here, and re-deriving any of them from the serialized body would make the
+            # record's account depend on a wire shape rather than on the decision.
+            #
+            # `detail` is where "which bound fired, and what it was set to" lives. The statement
+            # timeout and the result bound share ONE rule id by design, so `rule` alone cannot tell
+            # them apart and principle 9's carve-out claims the record does.
+            "detail": _bounded_audit_detail(refusal.detail) if refusal is not None else None,
+            # The whole receipt, verbatim, including every section's `undetermined` marker — the
+            # half that matters, since a section nobody checked has to keep saying so in the record
+            # too. `_emit` serializes the same `asdict` for the caller, so the row and the answer
+            # cannot disagree about what was reported.
+            "receipt": json.dumps(asdict(env.receipt), default=str),
+            # Lifted OUT of the receipt into its own column so a replay can SELECT on it. Inside the
+            # JSON as well, deliberately: see migration 017.
+            "model_version": env.receipt.model_version,
         }
     )
 
@@ -1855,6 +1903,56 @@ def _record_query(rec: dict[str, Any]) -> None:
         # Local: no SQL, no question, no org — the record's own fields are the caller's data, and
         # this line goes to the server log. The exception and the stack say where the write broke.
         _LOG.warning("query-execution audit write failed; the answer is unaffected", exc_info=True)
+
+
+def reset_typed_outcome() -> None:
+    """Clear the published outcome. Run by the transport INSIDE the context it hands the handler.
+
+    Load-bearing, and a test found it: `copy_context()` copies whatever is current, so a verdict
+    published by an earlier `execute_sql` call in this context would be inherited by the next tool's
+    context and read back as that tool's outcome. A tool that never reaches `execute_guarded` — every
+    model-backed one — has nothing to clear it, so a raising `list_datasources` was recorded with the
+    previous query's refusal rule instead of `exception`.
+
+    `execute_guarded` clears it too, on entry, for the calls that do reach it. Both are needed: that
+    one covers a second query in one context, this one covers a different tool after a query.
+    """
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(None)
+
+
+def typed_outcome_overrides(ctx: Any) -> dict[str, Any]:
+    """The `record_tool_call` overrides for a call whose Envelope classified itself (ACE-098).
+
+    The transport runs the tool handler inside a `contextvars.Context` it owns and passes it here.
+    That indirection is load-bearing: a ContextVar set inside `run_blocking`'s worker is invisible
+    to the caller, because anyio gives the thread a copy — so reading the var directly at the
+    recorder would read `None` on the one surface that records tool calls at all.
+
+    Returns `{}` for every other tool. The model-backed tools do not speak the Envelope (they return
+    the older `{"error": {kind, remediation}}` body) and never reach `_emit`, so there is nothing
+    typed to read and the body parse stays their path. `{}` means "derive it the way you always
+    have", which is exactly what `record_tool_call`'s override seam already documents.
+
+    The three come back as a group because that seam forces them to: stating any one replaces all
+    three, so returning a partial dict would silently blank the other two.
+    """
+    from execute_sql import _last_outcome
+
+    outcome = ctx.get(_last_outcome)
+    if outcome is None:
+        return {}
+    status, rule, row_count = outcome
+    success = status == "ok"
+    return {
+        "success": success,
+        # The rule the gate chose, straight off the `Refusal` — strictly more informative than the
+        # status alone, and no longer a `json.loads` of our own output. `status` is the fallback for
+        # a `failed`, which has a kind rather than a rule.
+        "error_kind": None if success else (rule or status),
+        "row_count": row_count,
+    }
 
 
 def record_tool_call(

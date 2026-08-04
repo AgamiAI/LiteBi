@@ -213,6 +213,18 @@ class QueryExecutionRecord(_Contract):
     # crosses). Bounded by the writer — `tools.AUDIT_ERROR_DETAIL_MAX_CHARS`.
     error_detail: str | None = None
     org_id: str = "local"  # the tenant this ran for; defaults to the single-tenant org
+    # The three that make the row re-derivable (ACE-098, principle 7). `detail` is the refusal's own
+    # sentence — NULL on every non-refusal row, because only a refusal has one — and it is where
+    # "which bound fired, and what it was set to" lives, since the statement timeout and the result
+    # bound share one rule id. `receipt` is the `Receipt` as JSON, all five sections including their
+    # `undetermined` markers: a section nobody checked has to keep saying so in the record too.
+    # Bounded by the writer (`tools.AUDIT_DETAIL_MAX_CHARS`) like `sql` and `error_detail`.
+    detail: str | None = None
+    receipt: str | None = None
+    # Duplicated inside `receipt` on purpose: a replay must be able to SELECT on the version, and a
+    # value inside a JSON blob is not portably filterable across SQLite and Postgres. NULL means
+    # either a pre-migration row or a call whose receipt could not pin a version at all.
+    model_version: str | None = None
 
 
 class ToolCallRecord(_Contract):
