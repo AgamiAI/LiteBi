@@ -2141,8 +2141,10 @@ def _joins_marker(items: list[dict[str, Any]], dropped: int) -> Optional[str]:
     and a sentence that ships on every statement means the section can never make it.
 
     Only `undetermined` counts. `undeclared` and `undeclarable` are SETTLED facts — the first says
-    the join wrote no predicate for a declaration to match, the second says its endpoint is a name
-    the statement bound for itself and so cannot be what any declaration is about. Counting those as
+    every declaration between those two tables was read and none of them is this join, the second
+    says an endpoint is a relation the statement bound for itself and so cannot be what any
+    declaration is about. A declaration we could NOT read reaches neither: it is our gap, it reports
+    `undetermined`, and it is counted here like any other. Counting the settled two as
     gaps would put every statement with a join in it under a non-null marker forever, which is the
     state the fixed sentence had and the reason it went.
 
