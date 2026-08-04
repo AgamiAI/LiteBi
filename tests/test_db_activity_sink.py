@@ -70,24 +70,57 @@ def test_record_query_writes_one_row(tmp_path, monkeypatch):
     ]
 
 
-def test_record_query_is_best_effort_on_db_error(tmp_path, monkeypatch, caplog):
-    # AGAMI_DB_URL points at a DB with NO migrations applied, so the INSERT into query_executions
-    # fails. _record_query must swallow it — a logging failure can't break a successful query — but
-    # it must SAY so: a permanently broken sink and a working one have to be distinguishable.
+_A_RECORD = {
+    "id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "ts": "2026-06-25T00:00:00Z",
+    "profile": "main",
+    "question": "q",
+    "sql": "SELECT 1",
+    "row_count": 1,
+    "source": "mcp_server",
+    "status": "ok",
+}
+
+
+def test_record_query_raises_on_a_db_error_when_a_store_is_configured(tmp_path, monkeypatch):
+    """Served: the write is part of the call, so its failure is the call's failure (ACE-097).
+
+    This test asserted the opposite until ACE-097 — that a broken sink is swallowed and warned
+    about, because "a logging failure can't break a successful query". That was right while the row
+    was a convenience. Principle 7 makes it load-bearing: an answer delivered with no record of the
+    statement that produced it is precisely what the principle forbids, and the operator reading a
+    warning hours later does not help the caller who already acted on the answer. The inversion is
+    deliberate and is recorded in the spec's `## Decisions`.
+
+    AGAMI_DB_URL points at a database with NO migrations applied, so the INSERT fails while the
+    store opens perfectly — the residual `execute_guarded`'s pre-execution reachability check cannot
+    cover, and therefore the case worth pinning here.
+    """
     url = "sqlite://" + str(tmp_path / "empty.db")
     Store.connect(url).close()  # create the file; no tables
     monkeypatch.setenv("AGAMI_DB_URL", url)
+
+    with pytest.raises(Exception):
+        tools._record_query(dict(_A_RECORD))
+
+
+def test_record_query_is_best_effort_with_no_store_configured(tmp_path, monkeypatch, caplog):
+    """Local keeps the old contract, unchanged, and still says so.
+
+    `governance-principles.md` scopes the principles to the served deployment. Here there is no
+    store, the sink is a jsonl file, and an unwritable artifacts directory must not stop a laptop
+    answering. Best-effort still never means silent: a sink broken for a month must not look
+    identical to a working one.
+    """
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    def _boom(path, record):
+        raise OSError("the log directory is read-only")
+
+    monkeypatch.setattr(tools, "_append_jsonl", _boom)
+
     with caplog.at_level("WARNING", logger="tools"):
-        tools._record_query(
-            {  # must NOT raise
-                "id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
-                "ts": "2026-06-25T00:00:00Z",
-                "profile": "main",
-                "question": "q",
-                "sql": "SELECT 1",
-                "row_count": 1,
-                "source": "mcp_server",
-                "status": "ok",
-            }
-        )
+        tools._record_query(dict(_A_RECORD))  # must NOT raise
+
     assert [r.levelname for r in caplog.records] == ["WARNING"]

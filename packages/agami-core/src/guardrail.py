@@ -50,6 +50,18 @@ RULE_TABLE_SCOPE = "table_scope"
 RULE_COLUMN_SCOPE = "column_scope"
 RULE_SELECT_STAR = "select_star"
 RULE_MODEL_UNAVAILABLE = "model_unavailable"
+# The audit store cannot take the record, so the statement does not run (ACE-097, principle 7). A
+# DEPLOYMENT-state rule, the sibling of `model_unavailable` rather than of the scope gates: neither
+# says anything about the statement, and both mean this deployment cannot do a thing it promises. It
+# is a rule and not a fourth REASON on purpose — `RefusalReason` stays closed at three, and the cost
+# of a deployment-state refusal is one entry here plus one in `REASON_FOR_RULE`, which is a diff a
+# reviewer reads.
+#
+# It is also the ONE refusal that is exempt from being recorded, by construction: writing a row to
+# say the row could not be written is the same write failing twice. `tools._record_execution` skips
+# it, and that exemption is the whole of the carve-out — every other outcome, refusals included,
+# still writes.
+RULE_AUDIT_UNAVAILABLE = "audit_unavailable"
 # Produced by the **per-statement** timeout the executor imposes: a watchdog cancels a statement that
 # outlives the configured budget, and `execute_sql.execute_guarded` turns that into this refusal. Its
 # subject is the statement, which is what earns it a rule at all — "narrow the query" is a fix we can
@@ -86,14 +98,17 @@ RULE_ENGINE_MISMATCH = "engine_mismatch"
 # entry is `undetermined`, so that is a one-line change, not a decision to re-litigate).
 RULE_UNSCOPABLE = "unscopable"
 
-PRE_MODEL_RULES: frozenset[str] = frozenset({RULE_READ_ONLY, RULE_RECON})
+PRE_MODEL_RULES: frozenset[str] = frozenset(
+    {RULE_READ_ONLY, RULE_RECON, RULE_AUDIT_UNAVAILABLE}
+)
 """The rules decided BEFORE any semantic model is consulted, and the home for the next one.
 
-Both gates run above the semantic-model pass — a write and a server-fingerprinting probe are stopped
-without asking what the model declares — so a statement either one refuses never resolved a model at
-all. That is a fact about the DECISION rather than about the deployment, and it has to be stated the
-same way whichever process decided it: the in-process path knows no model was loaded because it holds
-the gate, while the fork path holds only the rule the child sent back. Consulting this set is what
+All three gates run above the semantic-model pass — a write, a server-fingerprinting probe and an
+unrecordable call are stopped without asking what the model declares — so a statement any of them
+refuses never resolved a model at all. That is a fact about the DECISION rather than about the
+deployment, and it has to be stated the same way whichever process decided it: the in-process path
+knows no model was loaded because it holds the gate, while the fork path holds only the rule the
+child sent back. Consulting this set is what
 lets the two reach the same receipt, and it is what keeps the fork path from loading a model in order
 to describe a refusal that never looked at one (see `RECEIPT_BEFORE_MODEL`).
 
@@ -112,6 +127,10 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     # wrong about its own reason.
     RULE_SELECT_STAR: "undetermined",
     RULE_MODEL_UNAVAILABLE: "undetermined",
+    # Same reason as its sibling above, and for the same argument: we did not determine that the
+    # statement was safe or in scope, because we stopped before asking. Not `unsafe` — nothing about
+    # the statement is in question — and not `out_of_scope`, which is a claim about the model.
+    RULE_AUDIT_UNAVAILABLE: "undetermined",
     RULE_RECON: "unsafe",
     # A bound we imposed, not a property of the statement: neither unsafe nor out of scope — we
     # simply did not determine the answer within the bound. Pinned before it had a producer, so the

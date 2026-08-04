@@ -12,10 +12,13 @@ Three claims, in order of how load-bearing they are:
      the sink writes the caller's id as the row's primary key, so a caller can look up the record of
      its own execution. The sink used to mint a uuid inside the INSERT and discard it, which made
      the id unreferenceable the moment it existed.
-  3. **Best-effort never means silent, and never means fragile.** A broken sink must not change the
-     answer by one byte, must not be indistinguishable from a working one, and must not be able to
-     break a query merely by failing to OPEN — the bug that shipped when `Store.from_env()` sat
-     outside its try.
+  3. **A broken sink is never silent, and on a served deployment it is never survivable.** ACE-097
+     split what was one claim: locally, best-effort still means the answer is unchanged to the byte
+     and the failure is still logged; served, principle 7 makes the row part of the call, so a write
+     that fails takes the call with it. Both halves are pinned below. What did not change is that
+     the failure must never be able to break a query merely by failing to OPEN in an uncontrolled
+     place — the bug that shipped when `Store.from_env()` sat outside its try, and the reason the
+     served path can now re-raise deliberately from one place.
 
 Both surfaces are driven for real — a `python -m mcp_harness` subprocess speaking JSON-RPC on stdin,
 and `TestClient` over `create_app()`'s `/mcp` — rather than by calling the handler, because "the row
@@ -632,10 +635,22 @@ def _warnings(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.name == "tools"]
 
 
-def test_a_sink_whose_write_raises_changes_nothing_and_says_so(env, caplog, monkeypatch):
-    """The INSERT fails. The caller must not be able to tell from the answer — and an operator must."""
+def test_a_sink_whose_write_raises_fails_the_call(env, monkeypatch):
+    """The INSERT fails after the statement ran. The call fails; the caller is not handed an answer.
+
+    **This assertion is inverted from what ACE-035 shipped**, deliberately (ACE-097). It read
+    `broken == healthy` — a byte-identical answer, because "the caller must not be able to tell from
+    the answer". That was right while the audit row was a convenience. Principle 7 makes it
+    load-bearing: an answer whose statement left no record is the thing the principle forbids, and
+    the operator who reads the warning later cannot un-inform the caller who already acted. So the
+    caller now CAN tell, which is the point.
+
+    `execute_guarded` checks the store is reachable before executing, so this is the residual that
+    check cannot close: the sink was healthy at the gate and broke before the write.
+    """
     healthy = tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
     assert len(_rows(env.app_db)) == 1
+    assert healthy  # the positive control: a working sink still answers
 
     import model_store
 
@@ -644,25 +659,27 @@ def test_a_sink_whose_write_raises_changes_nothing_and_says_so(env, caplog, monk
 
     monkeypatch.setattr(model_store.DbActivitySink, "record_query_execution", _boom)
 
-    with caplog.at_level(logging.WARNING):
-        broken = tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
+    with pytest.raises(RuntimeError):
+        tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
 
-    assert broken == healthy  # byte-identical answer
-    assert len(_rows(env.app_db)) == 1  # nothing new landed
-    assert [r.levelname for r in _warnings(caplog)] == ["WARNING"]
-    assert _warnings(caplog)[0].exc_info is not None  # the cause is in the log, not just the fact
+    assert len(_rows(env.app_db)) == 1  # and nothing new landed
 
 
-def test_a_store_that_cannot_even_be_opened_changes_nothing_and_says_so(env, caplog, monkeypatch):
-    """The failure that used to escape: `Store.from_env()` raising.
+def test_a_store_that_cannot_even_be_opened_fails_the_call(env, monkeypatch):
+    """The failure that used to escape, and now escapes on purpose: `Store.from_env()` raising.
 
-    It sat OUTSIDE its try, so a malformed DSN or an uninstalled driver broke every query the server
-    logged rather than every log it wrote — on the success path, where the answer was already
-    computed. This is the test that proves the outer try covers store CONSTRUCTION, not just the
-    write; the sibling test above would still pass with the old shape.
+    Its original subject is unchanged and still worth pinning: this call sat OUTSIDE the try, so a
+    malformed DSN or an uninstalled driver broke every query the server logged rather than every log
+    it wrote. The body is inside the try, which is what lets the served path re-raise from ONE place
+    rather than leak from an arbitrary one — and the sibling test above would still pass with the
+    old shape, so this one is still the test that proves construction is covered.
+
+    What changed with ACE-097 is the direction: it asserted the answer was unaffected, and now
+    asserts the call fails. Same reasoning as its sibling.
     """
     healthy = tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
     assert len(_rows(env.app_db)) == 1
+    assert healthy
 
     import store as store_module
 
@@ -671,12 +688,35 @@ def test_a_store_that_cannot_even_be_opened_changes_nothing_and_says_so(env, cap
 
     monkeypatch.setattr(store_module.Store, "from_env", classmethod(_boom))
 
+    with pytest.raises(RuntimeError):
+        tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
+
+    assert len(_rows(env.app_db)) == 1
+
+
+def test_locally_a_broken_sink_still_changes_nothing_and_says_so(env, caplog, monkeypatch):
+    """The half of the old contract that survives, kept as its own test rather than deleted.
+
+    `governance-principles.md` scopes the principles to the served deployment. With no store
+    configured this is the local path, the sink is jsonl, and the original claim holds in full: a
+    broken sink must not change the answer by one byte, and must not be indistinguishable from a
+    working one.
+    """
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    healthy = tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
+
+    def _boom(path, record):
+        raise OSError("the log directory is read-only")
+
+    monkeypatch.setattr(tools, "_append_jsonl", _boom)
+
     with caplog.at_level(logging.WARNING):
         broken = tools._emit(_refused_envelope(), sql="DELETE FROM orders", execution_ms=None)
 
-    assert broken == healthy
-    assert len(_rows(env.app_db)) == 1
+    assert broken == healthy  # byte-identical answer
     assert [r.levelname for r in _warnings(caplog)] == ["WARNING"]
+    assert _warnings(caplog)[0].exc_info is not None  # the cause is in the log, not just the fact
 
 
 # ---------------------------------------------------------------------------

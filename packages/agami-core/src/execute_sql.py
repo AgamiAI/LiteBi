@@ -86,6 +86,7 @@ from guardrail import (
     RECEIPT_BUILD_FAILED,
     RECEIPT_NO_MODEL,
     RECEIPT_NO_RUNTIME,
+    RULE_AUDIT_UNAVAILABLE,
     RULE_MODEL_UNAVAILABLE,
     RULE_RESOURCE_LIMIT,
     Envelope,
@@ -1590,6 +1591,68 @@ def _hosted() -> bool:
     return bool(os.environ.get("AGAMI_DB_URL") or os.environ.get("APP_DATABASE_URL"))
 
 
+def _audit_store_reachable() -> bool:
+    """Whether the audit store can be opened right now — the pre-execution half of principle 7
+    (ACE-097).
+
+    Recording happens at the tool edge, AFTER the statement ran: `tools._record_execution` is called
+    from `tools._emit`, the serializer. So closing the swallows there can only turn a lost record
+    into a raised exception on a statement that already reached the customer's database. Refusing
+    *instead of* executing needs the question asked before execution, and this is that question.
+
+    `Store.from_env()` is the probe rather than a DSN parse because it is not a parse:
+    `Store.connect` calls `psycopg2.connect` / `sqlite3.connect` eagerly, so constructing one either
+    reaches the database or raises. It is also the identical call `_record_query` will make, which
+    is what makes the answer relevant rather than merely adjacent — a probe that opens a different
+    connection than the writer would is a probe of something else.
+
+    **Costs one connect per served call.** Deliberate and measured against the alternatives: a cached
+    health flag is stale in exactly the direction that matters (it says yes while the store is
+    already gone), and anything cheaper does not establish reachability at all. The deployment
+    already pays a comparable per-request open in `tools._model_version`; pooling the pair is
+    ACE-028's, not this slice's.
+
+    Local is always True and never opens anything. `governance-principles.md` scopes the principles
+    to the served deployment, and locally there is no store to reach: `_record_query` writes jsonl,
+    and a read-only artifacts directory must not stop a laptop from answering.
+    """
+    if not _hosted():
+        return True
+    try:
+        from store import Store
+
+        store = Store.from_env()
+    except Exception:
+        # Every way the store can be unopenable produces the same refusal, because there is only one
+        # thing a caller can do about any of them. But the CAUSE has to land somewhere, or this
+        # reintroduces the defect the spec exists to remove in a new place: a bad DSN scheme, an
+        # unreachable host and a missing driver would all read as one opaque refusal and an operator
+        # would have nothing to work from. Server log, with the traceback — the same treatment
+        # `_record_query` gives a swallowed write, and for the same reason.
+        #
+        # `_RAW_LOG`, not `_LOG`, and for BOTH of that logger's reasons. The exception text carries
+        # the host, the port and the DSN scheme — raw text, the operator's and never the caller's
+        # (ACE-039). And this module never calls `basicConfig`, so a record on `_LOG` falls through
+        # to `logging.lastResort` and lands on STDERR, which on the CLI/fork path is a wire carrying
+        # exactly one JSON object: a diagnostic line there does not merely add noise, it makes the
+        # refusal unparseable and the parent loses it entirely. `main` silences `_RAW_LOG` for the
+        # child's lifetime, so the child stays clean while in-process and hosted still get the cause
+        # on the server's root logger — which is where the operator being told to "restore the audit
+        # database" actually reads it.
+        _RAW_LOG.warning("audit store is not reachable; refusing to execute unrecorded",
+                         exc_info=True)
+        return False
+    if store is None:
+        # Reachable, not defensive: `_hosted()` tests the variable for truthiness while `from_env`
+        # strips it, so a whitespace-only `AGAMI_DB_URL` lands exactly here. A configured-but-empty
+        # store is a misconfiguration, and on a security gate a misconfiguration reads as
+        # unreachable, never as fine.
+        _RAW_LOG.warning("the audit store url is set but empty; treating it as unreachable")
+        return False
+    store.close()
+    return True
+
+
 def _resolve_guard_model(profile: str):
     """Resolve the semantic model for the safety pass, mirroring `tools._load_org` (ACE-051): from
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
@@ -2208,6 +2271,24 @@ def execute_guarded(
     # that says what it is for.
     received_sql = sql
     try:
+        # FIRST, above the read-only gate, because principle 7 records "every call ... whether it
+        # executed or was refused" — so gating only execution would leave the refusals unrecorded
+        # too, and the outcomes most worth reviewing are exactly the ones a reviewer could not find.
+        # A `DROP TABLE` therefore comes back `audit_unavailable` rather than `read_only` while the
+        # store is down. Nothing is weakened by that ordering: both are refusals, nothing runs, and
+        # the security gates below are unreachable only in the state where NOTHING is reachable.
+        #
+        # Outside the `no_safety` branch on purpose. That flag skips the semantic-model pass and
+        # nothing else; an audit guarantee is not a model check, and a caller able to opt out of
+        # being recorded is the hole this spec closes.
+        if not _audit_store_reachable():
+            refusal = refuse(
+                RULE_AUDIT_UNAVAILABLE,
+                detail="the audit store is not reachable, so this call cannot be recorded",
+                remediation="Restore the audit database, then run the statement again.",
+            )
+            return _envelope("refused", refusal=refusal,
+                             receipt=_refusal_receipt(refusal, received_sql, profile))
         import sql_guard
 
         refusal = sql_guard.check_read_only(sql)
