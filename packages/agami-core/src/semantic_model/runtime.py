@@ -1697,7 +1697,22 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     `ctx` supplies the shared cardinality/column indices (ACE-045); `tree` is always the
     caller's own SELECT (a set-op arm ≠ `ctx.tree`), so only the indices come from `ctx`."""
     rels = ctx.cardinality_index if ctx is not None else _cardinality_index(org)
-    tables_in_scope = _alias_map(tree)  # alias -> table
+    # Filtered to what THIS SELECT's own FROM/JOIN clauses bind, and derived once: every consumer
+    # below reads this one map. Asking for it twice with two flags would be the second tree walk
+    # ACE-099 exists to prevent, and would let the fan detector and the aggregation-semantics check
+    # disagree about which tables the statement is even reading.
+    tables_in_scope = _alias_map(tree, in_scope_only=True)  # alias -> table ("" when unbindable)
+    # A name the statement bound for itself stands where a table name would, and the map cannot
+    # tell the difference: `FROM oi` reads `oi` whether `oi` is a table or a WITH. Resolving it is
+    # what lets the fan detector see the join the statement actually takes, and the guard is the
+    # cheap half of the question, so a statement with no CTE in its FROM pays nothing for this.
+    if _cte_names(tree) & {_tkey(v) for v in tables_in_scope.values()}:
+        tidx = ctx.model_table_index if ctx is not None else _model_table_index(org)
+        tables_in_scope, cte_rels = _resolve_cte_scope(tree, tables_in_scope, tidx)
+        # A NEW list. `ctx.cardinality_index` is the model's own edges, shared across every guard
+        # in the battery and across every arm of a set operation; appending a statement-derived
+        # edge to it would leak this query's CTE into the next one's analysis.
+        rels = rels + cte_rels
     table_set = set(tables_in_scope.values())
 
     sites = _aggregate_sites(tree, tables_in_scope, scope, visible)
@@ -1825,6 +1840,185 @@ def _multiplication_status(site: "_AggSite", findings: list[Finding]) -> str:
     if any(f.risk in _MULTIPLYING_RISKS for f in findings):
         return MULTIPLIED
     return NOT_MULTIPLIED if site.resolved else UNDETERMINED
+
+
+# ---------------------------------------------------------------------------
+# What a CTE reference stands for
+#
+# The scope filter above is what makes these necessary. Once a reference written inside a CTE body
+# stops entering the outer query's map, `FROM oi` is all the outer query says, and `oi` is a name
+# the model never declared. Three answers are possible and the whole of the work here is telling
+# them apart: the CTE hands back the rows of a table unchanged, so the reference IS that table and
+# the model's own edges apply; the CTE changes the grain, so it is a source of its own whose
+# cardinality has to be derived from the grain it produces; or the analysis cannot read the body,
+# in which case the honest answer is that it could not tell.
+#
+# Fail-closed throughout. Every guard below returns None, `_resolve_cte_scope` turns a None into
+# the empty binding, and the empty binding makes every aggregate in that SELECT `undetermined`.
+# ---------------------------------------------------------------------------
+
+
+def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
+                             tidx: dict[str, tuple], seen: set[str]) -> Optional[str]:
+    """The declared table a CTE hands back ROW FOR ROW, or None when it is not that simple.
+
+    `WITH oi AS (SELECT * FROM order_items)` produces exactly the rows of `order_items`, so a join
+    to `oi` multiplies whatever a join to `order_items` would and the model's declared edge for
+    `order_items` describes it exactly. Returning the table name is what lets the fan detector name
+    the real join rather than the alias the statement invented for it.
+
+    Every guard is a way the body could produce a DIFFERENT number of rows than its source, and
+    each returns None rather than guessing:
+
+    * not an `exp.Select` — a UNION-bodied CTE, whose row count is the sum of its arms;
+    * already `seen` — the cycle guard, for a CTE that reads itself directly or through another;
+    * `GROUP BY`, `DISTINCT` — both collapse rows by definition;
+    * a `JOIN` — the join is the multiplication, one scope further in than the caller can see;
+    * an aggregate anywhere — `SELECT SUM(quantity) FROM order_items` is one row from many, and it
+      needs no `GROUP BY` to be so;
+    * no `FROM` — and this one is read with `body.find(exp.From)`, NEVER `body.args.get("from")`.
+      sqlglot keys that argument `"from_"`, so the `args` spelling is `None` on every SELECT ever
+      written and a resolver built on it silently answers None for every CTE, passing the corpus
+      and failing only the assertions that name the join. The guard is load-bearing on its own
+      terms too: `SELECT 1 AS x WHERE EXISTS (SELECT 1 FROM orders)` has no FROM and one
+      `exp.Table`, and without it the body would resolve to `orders`;
+    * more than one table, or none — a nested source, or a body that reads nothing nameable.
+
+    Recursive through a chain of grain-preserving CTEs, because one that reads another is still
+    handing back the same rows, and `seen` is what stops a cyclic WITH from recursing forever. A
+    source that is neither another CTE nor a table the model declares returns None: an undeclared
+    name is one the analysis can say nothing about.
+    """
+    body = bodies.get(key)
+    if not isinstance(body, exp.Select) or key in seen:
+        return None
+    seen.add(key)
+    if body.args.get("group") or body.args.get("distinct") or body.args.get("joins"):
+        return None
+    if body.find(exp.AggFunc) is not None:
+        return None
+    if body.find(exp.From) is None:
+        return None
+    tables = list(body.find_all(exp.Table))
+    if len(tables) != 1:
+        return None
+    name = _tkey(tables[0].name)
+    if name in bodies:
+        return _grain_preserving_source(name, bodies, tidx, seen)
+    return tables[0].name if name in tidx else None
+
+
+def _cte_edge(sel: "exp.Select", alias: str, cte_key: str, grain: list[str],
+              grains: dict[str, set[str]], scope_map: dict[str, str]) -> Optional[Relationship]:
+    """The join edge between a grain-CHANGING CTE and the table it is joined to, or None.
+
+    A CTE that groups is a source in its own right: `WITH oi AS (SELECT order_id, SUM(quantity)
+    FROM order_items GROUP BY order_id)` is one row per order, whatever `order_items` is per order.
+    Whether a join to it multiplies anything is decided by the same rule the model's own edges were
+    built with, so `infer_cardinality` is imported and applied rather than re-derived — two rules
+    about one edge is how a fan detector and a chasm detector start disagreeing about one join.
+
+    Grouped to the join key, the CTE is one row per joined row and nothing is multiplied. Grouped
+    finer than the join key — `GROUP BY order_id, product_id` joined on `order_id` alone — it is
+    many rows per joined row and the fan is real. That difference is the whole reason this returns
+    an edge instead of abstaining, and it is `infer_cardinality` that reads it off the grains.
+
+    Three ways to decline, each an honest `undetermined` rather than a guess:
+
+    * anything other than exactly ONE equality naming this alias. None means the join key is absent
+      (a comma join, or an edge written some way this does not read); more than one means a
+      composite key, whose cardinality is not the single-column rule's to state.
+    * the far side resolving to no table in scope.
+    * the far side's DECLARED GRAIN being empty. This guard sits BEFORE the call and that placement
+      is the point: `infer_cardinality` tests `bool(to_pk)`, so a table declared `grain: []` and a
+      table with no grain at all are indistinguishable to it and BOTH fall through to its
+      `many_to_one` default. Calling it anyway would put a cardinality on the receipt that no one
+      declared, which is worse than saying nothing.
+
+    The lazy import matches `cli.py`'s `from . import build as B` idiom, so `runtime.py`'s
+    module-load import closure — pinned by `tests/test_plugin_lib_resolution.py` — is untouched.
+    """
+    pairs: list[tuple["exp.Column", "exp.Column"]] = []
+    for on in _all_join_predicates(sel):
+        for conjunct in _and_conjuncts(on):
+            if not isinstance(conjunct, exp.EQ):
+                continue
+            left, right = conjunct.this, conjunct.expression
+            if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+                continue
+            if left.table == alias:
+                pairs.append((left, right))
+            elif right.table == alias:
+                pairs.append((right, left))
+    if len(pairs) != 1:
+        return None
+    near, far = pairs[0]
+    other = scope_map.get(far.table)
+    if not other or not grains.get(_tkey(other)):
+        return None
+
+    from .build import infer_cardinality
+    return Relationship(
+        from_table=cte_key, to_table=other,
+        from_column=near.name, to_column=far.name,
+        relationship=infer_cardinality(
+            _tkey(cte_key), _tkey(other), [near.name], [far.name],
+            {**grains, _tkey(cte_key): set(grain)},
+        ),
+    )
+
+
+def _resolve_cte_scope(sel: "exp.Select", scope_map: dict[str, str],
+                       tidx: dict[str, tuple]) -> tuple[dict[str, str], list[Relationship]]:
+    """The scope map with every CTE reference resolved, plus the edges that resolution derived.
+
+    One pass over the map the caller already built, never a second walk for the reference list. The
+    CTE BODIES are collected here because nothing else needs them: `_cte_body_scopes` answers which
+    CTE a reference sits IN, which is the opposite question.
+
+    Three outcomes per reference, and they are the three a caller can act on:
+
+    * a grain-preserving CTE rebinds to the table it hands back, and the model's declared edges then
+      describe the join with no new edge invented;
+    * a grain-changing CTE keeps its own name and contributes ONE derived edge, so the fan detector
+      sees it as the distinct source it is;
+    * anything else binds to the empty string, which `_aggregate_sites` reads as "this scope holds
+      something the analysis could not resolve" and reports `undetermined` for every aggregate in
+      the SELECT. That is the fail-closed branch and it is the common one: a CTE body with a join
+      in it, or a grain written as an expression rather than as columns, lands here.
+
+    The grain is the GROUP BY's columns and only those. A `GROUP BY date_trunc('month', created_at)`
+    groups by something with no column name to compare a join key against, so it is no grain this
+    can state and the reference falls to the empty binding.
+
+    Case is the reason the CTE's own written spelling is carried through rather than the folded key:
+    `_cte_names` and `_model_table_index` both fold, while `_alias_map` preserves what the statement
+    wrote, and the derived edge has to name the table the way `table_set` holds it or the detector
+    matches nothing. So `WITH OI AS (…) … JOIN OI` derives an edge named `OI`, and the grain lookup
+    that decides its cardinality folds on the way in.
+    """
+    bodies = {_tkey(cte.alias_or_name): cte.this
+              for cte in sel.find_all(exp.CTE) if cte.this is not None}
+    grains = {key: set(table.grain or []) for key, (table, _area) in tidx.items()}
+    resolved = dict(scope_map)
+    derived: list[Relationship] = []
+    for alias, written in scope_map.items():
+        key = _tkey(written)
+        if key not in bodies:
+            continue
+        source = _grain_preserving_source(key, bodies, tidx, set())
+        if source is not None:
+            resolved[alias] = source
+            continue
+        group = bodies[key].args.get("group")
+        keys = list(group.expressions) if group is not None else []
+        grain = [k.name for k in keys] if keys and all(isinstance(k, exp.Column) for k in keys) else []
+        edge = _cte_edge(sel, alias, written, grain, grains, resolved) if grain else None
+        if edge is None:
+            resolved[alias] = ""
+            continue
+        derived.append(edge)
+    return resolved, derived
 
 
 # ---------------------------------------------------------------------------
@@ -2987,7 +3181,7 @@ class TableRef(NamedTuple):
 
 
 class _RefSite(NamedTuple):
-    """One resolved `TableRef` beside the `exp.Table` node it was read from.
+    """One resolved `TableRef` beside the node it was read from.
 
     Internal, and the node stays here rather than on `TableRef` because `TableRef` is
     receipt-facing: its fields are rendered into tool output, and a parse-tree node is neither
@@ -2995,14 +3189,20 @@ class _RefSite(NamedTuple):
     `check_declared_filters` resolves a reference's own enclosing SELECT from it — and an analysis
     that re-walked `exp.Table` to find the node again would be walking the tree a second time to
     recover something the first walk had in hand.
+
+    `node` is an `exp.Table` on the default walk and may be an `exp.Subquery` / `exp.Lateral` /
+    `exp.Values` when `_reference_sites` is asked to bind derived sources, which is why the
+    annotation is the base class. TWO fields, and that is a contract: `tests/
+    test_ace043_set_operation_arms.py` unpacks a site positionally as `for ref, tbl in ...`.
     """
 
     ref: TableRef
-    node: "exp.Table"
+    node: "exp.Expression"
 
 
-def _reference_sites(node: "exp.Expression") -> list[_RefSite]:
-    """The one walk of `exp.Table`: every table REFERENCE, resolved to its scope, with its node.
+def _reference_sites(node: "exp.Expression", *,
+                     bind_derived: bool = False) -> list[_RefSite]:
+    """The one walk: every table REFERENCE, resolved to its scope, with the node it was read from.
 
     Deliberately not one entry per table, which is what keying by alias would give: a CTE reading
     `orders` and an outer `FROM orders` collapse into a single entry that way. The receipt needs
@@ -3029,15 +3229,65 @@ def _reference_sites(node: "exp.Expression") -> list[_RefSite]:
     The CTE name goes through `_echo_name` because it is CALLER-written text: a quoted identifier
     can hold any string at all, and this label lands in a receipt, which is tool output the calling
     model weights as server-authored.
+
+    `bind_derived` widens the SAME walk — never a second one — to the FROM/JOIN sources that bind a
+    name without naming a table: a derived table, a LATERAL, a VALUES list. Each yields a reference
+    whose `bare` is the empty string, which is the honest answer: the alias is in scope and resolves
+    to no model table. A caller that needs "everything this SELECT can see" has to know those
+    aliases exist, because a scope-filtered map that simply omitted them would leave the alias
+    looking unbound and let an unqualified column resolve as though the derived source were not
+    there. It defaults OFF so the receipt's roster and `check_declared_filters` see exactly the
+    reference list they saw before, and so that
+    `tests/test_ace043_set_operation_arms.py::test_no_reference_in_any_arm_of_a_set_operation_falls_through_to_subquery`
+    keeps counting the references it was written to count.
+
+    Two guards on that arm, both measured rather than defensive:
+
+    - The FROM/JOIN parent test is `check_column_scope`'s, reused rather than reinvented. A scalar
+      or `IN (...)` subquery is an `exp.Subquery` too and it binds no alias into the SELECT's scope.
+      It also excludes the inner `Subquery` of `LATERAL (SELECT 1) l`, whose parent is the
+      `Lateral`: the alias `l` belongs to the LATERAL and the wrapper inside it binds nothing.
+    - A `Subquery` wrapping a bare `exp.Table` is a PARENTHESIZED NAMED TABLE — `FROM (orders)`
+      parses to `Subquery(this=Table)` — and the `exp.Table` arm above has already bound it under
+      its real name. Binding it a second time would report a source the statement does not have.
+
+    An UNALIASED source that is anything else — `VALUES`, `LATERAL`, a derived `SELECT` — binds
+    under the empty key, and that is the point rather than an oversight. It introduces rows nothing
+    can name, and `FROM orders, (VALUES (1), (2))` doubles every order; reporting
+    `SUM(orders.total_amount)` clean over it is exactly the false receipt this spec exists to kill.
+    One falsy entry is all the scope-completeness conjunct in `_aggregate_sites` needs, so two
+    unaliased sources colliding on that one key costs nothing: the value is `""` either way.
+
+    The `exp.Lateral` and `exp.Values` arms look unreachable and are not. `check_scopable` (ACE-037)
+    refuses both source kinds at the `execute_guarded` chokepoint, so no GUARDED query reaches here
+    carrying one — but `cmd_preflight` and `cmd_prepare` in `cli.py` call `pre_flight_check`
+    directly with no gate battery at all, and on that surface both shapes reported a clean
+    `not_multiplied` over a source that can multiply rows. Deleting them as dead code would restore
+    exactly that.
     """
     cte_scopes = _cte_body_scopes(node)
     arm_suffixes = _arm_suffixes(node)
     output_ids = {id(sel) for sel in _output_selects(node)}
+    walk = (exp.Table, exp.Subquery, exp.Lateral, exp.Values) if bind_derived else (exp.Table,)
     sites: list[_RefSite] = []
-    for tbl in node.find_all(exp.Table):
-        written = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
-        scope = _scope_label(_enclosing_select(tbl), node, cte_scopes, arm_suffixes, output_ids)
-        sites.append(_RefSite(TableRef(written, tbl.name, tbl.alias or None, scope), tbl))
+    for ref_node in node.find_all(*walk):
+        # One scope determination for both arms, so a derived table nested inside a subquery is
+        # labelled `subquery` by the same three branches that label a table there, and is dropped
+        # by the same filter. `_scope_label` is that one composition, shared with the join walk.
+        scope = _scope_label(_enclosing_select(ref_node), node, cte_scopes, arm_suffixes,
+                             output_ids)
+        if isinstance(ref_node, exp.Table):
+            written = ".".join(p for p in (ref_node.catalog, ref_node.db, ref_node.name) if p)
+            sites.append(
+                _RefSite(TableRef(written, ref_node.name, ref_node.alias or None, scope), ref_node)
+            )
+            continue
+        if not isinstance(ref_node.parent, (exp.From, exp.Join)):
+            continue
+        if isinstance(ref_node, exp.Subquery) and isinstance(ref_node.this, exp.Table):
+            continue
+        sites.append(_RefSite(TableRef(ref_node.alias, "", ref_node.alias or None, scope),
+                              ref_node))
     return sites
 
 
@@ -3068,6 +3318,18 @@ def _scope_label(sel: "exp.Select | None", root: "exp.Expression",
     return "subquery"
 
 
+def _scope_family(scope: str) -> str:
+    """A `TableRef.scope` with its set-operation arm ordinal stripped: `"main#2"` -> `"main"`.
+
+    Split from the RIGHT, because the two things either side of a `#` are of different kinds. The
+    ordinal `_arm_suffixes` appends is ours and always last; the rest can hold a CTE name, which is
+    caller-written text. `_echo_name` already replaces a `#` in a caller's identifier with `?`
+    (measured: `_echo_name("a#b") == "a?b"`), so no CTE name can actually carry one today — the
+    right-side split is simply the form that stays correct without depending on that.
+    """
+    return scope.rsplit("#", 1)[0]
+
+
 def _table_references(node: "exp.Expression") -> list[TableRef]:
     """Every table REFERENCE in the statement, resolved to its query scope — the receipt's view.
 
@@ -3090,7 +3352,7 @@ def _table_references(node: "exp.Expression") -> list[TableRef]:
     return [site.ref for site in _reference_sites(node)]
 
 
-def _alias_map(node: "exp.Expression") -> dict[str, str]:
+def _alias_map(node: "exp.Expression", *, in_scope_only: bool = False) -> dict[str, str]:
     """alias (or table name) -> bare table name, derived from the one reference walk.
 
     Exactly what the former `_tables_in_scope` returned, and derived rather than walked a second
@@ -3103,8 +3365,31 @@ def _alias_map(node: "exp.Expression") -> dict[str, str]:
     Per NODE, never per tree: each caller passes the SELECT it is analyzing, so an arm of a UNION
     sees only its own tables. Flattening the whole tree into one map would let a table read by one
     arm decide the other arm's fan-trap and sensitive-projection results.
+
+    **`in_scope_only` is the map a caller may reason about JOINS from, and it is opt-in.** The
+    default keeps every reference whatever scope wrote it, which is what made the multiplication
+    report name a join only a CTE body takes and miss one the statement does take:
+    `WITH oi AS (SELECT … FROM order_items …) SELECT SUM(orders.total_amount) FROM orders JOIN oi …`
+    put `order_items` in the outer map, and `WITH o AS (SELECT * FROM orders) SELECT SUM(o.…) FROM o
+    JOIN order_items …` resolved `o` to `'o'` and found no join at all. Filtered to the `main`
+    family, the map holds what THIS query's FROM/JOIN clauses bind and nothing else.
+
+    Two things about that filter are deliberate. It tests `== "main"` rather than "not a CTE and not
+    a subquery", which is the same set today and stays right if a fourth scope family is ever added:
+    a scope we could not name must never read as the main query. And it turns on `bind_derived`,
+    which is not a second concern but the same one — dropping a CTE reference the outer query cannot
+    see while silently omitting the derived alias it CAN see would turn a genuinely inflated
+    statement into a clean one, since the outer scope would then look like a single table.
+
+    The default is a contract, and `tests/test_ace099_resolver_parity.py` is what holds it: three
+    other callers read this map, and two of them (`_projected_sensitive`, which REFUSES, and
+    `assemble_receipt`'s roster) would change what they disclose if the filter reached them.
     """
-    return {(r.alias or r.bare): r.bare for r in _table_references(node)}
+    if not in_scope_only:
+        return {(r.alias or r.bare): r.bare for r in _table_references(node)}
+    return {(r.alias or r.bare): r.bare
+            for r in (site.ref for site in _reference_sites(node, bind_derived=True))
+            if _scope_family(r.scope) == "main"}
 
 
 def _own_alias_map(sel: "exp.Select | None") -> dict[str, str]:
@@ -3516,6 +3801,16 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
     that marker would claim the opposite. `visible` defaults to None for a caller that has no index
     to hand, which keeps the old behaviour rather than failing every site closed.
 
+    **An alias in `scope_map` that resolves to NOTHING settles every aggregate in this SELECT.** A
+    derived table, a LATERAL or a VALUES list binds a name and no model table, so the scope-filtered
+    map holds it as `""`. The aggregate's own columns may resolve perfectly well without it, and the
+    statement can still be inflated: the source behind that alias is free to produce many rows per
+    row of everything else and no declared cardinality says whether it does. That is a property of
+    the scope all of them are computed in rather than of any one of them, hence a conjunct on the
+    map rather than a test on the columns. `SELECT SUM(orders.total_amount) FROM orders JOIN
+    (SELECT order_id FROM order_items) d ON d.order_id = orders.id` is the shape, and clean is the
+    one thing it is not.
+
     The label comes from `node.sql()`. That is a FRAGMENT serialized for a receipt: it rebinds
     nothing, is handed to no driver, and the statement that executes is still the one received.
     ACE-093's byte-identity pin is about the executed statement and is untouched. It is the
@@ -3540,7 +3835,7 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
             aggregate=_echo_expr(agg.sql()),
             scope=scope,
             sources=frozenset(t for t in value_tables if t),
-            resolved=bool(cols) and all(resolved) and (
+            resolved=bool(cols) and all(resolved) and all(scope_map.values()) and (
                 visible is None or all(_tkey(t) in visible for t in resolved)
             ),
         ))

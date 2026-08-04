@@ -22,6 +22,14 @@ word trap, and the marker sentence that reported the detector's old shortcoming 
 
 Slice 3 (S2) is here: the fan is attributed by where a column sits on the aggregate's VALUE path
 rather than by its presence anywhere inside the aggregate.
+
+Slices 4 and 5 (S3) are here, and they are ONE commit rather than two. The scope filter and the
+grain plumbing were planned as separate slices; they cannot be, and the corpus is what proved it.
+The filter stops a reference written inside a CTE body from entering the outer query's map, which
+is correct and is half of S3 — but `CTE_LAUNDERED_FAN` reported `multiplied` at HEAD only BECAUSE
+of that leak, and with the leak gone and no resolution for what `oi` stands for, a genuinely
+inflated statement read `not_multiplied`. The intermediate state fails the corpus's own criterion,
+so it is not a legal place to stop.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ from sqlglot import exp, parse_one  # noqa: E402
 # different path than the fixture came down yields a second module object with its own
 # `MULTIPLIED` / `NOT_MULTIPLIED` string objects and its own detector — so an assertion here could
 # compare a status produced by one copy against a constant defined by the other. One import.
-from test_semantic_model_runtime import _sales_org, rt  # noqa: E402
+from test_semantic_model_runtime import _sales_org, m, rt  # noqa: E402
 
 # Where the subprocess probe below finds the SAME source `rt` was imported from, derived from the
 # module object rather than rebuilt from the repo root. The header above explains why two copies of
@@ -100,6 +108,12 @@ JOINED_CTE_BODY = (
     "JOIN order_items i ON i.order_id = o.id) SELECT SUM(j.total_amount) FROM j"
 )
 
+# 8. The rows come from a source with no name at all. A `VALUES` list in a comma join multiplies
+#    every order by the number of tuples in it, and there is no alias to hang the fact on. Added
+#    when the scope filter's own alias guard was measured: the guard has to drop the wrapper of a
+#    parenthesized table, and dropping this one with it would have been a false clean.
+UNALIASED_VALUES_FAN = "SELECT SUM(orders.total_amount) FROM orders, (VALUES (1), (2))"
+
 # The corpus, named so the later slices can re-run it unchanged rather than restating it. Labels
 # are what a failure prints, so they name the disguise and not the SQL.
 INFLATED_SHAPES = [
@@ -110,6 +124,7 @@ INFLATED_SHAPES = [
     ("many side behind a derived table", DERIVED_TABLE_FAN),
     ("many side behind a CTE", CTE_LAUNDERED_FAN),
     ("join inside the CTE body", JOINED_CTE_BODY),
+    ("rows from an unaliased VALUES list", UNALIASED_VALUES_FAN),
 ]
 
 # A conditional count and a conditional sum over the many side. Both are honestly clean: one row
@@ -601,3 +616,571 @@ def test_the_aggregate_report_is_the_same_in_every_process():
     # And it is the answer this process gets, so four children agreeing on something wrong would
     # still fail rather than agree quietly.
     assert json.loads(seen.pop()) == [a.as_dict() for a in _reports(EVERY_STATUS_SQL)]
+
+
+# --- S3: what a SELECT can see, and what a CTE reference stands for ---------
+#
+# The two statements S3 names. Both were wrong at HEAD and wrong in opposite directions, which is
+# why one fix could not have been enough on its own.
+#
+# The first names a join only the CTE BODY takes. `oi` groups `order_items` to one row per order,
+# so the outer join is one-to-one and nothing is multiplied — but `order_items` leaked out of the
+# body into the outer scope map and the report claimed a fan over a table the statement never
+# joined to.
+GRAIN_CHANGING_CTE = (
+    "WITH oi AS (SELECT order_id, SUM(quantity) q FROM order_items GROUP BY order_id) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id"
+)
+# The second MISSES the join it does take. `o` hands back the rows of `orders` unchanged and the
+# outer query joins that to `order_items`, which is the plain fan wearing one disguise — but `o`
+# resolved to the string `'o'`, a name the model never declared, so nothing was found at all.
+GRAIN_PRESERVING_CTE = (
+    "WITH o AS (SELECT * FROM orders) SELECT SUM(o.total_amount) FROM o "
+    "JOIN order_items ON order_items.order_id = o.id"
+)
+# The same laundering one hop further out. Two grain-preserving CTEs in a chain are still the same
+# rows, so the resolution has to be transitive or it answers correctly only at depth one.
+TRANSITIVE_CTE = (
+    "WITH a AS (SELECT * FROM order_items), b AS (SELECT * FROM a) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN b ON b.order_id = orders.id"
+)
+# Grouped FINER than the join key: one row per (order, product), joined on the order alone. The
+# CTE is genuinely the many side of its own edge and the fan is real.
+CTE_GRAIN_BELOW_JOIN_KEY = (
+    "WITH oi AS (SELECT order_id, product_id, SUM(quantity) q FROM order_items "
+    "GROUP BY order_id, product_id) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id"
+)
+# `_cte_names` and `_model_table_index` fold case; `_alias_map` preserves it. Every comparison the
+# resolution makes therefore has to be explicit about which side it is on, and this is the shape
+# that catches one that is not.
+CASE_FOLDED_CTE = (
+    "WITH OI AS (SELECT * FROM order_items) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN OI ON OI.order_id = orders.id"
+)
+
+# The derived-table shape, with its aggregate's column UNQUALIFIED. Two independent mechanisms
+# would each have to fail for this to read clean: without the derived binding the outer scope is
+# the single table `orders`, so `total_amount` resolves by being the only candidate.
+DERIVED_TABLE_UNQUALIFIED = (
+    "SELECT SUM(total_amount) FROM orders "
+    "JOIN (SELECT order_id FROM order_items) d ON d.order_id = orders.id"
+)
+
+# A parenthesized named table. `Subquery(this=Table)` binds no name of its own — the `exp.Table`
+# arm already bound `orders` — so this reads one declared table and must stay clean.
+PARENTHESIZED_TABLE = "SELECT SUM(orders.total_amount) FROM (orders)"
+
+# The two shapes `check_scopable` refuses at the guarded chokepoint and `sm prepare` does not.
+VALUES_SOURCE = (
+    "SELECT SUM(orders.total_amount) FROM orders "
+    "JOIN (VALUES (1), (2)) AS v(order_id) ON v.order_id = orders.id"
+)
+LATERAL_SOURCE = "SELECT SUM(o.total_amount) FROM orders o, LATERAL (SELECT 1) l"
+
+# Every way `_grain_preserving_source` and `_cte_edge` can decline, one row per guard. Each body
+# below differs from a grain-preserving one in exactly one respect, so a guard that stopped firing
+# would show up as one row rather than as a general collapse.
+UNREADABLE_CTE_BODIES = [
+    ("the body is a set operation, not a SELECT",
+     "WITH u AS (SELECT order_id FROM order_items UNION SELECT id FROM orders) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN u ON u.order_id = orders.id"),
+    ("the body is DISTINCT, which collapses rows",
+     "WITH d AS (SELECT DISTINCT order_id FROM order_items) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN d ON d.order_id = orders.id"),
+    ("the body aggregates without grouping",
+     "WITH s AS (SELECT SUM(quantity) AS order_id FROM order_items) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN s ON s.order_id = orders.id"),
+    ("the body takes a join of its own",
+     "WITH j AS (SELECT o.id AS id FROM orders o JOIN order_items i ON i.order_id = o.id) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN j ON j.id = orders.id"),
+    ("the body has no FROM at all",
+     "WITH n AS (SELECT 1 AS order_id) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN n ON n.order_id = orders.id"),
+    ("the body reads more than one table",
+     "WITH t AS (SELECT order_id FROM order_items WHERE order_id IN (SELECT id FROM orders)) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN t ON t.order_id = orders.id"),
+    ("the body reads a table the model does not declare",
+     "WITH x AS (SELECT * FROM shipments) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN x ON x.order_id = orders.id"),
+    ("two CTEs read each other, so the walk would not terminate",
+     "WITH a AS (SELECT * FROM b), b AS (SELECT * FROM a) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN a ON a.order_id = orders.id"),
+    ("the join key is composite",
+     "WITH oi AS (SELECT order_id, product_id, SUM(quantity) q FROM order_items "
+     "GROUP BY order_id) SELECT SUM(orders.total_amount) FROM orders "
+     "JOIN oi ON oi.order_id = orders.id AND oi.product_id = orders.id"),
+    ("there is no join key, because it is a comma join",
+     "WITH oi AS (SELECT order_id, SUM(quantity) q FROM order_items GROUP BY order_id) "
+     "SELECT SUM(orders.total_amount) FROM orders, oi"),
+    ("the join predicate is an inequality, not an equality",
+     "WITH oi AS (SELECT order_id, SUM(quantity) q FROM order_items GROUP BY order_id) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id > orders.id"),
+    ("the far side of the join key is a literal, not a column",
+     "WITH oi AS (SELECT order_id, SUM(quantity) q FROM order_items GROUP BY order_id) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = 1"),
+    ("the far side resolves to nothing in scope",
+     "WITH oi AS (SELECT order_id, SUM(quantity) q FROM order_items GROUP BY order_id) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = zzz.id"),
+    ("the grain is an expression with no column name to compare",
+     "WITH oi AS (SELECT SUM(quantity) q FROM order_items GROUP BY order_id + 1) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.q = orders.id"),
+]
+
+
+def _parse(sql: str):
+    """One parse, so every assertion on the resolver reads the tree the analysis reads."""
+    return parse_one(sql)
+
+
+def _no_grain_org() -> "m.Datasource":
+    """`orders` with `grain: []` — the one thing `_sales_org` cannot express and must not learn.
+
+    Every `_sales_org` table declares a non-empty grain, which is what makes its assertions mean
+    what they say; weakening one of them to reach this branch would silently change what several
+    other tests are testing. So the empty-grain case gets its own two-table model, cut down to the
+    single edge the assertion is about.
+    """
+    tables = [
+        m.Table(name="orders", schema="public", storage_connection="c", grain=[],
+                description="orders",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="total_amount", type="decimal")]),
+        m.Table(name="order_items", schema="public", storage_connection="c",
+                grain=["order_id", "product_id"], description="order items",
+                columns=[m.Column(name="order_id", type="integer"),
+                         m.Column(name="product_id", type="integer"),
+                         m.Column(name="quantity", type="integer")]),
+    ]
+    rels = [m.Relationship(from_table="order_items", to_table="orders", from_column="order_id",
+                           to_column="id", relationship="many_to_one")]
+    return m.Datasource(datasource="Shop",
+                        subject_areas=[m.SubjectArea(name="sales", tables_defined=tables,
+                                                     relationships=rels)])
+
+
+def _averageable_org() -> "m.Datasource":
+    """One table with one `averageable` column — the smallest model `bad_aggregation` fires on.
+
+    `_sales_org` deliberately leaves every `Column.aggregation` at `unknown` so that the exact
+    risk-list assertions elsewhere stay about the fan/chasm detector. This model exists only to
+    hold `_check_aggregation_semantics` still while the scope map underneath it changes.
+    """
+    t = m.Table(name="facts", schema="public", storage_connection="c", grain=["id"],
+                description="facts",
+                columns=[m.Column(name="id", type="integer", aggregation="dimension"),
+                         m.Column(name="unit_price", type="decimal", aggregation="averageable")])
+    return m.Datasource(datasource="F",
+                        subject_areas=[m.SubjectArea(name="a", description="d",
+                                                     tables_defined=[t])])
+
+
+def test_a_grain_changing_cte_is_not_the_table_it_reads():
+    """A10. The join a CTE BODY takes is not a join the statement takes.
+
+    `oi` groups `order_items` to one row per order. The outer statement joins `orders` to that, one
+    order to one row, and `SUM(orders.total_amount)` is exactly the sum of the orders. Nothing is
+    multiplied and the receipt may say so.
+
+    What it said before was `multiplied`, naming `orders (1) <- order_items (N)` — an edge that
+    appears nowhere in the outer query. `order_items` is read once, inside the CTE body, under a
+    `GROUP BY` that is the whole point of writing the CTE. Reporting it is not an over-cautious
+    answer, it is a false one: it names a join the reader can look for and not find, and it does so
+    on a statement that is correct.
+
+    Both halves are asserted because they fail independently. Abstaining would fix the naming and
+    lose the answer; resolving the CTE without checking its grain would keep the answer and keep
+    naming the wrong edge. `joins` is asserted over EVERY item rather than the first, since the
+    criterion is that no item names `order_items` — a second aggregate would be a second chance to
+    get it wrong.
+    """
+    reports = _reports(GRAIN_CHANGING_CTE)
+    assert [a.status for a in reports] == [rt.NOT_MULTIPLIED], reports
+    assert [j for a in reports for j in a.joins] == [], reports
+    assert not any("order_items" in j for a in reports for j in a.joins), reports
+    assert [f.risk for a in reports for f in a.findings] == [], reports
+
+
+def test_a_grain_preserving_cte_carries_the_join_it_launders():
+    """A11. A CTE that hands back a table's rows unchanged IS that table, for this question.
+
+    `WITH o AS (SELECT * FROM orders)` produces exactly the rows of `orders`, so joining `o` to
+    `order_items` multiplies `SUM(o.total_amount)` precisely as joining `orders` would. The
+    statement is the plain fan with one indirection, and the fan is real.
+
+    It reported `undetermined` before, and that was not a cautious answer either — it was the
+    detector failing to resolve `o` to anything and then having nothing to say. The edge is asserted
+    by name: `order_items` and not `o`, because a reader who is told their number was multiplied
+    and handed back the alias they invented has been told something they already knew.
+    """
+    reports = _reports(GRAIN_PRESERVING_CTE)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert reports[0].joins == [FAN_EDGE], reports[0].joins
+    assert [f.risk for f in reports[0].findings] == ["fan_trap"], reports[0].findings
+
+
+def test_a_grain_preserving_cte_resolves_through_another_one():
+    """A13. Two grain-preserving hops are still the same rows, so the resolution is transitive.
+
+    `b` reads `a` and `a` reads `order_items`, neither changing a thing. A resolver that stopped at
+    the first hop would find `b` bound to `a`, which is not a declared table either, and fall back
+    to the same `undetermined` the single-hop case used to give — correct-looking on the corpus,
+    which only asks that nothing read clean, and wrong on the one assertion that matters here.
+
+    The cycle guard makes this safe rather than unbounded: `seen` is what stops `a` reading `b`
+    reading `a` from recursing forever, and it is exercised by its own row in the guard table below.
+    """
+    reports = _reports(TRANSITIVE_CTE)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert reports[0].joins == [FAN_EDGE], reports[0].joins
+
+
+def test_a_cte_grain_that_does_not_cover_the_join_key_still_fans():
+    """A14. Grouped finer than the join key, the CTE is the many side of its own edge.
+
+    `oi` is one row per (order, product) and the join uses `order_id` alone, so an order with three
+    products meets three rows and `SUM(orders.total_amount)` triples. That is a fan, and it is a fan
+    over a source the model never declared — which is exactly why the analysis has to DERIVE the
+    edge rather than abstain. Abstaining would report `undetermined` on a statement whose answer is
+    known and wrong.
+
+    The derived edge is asserted, not just the status. `many_to_one` from the CTE to `orders` is the
+    claim the report rests on, and `infer_cardinality` read it off the two grains — the CTE's
+    `(order_id, product_id)` against the join key `order_id`. A status assertion alone would pass
+    just as well if the fan came from somewhere else entirely.
+
+    The edge names `oi` because that is the only name this source has. It is the one place a join
+    on the receipt names an alias, and it is honest: there is no table to name.
+    """
+    tree = _parse(CTE_GRAIN_BELOW_JOIN_KEY)
+    scope, derived = rt._resolve_cte_scope(
+        tree, rt._alias_map(tree, in_scope_only=True), rt._model_table_index(_sales_org()))
+    assert scope == {"orders": "orders", "oi": "oi"}, scope
+    assert [(r.from_table, r.to_table, r.from_column, r.to_column, r.relationship)
+            for r in derived] == [("oi", "orders", "order_id", "id", "many_to_one")], derived
+
+    reports = _reports(CTE_GRAIN_BELOW_JOIN_KEY)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert reports[0].joins == ["orders (1) <- oi (N)"], reports[0].joins
+
+
+def test_a_cte_grain_that_covers_the_join_key_is_not_multiplied():
+    """A15. `not_multiplied` BECAUSE the grain covers the join key, not because we declined.
+
+    `oi` is one row per order and the join is on `order_id`, so each order meets exactly one row.
+    The derived edge is `one_to_one`, and that is the assertion: `undetermined` and `not_multiplied`
+    are different answers, and so are two routes to `not_multiplied`. A resolver that bound every
+    grain-changing CTE to nothing would also produce no fan here, and the item would then say
+    `undetermined` — so the status alone cannot tell the working rule from the abstaining one.
+
+    Same SQL as A10, read one layer down. A10 asserts what the receipt says; this asserts why.
+    """
+    tree = _parse(GRAIN_CHANGING_CTE)
+    scope, derived = rt._resolve_cte_scope(
+        tree, rt._alias_map(tree, in_scope_only=True), rt._model_table_index(_sales_org()))
+    assert scope == {"orders": "orders", "oi": "oi"}, scope
+    assert [(r.from_table, r.to_table, r.from_column, r.to_column, r.relationship)
+            for r in derived] == [("oi", "orders", "order_id", "id", "one_to_one")], derived
+
+
+@pytest.mark.parametrize("label,on,expected", [
+    ("the CTE is written on the left", "oi.order_id = orders.id", "one_to_one"),
+    ("the CTE is written on the right", "orders.id = oi.order_id", "one_to_one"),
+])
+def test_the_join_key_is_read_in_either_orientation(label, on, expected):
+    """Which side of the equality the CTE sits on is the author's typing, not a fact about the join.
+
+    `a = b` and `b = a` are the same predicate, and sqlglot keeps the two apart in the tree, so the
+    orientation has to be resolved rather than assumed. Getting it wrong is not a crash: the pair
+    would simply never be found, `_cte_edge` would see no join key, and the statement would report
+    `undetermined` — a receipt that declines to answer half the statements it can answer, on a
+    difference nobody writing SQL considers a difference.
+
+    The derived edge is compared rather than the status, because both orientations of THIS statement
+    happen to end at `not_multiplied` — one by deriving a `one_to_one` and one by abstaining — and
+    only the edge tells those apart.
+    """
+    sql = ("WITH oi AS (SELECT order_id, SUM(quantity) q FROM order_items GROUP BY order_id) "
+           f"SELECT SUM(orders.total_amount) FROM orders JOIN oi ON {on}")
+    tree = _parse(sql)
+    _scope, derived = rt._resolve_cte_scope(
+        tree, rt._alias_map(tree, in_scope_only=True), rt._model_table_index(_sales_org()))
+    assert [(r.from_table, r.to_table, r.from_column, r.to_column, r.relationship)
+            for r in derived] == [("oi", "orders", "order_id", "id", expected)], label
+    assert [a.status for a in _reports(sql)] == [rt.NOT_MULTIPLIED], label
+
+
+@pytest.mark.parametrize("label,sql", UNREADABLE_CTE_BODIES)
+def test_a_cte_body_the_analysis_cannot_read_is_undetermined(label, sql):
+    """A16. Every way the resolution can decline ends in `undetermined`, never in a clean answer.
+
+    Each row differs from a resolvable statement in exactly one respect, and each of those respects
+    is a way the rows behind the aggregate could differ from what the outer query appears to join.
+    A set-operation body sums its arms; `DISTINCT` and an aggregate collapse rows; a join inside the
+    body multiplies where the outer walk does not look; a body reading two tables or none, or a
+    table the model does not declare, resolves to nothing that can be reasoned about; and two CTEs
+    reading each other would not terminate at all.
+
+    The last six are the edge rather than the body: a composite or absent join key is not the single
+    -column cardinality rule's to state, an inequality and a literal are not a key, a far side that
+    resolves to nothing has no grain to compare against, and a grain written as an expression has no
+    column name to compare a join key to.
+
+    They share one assertion because they share one contract. This layer is allowed to say a number
+    was multiplied, or that it was not, or that it could not tell — and every one of these is the
+    third. What none of them may be is absent or clean: `not_multiplied` on any row here would be
+    the receipt asserting a statement is sound on the strength of a body it could not read.
+    """
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.UNDETERMINED], (label, reports)
+    assert [j for a in reports for j in a.joins] == [], (label, reports)
+
+
+def test_an_undeclared_grain_is_undetermined_rather_than_a_default_cardinality():
+    """A26. An EMPTY declared grain is not a grain, and the guard sits before the inference.
+
+    `infer_cardinality` tests `bool(from_pk)` and `bool(to_pk)`, so a table declared `grain: []` and
+    a table with no grain at all are the same thing to it, and both fall through to its
+    `many_to_one` default. That default is right for a model-authoring tool proposing an edge for
+    review. It is wrong here, where the answer lands on a receipt as a fact: the cardinality would
+    be one nobody declared.
+
+    Measured, and this is why the guard is placed before the call rather than after: with the guard
+    removed this same statement reports `not_multiplied`. The inference makes the CTE the ONE side
+    of a `one_to_many` — its own grain covers the join key, the far side's does not — so no fan
+    fires and the item claims the number is clean. A false clean out of a cardinality nobody
+    declared is the exact failure this spec exists to remove.
+
+    Its own model, because the branch is unreachable on `_sales_org` and weakening a fixture to
+    reach a branch changes what every other test on that fixture is asserting.
+    """
+    pf = rt.pre_flight_check(GRAIN_CHANGING_CTE, _no_grain_org())
+    assert pf.unchecked is None, pf.unchecked
+    assert [(a.aggregate, a.status) for a in pf.aggregates] == [
+        ("SUM(orders.total_amount)", rt.UNDETERMINED)], pf.aggregates
+
+
+def test_a_cte_name_is_resolved_case_insensitively_but_reported_as_written():
+    """The fold hazard, pinned in both directions on one statement.
+
+    `_cte_names` lowercases and `_model_table_index` is keyed folded, while `_alias_map` preserves
+    exactly what the statement wrote. So `WITH OI AS (…) … JOIN OI` has to fold on the way IN — to
+    recognise `OI` as a CTE and to look up its source's grain — and preserve on the way OUT, because
+    the derived edge has to name the source the way the scope map holds it or the detector matches
+    nothing at all.
+
+    A comparison that folded on neither side would leave this reading clean, which is the direction
+    that matters: `OI` is `order_items` under another spelling and the fan is real.
+    """
+    reports = _reports(CASE_FOLDED_CTE)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert reports[0].joins == [FAN_EDGE], reports[0].joins
+
+
+# --- A12: the map a caller may reason about joins from ----------------------
+
+
+@pytest.mark.parametrize("label,sql,scopes,expected", [
+    ("a reference inside a CTE body is not in the outer scope", CTE_LAUNDERED_FAN,
+     ["cte:oi", "main", "main"], {"orders": "orders", "oi": "oi"}),
+    ("a reference inside a derived table is not in the outer scope", DERIVED_TABLE_FAN,
+     ["main", "subquery"], {"orders": "orders", "d": ""}),
+    ("both arms of a set operation are the main query",
+     "SELECT SUM(orders.total_amount) FROM orders "
+     "UNION SELECT SUM(order_items.quantity) FROM order_items",
+     ["main#1", "main#2"], {"orders": "orders", "order_items": "order_items"}),
+])
+def test_the_scope_filtered_alias_map_keeps_only_references_the_select_can_see(
+    label, sql, scopes, expected,
+):
+    """A12. Asserted on the function, because the filter is a claim about the map and not about a
+    receipt.
+
+    Three shapes, one per thing the filter has to get right. A reference scoped `cte:oi` is written
+    in a body whose rows the outer query only sees through the CTE, so it is not a table the outer
+    FROM/JOIN clauses bind; a reference scoped `subquery` is the same case one construct over; and
+    an arm of a set operation IS the main query, which is why the family is compared after the arm
+    ordinal is stripped rather than before.
+
+    Each case asserts the scopes its references actually carry BEFORE asserting the map, so a case
+    proves what it claims rather than passing because the shape it names never arose. The third one
+    needs it most: `main#1` and `main#2` are two different scope STRINGS, equal to `"main"` only
+    once the ordinal is split off the right, and a filter written as a bare `scope == "main"` would
+    drop both arms and leave an empty map — which no assertion on the map alone tells apart from a
+    filter that is simply too keen.
+    """
+    tree = _parse(sql)
+    assert sorted(r.scope for r in rt._table_references(tree)) == sorted(scopes), label
+    assert rt._alias_map(tree, in_scope_only=True) == expected, label
+
+
+def test_the_arm_ordinal_is_split_off_the_right_and_a_cte_name_can_carry_no_hash():
+    """`_scope_family` splits from the RIGHT, and both halves of that choice are pinned.
+
+    The ordinal `_arm_suffixes` appends is ours and always last, while everything to its left can
+    hold a CTE name, which is caller-written text. Splitting from the left would read `cte:a#b` as
+    the family `cte:a` — a scope that is not the main query either way, so nothing observable moves
+    today, but the rule would be about the wrong thing.
+
+    That no CTE name can actually carry a `#` is a fact about `_echo_name` and not about this
+    function, so it is measured rather than assumed: the label a reference carries is echoed, and
+    `#` is not a character that survives echoing. The right-side split is simply the form that stays
+    correct without depending on it.
+    """
+    assert rt._scope_family("main") == "main"
+    assert rt._scope_family("main#2") == "main"
+    assert rt._scope_family("cte:recent#1") == "cte:recent"
+    assert rt._scope_family("subquery") == "subquery"
+    assert rt._echo_name("a#b") == "a?b"
+
+    tree = _parse("SELECT SUM(orders.total_amount) FROM orders "
+                  "UNION SELECT SUM(order_items.quantity) FROM order_items")
+    assert sorted(r.scope for r in rt._table_references(tree)) == ["main#1", "main#2"]
+
+
+@pytest.mark.parametrize("label,sql,expected", [
+    ("an aliased derived table in a JOIN", DERIVED_TABLE_FAN,
+     {"orders": "orders", "order_items": "order_items"}),
+    ("an unaliased VALUES list in a comma join", UNALIASED_VALUES_FAN, {"orders": "orders"}),
+])
+def test_the_default_alias_map_is_unchanged_by_the_derived_binding(label, sql, expected):
+    """A12b. The default path is bit-identical, on the shapes that could have moved.
+
+    `tests/test_ace099_resolver_parity.py` pins the default against the helper it replaced, and it
+    stays unedited — but it covers CTE and subquery shapes, none of which bind a FROM/JOIN derived
+    source. Those are precisely the shapes the new walk added a node type for, so they are precisely
+    the ones where a default that quietly picked up the binding would go unnoticed.
+
+    Three callers read this map on the default and two of them would change what they DISCLOSE if
+    the filter or the binding reached them: `_projected_sensitive` refuses, and `assemble_receipt`
+    builds the receipt's `joins` and `tables` sections. So the assertion is equality with the exact
+    map, plus the absence of the two keys the binding would have added.
+    """
+    tree = _parse(sql)
+    assert rt._alias_map(tree) == expected, label
+    assert "" not in rt._alias_map(tree), label
+    assert "d" not in rt._alias_map(tree), label
+
+
+# --- the false clean the filter itself creates ------------------------------
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("the aggregate's column is qualified", DERIVED_TABLE_FAN),
+    ("the aggregate's column is unqualified", DERIVED_TABLE_UNQUALIFIED),
+])
+def test_an_alias_bound_to_nothing_is_undetermined_rather_than_clean(label, sql):
+    """The proof that the derived binding had to ship in the same commit as the scope filter.
+
+    `d` is an `exp.Subquery`, so it never entered the alias map at all, and `order_items` reached
+    the outer map only by leaking out of `d`'s body — which is the single reason this shape reported
+    `multiplied` before. Land the filter alone and the leak stops, the outer scope is the one table
+    `orders`, `SUM(orders.total_amount)` resolves perfectly, and a statement whose rows a join
+    genuinely multiplied reports `not_multiplied`. That is the receipt asserting something false,
+    and no test on `main` would have failed.
+
+    The second row is the same shape with the column unqualified, and it needs both halves to fail
+    before it reads clean: with `d` bound, the scope holds two entries and `_resolve_col_table`
+    declines to attribute an unqualified column at all; with `d` absent, `orders` is the only
+    candidate and the column resolves cleanly to it. Either mechanism alone would have caught this
+    one, so it is the row that says the two are not the same mechanism.
+    """
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.UNDETERMINED], (label, reports)
+    assert [j for a in reports for j in a.joins] == [], (label, reports)
+
+
+def test_a_parenthesized_table_is_the_table_and_not_a_source_of_its_own():
+    """`FROM (orders)` binds no name, so the scope-completeness rule must not fire on it.
+
+    sqlglot parses it to `Subquery(this=Table)` with an empty alias — structurally the same node
+    kind as a derived table, and semantically just a bracket around a table name the `exp.Table`
+    arm has already bound. Binding it too would put an empty key in the map, and by the
+    scope-completeness conjunct that one entry turns EVERY aggregate in the SELECT `undetermined`.
+
+    Measured both ways while the guard was being placed: without the discriminator this statement
+    reports `undetermined`, with it `not_multiplied`. The distinction is `.this` being an
+    `exp.Table` and nothing else — an unaliased `VALUES`, `LATERAL` or derived `SELECT` in the same
+    position introduces rows nothing can name and MUST bind, which is the corpus member above.
+    """
+    reports = _reports(PARENTHESIZED_TABLE)
+    assert [(a.aggregate, a.status) for a in reports] == [
+        ("SUM(orders.total_amount)", rt.NOT_MULTIPLIED)], reports
+    assert rt._alias_map(_parse(PARENTHESIZED_TABLE), in_scope_only=True) == {"orders": "orders"}
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("a VALUES list", VALUES_SOURCE),
+    ("a LATERAL", LATERAL_SOURCE),
+])
+def test_a_source_the_guarded_path_refuses_is_still_answered_honestly_on_the_prepare_surface(
+    label, sql,
+):
+    """Why the `exp.Lateral` and `exp.Values` binding arms are not dead code.
+
+    `check_scopable` (ACE-037) refuses both of these source kinds at the `execute_guarded`
+    chokepoint, so no query that RUNS ever reaches the multiplication analysis carrying one. That is
+    asserted here rather than assumed, because it is the premise of the whole question.
+
+    But `cmd_preflight` and `cmd_prepare` in `semantic_model/cli.py` call `pre_flight_check`
+    directly, with no gate battery at all — `cmd_prepare`'s own docstring says it is not a gate and
+    never was — and the query skill runs `sm prepare` on every tier. On that surface both of these
+    reported `not_multiplied` over a source that can produce many rows per order. A reader of a
+    prepare receipt has no way to know a gate they never invoked would have refused the statement;
+    what they have is the sentence in front of them, and it said the number was sound.
+
+    So the analysis answers honestly on both surfaces, and the two arms exist for the one that has
+    no gate in front of it. `pre_flight_check` is called directly here for the same reason: driving
+    this through `execute_guarded` would measure the refusal and never reach the claim.
+    """
+    assert rt.check_scopable(sql, _sales_org()) is not None, label
+    pf = rt.pre_flight_check(sql, _sales_org())
+    assert pf.unchecked is None, (label, pf.unchecked)
+    assert [a.status for a in pf.aggregates] == [rt.UNDETERMINED], (label, pf.aggregates)
+
+
+# --- what the narrowed scope map costs the semantic checks ------------------
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("qualified", "SELECT SUM(facts.unit_price) FROM facts"),
+    ("unqualified, one table in scope", "SELECT SUM(unit_price) FROM facts"),
+])
+def test_an_aggregation_class_violation_still_fires_on_the_statement_that_makes_it(label, sql):
+    """`_check_aggregation_semantics` reads the same narrowed map, so its floor is pinned here.
+
+    It resolves the summed column's table through the scope map `_preflight_select` hands it, and
+    that map now holds only what this SELECT's own FROM/JOIN clauses bind. Two `bad_aggregation`
+    findings were measured to stop firing as a result, and both fired only by reading a table out of
+    a scope the outer statement cannot see: `SUM(unit_price) FROM (SELECT unit_price FROM facts) f`
+    and its CTE equivalent. That is ACE-099's rule applied consistently — a column in a CTE body is
+    not a reference of the outer statement — and it is recorded as a contract change rather than
+    hidden, since one of the two traded a lost finding for a killed false clean.
+
+    What may not narrow is the case the check exists for: a statement that sums an `averageable`
+    column off a table it plainly reads. Both spellings are pinned, because they take different
+    paths through the resolver — the qualified one through the map, the unqualified one through the
+    single-in-scope-table fallback — and the fallback reads the map's VALUES, which is the half the
+    filter changed.
+    """
+    pf = rt.pre_flight_check(sql, _averageable_org())
+    assert [f.risk for f in pf.findings] == ["bad_aggregation"], (label, pf.findings)
+    assert "unit_price" in pf.findings[0].reason, (label, pf.findings[0].reason)
+
+
+def test_the_chasm_still_reports_both_of_the_aggregates_it_inflates():
+    """The chasm reads `table_set` off the same map the filter narrowed, so it is re-pinned here.
+
+    `tests/test_semantic_model_runtime.py::test_chasm_trap_is_reported` is the gate and stays
+    unedited; this asserts the same property from the file that changed the map, so a narrowing that
+    cost the chasm one of its two items fails beside the change that caused it rather than in
+    another file. Both aggregates are inflated by the cross-product and both must say so — a chasm
+    reported on one of the two numbers it ruins is a receipt that reads as half a fact.
+    """
+    sql = ("SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
+           "LEFT JOIN orders o ON o.customer_id = c.id "
+           "LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.id")
+    reports = _reports(sql)
+    assert [(a.aggregate, a.status) for a in reports] == [
+        ("SUM(o.revenue)", rt.MULTIPLIED), ("COUNT(t.id)", rt.MULTIPLIED)], reports
+    assert [f.risk for a in reports for f in a.findings] == ["chasm_trap", "chasm_trap"], reports
