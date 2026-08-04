@@ -28,8 +28,12 @@ testpaths = ["tests"]
 # (IDE runners, quick local runs). The CI gate and `dev.py cover` pass --cov explicitly;
 # a --cov-fail-under floor will be added once the baseline is locked.
 markers = [
-  # Applied by the safety corpus's DB-path parametrizer, and counted by tests/e2e/conftest.py.
-  # Registered so an unknown-mark warning can never be the only sign that it was misspelt — the
-  # marker is how that run selects its work, and a typo there is a run that proves nothing.
+  # Applied by the safety corpus's parametrizers, and counted by tests/e2e/conftest.py — both at
+  # collection and again at session end, against a constant per marker. Registered so an unknown-mark
+  # warning can never be the only sign that one was misspelt: the marker is how that run selects its
+  # work, and a typo there is a run that proves nothing.
   "db_path: a safety-corpus vector driven against the DB-served model and the Postgres warehouse",
+  # Separate from db_path on purpose. It is a separate claim — the database refusing a write with the
+  # application out of the path — and it needs its own count, or one could shrink while the other grew.
+  "role_floor: a write issued straight at Postgres as the read-only role, with no application in the path",
 ]

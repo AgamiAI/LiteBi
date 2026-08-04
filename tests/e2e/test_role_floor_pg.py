@@ -22,6 +22,15 @@ privileges. So:
   * the error is read, never merely caught. A write must fail with SQLSTATE 42501,
     `insufficient_privilege` — a permission decision. `42P01`, "relation does not exist", would be
     the absent-table impostor and it fails here.
+
+**And the cases carry the `role_floor` marker, which is what puts them inside the sentinel.** They
+were outside it: the DB job's only count was of `db_path` vectors, and this file's items carry
+none, so deleting the file, renaming its test or thinning `WRITES` left the job green with the
+single most load-bearing claim in the spec unrun. The retired `pytest -k "db_path or role"`
+selector at least matched on "role"; replacing it with a count that never mentioned the role floor
+made the coverage narrower, not wider. `tests/e2e/conftest.py::EXPECTED_ROLE_FLOOR_VECTORS` is the
+number this file's five statements are held to, and it deliberately lives over there so that
+deleting this file cannot delete the expectation with it.
 """
 
 from __future__ import annotations
@@ -42,9 +51,12 @@ itdeps.importorfail("psycopg2")
 import harness  # noqa: E402
 
 if not harness.PG_ENABLED:
-    pytest.skip(
+    # A skip locally, a FAILURE in the job that declared it carries this evidence. The password is
+    # as much a prerequisite as the driver is, and a single deleted line in the workflow used to
+    # take the whole DB half down to a module-level skip and an exit code of 0.
+    itdeps.skip_or_fail(
         "set AGAMI_IT_PG_PASSWORD to run the Postgres role floor against the compose fixture",
-        allow_module_level=True,
+        module_level=True,
     )
 
 import psycopg2  # noqa: E402
@@ -94,7 +106,17 @@ def _control(conn) -> None:
     conn.rollback()
 
 
-@pytest.mark.parametrize("label, sql", WRITES, ids=[label for label, _ in WRITES])
+def _write_params():
+    """One parameter per write, each carrying the `role_floor` MARKER.
+
+    Applied by the parametrizer off `WRITES` itself, exactly as the corpus applies `db_path` off
+    `CASES`: the marker is then a property of the data rather than a decoration on a function name,
+    so thinning `WRITES` shrinks the marked set and the sentinel in `conftest.py` sees it.
+    """
+    return [pytest.param(label, sql, marks=pytest.mark.role_floor, id=label) for label, sql in WRITES]
+
+
+@pytest.mark.parametrize("label, sql", _write_params())
 def test_the_database_refuses_the_write_with_the_app_gate_out_of_the_loop(
     readonly_connection, label, sql
 ):
