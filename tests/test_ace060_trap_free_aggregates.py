@@ -417,6 +417,28 @@ def test_the_preflight_and_the_receipt_agree_about_the_aggregates(org, sql):
 # --- SC-8: no surface says a trap refuses -----------------------------------
 
 
+def test_the_module_docstring_does_not_claim_bare_completeness():
+    """The same class of defect as SC-8, found by review on this branch.
+
+    `runtime.py` opened with *"the detector here is **complete and deterministic**"*, two screens
+    above a module that now has a state literally called `undetermined`. The claim was already too
+    strong before this spec — a `COUNT(*)` under a fan went undetected then too — but keyed per
+    finding that was an absence nobody could see, and a docstring promising completeness beside a
+    report that declines to answer is a reader's problem rather than a historian's.
+
+    Pinned as the exact phrase rather than by parsing the sentence: the point is that the bare claim
+    does not come back, and any rewording that bounds it reads differently.
+    """
+    doc = RUNTIME_PY.read_text().split('"""')[1]
+    assert "complete and deterministic" not in doc, (
+        "the module docstring claims the detector is complete; it is complete over what it can "
+        "resolve, and the cases it cannot are exactly what `undetermined` reports"
+    )
+    assert "undetermined" in doc, (
+        "a reader of the docstring has to learn that the detector has a third answer"
+    )
+
+
 @pytest.mark.parametrize("path,claim", [
     (RUNTIME_PY, "refuse-vs-allow"),
     (RUNTIME_PY, "the caller's statement is what runs or nothing does"),

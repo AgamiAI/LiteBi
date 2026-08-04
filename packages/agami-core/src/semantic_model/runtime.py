@@ -19,8 +19,22 @@ Primitives (examples-first canonical loop):
   assemble_refusal_receipt  — the echo-bounded receipt every non-ok outcome carries
 
 Pre-flight scope note (documented decision, recorded in the PR description):
-The cardinality field on every relationship is the day-1 structural gate. The
-detector here is **complete and deterministic** for both fan-trap and chasm-trap.
+The cardinality field on every relationship is the day-1 structural gate. The detector
+here is **deterministic, and complete over what it can resolve**: given an aggregate
+whose source tables resolve and the model's declared relationships, it finds every fan
+and every chasm among them, and finds the same ones on every run.
+
+**Bare "complete" was too strong, and this is where that stopped being invisible.** An
+aggregate naming no column (`COUNT(*)`), an unqualified column with two or more tables
+in scope, and one reading a CTE or derived table the walk does not enter are all cases
+where nothing establishes which rows the value was computed from. That was always so;
+keyed per finding it surfaced as an ABSENCE, which says nothing, and keying per
+aggregate would have turned the same absence into `not_multiplied` — a positive claim
+that the number is clean. So those report `undetermined`, and the section's marker
+counts them. The gap in the other direction is ACE-083's: `MIN` / `MAX` /
+`COUNT(DISTINCT)` are still counted as fan-out risks although a fan-out cannot change
+what they return.
+
 There is no rewrite and no refusal. Every detected trap is reported as a fact about
 the aggregate it inflated, on an answer that RAN. This module used to rewrite the
 textbook aggregation-only fan-trap by dropping the redundant join, on the grounds
