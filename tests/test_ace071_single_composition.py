@@ -70,7 +70,7 @@ def _call_sites(tree: ast.AST) -> list[tuple[str, int]]:
 
 def _composing_function() -> ast.FunctionDef:
     """The `_model_safety` definition in `execute_sql.py` — the one place the battery is assembled."""
-    module = ast.parse(COMPOSER.read_text(), filename=str(COMPOSER))
+    module = ast.parse(COMPOSER.read_text(encoding="utf-8"), filename=str(COMPOSER))
     for node in ast.walk(module):
         if isinstance(node, ast.FunctionDef) and node.name == COMPOSING_FUNCTION:
             return node
@@ -88,7 +88,7 @@ def test_the_guard_battery_is_called_only_from_the_one_composing_function() -> N
 
     for root in SCANNED_ROOTS:
         for path in sorted(root.rglob("*.py")):
-            sites = _call_sites(ast.parse(path.read_text(), filename=str(path)))
+            sites = _call_sites(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
             expected = inside if path == COMPOSER else []
             assert sites == expected, f"{path.relative_to(REPO_ROOT)} calls a guard gate: {sites}"
 
