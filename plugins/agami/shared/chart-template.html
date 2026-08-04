@@ -51,9 +51,10 @@
       // An UNDECLARED reference (a CTE name, say) carries declared:false and null qname / rows /
       // rows_as_of / freshness, because there is no model row for those to be about.
       //
-      // `scope` is the query scope the reference was written in — "main", "cte:<name>", or
-      // "subquery", each carrying a trailing "#<n>" when that scope is one of two or more arms of
-      // a UNION / INTERSECT / EXCEPT ("main#2", "cte:recent#1"). It is what tells two entries with
+      // `scope` is the query scope the reference was written in — "main" or "cte:<name>", each
+      // carrying a trailing "#<n>" when that scope is one of two or more arms of a UNION /
+      // INTERSECT / EXCEPT ("main#2", "cte:recent#1"), or "subquery", which never takes an arm
+      // number because it names no scope to have arms. It is what tells two entries with
       // the SAME `ref` apart, and without it the `filters` list below cannot be read: a filter
       // satisfied inside a CTE body is not satisfied for the statement that READS that CTE, and a
       // filter applied in one arm of a UNION is not applied in the other. The ordinal is the arm's

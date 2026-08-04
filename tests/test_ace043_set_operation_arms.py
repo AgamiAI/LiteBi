@@ -210,8 +210,31 @@ ARM_SHAPES = {
     "a doubly-parenthesized select": "((SELECT id FROM t_paren_paren))",
     "a nested set operation": "(SELECT id FROM t_nest_a UNION SELECT id FROM t_nest_b)",
     "a VALUES arm": "VALUES (1)",
+    # Bare `VALUES (1)` is normalized by sqlglot into a Select and so contributes one; PARENTHESIZED
+    # it stays a Subquery wrapping Values and contributes NONE. That difference is invisible in the
+    # SQL and is exactly the shape that renumbered every later arm before `_output_select_arms`.
+    "a parenthesized VALUES arm": "(VALUES (1))",
     "a select with a join": "SELECT a.id FROM t_join_a a JOIN t_join_b b ON b.id = a.id",
     "a select from a derived table": "SELECT q.id FROM (SELECT id FROM t_derived) q",
+}
+
+# `t_other` is written as the LAST arm of every statement the sweep builds, so its ordinal must be
+# that statement's arm COUNT. Pinning the exact number rather than "starts with main#" is what
+# separates a true ordinal from a plausible one: an arm contributing no output SELECT still has to
+# consume its position, and a shape whose leading arm is itself a set operation pushes `t_other` to
+# three. Both are cases where a positional walk over the surviving SELECTs silently reports a
+# different arm than the caller wrote.
+EXPECTED_LAST_ARM_SCOPE = {
+    "a plain select": "main#2",
+    "a select with a WHERE": "main#2",
+    "a select with a GROUP BY": "main#2",
+    "a parenthesized select": "main#2",
+    "a doubly-parenthesized select": "main#2",
+    "a nested set operation": "main#3",
+    "a VALUES arm": "main#2",
+    "a parenthesized VALUES arm": "main#2",
+    "a select with a join": "main#2",
+    "a select from a derived table": "main#2",
 }
 
 
@@ -283,8 +306,54 @@ def test_no_reference_in_any_arm_of_a_set_operation_falls_through_to_subquery(op
     # contributed, and the count pins the references WITHIN a shape too — two apiece, three for the
     # nested set operation and for the join, one for the VALUES arm and one for the derived table.
     assert {entry[0] for entry in scoped} == set(ARM_SHAPES)
-    assert len(scoped) == 18
+    assert len(scoped) == 19
     assert nested == [("a select from a derived table", "t_derived", "subquery")]
+    # And the ordinals are the arms' real positions, not merely well-formed labels. Asserted last
+    # because it is the strictest claim here: `startswith("main#")` above would accept `main#1` for
+    # every reference in the corpus.
+    assert {
+        shape: scope for shape, table, scope in scoped if table == "t_other"
+    } == EXPECTED_LAST_ARM_SCOPE
+
+
+def test_an_arm_that_contributes_no_output_select_still_consumes_its_position():
+    """A shifted ordinal is a FALSE receipt fact, not a weaker one, and this is where it came from.
+
+    `(VALUES ('x', 0))` is ordinary SQL — appending a synthetic row to a result — and it parses to a
+    `Subquery` wrapping `Values`, which contributes no output SELECT. Numbering the flattened list
+    of surviving SELECTs therefore closed the gap and handed the THIRD arm the second arm's number:
+
+        SELECT a FROM t1 UNION ALL (VALUES ('x', 0)) UNION ALL SELECT c FROM t3
+          -> t3 read `main#2`
+
+    Nothing about that label looks wrong. It parses, it is well-formed, it is in the documented
+    vocabulary, and it points at a different piece of SQL than the caller wrote — which is the one
+    failure mode a trust receipt cannot have, because a reader has no second source to check it
+    against. The contract says the ordinal is the arm's position IN THE SQL; here it silently was
+    not.
+
+    The two-arm case is the same defect wearing a different hat: one surviving SELECT tripped the
+    `len(arms) < 2` guard, so a set operation was labelled exactly like a plain SELECT and the
+    docstring's promise that an absent suffix means "no suffix, never arm unknown" was false.
+
+    Caught by `_output_select_arms` keeping one slot per arm AS WRITTEN, empty or not. The mutation
+    this catches is flattening that back to `_output_selects` for tidiness — every other test in
+    this file passes if you do, because every other statement here has an output SELECT in every
+    arm.
+    """
+    three = "SELECT a FROM t1 UNION ALL (VALUES ('x', 0)) UNION ALL SELECT c FROM t3"
+    assert [(r.bare, r.scope) for r in rt._table_references(_parse(three))] == [
+        ("t3", "main#3"),
+        ("t1", "main#1"),
+    ]
+
+    two = "SELECT a FROM t1 UNION ALL (VALUES ('x', 0))"
+    assert [(r.bare, r.scope) for r in rt._table_references(_parse(two))] == [("t1", "main#1")]
+
+    # The flattened view is unchanged for every other caller: it still holds only real SELECTs, so
+    # the sensitive-projection and fan/chasm passes see exactly what they saw before.
+    assert len(rt._output_selects(_parse(three))) == 2
+    assert len(rt._output_select_arms(_parse(three))) == 3
 
 
 # --- the suffix is separable from the label it is appended to ----------------

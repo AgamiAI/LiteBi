@@ -92,10 +92,11 @@ below corresponds to one such version.
 - Receipt `tables` items carry an **arm ordinal on `scope`** (ACE-043). When a reference's scope is
   one of two or more arms of a `UNION` / `INTERSECT` / `EXCEPT`, its label gains a trailing 1-based
   `#<n>`: `main#1`, `main#2`, `cte:recent#2`. A plain `SELECT` and a single-arm CTE body are
-  unchanged and carry no suffix. **If you branch on `scope === 'main'` or `scope === 'cte:x'`, that
-  branch stops matching inside a set operation — split on the last `#` and branch on
-  `scope.split('#')[0]`.** The CTE-name half is sanitized to an identifier alphabet that excludes
-  `#`, so the last `#` is always the ordinal's. The ordinal is the arm's position in the SQL, which
+  unchanged and carry no suffix, and `subquery` never takes one. **If you branch on
+  `scope === 'main'` or `scope === 'cte:x'`, that branch stops matching inside a set operation —
+  strip the ordinal with `scope.replace(/#\d+$/, '')` (or `scope.rsplit('#', 1)[0]`) and branch on
+  that.** Split from the RIGHT, not the left: the CTE-name half is caller-written text, and it is
+  only sanitization to an identifier alphabet excluding `#` that keeps a left split working today. The ordinal is the arm's position in the SQL, which
   is not the order of this list: items are in parse-walk order, so a capped receipt can list
   ordinals that are neither contiguous nor monotonic, and the largest one is not the arm count.
 - Receipt `tables` items gain **`scope`** and **`filters`** (ACE-099). `ref` is unchanged and is

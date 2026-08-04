@@ -524,6 +524,31 @@ def _direct_from_tables(tree: "exp.Select") -> set[str]:
     return names
 
 
+def _output_select_arms(node: "exp.Expression") -> list[list["exp.Select"]]:
+    """One slot per arm AS THE CALLER WROTE IT, holding the output SELECTs that arm contributes.
+
+    The single walk. `_output_selects` is its flattened projection, the same way
+    `_table_references` is `_reference_sites`'.
+
+    A slot can be EMPTY, and that is the whole reason this shape exists rather than a flat list.
+    An arm need not contribute an output SELECT: `(VALUES ('x', 0))` parses to a `Subquery` wrapping
+    `Values`, and a malformed arm can parse to nothing at all. A flat list drops those arms
+    silently, and anything numbering the survivors positionally then closes the gap and reports a
+    LATER arm under an EARLIER arm's number — a receipt fact that is not merely missing but wrong,
+    which is the one outcome worth more code to avoid. Keeping a slot for such an arm costs one
+    empty list and keeps every other arm's position true to the SQL.
+
+    Nested set operations and parenthesized arms flatten into this list, because `(A UNION B) UNION
+    C` is three arms to the caller who wrote it and the label has to agree."""
+    if isinstance(node, exp.SetOperation):  # base of Union / Intersect / Except
+        return _output_select_arms(node.this) + _output_select_arms(node.expression)
+    if isinstance(node, (exp.Subquery, exp.Paren)) and node.this is not None:
+        return _output_select_arms(node.this)  # `(SELECT …) UNION (SELECT …)`
+    if isinstance(node, exp.Select):
+        return [[node]]
+    return [[]]  # an arm that reaches the output without an output SELECT, or nothing parseable
+
+
 def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     """The SELECTs whose projection reaches the query OUTPUT: the top-level SELECT, or
     — for a set operation (UNION / INTERSECT / EXCEPT) — every arm.
@@ -534,14 +559,12 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     the table-scope fix). Nested subquery / CTE SELECTs are excluded on purpose: their
     projections feed an enclosing query, not the final result, so a sensitive column a
     WHERE-subquery projects but the outer query only filters on is not exposed and must
-    not be refused."""
-    if isinstance(node, exp.Select):
-        return [node]
-    if isinstance(node, exp.SetOperation):  # base of Union / Intersect / Except
-        return _output_selects(node.this) + _output_selects(node.expression)
-    if isinstance(node, (exp.Subquery, exp.Paren)):  # `(SELECT …) UNION (SELECT …)`
-        return _output_selects(node.this) if node.this is not None else []
-    return []
+    not be refused.
+
+    Flattened from `_output_select_arms`, which keeps the arm boundaries this list discards.
+    Callers that only ask "which SELECTs reach the output" want this one; only something
+    NUMBERING the arms needs to know that an arm contributed none."""
+    return [sel for arm in _output_select_arms(node) for sel in arm]
 
 
 def projected_sensitive_columns(sql: str, org: Datasource,
@@ -1720,12 +1743,16 @@ def assemble_receipt(
             # Freshness describes a table the model declares. An undeclared reference (a CTE name,
             # say) has no model row for it to be about, so claiming it would be a lie by shape.
             "freshness": freshness if t else None,
-            # Which query scope wrote this reference: `main`, `cte:<name>`, or `subquery`. It is the
-            # fact that makes the `filters` list below readable — a filter satisfied inside a CTE
-            # body is not satisfied for the statement that READS that CTE, and two entries for the
-            # same table would otherwise be told apart only by an alias they need not have. The
-            # caller-written half of the label (the CTE's own name) is already `_echo_name`-bounded
-            # where the scope is decided, so it is composed here unchanged.
+            # Which query scope wrote this reference: `main`, `cte:<name>`, or `subquery`, the first
+            # two carrying a trailing `#<n>` arm ordinal inside a set operation. It is the fact that
+            # makes the `filters` list below readable — a filter satisfied inside a CTE body is not
+            # satisfied for the statement that READS that CTE, a filter applied in one arm of a
+            # UNION is not applied in the other, and two entries for the same table would otherwise
+            # be told apart only by an alias they need not have. The caller-written half of the
+            # label (the CTE's own name) is already `_echo_name`-bounded where the scope is decided,
+            # and the ordinal is generated there rather than echoed, so both are composed here
+            # unchanged. Note the ordinal is the arm's position in the SQL while this list is in
+            # parse-walk order, so a capped receipt can show ordinals that skip and go backwards.
             "scope": r.scope,
             # Which of this reference's declared `default_filters` the statement applied, omitted,
             # or left undetermined. Deliberately NOT subject to `_RECEIPT_MAX_REFS`: its length is
@@ -2019,10 +2046,17 @@ def _arm_suffixes(root: "exp.Expression") -> dict[int, str]:
     body and a top-level UNION would number by different rules, and a reader could not tell the two
     suffixes apart.
 
-    ONLY a genuine set operation is numbered. A plain SELECT is `_output_selects`'s one-element list,
-    and suffixing it would put `#1` on every ordinary statement — noise on the case that was never
+    ONLY a genuine set operation is numbered. A plain SELECT is a one-element list of arms, and
+    suffixing it would put `#1` on every ordinary statement — noise on the case that was never
     ambiguous, and a contract change to every consumer for nothing. Hence the `< 2` guard, and hence
     an absent key means "no suffix", never "arm unknown".
+
+    Numbered over `_output_select_arms`, NOT over the flattened `_output_selects`. An arm that
+    contributes no output SELECT — `(VALUES ('x', 0))` parses to a `Subquery` wrapping `Values` —
+    is absent from the flat list, so enumerating that list closes the gap and hands a LATER arm an
+    EARLIER arm's number. The ordinal is supposed to be the arm's position in the SQL; a shifted
+    one is not a weaker version of that fact, it is a false one, and a reader has no way to tell.
+    The empty slot costs nothing and keeps every other arm's position true.
 
     Deterministic, which the receipt requires of every fact it carries. `_output_selects` is a pure
     structural recursion over `this` then `expression` with no set, dict or hash iteration anywhere,
@@ -2032,11 +2066,12 @@ def _arm_suffixes(root: "exp.Expression") -> dict[int, str]:
     out: dict[int, str] = {}
     bodies = (cte.this for cte in root.find_all(exp.CTE) if cte.this is not None)
     for scope_root in (root, *bodies):
-        arms = _output_selects(scope_root)
+        arms = _output_select_arms(scope_root)
         if len(arms) < 2:
             continue
-        for position, sel in enumerate(arms, 1):
-            out[id(sel)] = f"#{position}"
+        for position, arm in enumerate(arms, 1):
+            for sel in arm:
+                out[id(sel)] = f"#{position}"
     return out
 
 
