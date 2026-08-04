@@ -57,6 +57,103 @@ jobs:
           pytest tests/ -q --cov=plugins --cov=packages/agami-core/src --cov-report=term-missing
           --cov-fail-under=85
 
+  # The safety corpus gets its own required checks rather than riding inside `lint-and-test`.
+  # Two reasons, and the second is why the spec exists:
+  #
+  #   * `lint-and-test` runs the corpus's FILE-path half already, but a failure there reads as "the
+  #     suite is red" — a named job makes a safety regression attributable at a glance, and branch
+  #     protection can require it by name.
+  #   * the DB-served half cannot run there at all: `lint-and-test` installs no database driver and
+  #     has no Postgres, so those tests skip. A suite that skips is a suite that exits 0, which is
+  #     precisely how this evidence went missing before. The job below sets `AGAMI_IT_PG_REQUIRED`,
+  #     which turns a missing dependency into a failure (`tests/e2e/itdeps.py`) and arms the
+  #     collection sentinel that ends the session if the run collected fewer vectors than the corpus
+  #     holds (`tests/e2e/conftest.py`).
+  #
+  # Both jobs name their work by PATH, never by `-k`: the job these replace selected with
+  # `pytest -k "db_path or role"`, a substring match on the node id, and a rename dropped 102 of 108
+  # vectors while the job still exited 0.
+  safety-corpus-file-path:
+    name: safety corpus (file path, no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+
+      # No database and no driver, deliberately: this is the half that must run on a machine with
+      # neither, and the DB-backed modules skip cleanly here because `AGAMI_IT_PG_REQUIRED` is NOT
+      # set. Coverage is not measured — `lint-and-test` owns the floor, and duplicating it here
+      # would report a number for a fraction of the suite.
+      - name: pytest tests/e2e (file path)
+        run: >-
+          uvx --python 3.12
+          --with pytest
+          --with-editable "packages/agami-core[model,server]"
+          pytest tests/e2e -q
+
+  safety-corpus-db-path:
+    name: safety corpus (DB path, Postgres in Docker)
+    runs-on: ubuntu-latest
+    env:
+      # The same values `tests/integration/docker-compose.yml` uses, so one invocation works in both
+      # places. The password belongs to a throwaway container that exists for the length of this job
+      # and is reachable from nowhere else; it is a fixture, not a credential.
+      AGAMI_IT_PG_HOST: 127.0.0.1
+      AGAMI_IT_PG_PORT: "55432"
+      AGAMI_IT_PG_USER: agami_test
+      AGAMI_IT_PG_PASSWORD: agami_test_pw
+      # The whole point of this job. It makes a missing driver a FAILURE rather than a skip, and it
+      # arms the collection sentinel — so a run that cannot execute the DB-backed evidence ends red
+      # instead of reporting green for work it never selected.
+      AGAMI_IT_PG_REQUIRED: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: shop
+          POSTGRES_USER: agami_test
+          POSTGRES_PASSWORD: agami_test_pw
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U agami_test -d shop"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+
+      # The role is created by executing the SAME file the compose fixture mounts into
+      # `docker-entrypoint-initdb.d`, so the recipe has exactly one copy and a change to it reaches
+      # both paths. Only the DELIVERY differs, and it has to: a service container starts BEFORE
+      # `actions/checkout` runs, so there is no repository on disk to mount from — and the image's
+      # init directory is read once, on an empty data directory, which by then has passed.
+      #
+      # Run through the container's own `psql` rather than the runner's, so the client is present and
+      # version-matched by construction. `ON_ERROR_STOP` is what makes a broken grants script fail
+      # this step: without it psql reports the error and exits 0, and every DB test below would then
+      # fail one layer down with a confusing permissions message instead.
+      - name: create the read-only role and the corpus database
+        run: |
+          docker exec -i "${{ job.services.postgres.id }}" \
+            psql -v ON_ERROR_STOP=1 -U agami_test -d shop \
+            < tests/integration/fixtures/postgres-readonly-grants.sql
+
+      # `psycopg2-binary` on top of the standard extras: without it the DB modules would raise
+      # through `itdeps.importorfail`, which is the correct outcome for a broken job and a waste of a
+      # run for a working one.
+      - name: pytest tests/e2e (DB path)
+        run: >-
+          uvx --python 3.12
+          --with pytest --with psycopg2-binary
+          --with-editable "packages/agami-core[model,server]"
+          pytest tests/e2e -q
+
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
