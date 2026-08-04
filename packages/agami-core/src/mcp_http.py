@@ -18,9 +18,9 @@ reliably auto-detected behind a proxy/LB.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import logging
 import os
-import contextvars
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -53,10 +53,10 @@ from tools import (
     bootstrap_paths,
     record_tool_call,
     reset_typed_outcome,
-    typed_outcome_overrides,
     resolved_org_id,
     server_version,
     set_injected_executor,
+    typed_outcome_overrides,
 )
 
 _log = logging.getLogger(__name__)
