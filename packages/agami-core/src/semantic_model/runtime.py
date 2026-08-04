@@ -3016,6 +3016,32 @@ def _alias_map(node: "exp.Expression") -> dict[str, str]:
     return {(r.alias or r.bare): r.bare for r in _table_references(node)}
 
 
+def _own_alias_map(sel: "exp.Select | None") -> dict[str, str]:
+    """alias (or table name) -> bare table name, for the sources THIS SELECT reads ITSELF.
+
+    `_alias_map` above is the whole-SUBTREE form and stays that way: the fan/chasm and
+    sensitive-projection callers resolve a column qualifier through it, and rescoping it would
+    change which references they resolve. It is the wrong map for a join, and not by a little.
+    Handed the outer SELECT it also returns every table referenced inside a CTE body or a nested
+    subquery, as a LAST-WINS dict — so in
+    `WITH t AS (SELECT … FROM orders o) SELECT … FROM t o JOIN customers c ON o.customer_id = c.id`
+    the CTE body's `o` overwrites the outer one and the join's left endpoint resolves to `orders`, a
+    table that join never touched. The item then reports `declared` under the sign-off of a
+    relationship declared on `orders`, which is the exact false receipt this section exists to
+    remove. It leaks the other way too, from a subquery beside the join into the scope holding it.
+
+    A source belongs to this SELECT iff its nearest enclosing SELECT is this SELECT — the same test
+    `_direct_from_tables` makes, for the same reason. A relation the statement COMPUTED (a derived
+    table, a `VALUES` list) is not an `exp.Table` and so is absent here on purpose: a qualifier
+    naming one then resolves to itself, which is the name the endpoint walk and the receipt's label
+    both want for it.
+    """
+    if sel is None:
+        return {}
+    return {(tbl.alias or tbl.name): tbl.name
+            for tbl in sel.find_all(exp.Table) if _enclosing_select(tbl) is sel}
+
+
 class _JoinSite(NamedTuple):
     """One join the statement WROTE, beside the `exp.Join` node it was read from.
 
@@ -3065,8 +3091,9 @@ def _predicate_pairs(pred: "exp.Expression",
     comparison would report a blessed join as unblessed on operand order alone.
 
     `scope_map` resolves a qualifier to the relation it names — for a written ON that is the
-    ENCLOSING SELECT's alias map and never the tree-wide one, so one arm of a UNION cannot resolve
-    through the other arm's tables; for declared text it is empty, because a declaration names its
+    enclosing SELECT's OWN sources (`_own_alias_map`) and never the subtree-wide `_alias_map`, so
+    one arm of a UNION cannot resolve through the other arm's tables and an outer join cannot
+    resolve through a CTE body's; for declared text it is empty, because a declaration names its
     tables directly. Both endpoints normalize through `_tkey(_bare(...))`: `_tkey` folds case
     without stripping a schema and `_bare` strips a schema without folding case, so a relationship
     declared on `sales.orders` and a statement writing `ORDERS` need both to meet.
@@ -3148,12 +3175,14 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
     for the same reason — a CTE alias, a derived table and a CTE shadowing a declared table are one
     case, a name the statement invented, and no declaration in the model is about any of them.
 
-    The alias map is per ENCLOSING SELECT, never tree-wide. One arm of a UNION must not resolve a
-    qualifier through the other arm's tables, and a join in a CTE body must not resolve through the
-    outer query's. It is memoized by `id(sel)` because a statement may write up to the receipt's cap
-    of joins into one SELECT and each lookup would otherwise re-walk that SELECT's whole subtree —
-    and by `id()` rather than by the node because exp nodes hash by STRUCTURE, so two identically
-    written arms would collide.
+    The alias map is the enclosing SELECT's OWN sources — `_own_alias_map`, never `_alias_map`. One
+    arm of a UNION must not resolve a qualifier through the other arm's tables; a join in a CTE body
+    must not resolve through the outer query's; and, the case the subtree-wide map got wrong, an
+    outer join must not resolve through a CTE body's or a nested subquery's, which is where a
+    last-wins map hands one alias the wrong relation entirely. It is memoized by `id(sel)` because a
+    statement may write up to the receipt's cap of joins into one SELECT and each lookup would
+    otherwise re-walk that SELECT's whole subtree — and by `id()` rather than by the node because exp
+    nodes hash by STRUCTURE, so two identically written arms would collide.
     """
     cte_scopes = _cte_body_scopes(node)
     arm_suffixes = _arm_suffixes(node)
@@ -3163,7 +3192,7 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
     for join in node.find_all(exp.Join):
         sel = _enclosing_select(join)
         if id(sel) not in scope_maps:
-            scope_maps[id(sel)] = _alias_map(sel) if sel is not None else {}
+            scope_maps[id(sel)] = _own_alias_map(sel)
         scope_map = scope_maps[id(sel)]
         on = join.args.get("on")
         right = _relation_name(join.this)

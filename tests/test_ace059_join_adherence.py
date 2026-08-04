@@ -252,6 +252,16 @@ ON_UNQUALIFIED = "SELECT c.id FROM orders o JOIN customers c ON customer_id = id
 # The declaration is schema-qualified and the statement is upper-cased: neither side is spelled the
 # way the other one is.
 FOLDED = "SELECT R.NAME FROM CUSTOMERS C JOIN REGIONS R ON C.REGION_ID = R.ID"
+# One alias, two scopes, two different relations behind it. The outer query binds `o` to the CTE;
+# the CTE's own body binds `o` to the real `orders`. A scope map built from the outer SELECT's whole
+# SUBTREE holds both bindings, and the nested one wins.
+CTE_BODY_REBINDS_ALIAS = ("WITH t AS (SELECT id, customer_id FROM orders o) "
+                          "SELECT c.id FROM t o JOIN customers c ON o.customer_id = c.id")
+# The same collision from a SIBLING scope rather than a CTE body: `o` is a derived table outside and
+# the real `orders` inside a WHERE-subquery.
+SUBQUERY_REBINDS_ALIAS = (
+    "SELECT c.id FROM (SELECT id, customer_id FROM orders) o JOIN customers c "
+    "ON o.customer_id = c.id WHERE c.id IN (SELECT o.customer_id FROM orders o)")
 
 
 # --- SC-1: one item per join the statement wrote ----------------------------
@@ -580,6 +590,30 @@ def test_an_unreducible_on_keeps_the_marker_honest(org):
     section = _section(org, COMPOUND_ON)
     assert section["items"][1]["status"] == rt.UNDETERMINED
     assert "could not be matched against the model" in (section["undetermined"] or "")
+
+
+@pytest.mark.parametrize("sql,from_to", [
+    (CTE_BODY_REBINDS_ALIAS, "t → customers"),
+    (SUBQUERY_REBINDS_ALIAS, "o → customers"),
+], ids=["cte-body", "where-subquery"])
+def test_a_qualifier_resolves_through_this_selects_own_sources_only(org, sql, from_to):
+    """An alias means whatever the SELECT it was written in bound it to, and nothing else.
+
+    Both statements bind one alias twice: once in the scope the join is written in, to a relation the
+    STATEMENT computed, and once in a scope beside it, to the declared table of the same name. A map
+    built from the enclosing SELECT's whole SUBTREE holds both bindings and the nested one wins, so
+    the qualifier resolves to a table this join never touched — and the item then reports `declared`
+    under the approved sign-off of a relationship declared on that table. That is the defect this
+    section exists to remove, arriving through the scope walk instead of through the matching.
+
+    `undeclarable` is the honest answer both times: in the scope the join was written in, the left
+    endpoint is a name the statement bound for itself. The label names it as the statement did.
+    """
+    (item,) = _items(org, sql)
+    assert item["from_to"] == from_to
+    assert item["status"] == rt.UNDECLARABLE
+    assert item["name"] is None
+    assert item["review_state"] is None
 
 
 def test_the_shadowing_cte_case_still_lists_the_join_it_wrote(org):
