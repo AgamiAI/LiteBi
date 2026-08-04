@@ -18,6 +18,47 @@ from semantic_model import runtime as rt  # noqa: E402
 
 
 def _sales_org():
+    """Four tables, three many-to-one edges, and a declared grain for every table.
+
+    `tables_defined` used to be absent, which made `_model_table_index(org)` empty. ACE-060 derives
+    its `visible` set from that index, so no aggregate on this org could ever be seen behind, and
+    `not_multiplied` — the positive claim that a number is clean — was unreachable here for every
+    statement. The tests below already assert things like "aggregating the many side is allowed",
+    a claim the fixture could not express. Declaring the tables is what lets them say it.
+
+    Two things are deliberately NOT declared. Every `Column.aggregation` stays at its default
+    `unknown` and no `metrics` are declared, which is what keeps `_check_aggregation_semantics`
+    silent: a declared `averageable` or a semi-additive metric would add `bad_aggregation` /
+    `semi_additive` findings to the exact risk lists the tests below assert, and those lists are
+    about the fan/chasm detector, not about aggregation class.
+
+    Extended in place rather than beside: a second sales org is drift, and every assertion here is
+    written against this one set of names and edges.
+    """
+    tables = [
+        m.Table(name="orders", schema="public", storage_connection="c", grain=["id"],
+                description="orders",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="customer_id", type="integer"),
+                         m.Column(name="total_amount", type="decimal"),
+                         m.Column(name="revenue", type="decimal"),
+                         m.Column(name="status", type="string"),
+                         m.Column(name="created_at", type="timestamp"),
+                         m.Column(name="flag", type="boolean")]),
+        m.Table(name="order_items", schema="public", storage_connection="c",
+                grain=["order_id", "product_id"], description="order items",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="order_id", type="integer"),
+                         m.Column(name="product_id", type="integer"),
+                         m.Column(name="quantity", type="integer")]),
+        m.Table(name="customers", schema="public", storage_connection="c", grain=["id"],
+                description="customers",
+                columns=[m.Column(name="id", type="integer")]),
+        m.Table(name="tickets", schema="public", storage_connection="c", grain=["id"],
+                description="support tickets",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="customer_id", type="integer")]),
+    ]
     rels = [
         m.Relationship(from_table="order_items", to_table="orders", from_column="order_id",
                        to_column="id", relationship="many_to_one"),
@@ -27,7 +68,8 @@ def _sales_org():
                        to_column="id", relationship="many_to_one"),
     ]
     return m.Datasource(datasource="Shop",
-                          subject_areas=[m.SubjectArea(name="sales", relationships=rels)])
+                          subject_areas=[m.SubjectArea(name="sales", tables_defined=tables,
+                                                       relationships=rels)])
 
 
 # --- pre-flight ---
@@ -123,12 +165,20 @@ def test_clean_set_operation_passes_preflight():
 
 
 def test_aggregating_many_side_is_allowed():
-    # aggregating the MANY side (order_items) is legitimate, not a fan trap
+    """Aggregating the MANY side (order_items) is legitimate, not a fan trap.
+
+    The status is asserted alongside the empty finding list because an empty list is also what a
+    statement the analysis could not read returns, so on its own it cannot tell "nothing is wrong"
+    apart from "nothing was established". `not_multiplied` is the positive claim, and it is the one
+    this test's name has always made.
+    """
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT SUM(order_items.quantity) FROM orders JOIN order_items ON order_items.order_id=orders.id",
         org)
     assert pf.findings == []
+    assert [(a.aggregate, a.status) for a in pf.aggregates] == [
+        ("SUM(order_items.quantity)", rt.NOT_MULTIPLIED)]
 
 
 # --- examples-first ---
