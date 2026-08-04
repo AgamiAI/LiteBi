@@ -107,13 +107,11 @@ class _SpyExecutor:
 
 @pytest.fixture(autouse=True)
 def _isolate():
-    """`_max_rows_override` is a request-scoped ContextVar and `_INJECTED_EXECUTOR` a process
-    global. The fork test below needs the latter to be `None` for a real subprocess to run at all,
-    so leaking an executor into it would silently turn it into a second in-process test."""
-    execute_sql._max_rows_override.set(None)
+    """`_INJECTED_EXECUTOR` is a process global. The fork test below needs it to be `None` for a
+    real subprocess to run at all, so leaking an executor into it would silently turn it into a
+    second in-process test."""
     tools.set_injected_executor(None)
     yield
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
 
 

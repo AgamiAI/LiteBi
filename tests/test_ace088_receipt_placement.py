@@ -64,10 +64,8 @@ CANARY_SIGNER = "dana@example.com"
 def _isolate():
     """`_INJECTED_EXECUTOR` is a process global — `create_app()` sets it and the in-process route
     sets it — so it must not leak between tests."""
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
     yield
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
 
 

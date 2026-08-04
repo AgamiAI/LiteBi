@@ -116,14 +116,9 @@ def pg_observer():
         conn.close()
 
 
-@pytest.fixture(autouse=True)
-def _reset_overrides():
-    # The row cap is a request-scoped ContextVar; isolate this file from whatever set it. The budget
-    # has no such surface at all — it travels by env var only, which is what lets a forked child and
-    # a thread this test starts both resolve the same number.
-    execute_sql._max_rows_override.set(None)
-    yield
-    execute_sql._max_rows_override.set(None)
+# No isolation fixture here any more. The row cap used to have a request-scoped override to reset;
+# it is now the deployment's env var alone (ACE-087), and so is the budget — which is what lets a
+# forked child and a thread this test starts both resolve the same number.
 
 
 def _dsn(creds: dict[str, str]) -> str:

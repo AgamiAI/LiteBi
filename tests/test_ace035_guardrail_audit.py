@@ -66,12 +66,10 @@ QUESTION = "how many orders"
 
 @pytest.fixture(autouse=True)
 def _isolate():
-    """`_INJECTED_EXECUTOR` is a process global and `_max_rows_override` a ContextVar; a test that
-    injects an executor (or that `create_app` injects one for) must not leak it into the next."""
-    execute_sql._max_rows_override.set(None)
+    """`_INJECTED_EXECUTOR` is a process global; a test that injects an executor (or that
+    `create_app` injects one for) must not leak it into the next."""
     tools.set_injected_executor(None)
     yield
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
 
 
@@ -288,6 +286,50 @@ def test_the_http_surface_records_a_row_for_every_status(env, label, sql, status
     pytest.importorskip("mcp")
     pytest.importorskip("jwt")
     _assert_recorded(env.app_db, _http_execute_sql(sql), status, rule)
+
+
+# ---------------------------------------------------------------------------
+# The result bound (ACE-087) — a refusal decided AFTER the statement ran
+# ---------------------------------------------------------------------------
+#
+# It gets its own pair rather than a row in `_STATUSES` because it is the only vector that needs the
+# environment bent to produce it, and threading a per-vector env override through that shared table
+# would complicate four other vectors to serve one.
+#
+# It is worth auditing separately for a reason the other refusals do not have: every rule in
+# `_STATUSES` is decided BEFORE the statement reaches the database, so a gap in their recording
+# costs a log line. This one is decided after a query has already run and consumed real warehouse
+# work, and it is the outcome an operator is most likely to want to count — a ceiling that refuses
+# too often is a misconfiguration, and the audit trail is the only thing that would show it.
+
+
+def test_the_stdio_surface_records_a_result_bound_refusal(env, monkeypatch):
+    # The warehouse holds two orders, so a ceiling of one overflows. The child inherits this
+    # environment through the fork, which is what makes this the real subprocess path.
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "1")
+
+    body = _stdio_execute_sql("SELECT id FROM orders")
+
+    _assert_recorded(env.app_db, body, "refused", guardrail.RULE_RESOURCE_LIMIT)
+    assert "rows" not in body  # refused carries no data, across the process boundary too
+    # The SHAPE crossed the fork too, not just the rule. `SELECT id FROM orders` is a listing, so the
+    # remediation must be the listing one and not the shape-neutral fallback — which also names LIMIT
+    # and ORDER BY, and so would satisfy a laxer assertion. Without this, a regression that stopped
+    # the child publishing the shape (the parent passing `--no-safety`, a model-resolution change)
+    # would silently drop stdio onto the fallback with the whole suite green.
+    assert "if it is a plain row listing" not in body["refusal"]["remediation"].lower()
+
+
+def test_the_http_surface_records_a_result_bound_refusal(env, monkeypatch):
+    pytest.importorskip("starlette")
+    pytest.importorskip("mcp")
+    pytest.importorskip("jwt")
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "1")
+
+    body = _http_execute_sql("SELECT id FROM orders")
+
+    _assert_recorded(env.app_db, body, "refused", guardrail.RULE_RESOURCE_LIMIT)
+    assert "rows" not in body
 
 
 # ---------------------------------------------------------------------------

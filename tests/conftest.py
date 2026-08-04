@@ -49,6 +49,33 @@ def _isolate_query_log(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _restore_raw_logger():
+    """`execute_sql.main()` silences `_RAW_LOG` for the lifetime of the process it owns, and a test
+    that calls it in-process owns the whole session instead.
+
+    The silencing is right in production: the CLI child's stderr is a wire carrying exactly one JSON
+    object, so a diagnostic line there makes the refusal unparseable. But it is a permanent mutation
+    of a module-level logger (a NullHandler plus `propagate = False`) with no restore, and
+    `propagate = False` is precisely what stops a record from reaching `caplog`. So every test that
+    runs AFTER an in-process `main()` sees a logger that can no longer be asserted on, and a test
+    proving the operator gets the cause of a failure passes or fails on file ordering alone.
+
+    Restored around every test rather than in the callers: there are five of them across two files
+    today, the next one will not know it is the fourth thing to trip this, and the failure it causes
+    lands in someone else's test.
+    """
+    try:
+        import execute_sql
+    except Exception:
+        yield
+        return
+    log = execute_sql._RAW_LOG
+    handlers, propagate = list(log.handlers), log.propagate
+    yield
+    log.handlers, log.propagate = handlers, propagate
+
+
+@pytest.fixture(autouse=True)
 def _reset_validation_cache():
     """The incremental-curation-validation cache (ACE-046) is module-global too; clear it around
     each test so one test's cached per-area findings can't bleed into the next."""

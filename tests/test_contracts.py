@@ -93,7 +93,6 @@ def test_execute_sql_result_roundtrip():
         "columns": ["total"],
         "rows": [[148.95]],
         "row_count": 1,
-        "truncated": False,
         "units": {"total": "USD"},
         "markdown": "| total |\n| --- |\n| $148.95 |",
         "sql": "SELECT SUM(amount) AS total FROM orders",
@@ -119,6 +118,11 @@ def test_the_receipt_is_the_envelopes_and_this_module_does_not_respell_it():
     assert not hasattr(contracts, "Receipt")
     assert not hasattr(contracts, "TableUsed")
     assert "receipt" not in ExecuteSqlResult.model_fields
+    # `truncated` is gone for the same reason and needs the same assertion (ACE-087). An oversized
+    # result is refused rather than trimmed, so the field could only ever be False — and because
+    # `extra="allow"` round-trips an undeclared key silently, the sample above went on carrying it
+    # long after the model stopped declaring it, which is exactly the drift this test exists to stop.
+    assert "truncated" not in ExecuteSqlResult.model_fields
     assert guardrail.Receipt.SECTIONS == (
         "columns", "tables", "joins", "aggregates", "assumptions")
 

@@ -340,11 +340,6 @@ def test_the_detail_names_which_bound_fired_and_what_it_was_set_to(env, monkeypa
     assert "7" in row["detail"], "the configured bound is not in the record"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the result bound is ACE-087, in flight and not on main; its refusal cannot be "
-    "constructed here yet. Owned by ACE-087 — delete this marker in the diff that lands it.",
-)
 def test_the_detail_tells_the_result_bound_apart_from_the_timeout(env):
     """The other half of the carve-out, and the reason `detail` is recorded rather than a new rule.
 

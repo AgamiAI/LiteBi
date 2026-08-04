@@ -1,16 +1,20 @@
 """ACE-038 (row-cap) + ACE-044 (per-call cap) — bound result sets at the single materialization
-chokepoint: `fetchmany(cap + 1)`, never `fetchall`, truncate at the cap and flag it. The SQL is
-never modified (no injected LIMIT). Effective cap = min(--max-rows, AGAMI_SQL_MAX_ROWS, 1000).
+chokepoint: `fetchmany(cap + 1)`, never `fetchall`. The SQL is never modified (no injected LIMIT).
+Effective cap = AGAMI_SQL_MAX_ROWS, default 1000.
+
+**What ACE-087 changed here.** The bound itself is untouched and is still what these tests pin: the
+fetch stops at cap+1, never `fetchall`, and the (cap+1)th row is what says "there was more". What
+that signal now TRIGGERS moved out of this file — it used to trim to the cap and write a
+`{"truncated": …}` marker to stderr, and it is now a `resource_limit` refusal built at
+`execute_guarded`. The refusal is pinned in `test_ace087_result_bound.py`; the per-call cap these
+tests also covered is gone with `--max-rows`.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import sys
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
@@ -19,14 +23,6 @@ if str(PKG_SRC) not in sys.path:
 
 import execute_sql  # noqa: E402
 import guardrail  # noqa: E402
-
-
-@pytest.fixture(autouse=True)
-def _reset_override():
-    # _max_rows_override is a request-scoped ContextVar (ACE-028); isolate every test from it.
-    execute_sql._max_rows_override.set(None)
-    yield
-    execute_sql._max_rows_override.set(None)
 
 
 class _FakeCur:
@@ -77,58 +73,72 @@ def test_collect_cursor_reads_description_after_fetch_for_named_cursors(monkeypa
     assert result.truncated is False
 
 
-def test_sink_bounds_at_cap_and_flags_truncation(monkeypatch, capsys):
+def test_the_fetch_stops_at_cap_plus_one_and_reports_the_overflow(monkeypatch):
+    """The bound itself, which is the half of this file ACE-087 did not touch.
+
+    `fetchmany(cap + 1)` and never `fetchall` is what keeps a huge result from being buffered whole,
+    and it is asserted on the FETCH rather than on the returned rows: a `fetchall` that sliced
+    afterwards would produce an identical `ExecResult` and cost the memory this exists to save.
+    Detection still costs exactly one extra row — no counting query runs first."""
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "3")
     cur = _FakeCur(2, 10)  # 10 rows available, cap 3
-    execute_sql._write_cursor_csv(cur)
-    out = capsys.readouterr()
 
-    assert len(out.out.strip().splitlines()) == 1 + 3  # header + exactly cap rows written
+    result = execute_sql._collect_cursor(cur)
+
     assert cur.fetchmany_args == [4] and not cur.fetchall_called  # fetchmany(cap+1), never fetchall
-    assert json.loads(out.err.strip())["truncated"]["row_cap"] == 3
+    assert result.truncated is True  # a (cap+1)th row existed
+    assert len(result.rows) == 3  # what it holds; `execute_guarded` discards these and refuses
 
 
-def test_sink_no_flag_when_result_is_within_cap(monkeypatch, capsys):
+def test_a_result_within_the_cap_is_not_flagged(monkeypatch, capsys):
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "5")
     cur = _FakeCur(1, 2)  # 2 rows, cap 5
-    execute_sql._write_cursor_csv(cur)
+
+    result = execute_sql._collect_cursor(cur)
+    execute_sql._emit_result_csv(result)
     out = capsys.readouterr()
 
+    assert result.truncated is False
     assert len(out.out.strip().splitlines()) == 1 + 2  # header + all rows
-    assert out.err.strip() == ""  # not truncated → no flag
+    assert out.err.strip() == ""  # nothing rides on stderr beside the rows
 
 
-def test_sink_exactly_cap_rows_is_complete_not_truncated(monkeypatch, capsys):
-    # The off-by-one boundary: a result of EXACTLY cap rows is complete — it must NOT flag truncation
-    # (only a (cap+1)th row does). Guards `len(rows) > cap` against a `>= cap` regression.
+def test_exactly_cap_rows_is_complete_not_overflowing(monkeypatch, capsys):
+    # The off-by-one boundary, and it matters more than it used to: a result of EXACTLY cap rows is
+    # complete, and a `>= cap` regression here would now REFUSE it rather than merely mislabel it.
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "3")
     cur = _FakeCur(1, 3)  # exactly cap rows
-    execute_sql._write_cursor_csv(cur)
+
+    result = execute_sql._collect_cursor(cur)
+    execute_sql._emit_result_csv(result)
     out = capsys.readouterr()
 
+    assert result.truncated is False  # exactly cap → complete
     assert len(out.out.strip().splitlines()) == 1 + 3  # header + all 3 rows written
-    assert out.err.strip() == ""  # exactly cap → NOT truncated
 
 
-def test_sink_empty_result_writes_header_only_no_flag(monkeypatch, capsys):
+def test_an_empty_result_writes_the_header_only(monkeypatch, capsys):
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "5")
     cur = _FakeCur(2, 0)  # columns present, zero rows
-    execute_sql._write_cursor_csv(cur)
+
+    result = execute_sql._collect_cursor(cur)
+    execute_sql._emit_result_csv(result)
     out = capsys.readouterr()
 
+    assert result.truncated is False
     assert out.out.strip().splitlines() == ["c0,c1"]  # header only
-    assert out.err.strip() == ""  # no rows → no truncation flag
 
 
-def test_effective_cap_is_min_of_env_and_per_call(monkeypatch):
+def test_the_cap_comes_from_the_deployment_env_alone(monkeypatch):
+    """The per-call half of this test went with `--max-rows` (ACE-087). What it asserted — that a
+    caller could lower the cap for one call — is no longer a behaviour: the one thing a caller might
+    know better than the operator is that it wants MORE rows, which a lowering-only override could
+    never express. The env assertions below are ACE-038's and are unchanged."""
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "1000")
     assert execute_sql._resolve_row_cap() == 1000  # env only
-    execute_sql._max_rows_override.set(50)
-    assert execute_sql._resolve_row_cap() == 50  # per-call is smaller → wins
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "20")
-    assert execute_sql._resolve_row_cap() == 20  # env smaller than per-call → wins
+    assert execute_sql._resolve_row_cap() == 20
     monkeypatch.delenv("AGAMI_SQL_MAX_ROWS", raising=False)
-    execute_sql._max_rows_override.set(None)
     assert execute_sql._resolve_row_cap() == 1000  # missing env → default
     # The env is the operator's DEPLOYMENT cap, not a hard 1000 ceiling — it may raise the default.
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "5000")
@@ -145,16 +155,47 @@ def test_sqlite_end_to_end_caps_without_rewriting_sql(tmp_path, monkeypatch, cap
     con.commit()
     con.close()
 
-    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "4")
-    rc = execute_sql._execute_sqlite({"path": str(db)}, "SELECT n FROM t ORDER BY n")
-    out = capsys.readouterr()
+    monkeypatch.setattr(
+        execute_sql, "_load_credentials", lambda p, org_id="local": {"type": "sqlite", "path": str(db)},
+    )
 
-    assert rc == 0
-    lines = out.out.strip().splitlines()
-    assert lines[0] == "n" and lines[1:] == ["0", "1", "2", "3"]  # first 4 by the query's own ORDER BY
-    assert json.loads(out.err.strip())["truncated"]["row_cap"] == 4
-    # The cap came from the bounded fetch, not a rewrite: the SQL passed to sqlite is the caller's
-    # verbatim (no LIMIT) — _write_cursor_csv never sees or edits the SQL.
+    # Over the cap: refused, with none of the four rows it had in hand (ACE-087). This test asserted
+    # `rc == 0` and a four-row CSV before, which is the behaviour the spec calls an arbitrary sample
+    # presented as the answer.
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "4")
+    env = execute_sql.execute_guarded(
+        "SELECT n FROM t ORDER BY n", "acme", None,
+        executor=execute_sql.BUILTIN_EXECUTOR, no_safety=True,
+    )
+
+    assert env.status == "refused"
+    assert env.refusal.rule == guardrail.RULE_RESOURCE_LIMIT
+    assert env.data is None
+
+    # A statement carrying its OWN bound, under the ceiling, runs untouched and returns exactly the
+    # rows it asked for — the behaviour the refusal's remediation tells a caller to reach for, and
+    # which `sql-generation-rules.md` now instructs the model to rely on. Asserted with a real
+    # `LIMIT` rather than by raising the ceiling: those are different statements, and only this one
+    # is the fix being recommended. That the cap came from the bounded fetch and never a rewrite is
+    # pinned independently by `test_ace093_byte_identity`.
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "4")
+    env = execute_sql.execute_guarded(
+        "SELECT n FROM t ORDER BY n LIMIT 3", "acme", None,
+        executor=execute_sql.BUILTIN_EXECUTOR, no_safety=True,
+    )
+
+    assert env.status == "ok"
+    assert env.data.rows == [(0,), (1,), (2,)]  # exactly the three it asked for, at a ceiling of 4
+
+    # And with no bound of its own, under a ceiling that fits, the whole result comes back.
+    monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "20")
+    env = execute_sql.execute_guarded(
+        "SELECT n FROM t ORDER BY n", "acme", None,
+        executor=execute_sql.BUILTIN_EXECUTOR, no_safety=True,
+    )
+
+    assert env.status == "ok"
+    assert env.data.rows == [(i,) for i in range(10)]
 
 
 def test_postgres_uses_a_server_side_named_cursor(monkeypatch, capsys):
@@ -215,16 +256,20 @@ def test_postgres_uses_a_server_side_named_cursor(monkeypatch, capsys):
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "2")
     creds = {"host": "h", "port": "5432", "user": "u", "password": "p", "database": "d"}
 
-    rc = execute_sql._execute_postgres(creds, "SELECT n FROM t")
-    assert rc == 0
+    # Driven through `_run_postgres`, the shared connect-and-run. It was `_execute_postgres`, one of
+    # the per-engine CSV wrappers ACE-087 deleted as a route around the chokepoint.
+    result = execute_sql._run_postgres(creds, "SELECT n FROM t")
+    assert result.truncated is True             # 3 rows available at cap 2
     assert seen["name"] == "agami_bounded"     # server-side cursor (bounds transfer, not just writes)
     assert seen["sql"] == "SELECT n FROM t"    # SQL verbatim — no injected LIMIT
     assert seen["fetchmany"] == 3              # cap(2)+1
 
 
-def test_bigquery_bounds_and_flags_like_the_sink(monkeypatch, capsys):
-    # BigQuery has no DB-API cursor so it can't use _write_cursor_csv; it must apply the SAME cap +
-    # truncation flag itself. Mock the google client and drive a 10-row result at cap 4.
+def test_bigquery_bounds_and_reports_overflow_like_the_cursor_path(monkeypatch):
+    # BigQuery has no DB-API cursor so it cannot go through `_collect_cursor`; it must apply the SAME
+    # cap and set the SAME flag itself. That is exactly why the verdict reads `ExecResult.truncated`
+    # at the chokepoint rather than living in `_collect_cursor` (ACE-087). Mock the google client and
+    # drive a 10-row result at cap 4.
     import types
 
     class _Field:
@@ -263,34 +308,18 @@ def test_bigquery_bounds_and_flags_like_the_sink(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "google.oauth2", goauth)
     monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", "4")
 
-    rc = execute_sql._execute_bigquery({"project": "p"}, "SELECT n FROM t")
-    out = capsys.readouterr()
-    assert rc == 0
-    assert out.out.strip().splitlines() == ["n", "0", "1", "2", "3"]  # capped at 4, not all 10
-    assert json.loads(out.err.strip())["truncated"]["row_cap"] == 4
+    result = execute_sql._run_bigquery({"project": "p"}, "SELECT n FROM t")
+
+    assert result.truncated is True                       # 10 available at cap 4
+    assert result.rows == [(i,) for i in range(4)]        # capped at 4, not all 10
 
 
-def test_executor_truncated_parses_the_stderr_flag():
-    """The scan reads stderr line by line and only the truncation flag counts. Whatever else the
-    child or a library wrote to the shared stream must not be mistaken for it, and must not stop it
-    being found on a later line."""
-    import tools
+def test_the_fork_command_carries_no_per_call_cap(monkeypatch):
+    """The inverse of the assertion this replaces (ACE-087).
 
-    # A non-JSON line stands in for anything sharing the stream. It was the `[agami] auto-corrected`
-    # notice until ACE-093 deleted the rewrite that wrote it; nothing about this scan depended on
-    # which notice it was, so it is synthetic now rather than borrowed from another slice.
-    other = "[agami] some notice on the shared stream"
-
-    assert tools._executor_truncated('{"truncated": {"row_cap": 1000}}') is True
-    assert tools._executor_truncated(f'{other}\n{{"truncated": {{"row_cap": 5}}}}') is True
-    assert tools._executor_truncated(other) is False
-    assert tools._executor_truncated("") is False
-    assert tools._executor_truncated(None) is False
-    assert tools._executor_truncated('{"error": {"kind": "permission"}}') is False  # not a truncation
-    assert tools._executor_truncated('{"truncated": not json}') is False  # a `{` line that won't parse
-
-
-def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
+    It used to pin that a caller's `max_rows` reached the child as `--max-rows N`. Both ends of that
+    are gone: the tool takes no such argument and the child's argparser has no such flag, so a
+    parent that still appended one would make every forked call die on an unrecognized argument."""
     import tools
 
     captured: dict = {}
@@ -298,7 +327,7 @@ def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
     class FakeProc:
         returncode = 0
         stdout = "n\n0\n1\n"
-        stderr = '{"truncated": {"row_cap": 2}}'
+        stderr = ""
 
     def fake_run(cmd, **kw):
         captured["cmd"] = cmd
@@ -306,15 +335,14 @@ def test_tool_execute_sql_passes_max_rows_and_surfaces_truncation(monkeypatch):
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "_resolve_units", lambda *a: {})
-    # There is no model behind this fake fork, and this test is about the row cap, so the receipt
-    # builder is stubbed out. It may not return `None` (ACE-088 SC-5 — a receipt that could not be
-    # built is an `undetermined` receipt, not an absence).
+    # There is no model behind this fake fork, so the receipt builder is stubbed. It may not return
+    # `None` (ACE-088 SC-5 — a receipt that could not be built is an `undetermined` receipt, not an
+    # absence).
     monkeypatch.setattr(
         tools, "_resolve_receipt",
         lambda *a, **kw: guardrail.undetermined_receipt("stubbed by the test"),
     )
 
-    resp = json.loads(tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme", "max_rows": 2}))
-    cmd = captured["cmd"]
-    assert "--max-rows" in cmd and cmd[cmd.index("--max-rows") + 1] == "2"  # capped at the source
-    assert resp["truncated"] is True  # executor's flag surfaced into the response
+    tools.tool_execute_sql({"sql": "SELECT n FROM t", "datasource": "acme"})
+
+    assert "--max-rows" not in captured["cmd"]

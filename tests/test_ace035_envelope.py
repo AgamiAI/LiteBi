@@ -57,15 +57,12 @@ class _SpyExecutor:
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch):
-    # `_max_rows_override` is a request-scoped ContextVar and `_INJECTED_EXECUTOR` a process global;
-    # isolate both, and make sure a stray inherited AGAMI_DB_URL can't flip a test onto the hosted
-    # branch.
-    execute_sql._max_rows_override.set(None)
+    # `_INJECTED_EXECUTOR` is a process global; isolate it, and make sure a stray inherited
+    # AGAMI_DB_URL can't flip a test onto the hosted branch.
     tools.set_injected_executor(None)
     monkeypatch.delenv("AGAMI_DB_URL", raising=False)
     monkeypatch.delenv("APP_DATABASE_URL", raising=False)
     yield
-    execute_sql._max_rows_override.set(None)
     tools.set_injected_executor(None)
 
 
@@ -260,8 +257,12 @@ def test_tool_edge_ok_shape_keeps_the_frozen_payload_and_adds_status_and_audit_i
 
     assert out["status"] == "ok" and out["audit_id"].strip()
     # `_finalize_execution`'s payload is frozen and merged whole — every key it owns survives.
-    assert {"columns", "rows", "row_count", "truncated", "units", "markdown", "sql",
+    assert {"columns", "rows", "row_count", "units", "markdown", "sql",
             "execution_ms", "receipt"} <= set(out)
+    # `truncated` is not among them any more (ACE-087). It could only ever be False once an
+    # overflowing result became a refusal, and a field that is structurally always False invites a
+    # client to branch on a state the server cannot produce.
+    assert "truncated" not in out
     assert out["columns"] == ["n"] and out["rows"] == [["1"]]
     # The nested `receipt` is the FLAT trust receipt `_finalize_execution` nests, NOT the typed
     # `Envelope.receipt` — two shapes of the same facts while both spellings exist, and the ok body

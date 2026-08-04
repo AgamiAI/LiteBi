@@ -1252,20 +1252,6 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
     return UNEXPECTED_FAILURE_MESSAGE
 
 
-def _executor_truncated(stderr: str | None) -> bool:
-    """True if execute_sql flagged a bounded-fetch truncation (ACE-044). The executor emits a
-    non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
-    for line in (stderr or "").splitlines():
-        line = line.strip()
-        if line.startswith("{") and '"truncated"' in line:
-            try:
-                if isinstance(json.loads(line).get("truncated"), dict):
-                    return True
-            except ValueError:
-                pass
-    return False
-
-
 # The composition-root executor (AH-012). ``None`` (the default) means "fork the execute_sql
 # subprocess" — the byte-identical local/single-user path. A consumer injects a ``ports.Executor``
 # via ``create_app(adapters=…)`` to run execution IN-PROCESS behind the same guard (no fork, native
@@ -1291,8 +1277,7 @@ def set_injected_executor(executor: Any | None) -> None:
 
 
 def _finalize_execution(
-    columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
-    execution_ms: int,
+    columns: list, data_rows: list, *, profile: str, sql: str, execution_ms: int,
 ) -> str:
     """Shape a successful result (units + exact-render markdown) and return the result JSON. Shared
     by both execution paths — the subprocess fork and the in-process executor — so a successful query
@@ -1326,7 +1311,6 @@ def _finalize_execution(
         "columns": columns,
         "rows": data_rows,
         "row_count": len(data_rows),
-        "truncated": truncated,
         "units": unit_map,
         "markdown": markdown,  # exact, full numbers (currency symbol + grouping) — render as-is
         "sql": sql,
@@ -1375,7 +1359,6 @@ def _emit(
     execution_ms: int | None,
     profile: str | None = None,
     args: dict[str, Any] | None = None,
-    max_rows: int | None = None,
 ) -> str:
     """Serialize ONE `Envelope` to the tool-edge JSON — the single serializer `tool_execute_sql`
     returns through, whichever path produced the Envelope.
@@ -1387,7 +1370,7 @@ def _emit(
     Per status:
       * `ok`      — `_finalize_execution`'s frozen payload with `status`, `receipt` and `audit_id`
                     merged on. Its rows are textualized here (`None` → `""`, else `str`) so both
-                    paths emit the same JSON, and the `max_rows` backstop is applied here too.
+                    paths emit the same JSON.
       * `refused` — `{status, refusal, sql?, execution_ms?, receipt, audit_id}`.
       * `failed`  — `{status, failure, sql?, execution_ms?, receipt, audit_id}`.
 
@@ -1406,15 +1389,9 @@ def _emit(
     if env.status == "ok":
         columns = list(env.data.columns)
         rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
-        truncated = env.data.truncated
-        # Backstop only: the executor already caps at the source (ACE-044) and flags it. This
-        # catches a result that slipped past that bound, and marks it truncated rather than
-        # presenting a trimmed result as complete.
-        if max_rows is not None and len(rows) > max_rows:
-            rows, truncated = rows[:max_rows], True
         payload = json.loads(
             _finalize_execution(
-                columns, rows, truncated,
+                columns, rows,
                 profile=profile or "", sql=sql or "", execution_ms=execution_ms or 0,
             )
         )
@@ -1583,7 +1560,7 @@ def _record_execution(
 
 
 def _run_in_process(
-    sql: str, profile: str, area: str | None, max_rows: int | None, executor: Any
+    sql: str, profile: str, area: str | None, executor: Any
 ) -> Envelope:
     """Run through the in-process executor behind the shared guarded envelope (no subprocess, no CSV
     round-trip) and return the `Envelope` it produced — unmodified.
@@ -1595,11 +1572,6 @@ def _run_in_process(
     the way to the caller on both paths."""
     import execute_sql
 
-    # The per-call cap rides execute_sql's `_max_rows_override` ContextVar (ACE-028) — request-scoped,
-    # so concurrent in-process queries with different caps don't stomp each other. Set/reset via the
-    # token (the `_current_org_ctx` pattern); `run_blocking` copied this request's context into the
-    # worker thread, so the set is isolated to this call.
-    cap_token = execute_sql._max_rows_override.set(max_rows)
     try:
         return execute_sql.execute_guarded(
             sql, profile, area, executor=executor, org_id=_credential_org_id()
@@ -1614,8 +1586,6 @@ def _run_in_process(
         return _envelope("failed", failure=Failure(
             kind="dsn", message="Datasource configuration error.",
         ), receipt=_resolve_receipt(profile, sql, bounded=True))
-    finally:
-        execute_sql._max_rows_override.reset(cap_token)
 
 
 def tool_execute_sql(args: dict[str, Any]) -> str:
@@ -1633,7 +1603,8 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
 
     The whole body runs inside the per-request resolve-once scope, opened here because this is the
     one point both paths pass through, and closed in a `finally` for the same reason
-    `_max_rows_override` is: a value left behind would describe the next call.
+    `_guard_model` is cleared at the entry to every call: a value left behind would describe the
+    next one.
     """
     cache_token = begin_request_cache()
     try:
@@ -1686,14 +1657,6 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
             sql=sql, execution_ms=None, profile=profile, args=args,
         )
 
-    max_rows = args.get("max_rows")
-    try:
-        max_rows = int(max_rows) if max_rows is not None else None
-    except (TypeError, ValueError):
-        max_rows = None
-    if max_rows is not None:
-        max_rows = max(1, min(max_rows, 10_000))
-
     area = str(args["area"]) if args.get("area") else None
 
     # In-process path (AH-012): a consumer injected an executor, so run behind the shared guarded
@@ -1701,11 +1664,10 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
     # when no executor is injected (the default) — that path stays byte-identical.
     if _INJECTED_EXECUTOR is not None:
         started = time.monotonic()
-        env = _run_in_process(sql, profile, area, max_rows, _INJECTED_EXECUTOR)
+        env = _run_in_process(sql, profile, area, _INJECTED_EXECUTOR)
         execution_ms = int((time.monotonic() - started) * 1000)
         return _emit(
-            env, sql=sql, execution_ms=execution_ms,
-            profile=profile, args=args, max_rows=max_rows,
+            env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
         )
 
     # The model safety pass (fan/chasm pre-flight + scope + PII) runs inside execute_sql.py;
@@ -1715,10 +1677,6 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
     cmd = [sys.executable, "-m", "execute_sql", "--profile", profile, "--sql", sql]
     if args.get("area"):
         cmd += ["--area", str(args["area"])]
-    if max_rows is not None:
-        # ACE-044: cap at the source so the executor's bounded fetch (fetchmany(cap+1)) never
-        # materializes the whole result — not a client-side trim after the fact.
-        cmd += ["--max-rows", str(max_rows)]
 
     # The supervisor's bound is the OUTERMOST of the four time bounds, and it is DERIVED from the
     # same resolver every inner layer reads rather than being a number of its own. A fixed 240s
@@ -1795,9 +1753,8 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
             env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
         )
 
-    # Parse the RFC-4180 CSV emitted on stdout. The executor caps at the source (ACE-044) and
-    # flags it on stderr; carry that flag so a truncated result is never presented as complete. The
-    # `max_rows` backstop is applied by `_emit`, the same one the in-process path gets.
+    # Parse the RFC-4180 CSV emitted on stdout. A result that exceeded the ceiling never reaches
+    # here: the child refuses it (ACE-087) and exits non-zero, which the branch above rebuilds.
     reader = csv.reader(io.StringIO(proc.stdout))
     rows_all = list(reader)
     columns = rows_all[0] if rows_all else []
@@ -1808,11 +1765,9 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
     env = _envelope("ok", data=ExecResult(
         columns=columns,
         rows=[tuple(r) for r in data_rows],
-        truncated=_executor_truncated(proc.stderr),
     ), receipt=_resolve_receipt(profile, sql))
     return _emit(
-        env, sql=sql, execution_ms=execution_ms,
-        profile=profile, args=args, max_rows=max_rows,
+        env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
     )
 
 
@@ -2253,9 +2208,13 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_execute_sql,
         "description": (
             "Execute a single read-only SELECT / WITH...SELECT against the local datasource and "
-            "return {columns, rows, row_count, truncated, sql, execution_ms}. SELECT-only is "
+            "return {status:'ok', columns, rows, row_count, units, markdown, sql, execution_ms, "
+            "receipt, audit_id} — `markdown` is the table to display verbatim, exact numbers "
+            "already formatted. SELECT-only is "
             "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
+            "A result larger than the deployment row ceiling is refused the same way rather than "
+            "trimmed, so a partial answer never arrives looking whole. "
             "Runs entirely locally via execute_sql.py — no data leaves the machine. "
             # The declared-filter clause. Spec ids stay in comments like this one — this string
             # ships to every client, and an id only resolves inside the spec repo.
@@ -2290,7 +2249,6 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "thread_id": _THREAD_ID_PROP,
                 "correlation_id": _CORRELATION_ID_PROP,
-                "max_rows": {"type": "integer", "description": "Row cap (clamped 1–10000)."},
             },
             "required": ["sql"],
             "additionalProperties": False,

@@ -67,13 +67,14 @@ _TINY = 0.05
 
 
 @pytest.fixture(autouse=True)
-def _reset_row_cap():
-    # The row cap is a request-scoped ContextVar; isolate every test from it. It matters more than it
-    # used to because the outer bound copies the caller's whole context into its worker, so a cap
-    # left set by one test is now visible to the next test's executor as well.
-    execute_sql._max_rows_override.set(None)
+def _reset_carriers():
+    # `_guard_shape` is request-scoped; isolate every test from it. It matters more than it looks,
+    # because the outer bound copies the caller's whole context into its worker, so a value left set
+    # by one test is visible to the next test's executor as well. (The row cap used to need the same
+    # treatment; it is the deployment's env var alone now — ACE-087.)
+    execute_sql._guard_shape.set(None)
     yield
-    execute_sql._max_rows_override.set(None)
+    execute_sql._guard_shape.set(None)
 
 
 @pytest.fixture(autouse=True)
@@ -217,8 +218,13 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # budget is resolved and spent, never read to compute a bound, and cleared at the entry to every
     # call. It also cannot cross the fork, which is the hazard here — and does not need to: the
     # parent sets it from the Envelope it rebuilds on its own side.
-    context_vars -= {"_last_error_detail", "_guard_model", "_last_outcome"}
-    assert context_vars == {"_max_rows_override"}, (
+    #
+    # `_guard_shape` (ACE-087) passes the same test for the fourth time: it carries the shape the
+    # safety pass read off the statement across to the refusal builder, within one call, and is
+    # cleared at entry beside `_guard_model`. It is read only to choose the WORDING of a refusal
+    # that has already been decided — never to compute a bound, and never before one is spent.
+    context_vars -= {"_last_error_detail", "_guard_model", "_last_outcome", "_guard_shape"}
+    assert context_vars == set(), (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"
     )
@@ -1136,29 +1142,26 @@ class _ContextProbeExecutor:
     def __init__(self) -> None:
         self.thread: threading.Thread | None = None
         self.seen_timeout: object = "not read"
-        self.seen_rows: object = "not read"
 
     def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> execute_sql.ExecResult:
         self.thread = threading.current_thread()
         self.seen_timeout = execute_sql._resolve_timeout_s()
-        self.seen_rows = execute_sql._max_rows_override.get()
         return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
 
 
-def test_the_request_scoped_row_cap_is_visible_inside_the_worker(warehouse, monkeypatch):
-    """A new thread starts with an EMPTY context, so without an explicit copy the caller's per-call
-    row cap would read as unset inside the worker and every in-process call would quietly fall back
-    to the deployment default — a bug with no symptom other than the wrong numbers.
+def test_the_executor_really_runs_off_thread_and_reads_the_same_budget(warehouse, monkeypatch):
+    """The budget rides the environment, which a new thread inherits for free, and it must resolve
+    to the same number inside the worker as outside it.
 
-    The budget is asserted alongside it for the opposite reason: it rides the environment, which a
-    new thread inherits for free, and the two must agree inside the worker as well as outside it.
+    The thread identity is asserted first, because it is what makes the rest mean anything: if the
+    call ever stopped running off-thread, the budget assertion would pass trivially.
 
-    The thread identity is asserted first, because it is what makes the rest of this test mean
-    anything: if the call ever stopped running off-thread, the ContextVar assertion would pass
-    trivially and the copy could be deleted with the suite still green.
+    This test used to also assert the per-call row cap reached the worker through `copy_context()`.
+    That cap is gone (ACE-087) and, with it, the last thing OF OURS that is read inside the worker.
+    The copy is still load-bearing and is witnessed by
+    `test_the_callers_request_context_reaches_the_executor` below, at the layer that performs it.
     """
     monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "7")
-    execute_sql._max_rows_override.set(5)
     probe = _ContextProbeExecutor()
 
     env = execute_sql.execute_guarded(
@@ -1168,7 +1171,32 @@ def test_the_request_scoped_row_cap_is_visible_inside_the_worker(warehouse, monk
     assert env.status == "ok"
     assert probe.thread is not threading.current_thread()  # it really ran on a worker
     assert probe.seen_timeout == 7
-    assert probe.seen_rows == 5
+
+
+def test_the_callers_request_context_reaches_the_executor(monkeypatch):
+    """`_execute_bounded` runs the executor on a worker thread, and a new thread starts with an
+    EMPTY context. The copy is what lets a consumer's injected executor — the pooled /
+    per-user-RBAC seam — pick its connection from the request it is actually serving.
+
+    Asserted on `_execute_bounded` directly rather than through `execute_guarded`, because the
+    chokepoint deliberately clears our own carriers on entry: any var set before calling it reads
+    as None inside by design, so the copy could be deleted with an end-to-end test still green.
+    """
+    monkeypatch.setenv("AGAMI_SQL_TIMEOUT_S", "30")
+    probe_var: ContextVar[str | None] = ContextVar("probe_request_scope", default=None)
+    probe_var.set("this-request")
+    seen: dict[str, object] = {}
+
+    class _Reader:
+        def execute(self, vetted_sql, creds, *, profile):
+            seen["thread"] = threading.current_thread()
+            seen["value"] = probe_var.get()
+            return execute_sql.ExecResult(columns=["c"], rows=[(1,)], truncated=False)
+
+    execute_sql._execute_bounded(_Reader(), "SELECT 1", {}, profile="acme")
+
+    assert seen["thread"] is not threading.current_thread()  # it really ran off-thread
+    assert seen["value"] == "this-request"  # ...and still saw the caller's context
 
 
 # --------------------------------------------------------------------------------------------
@@ -1711,23 +1739,35 @@ def test_a_cancel_that_lands_without_raising_is_still_a_refusal(engine, monkeypa
         case.run()
 
 
-def test_the_cli_adapter_renders_the_marker_as_a_refusal_not_a_traceback(monkeypatch, capsys):
-    """The per-engine CSV wrappers are the SECOND entry into the engine functions, and the engines
-    raise the internal marker.
+def test_the_cli_renders_the_marker_as_a_refusal_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """A marker raised inside an engine reaches the CLI wire as a refusal — one JSON object on
+    stderr and exit 1 — rather than as a traceback.
 
-    That adapter caught only `ExecutorError`, so a per-statement timeout reached through it escaped
-    as a traceback rather than as the exit code its contract documents. It renders what `main`
-    renders for any refusal — the one JSON object on stderr and exit 1 — so the two entries cannot
-    disagree about what a bound we imposed looks like.
+    This was asserted on `_execute_sqlite`, one of the per-engine CSV wrappers, which were the SECOND
+    entry into the engine functions and caught only `ExecutorError` until this test was written.
+    ACE-087 deleted that whole family: nothing in production reached it, and it trimmed results with
+    no refusal, so it was a route around the chokepoint that looked like a route through it. With one
+    entry left there is no longer a second renderer to disagree with, and the assertion moves to the
+    entry that survived.
     """
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setattr(execute_sql, "_deadline", _deadline_already_fired)
     case = ENGINE_CASES["sqlite"]
     case.install(monkeypatch, on_execute=lambda: RuntimeError("interrupted"))
+    # `main` routes through `execute_guarded`, which resolves credentials itself; the engine case
+    # carries only its driver-specific keys, so the dispatch key is added here.
+    creds = {**case.creds, "type": "sqlite"}
+    monkeypatch.setattr(execute_sql, "_load_credentials", lambda p, org_id="local": creds)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["execute_sql", "--profile", "acme", "--sql", "SELECT c FROM orders", "--no-safety"],
+    )
 
-    code = execute_sql._execute_sqlite(case.creds, "SELECT c FROM orders")
+    code = execute_sql.main()
 
     assert code == 1
-    body = json.loads(capsys.readouterr().err)  # one JSON object, on one line, and nothing else
+    err = capsys.readouterr().err
+    body = json.loads(err)  # parses WHOLE, so nothing rides alongside it
     assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT
     assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
 

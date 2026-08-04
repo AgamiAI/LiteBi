@@ -172,7 +172,14 @@ class ExecResult:
     Decimals, datetimes, ``None``), not stringified. Serializing to text — CSV for the subprocess
     wire, JSON at the MCP-tool edge — is the *caller's* single, final step, so an in-process
     executor never pays a serialize→re-parse round-trip and never loses a type or confuses NULL
-    with "". ``truncated`` mirrors the ``fetchmany(cap + 1)`` bound: True when the result was capped.
+    with "".
+
+    ``truncated`` mirrors the ``fetchmany(cap + 1)`` bound: True when a (cap+1)th row existed. It is
+    an INTERNAL carrier, not a caller-visible fact — ``execute_guarded`` reads it and refuses, so a
+    True never reaches an ``ok`` envelope and the rows beside it are discarded. Every executor must
+    set it, including an injected one: it is the only channel this contract has for saying "there
+    was more", and a consumer that leaves it False on a bounded read presents a partial result as a
+    whole one.
 
     This lives here (not in ``ports``) because ``execute_sql`` ships in the stdlib-lean plugin
     mirror, which does not include ``ports``; ``ports.Executor`` references it under TYPE_CHECKING.
@@ -1269,13 +1276,7 @@ def _run_duckdb(creds: dict[str, str], sql: str) -> ExecResult:
     return result
 
 
-_DEFAULT_MAX_ROWS = 1000  # rows materialized per result before truncation
-# Per-call cap from --max-rows (ACE-044). A ContextVar, not a plain global, so it is REQUEST-SCOPED
-# once the HTTP server runs execution in-process (ACE-028): concurrent handlers run in worker threads
-# (`run_blocking` copies the context per call, like `_current_org_ctx`), so each request's cap is
-# isolated and can't stomp another's. In the subprocess/CLI (one process, one thread) it behaves
-# exactly as the old module global did.
-_max_rows_override: ContextVar[int | None] = ContextVar("_max_rows_override", default=None)
+_DEFAULT_MAX_ROWS = 1000  # rows a result may hold before the transfer bound refuses it
 
 # The raw driver text of the failure this call classified, for the audit row only (ACE-039). A
 # ContextVar for the same reason as the cap above: request-scoped, so concurrent in-process handlers
@@ -1328,19 +1329,38 @@ _last_outcome: ContextVar[tuple[str, str | None, int | None] | None] = ContextVa
 # carry a value only the receipt wants is a worse trade than this carrier.
 _guard_model: ContextVar[Any | None] = ContextVar("_guard_model", default=None)
 
+# The shape `_model_safety` read off THIS call's parsed statement — "aggregate", "listing", or None
+# when there was no tree to read. Carried for exactly one consumer: the result-bound refusal, which
+# must not tell an aggregate caller to add a `LIMIT` (ACE-087).
+#
+# It is a carrier for the same reason `_guard_model` is, plus one this module cannot get around: the
+# classification needs sqlglot and this module ships in the stdlib-only vendored mirror, so the
+# verdict site literally cannot compute it. `semantic_model.runtime.statement_shape` does it where
+# the tree already is, and the answer travels as a plain string.
+#
+# None is a real, reachable answer rather than an error, and by more routes than the obvious one:
+# the vendored mirror has no `runtime` to import, `no_safety=True` skips the pass entirely, and a
+# local install returns from `_model_safety` before the classify line when the model package is
+# absent or no model has been built yet. All of them get the shape-neutral remediation, which is why
+# that third text is not a defensive branch — it is the answer for every deployment without a model.
+_guard_shape: ContextVar[str | None] = ContextVar("_guard_shape", default=None)
+
 
 def _resolve_row_cap() -> int:
     """Effective result-row cap. `AGAMI_SQL_MAX_ROWS` is the operator-configurable DEPLOYMENT cap
     (default 1000 when unset) — an operator owns their availability tradeoff and may set it higher OR
-    lower than 1000; it is NOT a hard 1000 ceiling. A per-call `--max-rows` can only LOWER it for a
-    single call (cap = min(env, --max-rows)). A missing/invalid/zero env value falls back to 1000."""
+    lower than 1000; it is NOT a hard 1000 ceiling. A missing/invalid/zero env value falls back to
+    1000.
+
+    The operator is the only voice here. A per-call override used to be able to lower it, and it went
+    with the trim (ACE-087): the one thing a caller might know better than the deployment — that it
+    wants MORE rows — is the thing a lowering-only override structurally could not express, and a
+    caller that wants 200 rows says so in the statement, where the intent is legible to everything
+    downstream."""
     raw = os.environ.get("AGAMI_SQL_MAX_ROWS", "").strip()
     cap = int(raw) if raw.isdigit() else _DEFAULT_MAX_ROWS
     if cap <= 0:
         cap = _DEFAULT_MAX_ROWS  # "0" / "00" → the default, never an empty result
-    override = _max_rows_override.get()
-    if override is not None and override > 0:
-        cap = min(cap, override)
     return cap
 
 
@@ -1468,19 +1488,72 @@ _EXECUTOR_SATURATED = "the executor already has its limit of abandoned calls out
 _NARROW_IT = ("Narrow the time range, reduce the grouping, or add a selective filter, "
               "then run it again.")
 
+# The transfer bound's remediation, keyed by the shape `_guard_shape` carries. Three entries rather
+# than one, because the right fix genuinely differs and the wrong one is not merely unhelpful:
+#
+#   * A LISTING can be bounded. `LIMIT` without `ORDER BY` still returns an arbitrary subset — the
+#     engine's emission order is not a promise — so the ORDER BY is what turns "some rows" into "the
+#     rows you asked for", and it is named first for that reason.
+#   * An AGGREGATE cannot. `LIMIT` on a grouped result silently drops groups, and a partial breakdown
+#     reads exactly like a complete one: no row is wrong, the total is. That is a worse outcome than
+#     the refusal the caller just got. The REMEDIATION does not warn against `LIMIT`; it does not
+#     mention it at all. The reader here is usually an LLM, negation is what an LLM follows least
+#     reliably, and "do not add a LIMIT" puts the token in front of it either way. Absence is the
+#     stronger control, and it is also what makes the acceptance check a plain one.
+#
+#     Scoped to the remediation deliberately: the shared `detail` says "the {N}-row limit", and that
+#     stays. It is prose naming the ceiling, not an instruction to write a clause — the same thing
+#     ACE-038's timeout detail does with its seconds — and the remediation is the field a caller acts
+#     on. Stripping the word from the detail too would cost the caller the one number they need.
+#   * None means nothing parsed the statement — the vendored mirror has no `runtime` to call, and
+#     `no_safety=True` skips the pass that sets the shape. Guessing "listing" here would hand an
+#     aggregate caller the one instruction that corrupts their answer, so this text hands the fork
+#     back to the caller, who does know which they wrote, and makes `LIMIT` conditional on it.
+# The keys are exactly `runtime.statement_shape`'s return domain, and the lookup below is direct
+# rather than defaulted on purpose: a fifth shape added there without a text here should fail loudly
+# in the first test that runs it, not quietly serve the neutral wording and let a shape ship with no
+# advice of its own. Adding a shape means adding an entry.
+_RESULT_BOUND_REMEDIATION = {
+    "listing": "Bound the result with LIMIT, and add an ORDER BY so the rows you get back are the "
+               "ones you meant to ask for.",
+    "aggregate": "Narrow the grouping, or add a selective filter, so the whole breakdown fits within "
+                 "the row cap, then run it again.",
+    None: "Add a selective filter to narrow the result. If it is a plain row listing rather than an "
+          "aggregate, you can instead bound it with LIMIT and an ORDER BY.",
+}
 
-def _resource_limit_refusal(exc: _ResourceLimit) -> Refusal:
-    """The ONE `resource_limit` refusal, built from whichever of the three bounds raised.
+
+def _resource_limit_refusal(exc: _ResourceLimit | None) -> Refusal:
+    """The ONE `resource_limit` refusal, built from whichever of the four bounds stopped the call.
 
     Single-sourced because two entries into the engines lead here — the guarded chokepoint and the
-    subprocess/CLI adapter — and a caller must not be able to tell which one it came through.
+    subprocess/CLI adapter — so neither can drift into wording the other does not have.
 
-    The budget is re-resolved rather than carried on the marker: the marker stays a plain exception,
-    and nothing between the engine call and here can change the environment the resolver reads, so it
-    is the same number the watchdog used. The configured number belongs in the detail — it is a
-    deployment setting, not a data value, and a bound the caller cannot see is one it cannot plan
-    around.
+    `exc is None` is the fourth bound, and the only one that is not a time bound: the result-transfer
+    ceiling (ACE-087). It arrives with no marker because there is nothing to raise — overflow is a
+    flag on a result the executor already returned — so the absence of an exception IS the signal.
+
+    What this deliberately no longer preserves is indistinguishability. The three time bounds still
+    read alike, but a transfer refusal names rows where a timeout names seconds, and its remediation
+    is shaped by the statement. That is the point of it: "add a LIMIT" and "narrow the grouping" are
+    different fixes, and a caller who gets the wrong one is worse off than one who gets neither. The
+    invariant that survives is one rule with one emit site, not one sentence.
+
+    The budget is re-resolved rather than carried: nothing between the engine call and here can
+    change the environment the resolvers read, so both `_resolve_timeout_s` and `_resolve_row_cap`
+    return the same number the bound itself used. The configured number belongs in the detail — it
+    is a deployment setting, not a data value, and a bound the caller cannot see is one it cannot
+    plan around.
     """
+    if exc is None:
+        # The transfer bound. No rows come back with this: an unordered prefix of a larger result is
+        # an arbitrary sample, and returning it under a `status=ok` is a wrong answer wearing a right
+        # one's clothes.
+        detail = (
+            f"The result exceeded the {_resolve_row_cap()}-row limit, so it was not returned."
+        )
+        return refuse(RULE_RESOURCE_LIMIT, detail=detail,
+                      remediation=_RESULT_BOUND_REMEDIATION[_guard_shape.get()])
     timeout_s = _resolve_timeout_s()
     if isinstance(exc, _ExecutorSaturated):
         # Nothing ran, so nothing about THIS statement is the finding. Saying "your query was too
@@ -1559,20 +1632,14 @@ def _deadline(cancel: Callable[[], None], timeout_s: float) -> Iterator[threadin
         timer.cancel()  # belt and braces, for a timer that has not started running yet
 
 
-def _flag_truncated(cap: int) -> None:
-    """Signal a bounded-fetch truncation to the caller — a non-error `{"truncated": …}` marker on
-    stderr (distinct from the guards' `{"error": …}`), so a truncated result is never mistaken for a
-    complete one (ACE-044). Shared by every engine's materialization path. One write so the
-    marker is always a single line, even if other notices surround it."""
-    sys.stderr.write(json.dumps({"truncated": {"row_cap": cap}}) + "\n")
-
-
 def _collect_cursor(cur: Any) -> ExecResult:
     """Fetch at most the row cap from a DB-API cursor into an ``ExecResult`` with **native types**.
     `fetchmany(cap + 1)` — never `fetchall` — so a huge result can't be buffered whole; a (cap+1)th
-    row means the result was truncated. The SQL itself is untouched (no injected LIMIT). This is the
-    single bounded-fetch implementation both the CSV wire (`_write_cursor_csv`) and the in-process
-    executor path share, so the row cap is enforced once, identically, for every caller.
+    row means there was more, and `execute_guarded` turns that into a refusal (ACE-087). The rows
+    below the cap are still returned here rather than dropped on the spot: this function reports what
+    it found and the chokepoint decides, which is what keeps the decision in one place. The SQL
+    itself is untouched (no injected LIMIT). Every DB-API engine shares this one implementation, so
+    the bound is applied once, identically.
 
     Fetch FIRST, then read ``cur.description``: a psycopg2 **server-side (named) cursor** — which the
     Postgres/Redshift path uses to bound transfer — reports ``description is None`` until the
@@ -1590,25 +1657,20 @@ def _collect_cursor(cur: Any) -> ExecResult:
 
 
 def _emit_result_csv(result: ExecResult) -> None:
-    """Serialize an ``ExecResult`` to stdout as CSV — the subprocess/CLI wire. Byte-for-byte what the
-    old inline cursor→CSV writer produced: header row then data rows, and a truncation marker on
-    stderr when capped. This is the *single, final* text serialization for the fork path; the
-    in-process path skips it and returns the native rows straight to the tool edge."""
+    """Serialize an ``ExecResult`` to stdout as CSV — the subprocess/CLI wire: header row then data
+    rows. This is the *single, final* text serialization for the fork path; the in-process path
+    skips it and returns the native rows straight to the tool edge.
+
+    Nothing is written to stderr any more. A `{"truncated": …}` marker used to ride there beside the
+    rows; a result that overflows never reaches this function now, because ``main`` branches to
+    ``_write_refusal`` before it (ACE-087). That also restores a property ``_write_refusal``'s
+    docstring asserts and the marker quietly broke: stderr carries one JSON object or nothing."""
     if not result.columns:  # cursor had no description → wrote nothing (e.g. a non-row statement)
         return
     writer = csv.writer(sys.stdout)
     writer.writerow(result.columns)
     for row in result.rows:
         writer.writerow(row)
-    if result.truncated:
-        _flag_truncated(_resolve_row_cap())
-
-
-def _write_cursor_csv(cur: Any) -> None:
-    """Collect the bounded result and write it to stdout as CSV — the per-engine sink the subprocess
-    path uses. Kept as the thin composition ``_emit_result_csv(_collect_cursor(cur))`` so the fetch
-    bound and the CSV shape stay single-sourced (and the existing bounded-fetch tests still pin it)."""
-    _emit_result_csv(_collect_cursor(cur))
 
 
 def _hosted() -> bool:
@@ -1821,6 +1883,10 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     # rebuilding its index (audit P2 / ACE-045). Behaviour-preserving: a guard given `ctx`
     # returns the same verdict as one that builds its own.
     ctx = RT.build_guard_context(sql, org)
+    # Published for the result-bound refusal, off the tree that was just parsed rather than a second
+    # one. Set here and not at the chokepoint because the chokepoint cannot import sqlglot — see
+    # `_guard_shape`. Stays None when `ctx` is None (no sqlglot) or the statement did not parse.
+    _guard_shape.set(RT.statement_shape(ctx))
 
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
@@ -1874,69 +1940,16 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
 # the default connect-per-query path, unchanged; a consumer injects its own `ports.Executor`
 # (pooled / RBAC / tunnelled) *behind* the same guard — no fork of the guard, per REQ-002/REQ-014.
 # The subprocess `main` and the in-process MCP handler both go through `execute_guarded`, so the
-# guard is applied identically and can't be bypassed. The per-engine `_execute_<db>` CSV wrappers
-# below are the subprocess/CLI adapter (they emit CSV + return an exit code); `_run_<db>` is the
-# shared connect-and-run that returns native rows to either caller.
-
-
-def _emit_or_err(run: Callable[[], ExecResult]) -> int:
-    """Subprocess/CLI adapter over a ``_run_<db>`` function: write its result to stdout as CSV and
-    return exit code 0, or translate an ``ExecutorError`` into the stderr message + exit code the CLI
-    contract documents (byte-identical to what the old ``_execute_<db>`` emitted).
-
-    The watchdog marker gets an arm of its own, AHEAD of the classified one, because this is the
-    second entry into the engine functions and they raise it. Without it a per-statement timeout
-    reached through here would escape as a traceback rather than as the exit code this docstring
-    promises. It renders exactly what ``main`` renders for a refusal — the one JSON object on stderr
-    and exit 1 — so the two entries cannot disagree about what a bound we imposed looks like."""
-    try:
-        _emit_result_csv(run())
-    except _ResourceLimit as exc:
-        _write_refusal(_resource_limit_refusal(exc))
-        return 1
-    except ExecutorError as e:
-        return _err(e.msg, code=e.code)
-    return 0
-
-
-def _execute_postgres(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_postgres(creds, sql))
-
-
-def _execute_mysql(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_mysql(creds, sql))
-
-
-def _execute_snowflake(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_snowflake(creds, sql))
-
-
-def _execute_bigquery(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_bigquery(creds, sql))
-
-
-def _execute_sqlite(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_sqlite(creds, sql))
-
-
-def _execute_sqlserver(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_sqlserver(creds, sql))
-
-
-def _execute_oracle(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_oracle(creds, sql))
-
-
-def _execute_databricks(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_databricks(creds, sql))
-
-
-def _execute_trino(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_trino(creds, sql))
-
-
-def _execute_duckdb(creds: dict[str, str], sql: str) -> int:
-    return _emit_or_err(lambda: _run_duckdb(creds, sql))
+# guard is applied identically and can't be bypassed. `_run_<db>` is the shared connect-and-run that
+# returns native rows to either caller.
+#
+# There is deliberately no second route into `_run_<db>`. A family of per-engine `_execute_<db>` CSV
+# wrappers used to sit here, reached through `_emit_or_err`, and by the time it was deleted (ACE-087)
+# nothing in production called them: `main` reaches the engines through `execute_guarded` and the
+# built-in executor. They mattered because they still TRIMMED and flagged, with no refusal and no
+# receipt, so anything wired back onto them would have gone round the chokepoint while looking like
+# it went through it. Keeping the single chokepoint true structurally, rather than by nobody
+# happening to call the alternative, is worth more than the wrappers were.
 
 
 def _builtin_execute(vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult:
@@ -2171,9 +2184,14 @@ def _execute_bounded(
     which ``tools._run_in_process`` nets one layer up, and swallowing it in a worker thread would
     turn that fail-closed answer into a silent hang until the bound expired.
 
-    The call runs inside a copy of the CALLER's context. A new thread starts with an empty one, so
-    without this the request-scoped ``_max_rows_override`` would read as unset inside the worker and
-    every in-process call would silently fall back to the deployment default.
+    The call runs inside a copy of the CALLER's context, and what that is FOR changed when the
+    per-call row cap went (ACE-087). It used to carry ``_max_rows_override`` to ``_resolve_row_cap``
+    inside the worker; the cap is the deployment's environment now and needs no carrier. What it
+    still carries is the *caller's* request scope — ``tools._current_org_ctx``, the resolve-once
+    request cache, the actor and session on the served path — into the one place a consumer's own
+    code runs. That is the point of the ``Executor`` seam: a pooled / per-user-RBAC executor picks
+    its connection from exactly that context, and a new thread starts with an empty one, so dropping
+    the copy would hand every injected executor a blank request to serve.
     """
     global _abandoned_workers
 
@@ -2274,8 +2292,8 @@ def execute_guarded(
 
     ``_load_credentials`` sits INSIDE the try deliberately, so a bad profile / missing DSN becomes a
     ``failed``/``dsn`` Envelope carrying its detailed message rather than escaping as an exception
-    the two callers would each have to translate. The row cap rides the request-scoped
-    ``_max_rows_override`` ContextVar the caller sets."""
+    the two callers would each have to translate. The row cap is the deployment's alone
+    (``AGAMI_SQL_MAX_ROWS``); no caller can lower it for one call."""
     # Clear before anything can set it, so a detail from a PREVIOUS call in this context can never
     # be attributed to this one. The recorder reads it unconditionally; a stale value would put the
     # wrong error text on a row that succeeded.
@@ -2287,6 +2305,9 @@ def execute_guarded(
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)
+    # And the same again for the shape. A stale value here is worse than none: it would word this
+    # call's refusal for a statement somebody else sent, and the two wordings give opposite advice.
+    _guard_shape.set(None)
     # The statement the CALLER sent. Every NON-OK receipt is built from this one, and the rule is
     # about the REBINDING rather than about any particular mechanism: whatever a safety pass rewrites
     # a statement INTO is the guard's own text, so a rebound string can name a table the caller never
@@ -2351,8 +2372,23 @@ def execute_guarded(
         # mechanism and for the leaked worker it costs on expiry.
         result = _execute_bounded(executor, sql, creds, profile=profile)
         # Inside the try on purpose: an executor that returns `None` (or anything else the contract
-        # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
-        # broken adapter, not a reason for the chokepoint to raise at its caller.
+        # does not accept) breaks here rather than at the chokepoint's caller — that is a broken
+        # adapter, not a reason for `execute_guarded` to stop being total. It used to fail the
+        # present-iff check in `Envelope.__post_init__`; since ACE-087 the `truncated` read below
+        # reaches it first and raises `AttributeError` instead. Same outcome by the same handler
+        # (`failed`/`other`, logged, audit row written), one line earlier.
+        # The transfer bound, checked BEFORE the `ok` envelope can be built (ACE-087). It sits here
+        # rather than in `_collect_cursor` because that function is only one of three ways a result
+        # arrives: BigQuery has no DB-API cursor and bounds itself, and an injected `ports.Executor`
+        # — the pooled / per-user-RBAC seam a hosted consumer supplies — reaches neither. All three
+        # set `truncated` on the ExecResult, so reading it here is the one place that covers them.
+        #
+        # The rows are dropped rather than returned. `_envelope("refused", …)` carries no data by
+        # construction, which is the whole point: what the executor holds is whichever rows the
+        # engine emitted first, and with no ORDER BY that is an arbitrary sample of the real result.
+        if result.truncated:
+            return _envelope("refused", refusal=_resource_limit_refusal(None),
+                             receipt=_receipt_for(received_sql, profile, bounded=True))
         # The one receipt built from the REBOUND statement: `ok` is the status SC-6 asks to describe
         # what actually executed, and it is also the one a caller cannot provoke without every name
         # in it having already satisfied the scope gates and the warehouse.
@@ -2427,15 +2463,7 @@ def main() -> int:
                    help="Subject area for the semantic-model safety pass (pre-flight + scope + PII).")
     p.add_argument("--no-safety", action="store_true",
                    help="Skip the semantic-model safety pass.")
-    p.add_argument("--max-rows", type=int, default=None,
-                   help="Lower the row cap for this call (never raises it). Effective cap = "
-                        "min(this, AGAMI_SQL_MAX_ROWS) — the env is the deployment cap, default 1000.")
     args = p.parse_args()
-
-    # Per-call cap (ACE-044); the sink reads it via _resolve_row_cap. No token/reset kept: main() is
-    # the one-shot subprocess/CLI entry (one process, one thread), so there's no sibling request to
-    # isolate from — unlike the in-process server path, which resets the token in tools._run_in_process.
-    _max_rows_override.set(args.max_rows)
 
     # Silence the raw-detail logger for the whole CLI/child lifetime. Without this it falls through
     # to `logging.lastResort`, which writes to stderr — and the parent relays the child's stderr into
