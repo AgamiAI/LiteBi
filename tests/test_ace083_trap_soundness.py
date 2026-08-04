@@ -12,11 +12,18 @@ number into `not_multiplied`, which is a positive claim on the receipt that the 
 Nothing on `main` fails when that happens. So the reverse corpus lands FIRST, in its own file,
 before a line of production code moves.
 
-Everything here passes on the base implementation. That is the point: these are not the tests for
-the new behaviour, they are the tests for the behaviour that must survive it.
+The reverse corpus passes on the base implementation. That is the point: those are not the tests for
+the new behaviour, they are the tests for the behaviour that must survive it. The batteries below it
+are the per-slice tests of what each correction actually changed, and they land beside the corpus
+rather than in files of their own so that a loosening and the pins guarding it are read together.
+
+Slice 2 (S1) is here: an aggregate a duplication cannot move keeps the multiplication and loses the
+word trap, and the marker sentence that reported the detector's old shortcoming is deleted.
 """
 
 from __future__ import annotations
+
+from typing import get_args
 
 import pytest
 
@@ -96,6 +103,57 @@ CONDITIONAL_SUM = (
 )
 
 FAN_EDGE = "orders (1) <- order_items (N)"
+
+# --- S1: the aggregates a duplication cannot move --------------------------
+#
+# Six spellings of one property. Duplicating a row does not move a minimum, a maximum, an aggregate
+# over the distinct values it was handed, or a fold over booleans. All six sit on the ONE side of
+# the same fan as `PLAIN_FAN`, so the multiplication behind them is identical and the only thing
+# that differs is whether the number moved with it.
+DISTINCT_COUNT_OVER_FAN = f"SELECT COUNT(DISTINCT orders.id) {FAN_JOIN}"
+MIN_OVER_FAN = f"SELECT MIN(orders.total_amount) {FAN_JOIN}"
+MAX_OVER_FAN = f"SELECT MAX(orders.total_amount) {FAN_JOIN}"
+# The spelling the predicate is most easily got wrong on: sqlglot parses this to
+# `exp.Sum(this=exp.Distinct(...))` and leaves `args["distinct"]` at `None`, so a check written
+# against the arg alone sees no DISTINCT here at all.
+DISTINCT_SUM_OVER_FAN = f"SELECT SUM(DISTINCT orders.total_amount) {FAN_JOIN}"
+# The boolean folds, which are `exp.LogicalOr` / `exp.LogicalAnd` whichever dialect wrote them and
+# whatever it called them. They are echoed on the receipt as `LOGICAL_OR` / `LOGICAL_AND`.
+BOOL_OR_OVER_FAN = f"SELECT BOOL_OR(orders.total_amount > 0) {FAN_JOIN}"
+BOOL_AND_OVER_FAN = f"SELECT BOOL_AND(orders.total_amount > 0) {FAN_JOIN}"
+
+# And four over the same fan that a duplication does move. `PLAIN_FAN` is the SUM.
+AVG_OVER_FAN = f"SELECT AVG(orders.total_amount) {FAN_JOIN}"
+COUNT_COLUMN_OVER_FAN = f"SELECT COUNT(orders.id) {FAN_JOIN}"
+# Echoed as the sqlglot-normalized `GROUP_CONCAT(...)`, not as the `STRING_AGG` that was written.
+STRING_AGG_OVER_FAN = f"SELECT STRING_AGG(orders.status, ',') {FAN_JOIN}"
+
+# `COUNT(*)` names no column, so ACE-060's rule resolves it to no table and it settles as
+# `undetermined` before any fan is considered.
+COUNT_STAR_OVER_FAN = f"SELECT COUNT(*) {FAN_JOIN}"
+
+# --- the marker, after the fan-immune clause is deleted --------------------
+#
+# Four statements, one per state `_aggregates_marker` can be in that this spec could have disturbed,
+# each carrying an aggregate a duplication cannot move so that the deleted clause would fire if it
+# were still there. The fifth clause (the cap's "further aggregate(s) are not listed") is pinned by
+# `test_ace060_trap_free_aggregates.py::test_the_cap_counts_aggregates_and_says_so`.
+MARKER_NULL = "SELECT MIN(orders.total_amount) FROM orders"
+MARKER_NESTED_SCOPE = (
+    "WITH x AS (SELECT SUM(orders.total_amount) AS t FROM orders) SELECT MAX(x.t) FROM x"
+)
+MARKER_FILTER_OR_SORT = (
+    "SELECT orders.id, MAX(orders.total_amount) FROM orders GROUP BY orders.id "
+    "HAVING SUM(orders.total_amount) > 1"
+)
+MARKER_UNRESOLVED = (
+    "SELECT COUNT(*), MIN(orders.total_amount) FROM customers "
+    "JOIN orders ON orders.customer_id = customers.id"
+)
+
+# The sentence this slice deleted, quoted by the fragment that identifies it rather than in full, so
+# that a reworded survivor cannot accidentally re-satisfy the absence assertions below.
+DELETED_MARKER_PHRASE = "MIN, MAX and COUNT(DISTINCT)"
 
 
 def _reports(sql: str) -> list["rt.AggregateReport"]:
@@ -180,3 +238,164 @@ def test_a_conditional_count_over_the_many_side_still_says_it_is_clean(label, sq
     reports = _reports(sql)
     assert [a.status for a in reports] == [rt.NOT_MULTIPLIED], (label, reports)
     assert [f.risk for f in reports[0].findings] == [], (label, reports[0].findings)
+
+
+def _every_risk(sql: str) -> list[str]:
+    """Every risk label the pre-flight produced for `sql`, from BOTH channels it reports on.
+
+    `PreFlightResult.findings` is the flat list the CLI reads and `.aggregates[].findings` is the
+    per-aggregate roster the receipt reads. They are meant to be projections of one analysis, so a
+    test that read only one of them would pass while the other still said `fan_trap` at whichever
+    surface it did not check.
+    """
+    pf = rt.pre_flight_check(sql, _sales_org())
+    assert pf.unchecked is None, pf.unchecked
+    return [f.risk for f in pf.findings] + [f.risk for a in pf.aggregates for f in a.findings]
+
+
+# --- S1: the fan is reported, and it is not called a trap -------------------
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("COUNT(DISTINCT)", DISTINCT_COUNT_OVER_FAN),
+    ("MIN", MIN_OVER_FAN),
+    ("MAX", MAX_OVER_FAN),
+    ("SUM(DISTINCT)", DISTINCT_SUM_OVER_FAN),
+    ("BOOL_OR", BOOL_OR_OVER_FAN),
+    ("BOOL_AND", BOOL_AND_OVER_FAN),
+])
+def test_an_aggregate_a_duplication_cannot_move_reports_the_fan_without_calling_it_a_trap(
+    label, sql,
+):
+    """A1-A5. The multiplication survives; the word `trap` does not.
+
+    The rows behind a `MAX` over the one side of a fan really are duplicated, so the report keeps
+    saying `multiplied` and keeps naming the edge that did it. Suppressing the finding instead would
+    make the item say `not_multiplied`, which is the positive claim that the rows were not
+    duplicated, and they were. What was false is only the label: `fan_trap` names a defect, and
+    there is no defect in a number a duplication cannot move. So `fan_out_invariant` is a second
+    derivable property of the same aggregate reported alongside the first fact, not a reason to drop
+    it — which is why it is a member of `_MULTIPLYING_RISKS` and `status` is untouched.
+
+    `joins` is asserted because it is what makes the finding actionable at all: a reader told the
+    rows were multiplied and not told by what has been given a fact they cannot check. It comes off
+    the same shared `triggering_joins` the trap branch builds, so the two labels describe one edge.
+
+    The `BOOL_OR` / `BOOL_AND` cases are the `exp.LogicalOr` / `exp.LogicalAnd` arms of the
+    predicate, and `SUM(DISTINCT)` is the arm that only `isinstance(agg.this, exp.Distinct)`
+    reaches. All three are TYPE tests: ACE-079 reads each statement in its engine's own dialect, so
+    the written function name is whatever that dialect spells the fold, and a name allowlist would
+    be wrong the first time the two differ.
+    """
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], (label, reports)
+    assert reports[0].joins == [FAN_EDGE], (label, reports[0].joins)
+    assert [f.risk for f in reports[0].findings] == ["fan_out_invariant"], (label, reports)
+    assert "fan_trap" not in _every_risk(sql), (label, _every_risk(sql))
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("SUM", PLAIN_FAN),
+    ("AVG", AVG_OVER_FAN),
+    ("COUNT of a column", COUNT_COLUMN_OVER_FAN),
+    ("STRING_AGG", STRING_AGG_OVER_FAN),
+])
+def test_an_aggregate_a_duplication_moves_carries_no_invariance(label, sql):
+    """A6. The other half of the split, and the half that must not move at all.
+
+    Each of these four returns a different number when its rows are duplicated: the sum and the
+    average shift, the count counts line items instead of orders, and the concatenation repeats
+    every status once per item. Whatever widened the invariance predicate, it may not reach them —
+    an aggregate wrongly labelled `fan_out_invariant` tells a reader the number is the same either
+    way, which is the one false statement this split makes possible and the reason the negative
+    assertion is here rather than left implicit in the positive one above.
+    """
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], (label, reports)
+    assert [f.risk for f in reports[0].findings] == ["fan_trap"], (label, reports)
+    assert "fan_out_invariant" not in _every_risk(sql), (label, _every_risk(sql))
+
+
+def test_count_star_over_a_fan_stays_undetermined_and_claims_no_invariance():
+    """A6. `COUNT(*)` names no column, so there is nothing to be invariant about.
+
+    ACE-060's rule is that an aggregate whose reads the analysis could not attribute to a table says
+    it could not tell, rather than claiming to be clean. `COUNT(*)` is that case exactly, and it is
+    reached before any fan is considered — no source table means no measure table, so the fan branch
+    never looks at it and the invariance predicate is never asked.
+
+    It is pinned because `COUNT(*)` parses to `exp.Count(this=exp.Star())`, one node type away from
+    the `exp.Count(this=exp.Distinct())` the predicate does accept. A widening that stopped
+    distinguishing them would attach `fan_out_invariant` here, and because that risk is a member of
+    `_MULTIPLYING_RISKS` the status would flip from `undetermined` to `multiplied` — turning "we
+    could not tell" into an assertion, over a join that genuinely does multiply what it counts.
+    """
+    reports = _reports(COUNT_STAR_OVER_FAN)
+    assert [(a.aggregate, a.status) for a in reports] == [("COUNT(*)", rt.UNDETERMINED)], reports
+    assert reports[0].joins == [], reports[0].joins
+    assert _every_risk(COUNT_STAR_OVER_FAN) == [], _every_risk(COUNT_STAR_OVER_FAN)
+
+
+# --- A21: what the marker says once the detector no longer has that gap -----
+
+
+@pytest.mark.parametrize("label,sql,phrase", [
+    ("nothing left unsaid", MARKER_NULL, None),
+    ("an aggregate in a CTE body", MARKER_NESTED_SCOPE, "CTE or a subquery"),
+    ("an aggregate in HAVING", MARKER_FILTER_OR_SORT, "HAVING or ORDER BY"),
+    ("an aggregate that resolved to no table", MARKER_UNRESOLVED, "could not be resolved"),
+])
+def test_the_marker_stops_calling_an_invariant_aggregate_a_fan_out_risk(label, sql, phrase):
+    """A21. The deleted clause is gone; the four it stood among are unchanged.
+
+    It said "MIN, MAX and COUNT(DISTINCT) are counted as fan-out risks although a fan-out cannot
+    change what they return" — a true statement about a shortcoming in the DETECTOR, which is why
+    ACE-060 put it on the marker rather than on an item. This slice removed the shortcoming: those
+    aggregates now carry `fan_out_invariant` on the item itself, where the reader is already
+    looking. Left in place the sentence would report a gap the analysis no longer has, and by the
+    four-state contract that costs the section its null marker, which is the only way it can make
+    the positive claim "established, here it is".
+
+    Nothing else moves, and the other clauses are pinned here rather than assumed because they were
+    deleted from a shared tuple: each of the three remaining conditional clauses is still true of
+    the statements it fires on. An aggregate inside a CTE or a subquery is still not reported, one
+    in `HAVING` or `ORDER BY` is still not reported, and one that resolved to no table still says
+    so. Every statement here carries a `MIN` or a `MAX` in its output list, so the deleted clause
+    would fire on all four if it survived — including the null case, which is the state it made
+    unreachable for every statement containing one.
+    """
+    marker = rt.assemble_receipt(_sales_org(), sql)["aggregates"]["undetermined"]
+    assert (marker is None) == (phrase is None), (label, marker)
+    assert phrase is None or phrase in marker, (label, marker)
+    assert DELETED_MARKER_PHRASE not in (marker or ""), (label, marker)
+
+
+# --- A22: a fact about correctness is still not a refusal -------------------
+
+
+def test_no_correctness_finding_can_become_a_refusal():
+    """A22. `fan_out_invariant` is not a refusal reason, and the type is what makes it so.
+
+    Asserted against `guardrail.RefusalReason` itself rather than by searching the tree for the
+    string, because the question is not whether some path happens to refuse today. It is whether one
+    could: the reason vocabulary is a closed three-member `Literal`, so a correctness finding has no
+    member to become, and adding a fourth means editing that one line in a diff a reviewer reads.
+    ACE-094 made a multiplication a fact rather than a refusal, and this slice adds a member to the
+    fact vocabulary — the assertion is that the new member landed on the side of that line it was
+    meant to.
+
+    `rt.guardrail` and not a fresh import: it is the module object `runtime` itself resolved, so
+    this cannot pass against a second copy of `guardrail` reached down a different `sys.path` entry
+    than the detector came down.
+
+    The disjointness check covers `_MULTIPLYING_RISKS` whole rather than the new member alone, so
+    the next risk added to it is held to the same rule without anyone remembering to come back here.
+    """
+    reasons = get_args(rt.guardrail.RefusalReason)
+    assert reasons == ("unsafe", "out_of_scope", "undetermined"), reasons
+    assert set(rt._MULTIPLYING_RISKS).isdisjoint(reasons), rt._MULTIPLYING_RISKS
+    assert "fan_out_invariant" in rt._MULTIPLYING_RISKS, rt._MULTIPLYING_RISKS
+    # And end to end: the statement that produces it produces a finding, not a refusal.
+    pf = rt.pre_flight_check(MIN_OVER_FAN, _sales_org())
+    assert {f.risk for f in pf.findings} == {"fan_out_invariant"}, pf.findings
+    assert pf.unchecked is None, pf.unchecked

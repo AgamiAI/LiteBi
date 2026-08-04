@@ -813,7 +813,10 @@ class Finding:
     disclosure naming an alternative presumes an intent principle 6 forbids us to presume.
     """
 
-    risk: str  # "fan_trap" | "chasm_trap" | "bad_aggregation" | "semi_additive"
+    # "fan_trap" | "fan_out_invariant" | "chasm_trap" | "bad_aggregation" | "semi_additive".
+    # `fan_out_invariant` is the fan its aggregate is immune to: the rows really were multiplied and
+    # the number is the same either way, so it belongs beside `fan_trap` and not instead of it.
+    risk: str
     reason: str
     triggering_joins: list[str] = field(default_factory=list)
     # WHICH aggregate this is about, as the parser read it. Without it a finding names the measure
@@ -1667,10 +1670,15 @@ def _aggregate_reports(tree, org: Datasource,
     return reports
 
 
-# The two risks that are statements about the ROWS an aggregate was computed from, and therefore
-# the two that decide `status`. `bad_aggregation` and `semi_additive` are about the aggregate's own
+# The risks that are statements about the ROWS an aggregate was computed from, and therefore the
+# ones that decide `status`. `bad_aggregation` and `semi_additive` are about the aggregate's own
 # meaning and leave the multiplication question exactly where they found it.
-_MULTIPLYING_RISKS = ("fan_trap", "chasm_trap")
+#
+# `fan_out_invariant` is in here, and that is the whole of what ACE-083 changed about `status`. The
+# rows behind a `MAX` over the one side of a fan ARE multiplied; what is false about calling it a
+# trap is the word trap, not the multiplication. Leaving it out would make the item say
+# `not_multiplied`, which is a positive claim that the rows were not duplicated, and they were.
+_MULTIPLYING_RISKS = ("fan_trap", "chasm_trap", "fan_out_invariant")
 
 
 def _preflight_select(tree: "exp.Select", org: Datasource,
@@ -1742,15 +1750,28 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
             }
             measure = _echo_name(measure_table)
             many = [_echo_name(mt) for mt in sorted(many_tables)]
-            reason = (
-                f"fan trap: aggregating {measure!r} (one side) across a join to "
-                f"{many} (many side)."
-            )
+            # Two sentences about ONE fan, picked per aggregate. The edge is the same edge and the
+            # duplication is the same duplication; what differs is whether the number moved with it.
+            # The second states that and stops there — it names no fix, because under principle 6c
+            # this layer does not hold the question and a sentence telling the caller to act on a
+            # value that did not change would be a verdict on a statement that is fine.
+            reason_for = {
+                "fan_trap": (
+                    f"fan trap: aggregating {measure!r} (one side) across a join to "
+                    f"{many} (many side)."
+                ),
+                "fan_out_invariant": (
+                    f"fan out: the join from {measure!r} (one side) to {many} (many side) "
+                    f"multiplies the rows this aggregate reads; its value is unchanged by that "
+                    f"duplication."
+                ),
+            }
             joins = [f"{measure} (1) <- {mt} (N)" for mt in many]
             for i, site in enumerate(sites):
                 if measure_table in site.sources:
+                    risk = "fan_out_invariant" if _is_fan_immune(site.node) else "fan_trap"
                     attached[i].append(Finding(
-                        "fan_trap", reason=reason,
+                        risk, reason=reason_for[risk],
                         triggering_joins=list(joins), aggregate=site.aggregate,
                     ))
 
@@ -2069,17 +2090,24 @@ def _undetermined_sections(reason: str) -> dict[str, dict[str, Any]]:
 
 
 def _is_fan_immune(agg: "exp.AggFunc") -> bool:
-    """Aggregates a fan-out cannot change the value of: MIN, MAX, COUNT(DISTINCT).
+    """Aggregates a row duplication cannot move: MIN, MAX, the boolean folds, anything DISTINCT.
 
-    Duplicating a row does not move a minimum, a maximum, or a count of distinct values, so the
-    detector counting these as fan-out risks is a false positive it currently makes. Fixing the
-    DETECTION is not this spec's; reporting that the detector does it, and only when this statement
-    contains one, is."""
-    if isinstance(agg, (exp.Min, exp.Max)):
+    Duplicating a row does not move a minimum, a maximum, a fold over booleans, or an aggregate
+    computed over the distinct values it was handed. The fan is still real for all of them, which is
+    why this decides the WORD the finding uses and not whether there is one.
+
+    A predicate over node TYPE, never over the written function name. ACE-079 reads every statement
+    in the engine's own dialect, so the same fold is `BOOL_OR` in Postgres and `LOGICAL_OR` on the
+    way back out and any name allowlist is wrong the first time a dialect spells it differently;
+    sqlglot has already resolved both to `exp.LogicalOr` by the time this runs.
+
+    Both DISTINCT spellings, and the first is the one that carries every dialect measured on sqlglot
+    30.15: `SUM(DISTINCT x)` parses to `exp.Sum(this=exp.Distinct(...))` with `args["distinct"]`
+    left at `None`, so testing the arg alone would see no DISTINCT at all. The arg test stays for
+    the older sqlglot the package's `>=20` floor still admits."""
+    if isinstance(agg, (exp.Min, exp.Max, exp.LogicalOr, exp.LogicalAnd)):
         return True
-    return isinstance(agg, exp.Count) and (
-        isinstance(agg.this, exp.Distinct) or bool(agg.args.get("distinct"))
-    )
+    return isinstance(agg.this, exp.Distinct) or bool(agg.args.get("distinct"))
 
 
 def _within(node: "exp.Expression", kinds: tuple) -> bool:
@@ -2128,8 +2156,12 @@ def _aggregates_marker(tree, reports: list[AggregateReport],
          if in_filter_or_sort else ""),
         ("An aggregate inside a CTE or a subquery is not reported: only the SELECT lists that "
          "reach the output are read." if in_nested_scope else ""),
-        ("MIN, MAX and COUNT(DISTINCT) are counted as fan-out risks although a fan-out cannot "
-         "change what they return." if any(_is_fan_immune(a) for a in output) else ""),
+        # The fan-immune clause stood here. It described a gap in the DETECTOR — that MIN, MAX and
+        # COUNT(DISTINCT) were counted as fan-out risks although a fan-out cannot change what they
+        # return — and ACE-083 closed that gap: those aggregates now carry `fan_out_invariant`,
+        # which says the same thing on the item itself where the reader is already looking. A marker
+        # sentence about a shortcoming the detector no longer has is a false statement about this
+        # statement, and the section's null state is the claim it would cost.
         (f"{dropped} further aggregate(s) are not listed." if dropped else ""),
     ) if clause) or None
 

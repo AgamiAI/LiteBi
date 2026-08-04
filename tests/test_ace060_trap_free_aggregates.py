@@ -322,17 +322,24 @@ def test_the_division_of_labour_sentence_is_gone(org):
 
 @pytest.mark.parametrize("sql,phrase", [
     # Each residual clause fires only when THIS statement contains what it describes.
-    ("SELECT MIN(o.total) FROM orders o", "MIN, MAX and COUNT(DISTINCT)"),
-    ("SELECT COUNT(DISTINCT o.id) FROM orders o", "MIN, MAX and COUNT(DISTINCT)"),
     ("SELECT o.id FROM orders o GROUP BY o.id HAVING SUM(o.total) > 1", "HAVING or ORDER BY"),
     ("WITH x AS (SELECT SUM(o.total) t FROM orders o) SELECT x.t FROM x", "CTE or a subquery"),
     (COUNT_STAR, "could not be resolved"),
 ])
 def test_each_residual_clause_is_conditional_on_the_statement(org, sql, phrase):
-    """SC-6. The clauses ACE-083 will delete stay, but only where they are true of the statement.
+    """SC-6. Every surviving clause fires only where it is true of the statement.
 
     Fixed, they pin the marker non-null forever and the null state is unreachable. Conditional, a
     reader who gets one knows it is about the statement in front of them.
+
+    Two rows stood here and are gone, and that is a deliberate contract change made by ACE-083:
+    `SELECT MIN(o.total) FROM orders o` and `SELECT COUNT(DISTINCT o.id) FROM orders o`, both
+    keyed to the clause "MIN, MAX and COUNT(DISTINCT) are counted as fan-out risks…". That clause
+    described a gap in the detector, and the detector no longer has it — an aggregate a duplication
+    cannot move now carries `fan_out_invariant` on its own item. Keeping the sentence would make the
+    marker say the analysis has a shortcoming it does not.
+    `tests/test_ace083_trap_soundness.py::test_the_marker_stops_calling_an_invariant_aggregate_a_fan_out_risk`
+    pins the composition that replaced it, both the clause's absence and the four survivors.
     """
     assert phrase in (_section(org, sql)["undetermined"] or ""), _section(org, sql)
     # And it is absent from a statement that contains no such thing.
