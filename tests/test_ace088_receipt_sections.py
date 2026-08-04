@@ -357,19 +357,21 @@ def test_joins_section_is_one_item_per_join_the_statement_wrote(org):
     assert [i["scope"] for i in section["items"]] == ["main"]
 
 
-def test_joins_section_reports_no_signoff_for_a_join_it_has_not_matched(org):
+def test_joins_section_carries_the_signoff_of_the_relationship_it_matched(org):
     """The sign-off keys are still on the item, and still the fields a client filters on to raise
     its own unreviewed-join banner — a structured state can be grouped, counted and linked back to
     the relationship it is about, which the `warnings` sentences it replaced could not.
 
-    They are null because matching a written join against a declared relationship has not landed.
-    The model here declares `orders -> customers` and this statement plainly joins those two tables,
-    and that is exactly why the item may not borrow the declaration's `review_state`: "the model
-    declares a relationship between these tables" and "this join is that relationship" are different
-    claims, and only the first has been established."""
+    They are filled because the written predicate MATCHED the declaration, which is a stronger claim
+    than the one the per-relationship build made. "The model declares a relationship between these
+    two tables" and "this join is that relationship" are different claims, and the item now carries
+    a trail only for the second — `test_ace059_join_adherence.py` pins the statement that joins the
+    same two declared tables on the wrong column and gets none of this."""
     (item,) = _sections(org)["joins"]["items"]
-    assert item["review_state"] is None
-    assert item["name"] is None and item["on"] is None
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_customers"
+    assert item["review_state"] == "unreviewed"
+    assert item["on"] is None  # this relationship is declared in the FK form
 
 
 def test_joins_section_reads_the_predicate_out_of_the_sql(org):
@@ -897,11 +899,16 @@ def test_a_case_folded_statement_does_not_deny_a_relationship_the_model_declares
     statement reported both tables in scope AND no declared join between them — the receipt stating
     that the model declares no relationship where the model declares one.
 
-    The fold moved with the section: the endpoints of a written join go through `_tkey` before they
-    are tested for membership, so `ORDERS` is a name the model could have a declaration about and
-    the join is left OPEN for the matching pass. Without the fold it would come back
-    `undeclarable`, which is the same false claim in the new vocabulary — and worse than the old
-    one, because `undeclarable` is a SETTLED status and would not even be counted on the marker.
+    The fold moved with the section, in both of the places the answer passes through. The endpoints
+    of a written join go through `_tkey` before they are tested for membership, so `ORDERS` is a name
+    the model could have a declaration about rather than one it could not — without that it would
+    come back `undeclarable`, which is the same false claim in the new vocabulary and worse than the
+    old one, because `undeclarable` is SETTLED and would not even be counted on the marker. Then the
+    matching normalizes both sides as `_tkey(bare_name(...))`, so the declaration is found and the
+    join reads `declared` rather than merely being left open.
+
+    The label is still the caller's own spelling: the status is the claim, and the label is the
+    address a reader finds the join by in their own SQL.
     """
     folded = ("SELECT c.id, SUM(amount) AS total FROM ORDERS o "
               "JOIN CUSTOMERS c ON o.customer_id = c.id GROUP BY c.id")
@@ -909,5 +916,6 @@ def test_a_case_folded_statement_does_not_deny_a_relationship_the_model_declares
 
     assert all(t["declared"] for t in sections["tables"]["items"]), "both tables are in scope"
     (join,) = sections["joins"]["items"]
-    assert join["status"] == rt.UNDETERMINED
+    assert join["status"] == rt.DECLARED
+    assert join["name"] == "orders_to_customers"
     assert join["from_to"] == "ORDERS → CUSTOMERS"

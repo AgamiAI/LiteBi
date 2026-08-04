@@ -10,21 +10,25 @@ What this slice pins:
 
   * one item per `exp.Join` node, each carrying the predicate as the parser read it, the two
     endpoints as the statement wrote them, the query scope, and exactly one status;
+  * a written join matches a declared relationship on an unordered set of `(table, column)` pairs,
+    declared as a SUBSET of written — so operand order does not decide it and a filtering conjunct
+    does not weaken it — in both the FK form and the `on:` escape hatch, and across the cross-area
+    edges the old walk never loaded. **A join between the same two declared tables on different
+    columns reads `undeclared`**, which is the regression: the old build listed it as declared;
   * a join whose endpoint is a name the statement bound for itself (a CTE, a derived table, a CTE
     shadowing a declared table) is `undeclarable` — a name the statement invented cannot carry a
-    declaration;
+    declaration — and that is settled, where an ON this layer could not reduce to a pair is not;
   * an explicit `CROSS JOIN` wrote no predicate, which is a settled fact and reports `undeclared`;
   * the comma join wrote its predicate into the WHERE, which this layer does not attribute, so it
     is `undetermined`;
   * the marker counts only what is UNSETTLED, so a statement with no joins and a statement whose
     joins are all settled both reach null — the state that means "established, here it is";
+  * a statement whose joins are all undeclared executes and is never refused;
   * the cap, the predicate's bound, and the same section on every run.
 
-Matching a written join against a declared relationship is the NEXT slice: every sign-off key on
-the item is null here, and every join with a predicate is therefore `undetermined`.
-
-The model is this battery's own rather than the one ACE-088/094/060 share: adding the edges these
-cases need to a shared fixture would move every receipt those batteries assert on.
+The model is this battery's own rather than the one ACE-088/094/060 share: no governance fixture
+declares an `on:` relationship or a cross-area edge, and adding either to a shared fixture would
+move every receipt those batteries assert on.
 """
 
 from __future__ import annotations
@@ -46,52 +50,119 @@ PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
 if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
+import execute_sql  # noqa: E402
+import guardrail  # noqa: E402
 from semantic_model import loader as L  # noqa: E402
 from semantic_model import runtime as rt  # noqa: E402
 
 # --- fixture ----------------------------------------------------------------
 
 
-def _write_model(root: Path) -> None:
-    """Three tables in one chain: `orders` -> `customers` -> `regions`.
+SIGNED_OFF = {"review_state": "approved", "signed_off_by": "you@example.com",
+              "signed_off_role": "data_owner", "signed_off_at": "2026-01-01T00:00:00Z"}
 
-    Two declared, unreviewed relationships, so the sign-off keys on an item have something they
-    COULD carry once matching lands and are demonstrably null until it does. `orders.amount` is
-    what the pre-aggregating CTE sums, which is the shape that produces an endpoint the model
-    cannot declare.
+# The org-level edges. Declared here rather than on a subject area because `_cardinality_index` is
+# the only loader that reaches them, and a walk over `org.subject_areas` — which is what the section
+# used to do — cannot see a single one of these however correct its matching is.
+CROSS_AREA_EDGES = [
+    # SC-3a: a plain FK edge between two areas.
+    {"from_subject_area": "ops", "to_subject_area": "s",
+     "from_table": "shipments", "from_column": "customer_id",
+     "to_table": "customers", "to_column": "id",
+     "relationship": "many_to_one", "confidence": "inferred", "review_state": "unreviewed"},
+    # A COMPOSITE `on:`, which the FK form cannot express: the model validator admits exactly one
+    # column pair there, so a two-column join reaches the matching only through this hatch.
+    {"from_subject_area": "ops", "to_subject_area": "s",
+     "from_table": "shipments", "to_table": "orders",
+     "on": "shipments.order_id = orders.id AND shipments.tenant_id = orders.tenant_id",
+     "relationship": "many_to_one", "confidence": "inferred", "review_state": "unreviewed"},
+    # Two `on:` texts no comparison can be made from. `Relationship.on` is unvalidated model-author
+    # text, so both are shapes a real model reaches this code with.
+    {"from_subject_area": "ops", "to_subject_area": "s",
+     "from_table": "shipments", "to_table": "regions", "on": "shipments.region_id =",
+     "relationship": "many_to_one", "confidence": "inferred", "review_state": "unreviewed"},
+    {"from_subject_area": "ops", "to_subject_area": "s",
+     "from_table": "shipments", "to_table": "regions",
+     "on": "shipments.region_id = regions.id AND regions.id = :region",
+     "relationship": "many_to_one", "confidence": "inferred", "review_state": "unreviewed"},
+]
+
+
+def _write_model(root: Path, *, storage_type: str = "PostgreSQL") -> None:
+    """Two areas: `s` chains `orders` -> `customers` -> `regions`, `ops` holds `shipments`.
+
+    The declared edges are chosen so that no two of them cover the same pair of tables. A second
+    edge on a pair would make "which one matched" a question about list order rather than about the
+    rule under test — except for the last pair below, where being unusable is the point and neither
+    edge can match anything:
+
+      * `orders` -> `customers`, FK form, approved and signed off: the block a `declared` item
+        carries, and the pair SC-2's wrong-column regression is written against;
+      * `public.customers` -> `public.regions`, FK form, schema-qualified and unreviewed: the two
+        halves of the table-name normalization, and the `introspect_heuristic` origin;
+      * `orders` -> `regions`, the `on:` escape hatch in its single-conjunct form;
+      * `shipments` -> `customers` (FK) and `shipments` -> `orders` (composite `on:`), declared
+        org-level as CROSS-AREA edges;
+      * `shipments` -> `regions` twice, with an `on:` that will not parse and one carrying a
+        `:param` a model author left for an executor to fill.
+
+    `orders.amount` is what the pre-aggregating CTE sums, which is the shape that produces an
+    endpoint the model cannot declare.
+
+    `storage_type` is a parameter for one reason: the end-to-end fixture needs an engine the
+    built-in executor can be pointed at, and every other test here reads the receipt off the model.
     """
     yaml = __import__("yaml")
     (root / "subject_areas" / "s" / "tables").mkdir(parents=True)
+    (root / "subject_areas" / "ops" / "tables").mkdir(parents=True)
     (root / "datasource.yaml").write_text(yaml.safe_dump({
         "datasource": "p", "version": 1,
-        "storage_connections": [{"name": "c", "storage_type": "PostgreSQL"}],
-        "subject_areas": ["subject_areas/s"]}))
+        "storage_connections": [{"name": "c", "storage_type": storage_type}],
+        "subject_areas": ["subject_areas/s", "subject_areas/ops"],
+        "cross_subject_area_relationships": CROSS_AREA_EDGES}))
     (root / "subject_areas" / "s" / "subject_area.yaml").write_text(yaml.safe_dump({
         "name": "s",
         "tables": [{"storage_connection": "c", "schema": "public", "table": t}
                    for t in ("orders", "customers", "regions")]}))
+    (root / "subject_areas" / "ops" / "subject_area.yaml").write_text(yaml.safe_dump({
+        "name": "ops",
+        "tables": [{"storage_connection": "c", "schema": "public", "table": "shipments"}]}))
 
-    def _table(name: str, columns: list[dict]) -> None:
-        (root / "subject_areas" / "s" / "tables" / f"{name}.yaml").write_text(yaml.safe_dump({
+    def _table(area: str, name: str, columns: list[dict]) -> None:
+        (root / "subject_areas" / area / "tables" / f"{name}.yaml").write_text(yaml.safe_dump({
             "name": name, "schema": "public", "storage_connection": "c", "grain": ["id"],
             "description": name, "columns": columns}))
 
-    _table("orders", [{"name": "id", "type": "integer", "primary_key": True},
-                      {"name": "customer_id", "type": "integer"},
-                      {"name": "amount", "type": "decimal"}])
-    _table("customers", [{"name": "id", "type": "integer", "primary_key": True},
-                         {"name": "region_id", "type": "integer"}])
-    _table("regions", [{"name": "id", "type": "integer", "primary_key": True},
-                       {"name": "name", "type": "string"}])
+    _table("s", "orders", [{"name": "id", "type": "integer", "primary_key": True},
+                           {"name": "customer_id", "type": "integer"},
+                           {"name": "region_id", "type": "integer"},
+                           {"name": "tenant_id", "type": "integer"},
+                           {"name": "amount", "type": "decimal"}])
+    _table("s", "customers", [{"name": "id", "type": "integer", "primary_key": True},
+                              {"name": "region_id", "type": "integer"}])
+    _table("s", "regions", [{"name": "id", "type": "integer", "primary_key": True},
+                            {"name": "name", "type": "string"}])
+    _table("ops", "shipments", [{"name": "id", "type": "integer", "primary_key": True},
+                                {"name": "order_id", "type": "integer"},
+                                {"name": "customer_id", "type": "integer"},
+                                {"name": "region_id", "type": "integer"},
+                                {"name": "tenant_id", "type": "integer"}])
     (root / "subject_areas" / "s" / "relationships.yaml").write_text(yaml.safe_dump({
         "relationships": [
             {"from_table": "orders", "from_column": "customer_id",
              "to_table": "customers", "to_column": "id",
              "from_schema": "public", "to_schema": "public",
+             "relationship": "many_to_one", "confidence": "confirmed", **SIGNED_OFF},
+            # Schema-qualified on BOTH endpoints, which is how an introspection that stamped the
+            # namespace writes them. `_tkey` folds case without stripping a schema and `bare_name`
+            # strips a schema without folding case, so a match needs both.
+            {"from_table": "public.customers", "from_column": "region_id",
+             "to_table": "public.regions", "to_column": "id",
+             "from_schema": "public", "to_schema": "public",
              "relationship": "many_to_one", "confidence": "inferred",
              "review_state": "unreviewed"},
-            {"from_table": "customers", "from_column": "region_id",
-             "to_table": "regions", "to_column": "id",
+            {"from_table": "orders", "to_table": "regions",
+             "on": "orders.region_id = regions.id",
              "from_schema": "public", "to_schema": "public",
              "relationship": "many_to_one", "confidence": "inferred",
              "review_state": "unreviewed"},
@@ -121,6 +192,8 @@ TWO_JOINS = ("SELECT r.name FROM orders o "
              "JOIN customers c ON o.customer_id = c.id "
              "JOIN regions r ON c.region_id = r.id")
 COMMA_JOIN = "SELECT c.id FROM orders o, customers c WHERE o.customer_id = c.id"
+TWO_COMMA_JOINS = ("SELECT r.name FROM orders o, customers c, regions r "
+                   "WHERE o.customer_id = c.id AND c.region_id = r.id")
 CROSS_JOIN = "SELECT c.id FROM orders o CROSS JOIN customers c"
 SINGLE_TABLE = "SELECT o.id FROM orders o WHERE o.amount > 10"
 # Pre-aggregate, then join the aggregate back: the join's right endpoint is a name the statement
@@ -146,6 +219,26 @@ JOIN_IN_SUBQUERY = ("SELECT o.id FROM orders o WHERE o.customer_id IN "
 COMPOUND_ON = ("SELECT r.name FROM orders o "
                "JOIN customers c ON o.customer_id = c.id "
                "JOIN regions r ON c.region_id = r.id AND o.id = r.id")
+# The same two declared tables, joined on a column pair no relationship declares.
+WRONG_COLUMN = "SELECT c.id FROM orders o JOIN customers c ON o.id = c.id"
+# The declared FK read right to left. A declared edge has a direction the SQL author never sees.
+REVERSED = "SELECT c.id FROM orders o JOIN customers c ON c.id = o.customer_id"
+# The declared pair plus a range predicate — the as-of / soft-delete shape.
+EXTRA_CONJUNCT = ("SELECT c.id FROM orders o JOIN customers c "
+                  "ON o.customer_id = c.id AND o.amount > 10")
+DECLARED_ON = "SELECT r.name FROM orders o JOIN regions r ON o.region_id = r.id"
+CROSS_AREA = "SELECT c.id FROM shipments s JOIN customers c ON s.customer_id = c.id"
+COMPOSITE = ("SELECT o.id FROM shipments s JOIN orders o "
+             "ON s.order_id = o.id AND s.tenant_id = o.tenant_id")
+# The pair whose two declared edges are both unusable.
+UNUSABLE_ON = "SELECT r.name FROM shipments s JOIN regions r ON s.region_id = r.id"
+# Two written ONs that reduce to no column pair: one joins on an expression, the other leaves its
+# columns unqualified.
+ON_AN_EXPRESSION = "SELECT c.id FROM orders o JOIN customers c ON o.customer_id = c.id + 1"
+ON_UNQUALIFIED = "SELECT c.id FROM orders o JOIN customers c ON customer_id = id"
+# The declaration is schema-qualified and the statement is upper-cased: neither side is spelled the
+# way the other one is.
+FOLDED = "SELECT R.NAME FROM CUSTOMERS C JOIN REGIONS R ON C.REGION_ID = R.ID"
 
 
 # --- SC-1: one item per join the statement wrote ----------------------------
@@ -164,16 +257,15 @@ def test_the_section_is_one_item_per_written_join(org):
         "o.customer_id = c.id", "c.region_id = r.id",
     ]
     assert [i["scope"] for i in items] == ["main", "main"]
-    assert [i["status"] for i in items] == [rt.UNDETERMINED, rt.UNDETERMINED]
+    assert [i["status"] for i in items] == [rt.DECLARED, rt.DECLARED]
 
 
-def test_every_item_carries_exactly_one_status_and_the_signoff_keys_it_has_not_matched_yet(org):
-    """The shape is flat and the sign-off keys are the ones the model-keyed item already had, so a
-    consumer reading `review_state` off a join keeps reading it off the same key.
+def test_every_item_carries_exactly_one_status_and_the_same_flat_key_set(org):
+    """The item is a wire contract the receipt panel and the CLI read, so the key set is asserted
+    rather than left to whichever keys a test happens to look at.
 
-    They are null because nothing has been matched: a written join is not yet tied to a declared
-    relationship, and inventing a `review_state` for a join no declaration is known to cover would
-    put a sign-off trail on something nobody signed off.
+    Flat, and the sign-off keys are the ones the model-keyed item already had: nesting them under a
+    `relationship` object would rewrite every reader for no gain.
     """
     (item,) = _items(org, ONE_JOIN)
     assert set(item) == {
@@ -181,9 +273,6 @@ def test_every_item_carries_exactly_one_status_and_the_signoff_keys_it_has_not_m
         "review_state", "signed_off_by", "signed_off_role", "signed_off_at", "cross_schema", "on",
     }
     assert item["status"] in {rt.DECLARED, rt.UNDECLARED, rt.UNDECLARABLE, rt.UNDETERMINED}
-    assert all(item[k] is None for k in (
-        "name", "cardinality", "confidence", "origin", "review_state", "signed_off_by",
-        "signed_off_role", "signed_off_at", "cross_schema", "on"))
 
 
 def test_two_identically_written_joins_are_two_items(org):
@@ -194,6 +283,174 @@ def test_two_identically_written_joins_are_two_items(org):
     assert len(items) == 2
     assert {i["scope"] for i in items} == {"main#1", "main#2"}
     assert {i["predicate"] for i in items} == {"o.customer_id = c.id"}
+
+
+# --- SC-2: matching a written join against a declared relationship ----------
+
+
+def test_the_same_two_declared_tables_on_different_columns_read_undeclared(org):
+    """The regression the spec names, and the reason this section was rebuilt.
+
+    The old walk listed a relationship because the model declares it and both of its tables are in
+    scope. So a statement joining `orders` to `customers` on the wrong column got the declared,
+    signed-off relationship printed beside its answer and read as blessed — the receipt vouching for
+    a join path nobody vouched for, which is worse than saying nothing.
+    """
+    (item,) = _items(org, WRONG_COLUMN)
+    assert item["status"] == rt.UNDECLARED
+    assert item["name"] is None
+    assert item["review_state"] is None
+
+
+def test_the_fk_form_matches_and_names_the_relationship(org):
+    (item,) = _items(org, ONE_JOIN)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_customers"
+
+
+def test_the_on_escape_hatch_matches(org):
+    """The other form a `Relationship` comes in. Its text is parsed into the same pairs the written
+    ON is reduced to, so one rule covers both and neither form is compared as a string."""
+    (item,) = _items(org, DECLARED_ON)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_regions"
+    assert item["on"] == "orders.region_id = regions.id"
+
+
+def test_reversed_operand_order_matches(org):
+    """A declared FK points from the many side to the one side. The author of the SQL has no reason
+    to write it in that order and every reason not to notice, so comparing the parsed trees would
+    report a blessed join as unblessed on operand order alone. The pair is unordered."""
+    (item,) = _items(org, REVERSED)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_customers"
+
+
+def test_a_composite_on_matches(org):
+    """`Relationship`'s validator admits exactly one column pair in the FK form, so a two-column
+    join can only be declared through `on:` — and only a rule that handles several pairs at once
+    can match it."""
+    (item,) = _items(org, COMPOSITE)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "shipments_to_orders"
+
+
+def test_an_extra_non_equality_conjunct_does_not_weaken_the_match(org):
+    """Declared is a SUBSET of written, not an equality.
+
+    `ON o.customer_id = c.id AND o.amount > 10` joins on the declared pair and then filters, which
+    is the as-of and soft-delete shape. Demanding equality would report `undeclared` on most real
+    statements, and a status is worth only what its rarity makes it worth. It is also the stance
+    ACE-099 shipped for declared filters, so a reader comparing `tables` and `joins` sees one rule.
+    """
+    (item,) = _items(org, EXTRA_CONJUNCT)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_customers"
+
+
+# --- SC-3a: the cross-area edges the old walk never loaded ------------------
+
+
+def test_a_cross_subject_area_edge_reads_declared(org):
+    """Asserted rather than assumed, because the section did not load these at all.
+
+    The old build walked `org.subject_areas` and never `org.cross_subject_area_relationships`, so a
+    genuinely declared cross-area join was missing from a section claiming to list declared ones —
+    a false negative in the direction that matters. `_cardinality_index` is the loader that reaches
+    both, and it is reused here rather than re-walked so a third place cannot drift from it.
+    """
+    (item,) = _items(org, CROSS_AREA)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "shipments_to_customers"
+
+
+# --- SC-2: the two spellings of a table name --------------------------------
+
+
+def test_a_schema_qualified_declaration_matches_a_case_folded_statement(org):
+    """Both halves of the name normalization at once, because either alone leaves a false negative.
+
+    `_tkey` folds case without stripping a schema and `bare_name` strips a schema without folding
+    case, so a relationship declared `public.customers` -> `public.regions` never matches a
+    statement writing `CUSTOMERS`/`REGIONS` unless both sides go through `_tkey(bare_name(...))`.
+    """
+    (item,) = _items(org, FOLDED)
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "public.customers_to_public.regions"
+
+
+# --- SC-2: declared text a comparison cannot be made from -------------------
+
+
+def test_an_unusable_declared_on_degrades_to_no_match(org):
+    """`Relationship.on` is model-author text nothing validates as SQL, so both shapes here are
+    shapes a real model arrives with, and neither may take the receipt down with it.
+
+    The `:param` half is the one that would fail silently. A bind marker is not a column, so the
+    conjunct holding it drops out of the pairs and what is left — `shipments.region_id =
+    regions.id` — matches the statement exactly. Without the marker check this join would read
+    `declared` against a relationship whose predicate the statement did not write.
+    """
+    (item,) = _items(org, UNUSABLE_ON)
+    assert item["status"] == rt.UNDECLARED
+    assert item["name"] is None
+
+
+@pytest.mark.parametrize("sql", [ON_AN_EXPRESSION, ON_UNQUALIFIED],
+                         ids=["expression", "unqualified"])
+def test_a_written_on_that_reduces_to_no_column_pair_is_undetermined(org, sql):
+    """The written side has its own way of yielding nothing, and it must not read `undeclared` —
+    that would assert the model does not declare this join, which nothing here established.
+
+    One of these joins on an EXPRESSION, which is not a column pair to compare against anything. The
+    other leaves its columns unqualified, and this layer will not guess which relation a bare column
+    belongs to: a pair naming the wrong table is not a weaker fact than no pair, it is a false one,
+    and it would match a declaration the statement never wrote.
+    """
+    (item,) = _items(org, sql)
+    assert item["status"] == rt.UNDETERMINED
+    assert item["name"] is None
+
+
+# --- SC-2: what a matched relationship contributes --------------------------
+
+
+def test_the_signoff_block_is_carried_on_declared(org):
+    """The keys are the ones the relationship-keyed item already carried, so a consumer reading
+    `review_state` off a join keeps reading it off the same key."""
+    (item,) = _items(org, ONE_JOIN)
+    assert item["status"] == rt.DECLARED
+    assert item["cardinality"] == "many_to_one"
+    assert item["confidence"] == "confirmed"
+    assert item["origin"] == "fk"
+    assert item["review_state"] == "approved"
+    assert item["signed_off_by"] == "you@example.com"
+    assert item["signed_off_role"] == "data_owner"
+    assert item["signed_off_at"] == "2026-01-01T00:00:00Z"
+    assert item["cross_schema"] is False
+    assert item["on"] is None
+
+
+def test_an_unconfirmed_relationship_reports_the_other_origin(org):
+    """`origin` is derived from `confidence`, which is the only place the two differ."""
+    (item,) = _items(org, FOLDED)
+    assert item["confidence"] == "inferred"
+    assert item["origin"] == "introspect_heuristic"
+    assert item["review_state"] == "unreviewed"
+    assert item["signed_off_by"] is None
+
+
+@pytest.mark.parametrize("sql", [WRONG_COLUMN, CROSS_JOIN, PRE_AGGREGATE, COMMA_JOIN],
+                         ids=["undeclared", "cross", "undeclarable", "undetermined"])
+def test_every_model_derived_key_is_null_on_every_other_status(org, sql):
+    """An item that matched nothing asserts nothing about a relationship it did not match. Borrowing
+    a sign-off from a relationship that merely happens to connect the two tables is exactly the
+    defect the wrong-column regression above pins."""
+    (item,) = _items(org, sql)
+    assert item["status"] != rt.DECLARED
+    assert all(item[k] is None for k in (
+        "name", "cardinality", "confidence", "origin", "review_state", "signed_off_by",
+        "signed_off_role", "signed_off_at", "cross_schema", "on"))
 
 
 # --- SC-2: a join that wrote no ON ------------------------------------------
@@ -243,10 +500,13 @@ def test_a_self_bound_endpoint_cannot_carry_a_declaration(org, sql):
 def test_a_self_join_resolves_to_the_one_table_on_both_sides(org):
     """Its ON names exactly one relation, because both sides of the join ARE that relation. That is
     two endpoints resolved, not a failure to resolve them — a model can declare a relationship from
-    a table to itself, so calling this undeclarable would be a settled claim that it cannot."""
+    a table to itself, so calling this undeclarable would be a settled claim that it cannot.
+
+    This model declares no such relationship, so the pair reaches the matching and comes back
+    `undeclared`: checked against every declared edge and matched by none of them."""
     (item,) = _items(org, "SELECT a.id FROM orders a JOIN orders b ON a.id = b.customer_id")
     assert item["from_to"] == "orders → orders"
-    assert item["status"] == rt.UNDETERMINED
+    assert item["status"] == rt.UNDECLARED
 
 
 def test_an_on_reaching_over_more_than_two_relations_is_not_reduced_to_a_pair(org):
@@ -266,7 +526,7 @@ def test_an_on_reaching_over_more_than_two_relations_is_not_reduced_to_a_pair(or
     SQL whatever the status says about it. The status is the claim; the label is the address.
     """
     first, second = _items(org, COMPOUND_ON)
-    assert first["status"] == rt.UNDETERMINED
+    assert first["status"] == rt.DECLARED  # the same statement's other join settles normally
     assert second["status"] == rt.UNDETERMINED
     assert second["from_to"] == "orders → regions"
 
@@ -317,18 +577,20 @@ def test_a_join_inside_a_cte_body_is_found_at_all(org):
 # --- SC-5: the marker states what THIS statement left unsettled -------------
 
 
-@pytest.mark.parametrize("sql", [SINGLE_TABLE, CROSS_JOIN], ids=["no-joins", "all-settled"])
+@pytest.mark.parametrize(
+    "sql", [SINGLE_TABLE, CROSS_JOIN, ONE_JOIN, WRONG_COLUMN, TWO_JOINS],
+    ids=["no-joins", "cross", "declared", "undeclared", "two-declared"])
 def test_the_marker_is_null_when_nothing_is_unsettled(org, sql):
-    """`undeclared` and `undeclarable` are settled facts, not gaps: the section established what it
-    could establish about them. Counting them would make null unreachable for any statement with a
-    join in it, which is the failure the fixed sentence had."""
+    """`declared`, `undeclared` and `undeclarable` are settled facts, not gaps: the section
+    established what it could establish about them. Counting them would make null unreachable for
+    any statement with a join in it, which is the failure the fixed sentence had."""
     assert _section(org, sql)["undetermined"] is None
 
 
 def test_the_marker_counts_the_unsettled_joins_and_names_nothing(org):
     """A bare count of the CALLER's own joins. Naming a table here would disclose model structure
     the items beside it did not already, and the items are where a name belongs anyway."""
-    section = _section(org, TWO_JOINS)
+    section = _section(org, TWO_COMMA_JOINS)
     assert section["undetermined"] == (
         "2 of the listed join(s) could not be matched against the model, so whether the model "
         "declares them is not established."
@@ -350,16 +612,21 @@ def test_the_marker_never_ships_an_internal_spec_id(org):
 # --- SC-6: the cap ----------------------------------------------------------
 
 
-def _many_joins(n: int) -> str:
-    joins = " ".join(f"JOIN customers c{i} ON o.customer_id = c{i}.id" for i in range(n))
-    return f"SELECT o.id FROM orders o {joins}"
+def _many_comma_joins(n: int) -> str:
+    """`n` joins that all stay UNSETTLED, so the marker composes both of its clauses at once.
+
+    Comma joins rather than the declared FK written `n` times: a written join that MATCHES is
+    settled, so a statement of those would drop the marker's first clause and the cap test could no
+    longer show the two composed.
+    """
+    return "SELECT o.id FROM orders o, " + ", ".join(f"customers c{i}" for i in range(n))
 
 
 def test_the_overflow_is_counted_never_listed(org):
     """One entry per join the CALLER wrote is caller-controlled length, unlike the metric list whose
     length is the deployment's own — so a statement inventing hundreds of joins would amplify a
     small request into a large section at no cost to whoever asked for it."""
-    section = _section(org, _many_joins(rt._RECEIPT_MAX_REFS + 1))
+    section = _section(org, _many_comma_joins(rt._RECEIPT_MAX_REFS + 1))
     assert len(section["items"]) == rt._RECEIPT_MAX_REFS
     assert section["undetermined"] == (
         f"{rt._RECEIPT_MAX_REFS} of the listed join(s) could not be matched against the model, so "
@@ -369,7 +636,7 @@ def test_the_overflow_is_counted_never_listed(org):
 
 
 def test_the_cap_does_not_bite_a_statement_under_it(org):
-    section = _section(org, _many_joins(rt._RECEIPT_MAX_REFS))
+    section = _section(org, _many_comma_joins(rt._RECEIPT_MAX_REFS))
     assert len(section["items"]) == rt._RECEIPT_MAX_REFS
     assert "not listed" not in section["undetermined"]
 
@@ -410,6 +677,58 @@ def test_an_endpoint_name_is_bounded(org):
     assert "SYSTEM NOTE" not in item["from_to"]
 
 
+# --- SC-8: reported, never refused ------------------------------------------
+
+
+class _SpyExecutor:
+    """Records the exact string the executor was handed, or that nothing was."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict, str]] = []
+
+    def execute(self, vetted_sql: str, creds: dict, *, profile: str) -> "execute_sql.ExecResult":
+        self.calls.append((vetted_sql, creds, profile))
+        return execute_sql.ExecResult(columns=["id"], rows=[(1,)], truncated=False)
+
+
+@pytest.fixture()
+def warehouse(tmp_path, monkeypatch):
+    """The same model plus the engine and environment `execute_guarded` reads.
+
+    Only the two tests that assert what a CALLER receives need it; every other test here reads the
+    receipt straight off the model and takes the lighter `org` above.
+    """
+    artifacts = tmp_path / "artifacts"
+    (artifacts / "p").mkdir(parents=True)
+    _write_model(artifacts / "p", storage_type="SQLite")
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
+    monkeypatch.setenv("DATASOURCE_URL__P", f"sqlite:///{tmp_path / 'w.db'}")
+    for var in ("AGAMI_DB_URL", "APP_DATABASE_URL", "AGAMI_ORG_ID", "AGAMI_SQL_TIMEOUT_S"):
+        monkeypatch.delenv(var, raising=False)
+    return artifacts
+
+
+@pytest.mark.parametrize("sql", [WRONG_COLUMN, UNUSABLE_ON], ids=["wrong-column", "unusable-on"])
+def test_a_statement_whose_joins_are_all_undeclared_executes_and_is_never_refused(warehouse, sql):
+    """SC-8, asserted against the refusal vocabulary rather than by convention.
+
+    An undeclared join reaches no table and no column outside the model, so it is none of the three
+    reasons a statement may be refused for. Whether that path is the right one depends on the
+    question, which never reaches this frame. A future change that reintroduced a correctness
+    refusal would have to widen `RefusalReason` to do it, and this fails first if it does.
+    """
+    assert set(guardrail.get_args(guardrail.RefusalReason)) == {
+        "unsafe", "out_of_scope", "undetermined"
+    }, "the refusal vocabulary widened — a correctness finding is still none of these"
+
+    spy = _SpyExecutor()
+    env = execute_sql.execute_guarded(sql, "p", "s", executor=spy)
+    assert env.status == "ok", env
+    assert env.refusal is None
+    assert spy.calls and spy.calls[0][0] == sql  # byte-identical, per ACE-093
+    assert [i["status"] for i in env.receipt.joins.items] == [rt.UNDECLARED]
+
+
 # --- SC-8: the same section on every run ------------------------------------
 
 
@@ -439,6 +758,11 @@ def test_the_section_is_the_same_in_every_process(tmp_path):
         assert proc.returncode == 0, proc.stderr
         seen.add(proc.stdout.strip())
     assert len(seen) == 1, f"the section differed across hash seeds: {seen}"
-    assert [i["from_to"] for i in json.loads(seen.pop())["items"]] == [
-        "orders → customers", "customers → regions",
+    items = json.loads(seen.pop())["items"]
+    assert [i["from_to"] for i in items] == ["orders → customers", "customers → regions"]
+    # Matching walks `_cardinality_index` in list order and takes the first match, so WHICH
+    # relationship an item names is fixed too — not just which items there are.
+    assert [i["name"] for i in items] == [
+        "orders_to_customers", "public.customers_to_public.regions",
     ]
+    assert [i["status"] for i in items] == ["declared", "declared"]

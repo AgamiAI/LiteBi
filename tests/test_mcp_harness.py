@@ -324,15 +324,15 @@ def test_mcp_receipt_surfaces_unapproved_metric_and_the_join_the_statement_wrote
     rev = next(i["metric"] for i in r.columns.items
                if i["metric"] and i["metric"]["name"] == "revenue")
     assert rev["review_state"] == "unreviewed"
-    # The join half of this used to read `review_state == "unreviewed"`, borrowed from the declared
-    # relationship the two in-scope tables happened to have. The section is one item per join the
-    # STATEMENT wrote now, and nothing has yet matched a written join to a declaration — so there is
-    # no sign-off state to surface and inventing one would put a trail on a join nobody matched. The
-    # `review_state` assertion returns here when matching lands; what the server can carry today is
-    # the join itself, which is what is pinned.
+    # The join half. `review_state` used to be borrowed from whichever declared relationship the two
+    # in-scope tables happened to have; the section is one item per join the STATEMENT wrote now, and
+    # this predicate MATCHES that declaration, so the state the server surfaces is a state about this
+    # join rather than about the pair of tables it touches. The predicate rides beside it, which is
+    # what lets a client show the join it is asking the user to sign off on.
     assert [j["from_to"] for j in r.joins.items] == ["orders → customers"]
     assert [j["predicate"] for j in r.joins.items] == ["o.customer_id = c.id"]
-    assert [j["review_state"] for j in r.joins.items] == [None]
+    assert [j["status"] for j in r.joins.items] == ["declared"]
+    assert [j["review_state"] for j in r.joins.items] == ["unreviewed"]
     # The ai-written column is flagged as an assumption.
     assert any(a["column"].endswith("orders.amount") for a in r.assumptions.items)
 

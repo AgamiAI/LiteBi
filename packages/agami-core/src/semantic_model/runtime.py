@@ -2201,7 +2201,8 @@ def assemble_receipt(
         # see UNDETERMINED_NO_PARSER.
         return {"model_version": model_version,
                 **_undetermined_sections(UNDETERMINED_NO_PARSER)}
-    tree = _parse_sql(sql, _dialect_of(org)[0])
+    dialect = _dialect_of(org)[0]
+    tree = _parse_sql(sql, dialect)
     if tree is None:
         return {"model_version": model_version,
                 **_undetermined_sections(UNDETERMINED_UNPARSEABLE)}
@@ -2225,9 +2226,9 @@ def assemble_receipt(
     # in scope. The old walk described the MODEL filtered by the statement: it listed a relationship
     # the statement never traversed as though the answer had leaned on it, and a join the statement
     # DID write that the model does not declare was invisible — which is the one thing a reader of
-    # this section most needs to see. `_join_sites` reads the joins off the parse tree; matching
-    # each one against a declaration is what fills in the sign-off keys below, and until it lands
-    # every one of them is null rather than borrowed from a relationship nobody matched.
+    # this section most needs to see. `_join_sites` reads the joins off the parse tree; `declared`
+    # below matches each one against a declaration, and only a MATCHED relationship fills the
+    # sign-off keys, so an item never borrows a trail from a relationship nobody matched.
     #
     # Capped like the reference sections, with the overflow COUNTED on the marker and never listed:
     # this is one entry per join the CALLER's statement wrote, so its length is caller-controlled
@@ -2237,8 +2238,15 @@ def assemble_receipt(
     # discloses nothing.
     join_sites = _join_sites(tree, visible)
     dropped_joins = max(0, len(join_sites) - _RECEIPT_MAX_REFS)
+    # Every relationship the model declares, through `_cardinality_index` — per subject area PLUS
+    # `org.cross_subject_area_relationships`. The old walk read only the subject areas, so a
+    # genuinely declared cross-area join was missing from a section that claimed to list declared
+    # ones. Reduced to pairs ONCE, before the loop: an `on:` costs a parse, and a statement may write
+    # up to the cap of joins against a model that may declare hundreds of edges.
+    declared_pairs = [(rel, _declared_pairs(rel, dialect)) for rel in _cardinality_index(org)]
     join_items: list[dict[str, Any]] = []
     for js in join_sites[:_RECEIPT_MAX_REFS]:
+        match: Optional[Relationship] = None
         if not js.declarable:
             # An endpoint the STATEMENT bound — a CTE name, a derived table, a CTE shadowing a
             # declared table — cannot be what any declaration is about, so this is settled rather
@@ -2255,13 +2263,46 @@ def assemble_receipt(
             # It wrote no predicate, which is a fact about the statement and not a gap in the
             # analysis: there is nothing here for a declaration to match.
             status = UNDECLARED
-        else:
-            # Two shapes reach here. The comma join (`FROM a, b WHERE a.id = b.id`) wrote its
-            # predicate into the WHERE, and attributing a WHERE conjunct to a join is an implication
-            # check ACE-099 ruled out. Everything else has a predicate and is UNDETERMINED because
-            # nothing has compared it against the model yet — ACE-059 slice 2 owns that comparison
-            # and is what turns this into `declared` or `undeclared`.
+        elif not js.pairs:
+            # Two shapes reach here and both leave the question open. The comma join
+            # (`FROM a, b WHERE a.id = b.id`) wrote its predicate into the WHERE, and attributing a
+            # WHERE conjunct to a join is an implication check ACE-099 ruled out. The other is an ON
+            # nothing in reduced to a pair of columns — a join on an expression, or on an
+            # unqualified column this layer will not guess the table of. Neither is evidence that
+            # the model does not declare the join, which is what `undeclared` would assert.
             status = UNDETERMINED
+        else:
+            # The written pairs against the declared ones, DECLARED-AS-A-SUBSET: extra conjuncts an
+            # author added — the as-of and soft-delete shapes — do not weaken the match, which is the
+            # stance ACE-099 shipped for declared filters, so a reader comparing `tables` and `joins`
+            # sees one rule and not two. First match in `_cardinality_index`'s own list order, so the
+            # same statement names the same relationship on every run (REQ-022).
+            match = next((rel for rel, pairs in declared_pairs
+                          if pairs is not None and pairs <= js.pairs), None)
+            status = DECLARED if match is not None else UNDECLARED
+        # Everything a DECLARATION contributes, and null on every other status: an item that matched
+        # nothing must assert nothing about a relationship it did not match, which is the defect the
+        # per-relationship build had — it printed a signed-off trail beside a join written on the
+        # wrong column. Composed as one dict so both branches carry the identical key set.
+        signoff: dict[str, Any] = {key: None for key in (
+            "name", "cardinality", "confidence", "origin", "review_state", "signed_off_by",
+            "signed_off_role", "signed_off_at", "cross_schema", "on")}
+        if match is not None:
+            signoff = {
+                "name": f"{match.from_table}_to_{match.to_table}",
+                "cardinality": match.relationship,
+                "confidence": match.confidence,
+                # A confirmed relationship is one the DATABASE declares as a foreign key; anything
+                # else was proposed by introspection and is a guess until someone signs it off.
+                "origin": "fk" if match.confidence == "confirmed" else "introspect_heuristic",
+                # The sign-off state a consumer filters on to raise its own unreviewed-join banner.
+                "review_state": match.review_state,
+                "signed_off_by": match.signed_off_by,
+                "signed_off_role": match.signed_off_role,
+                "signed_off_at": match.signed_off_at,
+                "cross_schema": match.cross_schema,
+                "on": match.on,
+            }
         left, right = js.endpoints
         join_items.append({
             "predicate": js.predicate,
@@ -2272,19 +2313,9 @@ def assemble_receipt(
             # receipt takes: the receipt is tool output the calling model weights as
             # server-authored, and a quoted identifier can hold any string at all.
             "from_to": f"{_echo_name(left)} → {_echo_name(right)}",
-            # Everything a DECLARATION would contribute, and null until one is matched. The keys are
-            # the ones the relationship-keyed item already carried, so a consumer reading
-            # `review_state` off a join keeps reading it off the same key.
-            "name": None,
-            "cardinality": None,
-            "confidence": None,
-            "origin": None,
-            "review_state": None,
-            "signed_off_by": None,
-            "signed_off_role": None,
-            "signed_off_at": None,
-            "cross_schema": None,
-            "on": None,
+            # The keys are the ones the relationship-keyed item already carried, so a consumer
+            # reading `review_state` off a join keeps reading it off the same key.
+            **signoff,
         })
 
     # Metrics carry their own `review_state` for the approve/change banner, for the same reason
@@ -3009,6 +3040,83 @@ class _JoinSite(NamedTuple):
     # apart because the assembler turns the first into a settled status and the second into an open
     # one, and `_joins_marker` counts only the open ones.
     pinned: bool
+    # The written ON reduced to the column pairs it joins on — see `_predicate_pairs` for the shape
+    # and why it is that shape. Empty when the join wrote no ON at all, and empty when nothing in
+    # the ON reduced to a pair; the assembler reads both as "not established" rather than as "the
+    # model does not declare this", because a predicate we could not read is not a predicate the
+    # model failed to declare.
+    pairs: frozenset[frozenset[tuple[str, str]]]
+
+
+def _predicate_pairs(pred: "exp.Expression",
+                     scope_map: dict[str, str]) -> frozenset[frozenset[tuple[str, str]]]:
+    """One predicate reduced to the column pairs it joins on — the shape both sides compare in.
+
+    An equality between two columns is one pair and everything else in the predicate is dropped,
+    because nothing else is a join. Each pair is a FROZENSET of its two `(table, column)` endpoints,
+    which is what makes reversed operand order match: a declared FK points from the many side to the
+    one side, the author of the SQL has no reason to write it that way round, and an ordered
+    comparison would report a blessed join as unblessed on operand order alone.
+
+    `scope_map` resolves a qualifier to the relation it names — for a written ON that is the
+    ENCLOSING SELECT's alias map and never the tree-wide one, so one arm of a UNION cannot resolve
+    through the other arm's tables; for declared text it is empty, because a declaration names its
+    tables directly. Both endpoints normalize through `_tkey(_bare(...))`: `_tkey` folds case
+    without stripping a schema and `_bare` strips a schema without folding case, so a relationship
+    declared on `sales.orders` and a statement writing `ORDERS` need both to meet.
+
+    A column with no qualifier contributes nothing. The pair would name a relation this layer did
+    not resolve, and a pair naming the wrong table is not a weaker fact than no pair — it is a false
+    one, and it would match a declaration the statement did not write.
+
+    `_and_conjuncts` is the flattener, and it is iterative for a reason this call site inherits: a
+    wide AND walked recursively raises `RecursionError` out of the assembler, which takes every
+    section of the receipt down with it for a statement the engine ran without complaint.
+    """
+    pairs: set[frozenset[tuple[str, str]]] = set()
+    for conj in _and_conjuncts(pred):
+        if not isinstance(conj, exp.EQ):
+            continue
+        lhs, rhs = conj.this, conj.expression
+        if not (isinstance(lhs, exp.Column) and isinstance(rhs, exp.Column)):
+            continue
+        if not (lhs.table and rhs.table):
+            continue
+        pairs.add(frozenset({
+            (_tkey(_bare(scope_map.get(lhs.table, lhs.table))), lhs.name.lower()),
+            (_tkey(_bare(scope_map.get(rhs.table, rhs.table))), rhs.name.lower()),
+        }))
+    return frozenset(pairs)
+
+
+def _declared_pairs(rel: Relationship,
+                    dialect: "str | None") -> "frozenset[frozenset[tuple[str, str]]] | None":
+    """One declared relationship in that same shape, or None when no comparison can be made from it.
+
+    The FK form yields exactly one pair, because `Relationship`'s validator admits either the column
+    pair or the `on:` escape hatch and never both — so a composite join reaches the matching only
+    through `on:`, which yields one pair per equality conjunct.
+
+    None rather than an exception, and None rather than an empty set, on the module's usual posture:
+    `Relationship.on` is model-author text that nothing validates as SQL, so an `on:` that will not
+    parse is a thing that happens, and a receipt that raises on one is a receipt the caller never
+    sees. A `:param` a model author left for an executor to fill is the case that would fail
+    SILENTLY rather than loudly: a bind marker is not a column, so the conjunct holding it drops out
+    of the pairs and what remains would match a statement that never wrote its condition. Both
+    degrade to "this relationship matches nothing", which costs a `declared` we cannot justify.
+    """
+    if rel.from_column is not None and rel.to_column is not None:
+        return frozenset({frozenset({
+            (_tkey(_bare(rel.from_table)), rel.from_column.lower()),
+            (_tkey(_bare(rel.to_table)), rel.to_column.lower()),
+        })})
+    text = rel.on or ""
+    if _BIND_MARKER.search(text):
+        return None
+    predicate = _parse_declared_predicate(text, dialect)
+    if predicate is None:
+        return None
+    return _predicate_pairs(predicate, {}) or None
 
 
 def _relation_name(rel: "exp.Expression") -> str:
@@ -3083,6 +3191,8 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
             endpoints=(left, right),
             declarable=_tkey(left) in visible and _tkey(right) in visible,
             pinned=pinned,
+            # Resolved through THIS join's own enclosing scope, which is the map already in hand.
+            pairs=_predicate_pairs(on, scope_map) if on is not None else frozenset(),
         ))
     return sites
 
