@@ -39,6 +39,7 @@ if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
 import execute_sql  # noqa: E402
+import guardrail  # noqa: E402
 from semantic_model import runtime as rt  # noqa: E402
 
 PROFILE = "acme"
@@ -181,24 +182,45 @@ def test_the_executed_statement_equals_the_received_one(shop, sql):
     assert spy.calls[0][0] == sql
 
 
-def test_bracket_quoting_is_byte_identical_or_refused_and_never_mangled(shop):
-    """The property holds under BOTH regimes, which is what keeps this test honest across the
-    dialect work it does not own.
+def test_bracket_quoting_is_byte_identical_and_never_mangled(shop):
+    """Was written as a disjunction — byte-identical OR refused — to survive the dialect work it
+    does not own. That work has landed, so the outcome is determinate and the disjunction is gone.
 
-    Today `[orders]` clears the scope gate — the default dialect reads it as an array literal, so
-    there is no table to find undeclared — and reaches the driver. Once dialect-aware parsing lands
-    it will be read as a table, found undeclared, and refused. Either is fine here. What must never
-    happen is the third thing: the statement reaching the driver ALTERED, which is the only outcome
-    this file exists to forbid.
+    The prediction it carried turned out to be wrong in an instructive direction. It expected
+    `[orders]` to be "read as a table, found undeclared, and refused", on the assumption that the
+    brackets were an artifact no grammar would accept. sqlglot's `sqlite` grammar does accept them:
+    it reads the table `orders`, which this model DOES declare, so the statement is now understood
+    rather than merely tolerated, clears the scope gate for the real reason, and reaches the driver
+    unaltered. Before the fix it also reached the driver, but only because the generic dialect read
+    `[orders]` as an array literal and left the scope gate with no table to object to — the right
+    outcome from a gate that had not understood the statement.
+
+    Leaving the `or refused` branch in would let a regression to that fail-open pass silently: an
+    undeclared bracket-quoted table would refuse, this test would take the other branch, and nothing
+    would notice that the declared one had stopped being readable. `[secret]` below is the pair that
+    makes the reading real rather than incidental.
     """
     spy = _SpyExecutor()
     env = execute_sql.execute_guarded(BRACKET_QUOTED, PROFILE, AREA, executor=spy)
 
-    if env.status == "refused":
-        assert spy.calls == []          # a refusal executes nothing at all
-    else:
-        assert env.status == "ok", env
-        assert spy.calls[0][0] == BRACKET_QUOTED
+    assert env.status == "ok", env
+    assert spy.calls[0][0] == BRACKET_QUOTED
+
+
+def test_a_bracket_quoted_undeclared_table_is_refused(shop):
+    """The pair to the case above, and what makes it evidence rather than a coincidence.
+
+    Identical shape, one identifier changed: `[secret]` is not declared. If the guard were still
+    failing to read the brackets, both statements would reach the driver — so this refusing is what
+    says the one above was allowed because the model declares `orders`, and not because the gate saw
+    nothing to object to.
+    """
+    spy = _SpyExecutor()
+    env = execute_sql.execute_guarded("SELECT id FROM [secret]", PROFILE, AREA, executor=spy)
+
+    assert env.status == "refused", env
+    assert env.refusal.rule == guardrail.RULE_TABLE_SCOPE
+    assert spy.calls == []
 
 
 def test_a_refused_statement_never_reaches_the_executor(shop):
