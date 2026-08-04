@@ -212,11 +212,18 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # call. Nothing reads it to compute a bound, and it is cleared at the entry to every call, so it
     # cannot outlive the call that set it — let alone reach a child.
     #
-    # `_guard_shape` (ACE-087) passes the same test for the third time: it carries the shape the
+    # `_last_outcome` (ACE-098) is the third, and it is the same kind as the first: an OUTPUT
+    # carrier. It holds the classified verdict of a call that has already finished, so the transport
+    # can record why it failed without re-parsing the body it is about to return. Written after the
+    # budget is resolved and spent, never read to compute a bound, and cleared at the entry to every
+    # call. It also cannot cross the fork, which is the hazard here — and does not need to: the
+    # parent sets it from the Envelope it rebuilds on its own side.
+    #
+    # `_guard_shape` (ACE-087) passes the same test for the fourth time: it carries the shape the
     # safety pass read off the statement across to the refusal builder, within one call, and is
     # cleared at entry beside `_guard_model`. It is read only to choose the WORDING of a refusal
     # that has already been decided — never to compute a bound, and never before one is spent.
-    context_vars -= {"_last_error_detail", "_guard_model", "_guard_shape"}
+    context_vars -= {"_last_error_detail", "_guard_model", "_last_outcome", "_guard_shape"}
     assert context_vars == set(), (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"

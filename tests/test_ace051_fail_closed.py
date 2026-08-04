@@ -227,12 +227,20 @@ def test_hosted_refusal_stderr_is_a_single_clean_json_object(tmp_path):
 
     `_model_safety` no longer writes, so the single-clean-object property is now `main`'s to keep —
     and this is where it must be pinned, because this is where a caller actually reads it. The
-    child is given an unreachable DB and no disk model, which is the same fail-closed condition the
-    in-process test above exercises.
+    child is given a REACHABLE but empty app database and no disk model, so the only thing missing
+    is the model.
+
+    It used to be given an unreachable one, which was the same fail-closed condition until ACE-097:
+    an unreachable app DB is now BOTH "no model source" and "no audit store", and the audit gate
+    runs above the model pass, so the child refused `audit_unavailable` and this test's subject
+    became unreachable. Isolating the cause is what keeps it testing what it says — the sibling
+    in-process tests above call `_model_safety` directly and never met the new gate, which is why
+    only this one moved.
     """
+    app_db = tmp_path / "app.db"
     env = {
         **os.environ,
-        "AGAMI_DB_URL": "postgres://user:pw@127.0.0.1:1/nope",
+        "AGAMI_DB_URL": f"sqlite://{app_db}",
         "AGAMI_ARTIFACTS_DIR": str(tmp_path / "no_disk"),
     }
     proc = subprocess.run(

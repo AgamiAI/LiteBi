@@ -51,10 +51,14 @@
       // An UNDECLARED reference (a CTE name, say) carries declared:false and null qname / rows /
       // rows_as_of / freshness, because there is no model row for those to be about.
       //
-      // `scope` is the query scope the reference was written in — "main", "cte:<name>", or
-      // "subquery". It is what tells two entries with the SAME `ref` apart, and without it the
-      // `filters` list below cannot be read: a filter satisfied inside a CTE body is not satisfied
-      // for the statement that READS that CTE.
+      // `scope` is the query scope the reference was written in — "main" or "cte:<name>", each
+      // carrying a trailing "#<n>" when that scope is one of two or more arms of a UNION /
+      // INTERSECT / EXCEPT ("main#2", "cte:recent#1"), or "subquery", which never takes an arm
+      // number because it names no scope to have arms. It is what tells two entries with
+      // the SAME `ref` apart, and without it the `filters` list below cannot be read: a filter
+      // satisfied inside a CTE body is not satisfied for the statement that READS that CTE, and a
+      // filter applied in one arm of a UNION is not applied in the other. The ordinal is the arm's
+      // position in the SQL, which is NOT this list's order.
       //
       // `filters` is one entry per declared `default_filters` condition of that table, each
       // {expr, status} with status "applied" | "omitted" | "undetermined" — did THAT reference's
@@ -1391,16 +1395,29 @@
             li.appendChild(document.createTextNode(' → '));
             li.appendChild(el('code', { text: t.qname }));
           }
-          // WHICH query scope wrote this reference. Drawn only when it is not the main SELECT,
-          // because "main" is the unremarkable case and labelling every row with it would bury the
+          // WHICH query scope wrote this reference. Drawn only when it is not a bare main SELECT,
+          // because that is the unremarkable case and labelling every row with it would bury the
           // one that matters. It is also the ONLY thing that tells two entries apart when a
           // statement reads the same table twice under the same name and no alias — and it is what
           // makes the filter verdicts below readable, since a filter satisfied inside a CTE body
           // is not satisfied for the statement that reads that CTE.
+          //
+          // An arm of a set operation is NOT unremarkable: the scope carries a trailing "#<n>"
+          // there, and it is the only thing distinguishing two arms of one UNION that read the
+          // same table — the item list is in parse-walk order, so position in the list does not
+          // recover the arm. Split on the LAST "#": the CTE-name half is sanitized to an
+          // identifier alphabet that excludes "#" before the label is composed, so any "#" here
+          // is the ordinal's.
           const scope = t.scope ? String(t.scope) : '';
-          if (scope && scope !== 'main') {
-            li.appendChild(el('span', { class: 'receipt-meta', text: scope.startsWith('cte:')
-              ? ' · read inside the CTE ' + scope.slice(4) : ' · read inside a subquery' }));
+          const hash = scope.lastIndexOf('#');
+          const base = hash > 0 ? scope.slice(0, hash) : scope;
+          const arm = hash > 0 ? scope.slice(hash + 1) : '';
+          if (base && (base !== 'main' || arm)) {
+            const where = base.startsWith('cte:') ? 'read inside the CTE ' + base.slice(4)
+                        : base === 'main' ? 'read in the main query'
+                        : 'read inside a subquery';
+            li.appendChild(el('span', { class: 'receipt-meta',
+              text: ' · ' + where + (arm ? ', set-operation arm ' + arm : '') }));
           }
           if (t.declared === false) {
             // An undeclared reference has no model row, so there is no row estimate and no

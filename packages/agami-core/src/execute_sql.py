@@ -86,6 +86,7 @@ from guardrail import (
     RECEIPT_BUILD_FAILED,
     RECEIPT_NO_MODEL,
     RECEIPT_NO_RUNTIME,
+    RULE_AUDIT_UNAVAILABLE,
     RULE_MODEL_UNAVAILABLE,
     RULE_RESOURCE_LIMIT,
     Envelope,
@@ -1288,6 +1289,33 @@ _DEFAULT_MAX_ROWS = 1000  # rows a result may hold before the transfer bound ref
 # eventually serializes.
 _last_error_detail: ContextVar[str | None] = ContextVar("_last_error_detail", default=None)
 
+# The classified outcome of THIS call, for the tool-call recorder (ACE-098). `tools.record_tool_call`
+# derived `success` / `error_kind` by `json.loads`-ing the serialized body and reading
+# `refusal["rule"]` out of it — so the tool_calls row's account of WHY a call failed depended on our
+# own wire shape holding still, which is exactly what principle 7's re-derivation bar cannot rest on.
+#
+# It has to travel out-of-band because the tool handler returns a `str`: by the time the transport
+# runs its `finally`, the Envelope is gone and a serialized body is all there is. Same mechanism and
+# same reasoning as `_last_error_detail` directly above, including the clear-on-entry — a verdict
+# left behind by an earlier call must never label this one — and the same reason it is a ContextVar
+# rather than a module global: the in-process path runs tool handlers on worker threads.
+#
+# **Read by the TRANSPORT, out of a context it owns.** That is not a detail — a ContextVar set
+# inside `async_offload.run_blocking`'s worker thread is invisible to the caller and to every other
+# worker, because anyio hands the thread a COPY of the context. Verified rather than assumed: a var
+# set in one `run_blocking` reads back `None` both in the request task and in a second
+# `run_blocking`. So `mcp_http` runs the handler inside its own `contextvars.copy_context()` and
+# reads the result out of that object afterwards. A plain "set here, read there" would silently
+# record nothing on the one surface that records tool calls at all.
+#
+# `(status, rule, row_count)`, not the whole Envelope: the transport needs to say whether the call
+# succeeded, which gate stopped it, and how many rows came back. Putting a contract object in here
+# invites somebody to serialize it from the transport instead of from the one place that owns the
+# wire shape.
+_last_outcome: ContextVar[tuple[str, str | None, int | None] | None] = ContextVar(
+    "_last_outcome", default=None
+)
+
 # The semantic model `_model_safety` resolved for THIS call, so the receipt describes the model the
 # gates actually consulted rather than one re-resolved a moment later — and so the hosted path loads
 # it ONCE per query rather than twice (`_resolve_guard_model` is a full DB or disk load and is not
@@ -1650,6 +1678,68 @@ def _hosted() -> bool:
     `tools._load_org` / `Store.from_env` use. On it, a missing model is a safety failure (fail
     closed); locally (no DB) a not-yet-built model legitimately means 'no model yet'."""
     return bool(os.environ.get("AGAMI_DB_URL") or os.environ.get("APP_DATABASE_URL"))
+
+
+def _audit_store_reachable() -> bool:
+    """Whether the audit store can be opened right now — the pre-execution half of principle 7
+    (ACE-097).
+
+    Recording happens at the tool edge, AFTER the statement ran: `tools._record_execution` is called
+    from `tools._emit`, the serializer. So closing the swallows there can only turn a lost record
+    into a raised exception on a statement that already reached the customer's database. Refusing
+    *instead of* executing needs the question asked before execution, and this is that question.
+
+    `Store.from_env()` is the probe rather than a DSN parse because it is not a parse:
+    `Store.connect` calls `psycopg2.connect` / `sqlite3.connect` eagerly, so constructing one either
+    reaches the database or raises. It is also the identical call `_record_query` will make, which
+    is what makes the answer relevant rather than merely adjacent — a probe that opens a different
+    connection than the writer would is a probe of something else.
+
+    **Costs one connect per served call.** Deliberate and measured against the alternatives: a cached
+    health flag is stale in exactly the direction that matters (it says yes while the store is
+    already gone), and anything cheaper does not establish reachability at all. The deployment
+    already pays a comparable per-request open in `tools._model_version`; pooling the pair is
+    ACE-028's, not this slice's.
+
+    Local is always True and never opens anything. `governance-principles.md` scopes the principles
+    to the served deployment, and locally there is no store to reach: `_record_query` writes jsonl,
+    and a read-only artifacts directory must not stop a laptop from answering.
+    """
+    if not _hosted():
+        return True
+    try:
+        from store import Store
+
+        store = Store.from_env()
+    except Exception:
+        # Every way the store can be unopenable produces the same refusal, because there is only one
+        # thing a caller can do about any of them. But the CAUSE has to land somewhere, or this
+        # reintroduces the defect the spec exists to remove in a new place: a bad DSN scheme, an
+        # unreachable host and a missing driver would all read as one opaque refusal and an operator
+        # would have nothing to work from. Server log, with the traceback — the same treatment
+        # `_record_query` gives a swallowed write, and for the same reason.
+        #
+        # `_RAW_LOG`, not `_LOG`, and for BOTH of that logger's reasons. The exception text carries
+        # the host, the port and the DSN scheme — raw text, the operator's and never the caller's
+        # (ACE-039). And this module never calls `basicConfig`, so a record on `_LOG` falls through
+        # to `logging.lastResort` and lands on STDERR, which on the CLI/fork path is a wire carrying
+        # exactly one JSON object: a diagnostic line there does not merely add noise, it makes the
+        # refusal unparseable and the parent loses it entirely. `main` silences `_RAW_LOG` for the
+        # child's lifetime, so the child stays clean while in-process and hosted still get the cause
+        # on the server's root logger — which is where the operator being told to "restore the audit
+        # database" actually reads it.
+        _RAW_LOG.warning("audit store is not reachable; refusing to execute unrecorded",
+                         exc_info=True)
+        return False
+    if store is None:
+        # Reachable, not defensive: `_hosted()` tests the variable for truthiness while `from_env`
+        # strips it, so a whitespace-only `AGAMI_DB_URL` lands exactly here. A configured-but-empty
+        # store is a misconfiguration, and on a security gate a misconfiguration reads as
+        # unreachable, never as fine.
+        _RAW_LOG.warning("the audit store url is set but empty; treating it as unreachable")
+        return False
+    store.close()
+    return True
 
 
 def _resolve_guard_model(profile: str):
@@ -2208,6 +2298,10 @@ def execute_guarded(
     # be attributed to this one. The recorder reads it unconditionally; a stale value would put the
     # wrong error text on a row that succeeded.
     _last_error_detail.set(None)
+    # Same reason again: a verdict left behind by an earlier call in this context must never label
+    # this one. The recorder falls back to parsing the body when this is None, so a stale value is
+    # strictly worse than no value — it would be believed.
+    _last_outcome.set(None)
     # Same reason, same load-bearing half: a model resolved for an earlier call in this context must
     # never be the one this call's receipt describes.
     _guard_model.set(None)
@@ -2229,6 +2323,24 @@ def execute_guarded(
     # that says what it is for.
     received_sql = sql
     try:
+        # FIRST, above the read-only gate, because principle 7 records "every call ... whether it
+        # executed or was refused" — so gating only execution would leave the refusals unrecorded
+        # too, and the outcomes most worth reviewing are exactly the ones a reviewer could not find.
+        # A `DROP TABLE` therefore comes back `audit_unavailable` rather than `read_only` while the
+        # store is down. Nothing is weakened by that ordering: both are refusals, nothing runs, and
+        # the security gates below are unreachable only in the state where NOTHING is reachable.
+        #
+        # Outside the `no_safety` branch on purpose. That flag skips the semantic-model pass and
+        # nothing else; an audit guarantee is not a model check, and a caller able to opt out of
+        # being recorded is the hole this spec closes.
+        if not _audit_store_reachable():
+            refusal = refuse(
+                RULE_AUDIT_UNAVAILABLE,
+                detail="the audit store is not reachable, so this call cannot be recorded",
+                remediation="Restore the audit database, then run the statement again.",
+            )
+            return _envelope("refused", refusal=refusal,
+                             receipt=_refusal_receipt(refusal, received_sql, profile))
         import sql_guard
 
         refusal = sql_guard.check_read_only(sql)

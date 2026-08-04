@@ -12,6 +12,45 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The audit row now says what the decision was made against, and what you were told (ACE-098).**
+  A row recorded the verdict — `ok` / `refused` / `failed`, and for a refusal which rule under which
+  reason — but nothing about the basis for it, so nobody could take a row and check the decision
+  again. Three columns close that: `detail` (the refusal's own sentence, which is where "which bound
+  fired and what it was set to" lives, since the statement timeout and the row bound share one rule),
+  `receipt` (everything the trust receipt reported, including its `undetermined` markers), and
+  `model_version` as a column you can filter on.
+
+  A test now takes those rows and **re-derives each refusal with no database connection at all**,
+  matching what was recorded. That is the check that tells whether the fields are sufficient rather
+  than merely present. The two runtime bounds are exempt and stay exempt: whether a statement
+  outruns its budget is a property of the run, not of the SQL, so it is not reproducible offline by
+  anyone.
+
+  Also, the **tool-call log now reads the verdict rather than re-reading the answer**. It used to
+  parse the response body to work out whether a call failed and why, which made the audit trail
+  depend on the wire format; it now takes the classified outcome directly.
+
+- **A self-hosted server that cannot record a query no longer runs it (ACE-097).** Recording was
+  best-effort in three places, and two of them were silent, so a deployment could execute SQL
+  against your database and keep no record of having done so with nothing anywhere saying the
+  record was lost.
+
+  On a **server** (one with `AGAMI_DB_URL` or `APP_DATABASE_URL` configured), the audit store is now
+  checked before the statement runs. If it cannot be opened the call is refused, with
+  `rule: audit_unavailable` and a remediation naming the operator action, and the statement never
+  reaches your database. If the store was reachable at that check and the write fails afterwards,
+  the call fails rather than returning an answer whose statement left no trace. The connection is
+  read-only, so nothing was changed and re-running costs only the round trip.
+
+  **Local single-player use is unchanged.** With no database configured there is no audit store to
+  reach: the log is a local jsonl file, a write failure is still logged and never breaks your query,
+  and a read-only artifacts directory cannot stop you asking questions.
+
+  For operators this is an availability change, and a deliberate one: a briefly unreachable audit
+  database now produces refusals rather than unrecorded answers.
+
 ### Added
 
 - **The receipt now tells you which of a table's declared filters your statement actually applied
@@ -114,6 +153,16 @@ below corresponds to one such version.
 
 ### Contract changes
 
+- Receipt `tables` items carry an **arm ordinal on `scope`** (ACE-043). When a reference's scope is
+  one of two or more arms of a `UNION` / `INTERSECT` / `EXCEPT`, its label gains a trailing 1-based
+  `#<n>`: `main#1`, `main#2`, `cte:recent#2`. A plain `SELECT` and a single-arm CTE body are
+  unchanged and carry no suffix, and `subquery` never takes one. **If you branch on
+  `scope === 'main'` or `scope === 'cte:x'`, that branch stops matching inside a set operation —
+  strip the ordinal with `scope.replace(/#\d+$/, '')` (or `scope.rsplit('#', 1)[0]`) and branch on
+  that.** Split from the RIGHT, not the left: the CTE-name half is caller-written text, and it is
+  only sanitization to an identifier alphabet excluding `#` that keeps a left split working today. The ordinal is the arm's position in the SQL, which
+  is not the order of this list: items are in parse-walk order, so a capped receipt can list
+  ordinals that are neither contiguous nor monotonic, and the largest one is not the arm count.
 - Receipt `tables` items gain **`scope`** and **`filters`** (ACE-099). `ref` is unchanged and is
   still a string. A `refused` or `failed` receipt is unchanged too — it carries `{ref, declared}`
   and neither new field, because a declared filter names the columns and literals the model author

@@ -734,6 +734,20 @@ def test_echoing_the_callers_own_identifier_is_allowed():
 # five-rule literal could not see. It is unproduced today, so nothing leaked; that it was invisible
 # to the completeness assertion is the point.
 _NO_VECTOR = {
+    guardrail.RULE_AUDIT_UNAVAILABLE: (
+        "Not drivable from this matrix, and it has nothing to enumerate FROM. Every vector here "
+        "runs against the fixture's healthy app database, and breaking that database is what "
+        "produces this rule — so a vector for it would have to dismantle the environment the other "
+        "five need, and would then be measuring the fixture rather than the refusal. What makes the "
+        "exemption safe rather than convenient is that this refusal interpolates NOTHING: its "
+        "detail and remediation are two authored sentences that touch neither the model nor the "
+        "caller's statement, so there is no value for a crafted query to steer into them. That is a "
+        "property rather than an observation, and it is asserted directly in "
+        "test_ace097_recording_mandatory.py::test_the_refusal_says_nothing_about_where_the_store_lives, "
+        "which checks the whole serialized refusal against the DSN, the scheme, the artifacts path "
+        "and the app database url. A future gate that interpolates anything into this rule's text "
+        "has to delete this entry and earn a vector."
+    ),
     guardrail.RULE_UNPARSEABLE: (
         "One producer, unreachable on every route. `sql_guard.check_no_recon` refuses `unparseable` "
         "when the neutralizer cannot read the statement (ACE-039) — but at the chokepoint "

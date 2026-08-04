@@ -557,8 +557,10 @@ def test_sections_carry_metadata_and_structure_only_never_values(org):
     assert {frozenset(i) for i in sections["columns"]["items"]} == {frozenset({"column", "metric"})}
     assert {frozenset(i) for i in sections["tables"]["items"]} == {
         frozenset({"ref", "alias", "qname", "declared", "rows", "rows_as_of", "freshness",
-                   # The two the declared-filter accounting added. `scope` is a label from a closed
-                   # set (`main` / `cte:<name>` / `subquery`) and `filters` is a list of
+                   # The two the declared-filter accounting added. `scope` is a label built from a
+                   # closed set of forms — `main` / `cte:<name>` / `subquery`, the first two taking
+                   # a `#<n>` arm ordinal when the scope is one of several arms of a set operation —
+                   # and `filters` is a list of
                    # `{expr, status}` whose `expr` is the MODEL author's own declaration with this
                    # reference's identifier bound into it — model metadata and statement structure,
                    # the same two things every other field here is made of. Neither can carry a

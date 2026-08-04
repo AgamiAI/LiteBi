@@ -194,11 +194,20 @@ def test_a_top_level_reference_is_scoped_to_the_main_query():
     assert _scopes("SELECT o.id FROM orders o") == {"orders": "main"}
 
 
-def test_every_arm_of_a_set_operation_is_scoped_to_the_main_query():
+def test_every_arm_of_a_set_operation_is_scoped_to_the_main_query_and_numbered():
     """An arm is an OUTPUT query, not a nested one: its rows reach the caller directly, so a filter
-    is owed on it exactly as it is owed on a single top-level SELECT."""
+    is owed on it exactly as it is owed on a single top-level SELECT. That is why the label is
+    `main` and not `subquery`, and it is unchanged.
+
+    What ACE-043 added is the second half of the label. `main` alone is the same answer for every
+    arm, so two arms reading one table under one alias were two identical rows on the receipt and
+    the filter accounting could not say which of them applied a declared filter. The 1-based `#<n>`
+    is the arm's position in the SQL, and it appears only where there are two or more arms to tell
+    apart — `test_a_top_level_reference_is_scoped_to_the_main_query` above is the other side of that
+    guard and still reads a bare `main`.
+    """
     assert _scopes("SELECT id FROM orders UNION SELECT id FROM payments") == {
-        "orders": "main", "payments": "main",
+        "orders": "main#1", "payments": "main#2",
     }
 
 

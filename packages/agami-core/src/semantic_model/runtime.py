@@ -552,6 +552,31 @@ def _direct_from_tables(tree: "exp.Select") -> set[str]:
     return names
 
 
+def _output_select_arms(node: "exp.Expression") -> list[list["exp.Select"]]:
+    """One slot per arm AS THE CALLER WROTE IT, holding the output SELECTs that arm contributes.
+
+    The single walk. `_output_selects` is its flattened projection, the same way
+    `_table_references` is `_reference_sites`'.
+
+    A slot can be EMPTY, and that is the whole reason this shape exists rather than a flat list.
+    An arm need not contribute an output SELECT: `(VALUES ('x', 0))` parses to a `Subquery` wrapping
+    `Values`, and a malformed arm can parse to nothing at all. A flat list drops those arms
+    silently, and anything numbering the survivors positionally then closes the gap and reports a
+    LATER arm under an EARLIER arm's number — a receipt fact that is not merely missing but wrong,
+    which is the one outcome worth more code to avoid. Keeping a slot for such an arm costs one
+    empty list and keeps every other arm's position true to the SQL.
+
+    Nested set operations and parenthesized arms flatten into this list, because `(A UNION B) UNION
+    C` is three arms to the caller who wrote it and the label has to agree."""
+    if isinstance(node, exp.SetOperation):  # base of Union / Intersect / Except
+        return _output_select_arms(node.this) + _output_select_arms(node.expression)
+    if isinstance(node, (exp.Subquery, exp.Paren)) and node.this is not None:
+        return _output_select_arms(node.this)  # `(SELECT …) UNION (SELECT …)`
+    if isinstance(node, exp.Select):
+        return [[node]]
+    return [[]]  # an arm that reaches the output without an output SELECT, or nothing parseable
+
+
 def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     """The SELECTs whose projection reaches the query OUTPUT: the top-level SELECT, or
     — for a set operation (UNION / INTERSECT / EXCEPT) — every arm.
@@ -562,14 +587,12 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     the table-scope fix). Nested subquery / CTE SELECTs are excluded on purpose: their
     projections feed an enclosing query, not the final result, so a sensitive column a
     WHERE-subquery projects but the outer query only filters on is not exposed and must
-    not be refused."""
-    if isinstance(node, exp.Select):
-        return [node]
-    if isinstance(node, exp.SetOperation):  # base of Union / Intersect / Except
-        return _output_selects(node.this) + _output_selects(node.expression)
-    if isinstance(node, (exp.Subquery, exp.Paren)):  # `(SELECT …) UNION (SELECT …)`
-        return _output_selects(node.this) if node.this is not None else []
-    return []
+    not be refused.
+
+    Flattened from `_output_select_arms`, which keeps the arm boundaries this list discards.
+    Callers that only ask "which SELECTs reach the output" want this one; only something
+    NUMBERING the arms needs to know that an arm contributed none."""
+    return [sel for arm in _output_select_arms(node) for sel in arm]
 
 
 def projected_sensitive_columns(sql: str, org: Datasource,
@@ -1748,12 +1771,16 @@ def assemble_receipt(
             # Freshness describes a table the model declares. An undeclared reference (a CTE name,
             # say) has no model row for it to be about, so claiming it would be a lie by shape.
             "freshness": freshness if t else None,
-            # Which query scope wrote this reference: `main`, `cte:<name>`, or `subquery`. It is the
-            # fact that makes the `filters` list below readable — a filter satisfied inside a CTE
-            # body is not satisfied for the statement that READS that CTE, and two entries for the
-            # same table would otherwise be told apart only by an alias they need not have. The
-            # caller-written half of the label (the CTE's own name) is already `_echo_name`-bounded
-            # where the scope is decided, so it is composed here unchanged.
+            # Which query scope wrote this reference: `main`, `cte:<name>`, or `subquery`, the first
+            # two carrying a trailing `#<n>` arm ordinal inside a set operation. It is the fact that
+            # makes the `filters` list below readable — a filter satisfied inside a CTE body is not
+            # satisfied for the statement that READS that CTE, a filter applied in one arm of a
+            # UNION is not applied in the other, and two entries for the same table would otherwise
+            # be told apart only by an alias they need not have. The caller-written half of the
+            # label (the CTE's own name) is already `_echo_name`-bounded where the scope is decided,
+            # and the ordinal is generated there rather than echoed, so both are composed here
+            # unchanged. Note the ordinal is the arm's position in the SQL while this list is in
+            # parse-walk order, so a capped receipt can show ordinals that skip and go backwards.
             "scope": r.scope,
             # Which of this reference's declared `default_filters` the statement applied, omitted,
             # or left undetermined. Deliberately NOT subject to `_RECEIPT_MAX_REFS`: its length is
@@ -2019,6 +2046,10 @@ def _cte_body_scopes(root: "exp.Expression") -> dict[int, str]:
     recognized": a filter satisfied in a UNION-ed CTE was reported as satisfied nowhere nameable.
     `_output_selects` returns `[cte.this]` unchanged when the body is a plain SELECT, so the extra
     registration below is only ever a second write of the same pair in that case.
+
+    This answers WHICH CTE a reference sits in, and stops there. WHICH ARM of a UNION-ed body it
+    sits in is `_arm_suffixes`, so that one numbering rule covers CTE bodies and the statement root
+    alike; `_reference_sites` composes the two labels.
     """
     out: dict[int, str] = {}
     for cte in root.find_all(exp.CTE):
@@ -2028,6 +2059,47 @@ def _cte_body_scopes(root: "exp.Expression") -> dict[int, str]:
         out[id(cte.this)] = name
         for sel in _output_selects(cte.this):
             out[id(sel)] = name
+    return out
+
+
+def _arm_suffixes(root: "exp.Expression") -> dict[int, str]:
+    """id(<an output select>) -> the `#<n>` its scope label carries; an absent key means no suffix.
+
+    Keyed by object identity for the same reason `_cte_body_scopes` is: exp nodes hash by STRUCTURE,
+    so two arms written identically would collide on the node itself.
+
+    ONE mechanism for both scope families. "Which of these arms is this?" is the same question asked
+    of the statement root and of each CTE body, so it is answered once here and `_reference_sites`
+    composes the answer onto whichever label it built. Two mechanisms would drift: a UNION-ed CTE
+    body and a top-level UNION would number by different rules, and a reader could not tell the two
+    suffixes apart.
+
+    ONLY a genuine set operation is numbered. A plain SELECT is a one-element list of arms, and
+    suffixing it would put `#1` on every ordinary statement — noise on the case that was never
+    ambiguous, and a contract change to every consumer for nothing. Hence the `< 2` guard, and hence
+    an absent key means "no suffix", never "arm unknown".
+
+    Numbered over `_output_select_arms`, NOT over the flattened `_output_selects`. An arm that
+    contributes no output SELECT — `(VALUES ('x', 0))` parses to a `Subquery` wrapping `Values` —
+    is absent from the flat list, so enumerating that list closes the gap and hands a LATER arm an
+    EARLIER arm's number. The ordinal is supposed to be the arm's position in the SQL; a shifted
+    one is not a weaker version of that fact, it is a false one, and a reader has no way to tell.
+    The empty slot costs nothing and keeps every other arm's position true.
+
+    Deterministic, which the receipt requires of every fact it carries. `_output_selects` is a pure
+    structural recursion over `this` then `expression` with no set, dict or hash iteration anywhere,
+    so its order is left-to-right textual arm order for a given tree. The CTE loop's own order cannot
+    reach the result: CTE bodies are disjoint, so each iteration writes only keys it alone owns.
+    """
+    out: dict[int, str] = {}
+    bodies = (cte.this for cte in root.find_all(exp.CTE) if cte.this is not None)
+    for scope_root in (root, *bodies):
+        arms = _output_select_arms(scope_root)
+        if len(arms) < 2:
+            continue
+        for position, arm in enumerate(arms, 1):
+            for sel in arm:
+                out[id(sel)] = f"#{position}"
     return out
 
 
@@ -2042,9 +2114,13 @@ class TableRef(NamedTuple):
     written: str  # as the statement wrote it, e.g. "public.orders"
     bare: str  # "orders"
     alias: Optional[str]  # "o", or None when there is none
-    # "main" | "cte:<name>" | "subquery" — which query scope the reference was written in. A filter
-    # satisfied inside a CTE body is not satisfied for the statement that reads that CTE, so a
-    # reference has to carry the scope it lives in or the two cannot be told apart downstream.
+    # "main" | "cte:<name>" | "subquery" — which query scope the reference was written in, with a
+    # 1-based "#<n>" appended when that scope is one of TWO OR MORE arms of a set operation
+    # ("main#2", "cte:recent#1"). A filter satisfied inside a CTE body is not satisfied for the
+    # statement that reads that CTE, so a reference has to carry the scope it lives in or the two
+    # cannot be told apart downstream — and two arms of a UNION reading the same table under the
+    # same alias are told apart by the ordinal and by nothing else. A plain SELECT and a single-arm
+    # CTE body take no suffix: "#1" on every ordinary statement is noise on the unambiguous case.
     scope: str
 
 
@@ -2078,23 +2154,32 @@ def _reference_sites(node: "exp.Expression") -> list[_RefSite]:
       * `main` — the reference sits in a SELECT whose projection reaches the query OUTPUT, which is
         the top-level SELECT or, for a set operation, ANY arm. An arm is an output query rather than
         a nested one, so every arm of a UNION reads `main`;
+      * either of the two above, plus `#<n>`, when the scope it names has TWO OR MORE output arms —
+        `main#2`, `cte:recent#1`. `n` is the arm's position IN THE SQL, from `_arm_suffixes`, which
+        is NOT the order these sites are returned in: the walk reaches `A UNION B UNION C` as
+        C, A, B, and the ordinal is the only thing that recovers what the caller wrote. Without it,
+        two arms reading one table under one alias are indistinguishable rows on the receipt;
       * `subquery` — anything else, including a reference whose enclosing SELECT we cannot find.
-        Conservative on purpose: an unrecognized scope must never be mistaken for the main query.
+        Conservative on purpose: an unrecognized scope must never be mistaken for the main query,
+        and it takes NO arm ordinal: a label that says "we did not name this scope" must not then
+        claim to know which of its arms you are in.
 
     The CTE name goes through `_echo_name` because it is CALLER-written text: a quoted identifier
     can hold any string at all, and this label lands in a receipt, which is tool output the calling
     model weights as server-authored.
     """
     cte_scopes = _cte_body_scopes(node)
+    arm_suffixes = _arm_suffixes(node)
     output_ids = {id(sel) for sel in _output_selects(node)}
     sites: list[_RefSite] = []
     for tbl in node.find_all(exp.Table):
         written = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
         sel = _enclosing_select(tbl)
+        arm = arm_suffixes.get(id(sel), "") if sel is not None else ""
         if sel is not None and id(sel) in cte_scopes:
-            scope = "cte:" + _echo_name(cte_scopes[id(sel)])
+            scope = "cte:" + _echo_name(cte_scopes[id(sel)]) + arm
         elif sel is not None and (sel is node or id(sel) in output_ids):
-            scope = "main"
+            scope = "main" + arm
         else:
             scope = "subquery"
         sites.append(_RefSite(TableRef(written, tbl.name, tbl.alias or None, scope), tbl))
@@ -2111,6 +2196,14 @@ def _table_references(node: "exp.Expression") -> list[TableRef]:
     truncates from the FRONT of exactly this order — reordering the walk would silently change
     which references a capped receipt lists, and the parse order is at least deterministic for a
     given statement, which is what a receipt needs.
+
+    The arm ordinal on `scope` is the TEXT order, and the two deliberately differ. So a capped
+    receipt over a set operation with more arms than `_RECEIPT_MAX_REFS` lists ordinals that are
+    neither contiguous nor monotonic: each one is a true statement about the SQL, but the largest
+    of them is not the number of arms, and a consumer inferring the arm count from it is wrong.
+    Renumbering the survivors would make the ordinal a fact about the receipt rather than about the
+    statement, which is the opposite of what it is for; the cap's own clause on
+    `tables.undetermined` is what reports the drop.
     """
     return [site.ref for site in _reference_sites(node)]
 

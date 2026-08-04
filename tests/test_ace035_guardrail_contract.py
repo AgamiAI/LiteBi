@@ -217,6 +217,7 @@ CONTRACT_RULES = frozenset({
     "unscopable",
     "model_unavailable",
     "engine_mismatch",
+    "audit_unavailable",
 })
 
 # Rules this module declares that the contract does NOT name. There are NONE, and that is the
@@ -281,6 +282,10 @@ def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
         # and the model alone. The ban is a determinability refusal, not a reach.
         ("select_star", "undetermined"),
         ("model_unavailable", "undetermined"),
+        # ACE-097's sibling of the line above, on the same argument: the deployment cannot record,
+        # so we stopped before asking whether the statement was unsafe or out of scope. Neither of
+        # those two reasons is a claim we made.
+        ("audit_unavailable", "undetermined"),
         ("resource_limit", "undetermined"),
         ("unparseable", "undetermined"),
         # Pinned by ACE-039, the gate that produces it. `unsafe` rather than `out_of_scope`

@@ -52,6 +52,7 @@ from guardrail import (
     RECEIPT_BEFORE_MODEL,
     RECEIPT_BUILD_FAILED,
     RECEIPT_NO_MODEL,
+    RULE_AUDIT_UNAVAILABLE,
     Envelope,
     Failure,
     Receipt,
@@ -108,8 +109,11 @@ SERVER_INSTRUCTIONS = (
     "them. Don't refuse on an unreviewed metric — answer and warn. ALSO read "
     "`receipt.tables.items[].filters`: one entry per declared `default_filters` of that table "
     "reference, each `{expr, status}` with status applied / omitted / undetermined, scoped by the "
-    "sibling `scope` field ('main', 'cte:<name>', 'subquery') because a filter satisfied inside a "
-    "CTE body is not satisfied for the statement reading it. Nothing applied them for you, so an "
+    "sibling `scope` field ('main' or 'cte:<name>', each carrying a trailing '#<n>' arm number "
+    "when that scope is one of two or more arms of a UNION / INTERSECT / EXCEPT, or 'subquery', "
+    "which never takes one) because a "
+    "filter satisfied inside a CTE body is not satisfied for the statement reading it, and a "
+    "filter applied in one arm is not applied in another. Nothing applied them for you, so an "
     "`omitted` or `undetermined` one is a real gap between what the org means by that table and "
     "what the answer counted — tell the user, and re-run with the filter written in if the "
     "question wanted it. ALSO surface each section's "
@@ -1412,6 +1416,17 @@ def _emit(
     body["audit_id"] = env.audit_id
 
     _record_execution(env, sql=sql, profile=profile, args=args, row_count=row_count)
+    # Publish the TYPED outcome for the tool-call recorder (ACE-098). It runs later, in the
+    # transport's `finally`, where the Envelope no longer exists and only this serialized string
+    # does — so without this the tool_calls row's account of why a call failed is a `json.loads` of
+    # our own output. Set here rather than in `execute_guarded` because the tool edge is what
+    # decides the final status: the fork path rebuilds the Envelope on the parent side, and the
+    # chokepoint that ran in the child cannot reach this context at all.
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(
+        (env.status, env.refusal.rule if env.refusal is not None else None, row_count)
+    )
     return json.dumps(body, indent=2, default=str)
 
 
@@ -1430,6 +1445,15 @@ AUDIT_SQL_MAX_CHARS = 8_000
 # couple of thousand characters is the whole of what is worth keeping.
 AUDIT_ERROR_DETAIL_MAX_CHARS = 2_000
 
+# The refusal's own sentence, bounded on 015's argument (ACE-098). `Refusal.detail` is authored by
+# us and value-free by contract, so it is nothing like the unbounded driver text above — but it
+# ECHOES identifiers the caller sent, and an echo is caller-controlled length. 1,000 characters is
+# several times the longest detail any gate writes, so this bites only on something that has already
+# gone wrong. `receipt` needs no bound here: `runtime._RECEIPT_MAX_REFS` caps every section before
+# the receipt is built, so its JSON has a ceiling by construction — and truncating JSON would leave
+# a blob that does not parse, which is worse than the row having no receipt at all.
+AUDIT_DETAIL_MAX_CHARS = 1_000
+
 
 def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     """The statement as it will be stored, plus whether it had to be cut.
@@ -1440,6 +1464,17 @@ def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     if len(sql) <= AUDIT_SQL_MAX_CHARS:
         return sql, False
     return sql[:AUDIT_SQL_MAX_CHARS], True
+
+
+def _bounded_audit_detail(detail: str) -> str:
+    """The refusal's detail as it will be stored (ACE-098).
+
+    No companion truncation flag, unlike `sql`. The flag exists there because a cut statement reads
+    as the whole one and a reviewer would re-run something that does not reproduce the decision. A
+    detail is prose we authored, not something anyone re-runs, and it is bounded well above what any
+    gate writes — so the flag would be a column that is false on every row ever written.
+    """
+    return detail[:AUDIT_DETAIL_MAX_CHARS]
 
 
 def _record_execution(
@@ -1466,6 +1501,16 @@ def _record_execution(
     `sql` is BOUNDED before it is stored — see `AUDIT_SQL_MAX_CHARS`.
     """
     refusal = env.refusal
+    if refusal is not None and refusal.rule == RULE_AUDIT_UNAVAILABLE:
+        # The ONE outcome that writes no row, and the only exemption there is (ACE-097). This
+        # refusal means the store could not be opened, so writing a row to say so is the same write
+        # failing a second time — and on the hosted path a failing write now raises, which would
+        # turn the tidy fail-closed refusal into an unhandled exception at the serializer. Every
+        # other outcome, refusals included, still records.
+        #
+        # Keyed on the RULE rather than on a flag threaded down from the gate: the rule is the fact,
+        # a flag would be a second way to say it, and the two could disagree.
+        return
     stored_sql, sql_truncated = _bounded_audit_sql(sql or "")
     # The RAW driver text, for the operator only — the caller's `failure.message` is the classified
     # value-free sentence and stays that way. Present only when the chokepoint ran in THIS process:
@@ -1493,6 +1538,23 @@ def _record_execution(
             "status": env.status,
             "reason": refusal.reason if refusal is not None else None,
             "rule": refusal.rule if refusal is not None else None,
+            # The three that make the row re-derivable (ACE-098). All read off the Envelope this
+            # function already holds, for the same reason `reason` and `rule` are: the typed object
+            # is right here, and re-deriving any of them from the serialized body would make the
+            # record's account depend on a wire shape rather than on the decision.
+            #
+            # `detail` is where "which bound fired, and what it was set to" lives. The statement
+            # timeout and the result bound share ONE rule id by design, so `rule` alone cannot tell
+            # them apart and principle 9's carve-out claims the record does.
+            "detail": _bounded_audit_detail(refusal.detail) if refusal is not None else None,
+            # The whole receipt, verbatim, including every section's `undetermined` marker — the
+            # half that matters, since a section nobody checked has to keep saying so in the record
+            # too. `_emit` serializes the same `asdict` for the caller, so the row and the answer
+            # cannot disagree about what was reported.
+            "receipt": json.dumps(asdict(env.receipt), default=str),
+            # Lifted OUT of the receipt into its own column so a replay can SELECT on it. Inside the
+            # JSON as well, deliberately: see migration 017.
+            "model_version": env.receipt.model_version,
         }
     )
 
@@ -1727,20 +1789,41 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> bool:
         return False
 
 
+def _audit_is_load_bearing() -> bool:
+    """Whether a failed audit write must break the call — the served deployment, and only it.
+
+    Reads `execute_sql._hosted()` rather than re-testing the environment here, so the question "is
+    this a served deployment?" has ONE answer in the codebase. The same function decides whether
+    `execute_guarded` runs the pre-execution reachability check, and the two must not be able to
+    disagree: a deployment that fails closed at the gate but shrugs at the write would refuse
+    healthy calls and quietly lose the record on the broken ones.
+    """
+    from execute_sql import _hosted
+
+    return _hosted()
+
+
 def _record_query(rec: dict[str, Any]) -> None:
-    """Log a query execution through the DB sink (AGAMI_DB_URL) or the local jsonl. **Best-effort:**
-    a logging failure must never break an otherwise-successful query, and must never turn a refusal
-    into an exception.
+    """Log a query execution through the DB sink (AGAMI_DB_URL) or the local jsonl.
+
+    **Served: the write is load-bearing and its failure is raised** (ACE-097, principle 7). An answer
+    that reached the caller with no record of the statement that produced it is the thing the
+    principle forbids, and a warning is not a substitute: the operator reads it hours later, the
+    caller acted on the answer immediately. `execute_guarded` establishes the store is reachable
+    BEFORE executing, so this raise is the narrow residual — the store died between that check and
+    this write — rather than the common path.
+
+    **Local stays best-effort**, and unchanged. `governance-principles.md` scopes the principles to
+    the served deployment; here there is no store and this writes jsonl, so a read-only artifacts
+    directory would otherwise stop a laptop answering. A swallowed failure is still LOGGED at WARNING
+    with its traceback, never passed silently: a sink broken for a month must not look identical to a
+    working one.
 
     The WHOLE body sits inside the try, `Store.from_env()` included. Constructing the store can
     itself raise — a malformed DSN, an uninstalled driver — and with that call outside the try the
-    exception escaped onto the success path: a deployment with a bad `AGAMI_DB_URL` broke every query
-    it logged, rather than every log it wrote. `_record_tool_call` has this shape already; this is
-    the same fix for the same reason.
-
-    A swallowed failure is LOGGED at WARNING with its traceback, not passed silently. The audit trail
-    is the point of the write, so a sink that has been broken for a month must not look identical to
-    one that is working."""
+    exception escaped onto the success path even locally, breaking every query the deployment logged
+    rather than every log it wrote. That shape is what now lets the served path re-raise deliberately
+    from one place instead of leaking from an arbitrary one."""
     try:
         from store import Store
 
@@ -1765,9 +1848,66 @@ def _record_query(rec: dict[str, Any]) -> None:
         finally:
             store.close()
     except Exception:
-        # No SQL, no question, no org — the record's own fields are the caller's data, and this line
-        # goes to the server log. The exception and the stack say where the write broke.
+        if _audit_is_load_bearing():
+            # Served: no record, no answer. Raised rather than logged, and deliberately not wrapped
+            # in a friendlier exception — this escapes past `_emit`, so the caller gets a transport
+            # error and the operator gets the traceback. Converting it into a tidy refusal Envelope
+            # is not available: that Envelope would itself need an audit row, written through this
+            # same broken sink.
+            raise
+        # Local: no SQL, no question, no org — the record's own fields are the caller's data, and
+        # this line goes to the server log. The exception and the stack say where the write broke.
         _LOG.warning("query-execution audit write failed; the answer is unaffected", exc_info=True)
+
+
+def reset_typed_outcome() -> None:
+    """Clear the published outcome. Run by the transport INSIDE the context it hands the handler.
+
+    Load-bearing, and a test found it: `copy_context()` copies whatever is current, so a verdict
+    published by an earlier `execute_sql` call in this context would be inherited by the next tool's
+    context and read back as that tool's outcome. A tool that never reaches `execute_guarded` — every
+    model-backed one — has nothing to clear it, so a raising `list_datasources` was recorded with the
+    previous query's refusal rule instead of `exception`.
+
+    `execute_guarded` clears it too, on entry, for the calls that do reach it. Both are needed: that
+    one covers a second query in one context, this one covers a different tool after a query.
+    """
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(None)
+
+
+def typed_outcome_overrides(ctx: Any) -> dict[str, Any]:
+    """The `record_tool_call` overrides for a call whose Envelope classified itself (ACE-098).
+
+    The transport runs the tool handler inside a `contextvars.Context` it owns and passes it here.
+    That indirection is load-bearing: a ContextVar set inside `run_blocking`'s worker is invisible
+    to the caller, because anyio gives the thread a copy — so reading the var directly at the
+    recorder would read `None` on the one surface that records tool calls at all.
+
+    Returns `{}` for every other tool. The model-backed tools do not speak the Envelope (they return
+    the older `{"error": {kind, remediation}}` body) and never reach `_emit`, so there is nothing
+    typed to read and the body parse stays their path. `{}` means "derive it the way you always
+    have", which is exactly what `record_tool_call`'s override seam already documents.
+
+    The three come back as a group because that seam forces them to: stating any one replaces all
+    three, so returning a partial dict would silently blank the other two.
+    """
+    from execute_sql import _last_outcome
+
+    outcome = ctx.get(_last_outcome)
+    if outcome is None:
+        return {}
+    status, rule, row_count = outcome
+    success = status == "ok"
+    return {
+        "success": success,
+        # The rule the gate chose, straight off the `Refusal` — strictly more informative than the
+        # status alone, and no longer a `json.loads` of our own output. `status` is the fallback for
+        # a `failed`, which has a kind rather than a rule.
+        "error_kind": None if success else (rule or status),
+        "row_count": row_count,
+    }
 
 
 def record_tool_call(
@@ -1792,7 +1932,9 @@ def record_tool_call(
     result (a tool returns a refusal or failure body without raising, so `raised` alone would see
     almost nothing). The self-report fields (`user_question`/`agent_query`/`thread_id`) are whatever
     Claude supplied — may be None.
-    **Best-effort and never raises** — a logging failure must not break the tool.
+    **Best-effort locally; load-bearing on the served path** (ACE-097). Locally a logging failure
+    must not break the tool and is warned about. Served, principle 7 makes the row part of the call:
+    the write's failure is raised, and the tool call fails with it.
 
     The trailing parameters are an **override seam for an embedder that dispatches tool handlers
     itself** rather than through this package's transport. Each defaults to `None`, meaning *derive it
@@ -1903,8 +2045,28 @@ def record_tool_call(
 
 
 def _record_tool_call(rec: dict[str, Any]) -> None:
-    """Write a tool-call record through the DB sink (AGAMI_DB_URL) or the local jsonl. Wrapped so the
-    whole thing is best-effort — even opening the store can't surface an error to the caller."""
+    """Write a tool-call record through the DB sink (AGAMI_DB_URL) or the local jsonl.
+
+    Served: the failure is raised, for the reason `_record_query` gives. Local: swallowed, and now
+    logged rather than passed silently — the `except Exception: pass` this replaced was the quieter
+    of the two swallows this spec closes, and the reason neither had been closed before is that they
+    masked each other exactly: this one hid inside the transport's, and the transport's had nothing
+    to catch once this one stopped raising. Removing either alone was a PR with no observable
+    change, which is indistinguishable from not having done the work.
+
+    The `audit_unavailable` exemption applies here too, and it has to. `_record_execution` skipping
+    the query row is not enough on its own: the HTTP transport writes a tool-call row in a `finally`
+    for EVERY call, so on that surface the row this exemption exists to avoid was written anyway,
+    failed, and raised — replacing the clean fail-closed refusal with a transport error and losing
+    the remediation that tells the operator what to restore. On the surface where an operator most
+    needs it. Found by driving a real server whose store died under it; no unit test saw it, because
+    the exemption looked complete at the one write path a unit test drives.
+
+    Read off `error_kind` because that IS the rule for a refusal — `record_tool_call` derives it as
+    `refusal["rule"]`. ACE-098 replaces that derivation with the typed refusal, and this check moves
+    with it rather than needing its own signal."""
+    if rec.get("error_kind") == RULE_AUDIT_UNAVAILABLE:
+        return
     try:
         from store import Store
 
@@ -1921,7 +2083,9 @@ def _record_tool_call(rec: dict[str, Any]) -> None:
         finally:
             store.close()
     except Exception:
-        pass  # best-effort: never fail the tool because logging failed
+        if _audit_is_load_bearing():
+            raise
+        _LOG.warning("tool-call audit write failed; the answer is unaffected", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
