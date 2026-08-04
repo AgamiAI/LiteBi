@@ -1344,8 +1344,10 @@ def pre_flight_check(sql: str, org: Datasource,
         return PreFlightResult(unchecked=UNCHECKED_NO_PARSER)
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
     # call are byte-identical: _parse_sql swallows an unparseable statement to None exactly as a
-    # prebuilt ctx.tree would be None.
-    tree = ctx.tree if ctx is not None else _parse_sql(sql)
+    # prebuilt ctx.tree would be None. The grammar has to be resolved the same way too, or the two
+    # paths would read the same statement differently and stop being byte-identical for a reason
+    # that has nothing to do with the parse being shared.
+    tree = ctx.tree if ctx is not None else _parse_sql(sql, _dialect_of(org)[0])
     if tree is None:
         return PreFlightResult(unchecked=UNCHECKED_UNPARSEABLE)
     if tree.find(exp.Select) is None:
