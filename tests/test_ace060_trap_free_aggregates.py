@@ -191,6 +191,34 @@ def test_an_unresolvable_aggregate_is_undetermined_not_clean(org, sql, label):
     assert "could not be resolved" in (_section(org, sql)["undetermined"] or "")
 
 
+@pytest.mark.parametrize("sql,label", [
+    ("WITH x AS (SELECT SUM(o.total) t FROM orders o JOIN order_items i ON i.order_id = o.id) "
+     "SELECT MAX(x.t) FROM x", "MAX(x.t)"),
+    ("SELECT SUM(d.total) FROM (SELECT o.total FROM orders o) d", "SUM(d.total)"),
+])
+def test_an_aggregate_over_a_scope_the_walk_does_not_enter_is_undetermined(org, sql, label):
+    """The same over-claim as `COUNT(*)`, on a shape where the qualifier resolves perfectly well.
+
+    `x` is a name the statement bound to a result of its own, and the walk does not enter the CTE
+    that defines it — so a fan INSIDE it multiplied the rows behind `MAX(x.t)` where nothing looked.
+    A derived table is the same case. The section's marker already says it does not read those
+    scopes; an item beside that marker claiming `not_multiplied` would contradict it, which is worse
+    than either statement alone.
+    """
+    (item,) = _items(org, sql)
+    assert item["aggregate"] == label
+    assert item["status"] == rt.UNDETERMINED, item
+
+
+def test_a_cte_that_shadows_a_declared_table_does_not_borrow_its_relationships(org):
+    """`WITH orders AS (…)` binds `orders` to something the statement computed, so the model's
+    relationships for the real `orders` say nothing about it — the same subtraction the `tables`
+    section makes when it decides whether a reference is declared."""
+    sql = "WITH orders AS (SELECT 1 AS total) SELECT SUM(o.total) FROM orders o"
+    (item,) = _items(org, sql)
+    assert item["status"] == rt.UNDETERMINED, item
+
+
 def test_a_chasm_reports_on_both_aggregates_one_item_each(org):
     """SC-3. The cross-product inflates two numbers, and two numbers is two items.
 

@@ -1239,7 +1239,8 @@ def pre_flight_check(sql: str, org: Datasource,
 
 
 def _aggregate_reports(tree, org: Datasource,
-                       ctx: "GuardContext | None" = None) -> list[AggregateReport]:
+                       ctx: "GuardContext | None" = None,
+                       *, visible: Optional[set[str]] = None) -> list[AggregateReport]:
     """The analysis half, on an already-parsed tree: one report per aggregate the statement outputs.
 
     This was `_collect_findings`, which returned the flat finding list this is now a projection of.
@@ -1264,12 +1265,24 @@ def _aggregate_reports(tree, org: Datasource,
     if tree is None or tree.find(exp.Select) is None:
         return []
     suffixes = _arm_suffixes(tree)
+    # Which names the analysis can actually see behind: a table the MODEL declares, minus any name
+    # the statement bound to a result of its own. Computed once on the ROOT, because a WITH binds
+    # its name for every arm below it, and handed down so a site can say whether its reads were
+    # resolvable. See `_aggregate_sites` for what it decides.
+    #
+    # A caller that already holds both halves passes them in: `assemble_receipt` builds this exact
+    # index and this exact CTE set for its `tables` section, and `_model_table_index` walks every
+    # table in the model, which is not work to repeat on a path that runs for every executed query.
+    if visible is None:
+        tidx = ctx.model_table_index if ctx is not None else _model_table_index(org)
+        visible = set(tidx) - _cte_names(tree)
     reports: list[AggregateReport] = []
     for arm in _output_select_arms(tree):
         for sel in arm:
-            reports.extend(
-                _preflight_select(sel, org, ctx=ctx, scope="main" + suffixes.get(id(sel), ""))
-            )
+            reports.extend(_preflight_select(
+                sel, org, ctx=ctx,
+                scope="main" + suffixes.get(id(sel), ""), visible=visible,
+            ))
     return reports
 
 
@@ -1281,7 +1294,8 @@ _MULTIPLYING_RISKS = ("fan_trap", "chasm_trap")
 
 def _preflight_select(tree: "exp.Select", org: Datasource,
                       ctx: "GuardContext | None" = None,
-                      *, scope: str = "main") -> list[AggregateReport]:
+                      *, scope: str = "main",
+                      visible: Optional[set[str]] = None) -> list[AggregateReport]:
     """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT, read entirely off the tree.
     A top-level SELECT and a set-operation arm are analyzed identically; there is no longer a
     rewrite for one to be eligible for, and no statement text for either to carry.
@@ -1297,7 +1311,7 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     tables_in_scope = _alias_map(tree)  # alias -> table
     table_set = set(tables_in_scope.values())
 
-    sites = _aggregate_sites(tree, tables_in_scope, scope)
+    sites = _aggregate_sites(tree, tables_in_scope, scope, visible)
     # The set the detectors read, derived from the sites rather than walked again — the two must
     # agree about which aggregates exist, and deriving is how that is guaranteed rather than hoped.
     agg_sources = {t for site in sites for t in site.sources}
@@ -2094,7 +2108,9 @@ def assemble_receipt(
     # listed: a truncated list under a silent marker is a positive claim of completeness. The cap
     # counts AGGREGATES now rather than findings, because that is what the items are; the count is
     # of the caller's own expressions either way, so stating it discloses nothing.
-    reports = _aggregate_reports(tree, org, ctx=None)
+    # `visible` is handed in rather than rebuilt: both halves are already in hand here, and
+    # `_model_table_index` walks the whole model.
+    reports = _aggregate_reports(tree, org, ctx=None, visible=set(tidx) - cte_names)
     dropped_aggregates = max(0, len(reports) - _RECEIPT_MAX_REFS)
     aggregate_items: list[dict[str, Any]] = [
         r.as_dict() for r in reports[:_RECEIPT_MAX_REFS]
@@ -2512,8 +2528,8 @@ class _AggSite(NamedTuple):
     resolved: bool
 
 
-def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str],
-                     scope: str) -> list["_AggSite"]:
+def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
+                     visible: Optional[set[str]] = None) -> list["_AggSite"]:
     """Every aggregate in this SELECT's output list, in the order the statement wrote it.
 
     This was `_aggregate_source_tables`, which returned a `set[str]` of table names. The set was
@@ -2528,6 +2544,15 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str],
     positive claim that the number is clean — and for `COUNT(*)` under a one-to-many join that
     claim is false. So the site records that its reads were not fully resolved, and the report says
     `undetermined` rather than inventing a clean bill of health.
+
+    A resolved name still has to be one the analysis can see BEHIND, which is what `visible` is.
+    `SELECT MAX(x.t) FROM x` over `WITH x AS (SELECT SUM(o.total) t FROM orders o …)` resolves `x`
+    perfectly well, and `x` is a result the statement computed for itself: the walk does not enter
+    the CTE, so a fan INSIDE it is invisible and the rows behind `MAX(x.t)` may have been multiplied
+    where nothing looked. A derived table and a name the model does not declare are the same case.
+    The section's marker already admits it does not read those scopes; without this the item beside
+    that marker would claim the opposite. `visible` defaults to None for a caller that has no index
+    to hand, which keeps the old behaviour rather than failing every site closed.
 
     The label comes from `node.sql()`. That is a FRAGMENT serialized for a receipt: it rebinds
     nothing, is handed to no driver, and the statement that executes is still the one received.
@@ -2544,7 +2569,9 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str],
             aggregate=_echo_expr(agg.sql()),
             scope=scope,
             sources=frozenset(t for t in resolved if t),
-            resolved=bool(cols) and all(resolved),
+            resolved=bool(cols) and all(resolved) and (
+                visible is None or all(_tkey(t) in visible for t in resolved)
+            ),
         ))
     return sites
 
