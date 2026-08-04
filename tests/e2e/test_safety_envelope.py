@@ -65,8 +65,11 @@ def _vectors(predicate=None) -> list:
     ]
 
 
-def _drive(case, monkeypatch, route=None) -> dict:
-    """One vector over a route, with the deployment ceiling lowered for the vectors that need it.
+def _drive(case, monkeypatch) -> dict:
+    """One vector over HTTP, with the deployment ceiling lowered for the vectors that need it.
+
+    HTTP throughout, matching `test_safety_corpus.py`: what these invariants are about is what a
+    caller actually receives, and the served transport is where a caller actually is.
 
     The availability vectors return more rows than the ceiling they are driven under, and every
     other vector needs the ceiling left alone — the governed ones return more rows than the lowered
@@ -74,7 +77,7 @@ def _drive(case, monkeypatch, route=None) -> dict:
     """
     if case.rule == guardrail.RULE_RESOURCE_LIMIT:
         monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", str(harness.LOW_ROW_CAP))
-    return (route or harness.ROUTES["http"])(case.sql)
+    return harness.ROUTES["http"](case.sql)
 
 
 def _assert_receipt_is_whole(body: dict) -> None:
@@ -279,8 +282,12 @@ def test_every_other_outcome_writes_exactly_one_row_keyed_by_its_audit_id(
     stop recording the outcomes worth reviewing and every status-level count would still balance.
     Exactly one row, and its primary key is the id the answer carried back — so the record and the
     answer are the same call rather than two plausible ones.
+
+    Driven over the served transport, which writes a tool-call row of its own in a `finally` for
+    every call: the count below stays one because that row lands in a different table, and driving
+    it here is what proves the two recorders do not double up in the one this asserts on.
     """
-    body = _drive(case, monkeypatch, route=harness.route_in_process)
+    body = _drive(case, monkeypatch)
 
     rows = _audit_rows(served)
     assert [row["id"] for row in rows] == [body["audit_id"]], (case.id, rows, body)
