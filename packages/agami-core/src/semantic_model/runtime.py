@@ -2201,6 +2201,12 @@ def assemble_receipt(
         # see UNDETERMINED_NO_PARSER.
         return {"model_version": model_version,
                 **_undetermined_sections(UNDETERMINED_NO_PARSER)}
+    # The REASON the engine could not be resolved is dropped here on purpose: every section below
+    # states what IT did not establish, and "the model does not say which engine this is" is not a
+    # fact about any one of them. It is not free, though — with `dialect=None` a backtick-quoted
+    # `on:` does not parse, so a declaration a MySQL model writes perfectly well becomes one the
+    # analysis cannot read. That lands in the unread-declaration branch of the joins loop below,
+    # which is why that branch may not report `undeclared`.
     dialect = _dialect_of(org)[0]
     tree = _parse_sql(sql, dialect)
     if tree is None:
@@ -2294,9 +2300,33 @@ def assemble_receipt(
             # stance ACE-099 shipped for declared filters, so a reader comparing `tables` and `joins`
             # sees one rule and not two. First match in `_cardinality_index`'s own list order, so the
             # same statement names the same relationship on every run (REQ-022).
+            #
+            # The two sides are reduced ASYMMETRICALLY and that is the whole design. The WRITTEN side
+            # is lossy on purpose — a conjunct the SQL author added beyond the declared join is not a
+            # reason to withhold the match. The DECLARED side may not be: a declaration reduced to a
+            # subset of itself would match a statement that never wrote the rest of it. So
+            # `_declared_pairs` returns None rather than a partial reduction, which is what makes
+            # `pairs is not None` here a filter and not a formality.
             match = next((rel for rel, pairs in declared_pairs
                           if pairs is not None and pairs <= js.pairs), None)
-            status = DECLARED if match is not None else UNDECLARED
+            if match is not None:
+                status = DECLARED
+            elif any(pairs is None and _rel_tables(rel) == {_tkey(js.endpoints[0]),
+                                                           _tkey(js.endpoints[1])}
+                     for rel, pairs in declared_pairs):
+                # Nothing matched, and a declaration between THESE TWO TABLES is one we could not
+                # read — an `on:` that will not parse, one carrying a bind marker, one that did not
+                # reduce whole. `undeclared` would tell the reader "the model does not declare this
+                # join" on the strength of our own failure to read the model, and send a model
+                # author off to add an edge they already have. It is our gap, so it stays open and
+                # the marker counts it.
+                #
+                # Scoped to declarations touching BOTH endpoints, because an unreadable edge
+                # elsewhere in the model says nothing about this join and would otherwise make every
+                # join in every statement unanswerable.
+                status = UNDETERMINED
+            else:
+                status = UNDECLARED
         # Everything a DECLARATION contributes, and null on every other status: an item that matched
         # nothing must assert nothing about a relationship it did not match, which is the defect the
         # per-relationship build had — it printed a signed-off trail beside a join written on the
@@ -3183,7 +3213,13 @@ def _declared_pairs(rel: Relationship,
     sees. A `:param` a model author left for an executor to fill is the case that would fail
     SILENTLY rather than loudly: a bind marker is not a column, so the conjunct holding it drops out
     of the pairs and what remains would match a statement that never wrote its condition. Both
-    degrade to "this relationship matches nothing", which costs a `declared` we cannot justify.
+    degrade to "this relationship matches nothing".
+
+    What that degradation costs is NOT only a `declared` we cannot justify. The assembler asks this
+    of every declaration and then reports a join nothing matched as `undeclared` — a settled claim
+    that the model does not declare it, made on the strength of our own failure to read the model.
+    So the caller keeps a record of WHICH declarations came back None and routes a join whose two
+    tables one of them is about to `undetermined` instead.
     """
     if rel.from_column is not None and rel.to_column is not None:
         return frozenset({frozenset({
@@ -3197,6 +3233,18 @@ def _declared_pairs(rel: Relationship,
     if predicate is None:
         return None
     return _predicate_pairs(predicate, {}) or None
+
+
+def _rel_tables(rel: Relationship) -> frozenset[str]:
+    """The two tables a declaration is between, keyed the way a join's endpoints are.
+
+    `_bare` strips a schema without folding case and `_tkey` folds case without stripping one, which
+    is the pairing `_declared_pairs` normalizes its own endpoints through: a declaration on
+    `public.regions` and a statement writing `REGIONS` need both to meet. A FROZENSET because a
+    declared edge has a direction the author of the SQL never sees, and a set of one is the
+    self-edge.
+    """
+    return frozenset({_tkey(_bare(rel.from_table)), _tkey(_bare(rel.to_table))})
 
 
 def _relation_name(rel: "exp.Expression") -> str:

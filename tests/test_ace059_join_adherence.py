@@ -444,8 +444,34 @@ def test_an_unusable_declared_on_degrades_to_no_match(org):
     `declared` against a relationship whose predicate the statement did not write.
     """
     (item,) = _items(org, UNUSABLE_ON)
-    assert item["status"] == rt.UNDECLARED
     assert item["name"] is None
+    assert all(item[k] is None for k in ("cardinality", "review_state", "on"))
+
+
+def test_a_declaration_the_analysis_could_not_read_leaves_the_question_open(org):
+    """The other half of the degradation, and the half that made it a false claim rather than a lost
+    one.
+
+    Both `shipments` -> `regions` edges are unreadable — one will not parse, one carries a `:param`
+    — so nothing matches, and falling through to `undeclared` told the reader "the model does not
+    declare this join" about a model that declares it twice. A settled claim about the MODEL,
+    produced by our own failure to read it, and it sends a model author off to add an edge they
+    already have.
+
+    `undetermined` is what we actually know, and the marker counts it. Scoped to declarations
+    touching BOTH of this join's endpoint tables: one unreadable edge elsewhere in the model must
+    not make every other join in the statement unanswerable.
+    """
+    section = _section(org, UNUSABLE_ON)
+    (item,) = section["items"]
+    assert item["status"] == rt.UNDETERMINED
+    assert "could not be matched against the model" in (section["undetermined"] or "")
+
+    # And a join whose two tables carry only READABLE declarations still settles: the model was read
+    # and does not declare this pair on these columns.
+    (other,) = _items(org, WRONG_COLUMN)
+    assert other["status"] == rt.UNDECLARED
+    assert _section(org, WRONG_COLUMN)["undetermined"] is None
 
 
 @pytest.mark.parametrize("sql", [ON_AN_EXPRESSION, ON_UNQUALIFIED],
@@ -925,14 +951,22 @@ def warehouse(tmp_path, monkeypatch):
     return artifacts
 
 
-@pytest.mark.parametrize("sql", [WRONG_COLUMN, UNUSABLE_ON], ids=["wrong-column", "unusable-on"])
-def test_a_statement_whose_joins_are_all_undeclared_executes_and_is_never_refused(warehouse, sql):
+@pytest.mark.parametrize("sql,status", [(WRONG_COLUMN, rt.UNDECLARED),
+                                        (UNUSABLE_ON, rt.UNDETERMINED)],
+                         ids=["wrong-column", "unusable-on"])
+def test_a_statement_whose_joins_are_not_declared_executes_and_is_never_refused(
+        warehouse, sql, status):
     """SC-8, asserted against the refusal vocabulary rather than by convention.
 
-    An undeclared join reaches no table and no column outside the model, so it is none of the three
-    reasons a statement may be refused for. Whether that path is the right one depends on the
-    question, which never reaches this frame. A future change that reintroduced a correctness
-    refusal would have to widen `RefusalReason` to do it, and this fails first if it does.
+    A join the model does not declare, and one whose declaration we could not read, both reach no
+    table and no column outside the model, so neither is any of the three reasons a statement may be
+    refused for. Whether that path is the right one depends on the question, which never reaches
+    this frame. A future change that reintroduced a correctness refusal would have to widen
+    `RefusalReason` to do it, and this fails first if it does.
+
+    The two statuses are spelled out per case rather than shared, because the two ARE different
+    facts and the surface has to keep telling them apart: one is a claim about the model, the other
+    a claim about this analysis.
     """
     assert set(guardrail.get_args(guardrail.RefusalReason)) == {
         "unsafe", "out_of_scope", "undetermined"
@@ -943,7 +977,7 @@ def test_a_statement_whose_joins_are_all_undeclared_executes_and_is_never_refuse
     assert env.status == "ok", env
     assert env.refusal is None
     assert spy.calls and spy.calls[0][0] == sql  # byte-identical, per ACE-093
-    assert [i["status"] for i in env.receipt.joins.items] == [rt.UNDECLARED]
+    assert [i["status"] for i in env.receipt.joins.items] == [status]
 
 
 # --- SC-8: the finding reaches a caller, on both surfaces -------------------
