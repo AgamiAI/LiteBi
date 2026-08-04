@@ -285,9 +285,11 @@ def test_the_result_carries_no_statement_and_no_rewrite_action():
 
     # `unchecked` is null when the analysis ran and a sentence when it could not — without it an
     # empty `findings` would mean both "clean" and "not checked", and silence would read as clean.
-    assert set(rt.PreFlightResult().as_dict()) == {"findings", "unchecked"}
+    # `aggregates` is the per-aggregate roster the findings are a projection of; it says nothing
+    # about a statement of ours, which is what this test is guarding.
+    assert set(rt.PreFlightResult().as_dict()) == {"findings", "aggregates", "unchecked"}
     assert set(rt.Finding("fan_trap", "why").as_dict()) == {
-        "risk", "reason", "triggering_joins"}
+        "risk", "reason", "triggering_joins", "aggregate"}
 
 
 def test_the_preflight_signature_has_no_rewrite_switch():
@@ -367,30 +369,69 @@ def test_no_shipped_prose_promises_a_rewrite():
 # --- SC-4: nothing re-serialises a parsed statement onto the execution path --
 
 
+# The ONE place a `.sql()` call is permitted, by file and by the function that makes it. Adding a
+# second entry is a decision about this invariant and belongs in a spec, not in a diff: the value of
+# the rule is that no call site has to be judged on its merits, and every entry here spends some of
+# that. See the docstring below for what earns this one.
+_RESERIALISE_EXEMPT = {
+    ("packages/agami-core/src/semantic_model/runtime.py", "_aggregate_sites"),
+}
+
+
 def test_nothing_re_serialises_a_parsed_statement():
     """`.sql()` regenerates a statement from a parsed tree. Doing that anywhere a statement can
     reach the driver is what made byte-identity unassertable, whether or not the regeneration
     changed anything meaningful.
 
-    There is NO allowlist, which is the strong form of the claim and it took one more deletion to
-    earn. `pre_flight_check` walked each arm of a set operation and handed `arm.sql()` down to
-    become that arm's `original_sql`; with the field gone the parameter had no reader, so the
-    re-serialisation was pure waste and went too. The analysis reads trees.
+    The rule was absolute and it took one more deletion to earn: `pre_flight_check` walked each arm
+    of a set operation and handed `arm.sql()` down to become that arm's `original_sql`; with the
+    field gone the parameter had no reader, so the re-serialisation was pure waste and went too.
+    The analysis reads trees.
+
+    **`_aggregate_sites` is the one exception, and it is not a statement.** It serializes a single
+    `exp.AggFunc` subtree into the label the receipt's `aggregates` section keys its items on — the
+    text that answers "which of my numbers is this". That string is never handed to a driver, never
+    assigned to anything a driver reads, and is data the caller reads rather than SQL anyone runs.
+    Neither of the two reasons above reaches it: it cannot be one assignment away from execution
+    because there is no statement, and sqlglot's normalization of spacing and keyword case is a
+    property of a LABEL, which is why ACE-060 says "the aggregate as parsed" rather than "as
+    written". What it does cost is the strong form of the claim, which is why the exemption is
+    named here rather than argued at the call site.
 
     Scanned at module level as well as inside functions: a re-serialiser hoisted to a module
-    constant would reach the driver the same way one inside a function does. Calls WITH arguments
-    (`.sql(dialect=...)`) count too — a dialect-qualified regeneration is still a regeneration.
+    constant would reach the driver the same way one inside a function does, and takes no
+    exemption. Calls WITH arguments (`.sql(dialect=...)`) count too — a dialect-qualified
+    regeneration is still a regeneration.
     """
     offenders: list[str] = []
+    exercised: set[tuple[str, str]] = set()
 
     for path in _python_sources():
         tree = ast.parse(path.read_text(), filename=str(path))
+        # Which function each node sits in. Walk order is breadth-first, so a nested definition is
+        # visited after the one enclosing it and the plain assignment leaves the INNERMOST name —
+        # an exemption must name the function that actually makes the call.
+        enclosing: dict[int, str] = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(fn):
+                    enclosing[id(child)] = fn.name
+        rel = str(path.relative_to(REPO_ROOT))
         for node in ast.walk(tree):
             if (isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "sql"):
-                offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+                where = (rel, enclosing.get(id(node), ""))
+                if where in _RESERIALISE_EXEMPT:
+                    exercised.add(where)
+                    continue
+                offenders.append(f"{rel}:{node.lineno}")
     assert not offenders, f"a parsed statement is re-serialised: {offenders}"
+    # And an exemption nobody uses is a hole standing open for the next caller to find. If the
+    # label stops needing it, the entry goes with it.
+    assert exercised == _RESERIALISE_EXEMPT, (
+        f"exempted but no longer re-serialising: {_RESERIALISE_EXEMPT - exercised}"
+    )
 
 
 # --- SC-3: the trap refuses, on both routes ---------------------------------

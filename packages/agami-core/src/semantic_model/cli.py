@@ -221,11 +221,16 @@ def cmd_prepare(args) -> int:
     depends on the question, and this command has the statement but not the question. So it reports
     what it found and lets the caller, who has both, decide.
 
-    `findings` is that report, and **an empty list is not by itself a clean bill of health.** The
-    analysis does not run when sqlglot is missing, when the statement does not parse, or when there
-    is no SELECT, and each of those yields the same empty list a genuinely clean statement does.
-    `unchecked` is what separates them: null when the checks ran, a sentence when they could not.
-    Read both or read neither.
+    `aggregates` is that report: one entry per aggregate the statement computes, saying whether a
+    join multiplies the rows behind it and which join does. `findings` is the same information
+    projected flat, kept because a caller that only wants "what went wrong" should not have to walk
+    the roster to find it — but it is the roster that carries the cleared aggregates, and a surface
+    reading only `findings` reports a clean number by saying nothing about it.
+
+    **An empty `findings` is not by itself a clean bill of health.** The analysis does not run when
+    sqlglot is missing, when the statement does not parse, or when there is no SELECT, and each of
+    those yields the same empty list a genuinely clean statement does. `unchecked` is what separates
+    them: null when the checks ran, a sentence when they could not. Read both or read neither.
 
     A table's declared `default_filters` are NOT applied here — ACE-042 deleted the injection, and
     nothing has replaced it — so this command emits no `applied_filters` key. An always-empty list
@@ -240,6 +245,10 @@ def cmd_prepare(args) -> int:
     pf = RT.pre_flight_check(sql, org)
     _print_json({
         "sql": sql,
+        # One entry per aggregate, cleared ones included — the same roster the receipt's
+        # `aggregates` section carries, from the same analysis, so the two surfaces cannot describe
+        # one statement two ways.
+        "aggregates": [a.as_dict() for a in pf.aggregates],
         "findings": [f.as_dict() for f in pf.findings],
         # Null when the checks ran. A caller that ignores this reads "skipped" as "clean".
         "unchecked": pf.unchecked,
@@ -693,10 +702,12 @@ def cmd_seed_examples(args) -> int:
 
 def cmd_seed_validate(args) -> int:
     """Phase-6 trust onboarding: run every written seed against the live DB and emit the
-    examples-validation items. Each seed runs THROUGH execute_sql.py (the agami-query path)
-    so the fan/chasm pre-flight and the scope/PII gates always apply — a raw driver could skip
-    that and let a fan-out scan the whole table. A refused/errored seed is surfaced with
-    its `error`, not faked. Replaces ad-hoc 'run all the seeds' scripts."""
+    examples-validation items. Each seed runs THROUGH execute_sql.py (the agami-query path) so the
+    scope gates always apply and every seed carries the same receipt a caller's own query would — a
+    raw driver could skip both. The gates here are table scope, the `SELECT *` ban and column scope;
+    the fan/chasm pre-flight is a report, not a gate, and there is no PII gate, which ACE-094
+    deleted. A refused/errored seed is surfaced with its `error`, not faked. Replaces ad-hoc 'run
+    all the seeds' scripts."""
     import csv as _csv
     import os
     import subprocess
@@ -732,7 +743,8 @@ def cmd_seed_validate(args) -> int:
             capture_output=True, text=True, env=env,
         )
         if proc.returncode != 0:
-            # SQL error, or a fan/chasm pre-flight refusal — surface it; never fake a result.
+            # A SQL error or a scope refusal — surface it; never fake a result. NOT a fan or chasm
+            # trap: those are reported on the receipt of an answer that ran, and exit 0 with them.
             item["error"] = (proc.stderr or "").strip()[:600] or f"execute_sql exit {proc.returncode}"
         else:
             rows = list(_csv.reader(io.StringIO(proc.stdout)))

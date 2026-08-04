@@ -202,8 +202,11 @@ def test_each_condition_executes_and_carries_its_finding(shop, risk, sql):
     assert env.status == "ok", env
     assert spy.calls and spy.calls[0][0] == sql   # and byte-identical, per ACE-093
 
+    # Keyed per AGGREGATE since ACE-060, so the risk is on the item's `findings` rather than being
+    # the item's own name. What this test claims is unchanged: the condition executed, and the
+    # receipt beside the answer says what was found.
     items = rt.assemble_receipt(shop.org, sql)["aggregates"]["items"]
-    assert risk in [i["name"] for i in items], items
+    assert risk in [f["risk"] for i in items for f in i["findings"]], items
 
 
 def test_a_statement_that_trips_two_conditions_carries_both(shop):
@@ -219,8 +222,12 @@ def test_a_statement_that_trips_two_conditions_carries_both(shop):
     env = execute_sql.execute_guarded(sql, PROFILE, AREA, executor=spy)
 
     assert env.status == "ok", env
-    names = [i["name"] for i in rt.assemble_receipt(shop.org, sql)["aggregates"]["items"]]
+    items = rt.assemble_receipt(shop.org, sql)["aggregates"]["items"]
+    names = [f["risk"] for i in items for f in i["findings"]]
     assert "fan_trap" in names and "bad_aggregation" in names, names
+    # And both land on the ONE aggregate they are about, which is what ACE-060 added: the two facts
+    # were already carried, and nothing said they were about the same number.
+    assert len(items) == 1 and len(items[0]["findings"]) == 2, items
 
 
 # --- SC-2: no refusal anywhere carries a correctness reason ------------------
@@ -349,16 +356,22 @@ def test_the_boundary_that_survives(shop):
 
 
 def test_the_finding_reaches_the_receipt_without_loss(shop):
-    """What the analysis produced is what the receipt carries: the risk, the sentence, and which
-    join does it. Nothing is enriched here — turning these into full 6a/6c facts is a later slice —
-    and nothing is dropped on the way."""
-    produced = rt.pre_flight_check(FAN, shop.org).findings
+    """What the analysis produced is what the receipt carries: the aggregate, the risk, the
+    sentence, and which join does it. Nothing is enriched on the way and nothing is dropped.
+
+    The item became the AGGREGATE with ACE-060, so the comparison is against `pre_flight_check`'s
+    own roster rather than its flat finding list — and that they are the same object is the
+    property worth pinning, because the CLI reads one and the receipt reads the other.
+    """
+    result = rt.pre_flight_check(FAN, shop.org)
     carried = rt.assemble_receipt(shop.org, FAN)["aggregates"]["items"]
 
-    assert len(carried) == len(produced) == 1
-    assert carried[0]["name"] == produced[0].risk
-    assert carried[0]["detail"] == produced[0].reason
-    assert carried[0]["joins"] == produced[0].triggering_joins == ["orders (1) <- order_items (N)"]
+    assert carried == [a.as_dict() for a in result.aggregates]
+    assert len(carried) == len(result.findings) == 1
+    assert carried[0]["aggregate"] == "SUM(o.total)"
+    assert carried[0]["findings"][0]["reason"] == result.findings[0].reason
+    assert carried[0]["joins"] == result.findings[0].triggering_joins == [
+        "orders (1) <- order_items (N)"]
 
 
 def test_every_arm_of_a_set_operation_is_described(shop):
@@ -374,15 +387,16 @@ def test_every_arm_of_a_set_operation_is_described(shop):
 def test_the_marker_states_what_the_check_still_misses(shop):
     """The `aggregates` marker is the half of this that keeps the section honest.
 
-    Nulling it would claim completeness the detector does not have: `_output_selects` skips CTE and
-    subquery SELECTs, so a trap inside a `WITH` is invisible and the section would report nothing
-    while looking checked. Keeping the old sentence would have it report findings under a claim that
-    nothing was checked. It says both: the check ran, and here is what it does not reach."""
-    marker = rt.assemble_receipt(shop.org, FAN)["aggregates"]["undetermined"]
+    It is composed per statement since ACE-060, so `FAN` — where every aggregate settled — earns
+    none of its clauses and reads null. That is the state the four-state contract calls "established,
+    here it is", and one fixed sentence made it unreachable. A statement that DOES have a gap still
+    gets it: a trap inside a `WITH` is invisible to the walk, and the section says so rather than
+    reporting nothing while looking checked."""
+    assert rt.assemble_receipt(shop.org, FAN)["aggregates"]["undetermined"] is None
 
-    assert marker and "checked" in marker
-    assert "is not checked" not in marker
-    assert "CTE" in marker or "subquery" in marker
+    hidden = "WITH x AS (SELECT SUM(o.total) t FROM orders o) SELECT 1 FROM x"
+    marker = rt.assemble_receipt(shop.org, hidden)["aggregates"]["undetermined"]
+    assert marker and ("CTE" in marker or "subquery" in marker)
     # It ships to a user, so it carries no spec id — the same bound every other marker takes.
     import re
     assert not re.search(r"\b[A-Z]{2,}-\d+\b", marker), marker

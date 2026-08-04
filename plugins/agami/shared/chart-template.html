@@ -81,7 +81,16 @@
                            "cross_schema":false,"on":"orders.customer_id = customers.id"}],
                 "undetermined": "..."},
 
-      "aggregates": {"items": [], "undetermined": "..."},
+      // One entry per aggregate the statement computes, cleared ones included: `status` is
+      // "multiplied" (and `joins` names the join that did it), "not_multiplied", or
+      // "undetermined". `findings` is the other axis — aggregation class and semi-additivity,
+      // which are about what the number MEANS rather than how many rows went into it.
+      "aggregates": {"items": [{"aggregate":"SUM(o.total)","scope":"main","status":"multiplied",
+                                "joins":["orders (1) <- order_items (N)"],
+                                "findings":[{"risk":"fan_trap","reason":"...",
+                                             "triggering_joins":["..."],
+                                             "aggregate":"SUM(o.total)"}]}],
+                     "undetermined": null},
 
       // Capped at three: a person confirms three prose meanings next to an answer, not forty. The
       // marker is null when they all fit and COUNTS the rest when they do not — it is never null
@@ -106,8 +115,9 @@
       items set,   undetermined set  : partly established, and here is what is missing.
 
   Render the marker. A section drawn as items-only turns "not checked" back into "clean", which
-  is the exact defect the marker exists to remove. `aggregates` ships empty WITH a marker today,
-  so a correct rendering visibly says aggregates were not checked; that is honest, not a bug.
+  is the exact defect the marker exists to remove. Every section can now reach a null marker, so
+  one that is drawn is one this statement earned: on `aggregates` it means an aggregate was left
+  unresolved, or sits somewhere the walk does not read, and not that nothing was checked.
 
   There is no `warnings` key. The unreviewed-join banner is DERIVED here, from `joins.items`
   filtered to review_state != "approved": a review state can be counted, grouped and linked back
@@ -1563,20 +1573,47 @@
         }
       });
 
-      // Findings about the aggregates in this statement: fan-out, chasm cross-products, and
-      // aggregation-class problems. Each is a FACT, never a verdict — whether it is a bug depends on
-      // the question, which the checks do not have. The section was declared and empty until the
-      // checks stopped refusing and started reporting; its marker still renders beneath, because
-      // "checked and found two things" and "checked completely" are different claims.
+      // One entry per aggregate the statement computes, saying whether a join multiplies the rows
+      // its value was computed from and which join does. Each is a FACT, never a verdict — whether
+      // a multiplication is a bug depends on the question, which the checks do not have.
+      //
+      // The CLEAN ones are rendered too, and that is the point of the section rather than clutter
+      // in it: a list of problems reports a sound number by containing nothing about it, which is
+      // indistinguishable from not having checked. Reading "not multiplied" beside a total is the
+      // whole difference. The marker still renders beneath, because "every aggregate settled" and
+      // "every aggregate a reader might care about was read" are different claims.
       renderSection('aggregates', 'Aggregates', null, list => {
         const ul = el('ul');
+        // The three states, on the three badge styles the panel already has rather than three new
+        // ones — the same mapping `FILTER_BADGE` makes, for the same reason. `multiplied` is the
+        // amber state a reader has to act on, `not_multiplied` reads like an approved thing, and
+        // `undetermined` is the grey "we could not tell", which is not a failure and is not a
+        // softer `multiplied`: it says the analysis could not resolve what the aggregate reads, so
+        // it declines to claim either way. An unrecognised status falls through to grey, because
+        // inventing a green for a word we do not know is the one direction that lies.
+        const AGG_BADGE = {
+          multiplied: ['unreviewed', 'rows multiplied by a join'],
+          not_multiplied: ['approved', 'not multiplied'],
+          undetermined: ['stale', 'could not be determined'],
+        };
         list.forEach(a => {
           const li = el('li');
-          li.appendChild(el('strong', { text: (a.name || 'finding').replace(/_/g, ' ') }));
-          if (a.detail) li.appendChild(el('span', { text: ' — ' + a.detail }));
+          li.appendChild(el('code', { text: a.aggregate || '<aggregate>' }));
+          // Which arm of a set operation wrote it. Absent on an ordinary statement, where every
+          // aggregate is in the only query there is and `#1` would be noise.
+          if (a.scope && a.scope !== 'main') {
+            li.appendChild(document.createTextNode(' ' + a.scope));
+          }
+          const said = AGG_BADGE[a.status] || ['stale', a.status || 'unknown'];
+          li.appendChild(el('span', { class: 'conf-badge ' + said[0], text: said[1] }));
           if (a.joins && a.joins.length) {
             li.appendChild(el('div', { class: 'receipt-meta', text: a.joins.join(', ') }));
           }
+          // The other axis: aggregation-class and semi-additivity are about what the aggregate
+          // MEANS, and a number can be un-multiplied and still meaningless.
+          (a.findings || []).forEach(f => {
+            if (f.reason) li.appendChild(el('div', { class: 'receipt-meta', text: f.reason }));
+          });
           ul.appendChild(li);
         });
         rb.appendChild(ul);

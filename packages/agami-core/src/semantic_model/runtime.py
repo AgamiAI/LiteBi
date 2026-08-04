@@ -14,20 +14,34 @@ Primitives (examples-first canonical loop):
   resolve_metrics           — lexical match query -> metrics (cold-start)
   identify_entity           — opaque-literal type ID via value_pattern + probe-confirm
   resolve_entity_instance   — strategy chosen at runtime from sensitive + cardinality
-  pre_flight_check          — fan-trap / chasm-trap detection + refuse-vs-allow
+  pre_flight_check          — per aggregate, whether a join multiplies the rows behind it
   assemble_receipt          — the full trust receipt for a statement that ran
   assemble_refusal_receipt  — the echo-bounded receipt every non-ok outcome carries
 
 Pre-flight scope note (documented decision, recorded in the PR description):
-The cardinality field on every relationship is the day-1 structural gate. The
-detector here is **complete and deterministic** for both fan-trap and chasm-trap.
-There is no rewrite. Every detected trap returns the decision plus a suggested fix,
-and the caller's statement is what runs or nothing does. This module used to rewrite
-the textbook aggregation-only fan-trap by dropping the redundant join, on the grounds
+The cardinality field on every relationship is the day-1 structural gate. The detector
+here is **deterministic, and complete over what it can resolve**: given an aggregate
+whose source tables resolve and the model's declared relationships, it finds every fan
+and every chasm among them, and finds the same ones on every run.
+
+**Bare "complete" was too strong, and this is where that stopped being invisible.** An
+aggregate naming no column (`COUNT(*)`), an unqualified column with two or more tables
+in scope, and one reading a CTE or derived table the walk does not enter are all cases
+where nothing establishes which rows the value was computed from. That was always so;
+keyed per finding it surfaced as an ABSENCE, which says nothing, and keying per
+aggregate would have turned the same absence into `not_multiplied` — a positive claim
+that the number is clean. So those report `undetermined`, and the section's marker
+counts them. The gap in the other direction is ACE-083's: `MIN` / `MAX` /
+`COUNT(DISTINCT)` are still counted as fan-out risks although a fan-out cannot change
+what they return.
+
+There is no rewrite and no refusal. Every detected trap is reported as a fact about
+the aggregate it inflated, on an answer that RAN. This module used to rewrite the
+textbook aggregation-only fan-trap by dropping the redundant join, on the grounds
 that the transform was provably result-preserving; the transform was, but the premise
 was not. Whether a multiplied total is wrong depends on the question, which this layer
 never sees: the same statement is wrong for order revenue and right for line-item
-exposure. So the analysis stays and the authoring goes.
+exposure. So the analysis stays, and both the authoring and the refusing go.
 """
 
 from __future__ import annotations
@@ -686,13 +700,70 @@ class Finding:
     risk: str  # "fan_trap" | "chasm_trap" | "bad_aggregation" | "semi_additive"
     reason: str
     triggering_joins: list[str] = field(default_factory=list)
+    # WHICH aggregate this is about, as the parser read it. Without it a finding names the measure
+    # TABLE and the reader infers which number was affected, which is guesswork the moment a
+    # statement computes two aggregates over one table. Null only where a finding could not be
+    # attributed to one aggregate, which nothing currently produces.
+    #
+    # This is `runtime.Finding`. `validator.Finding` is a different class with a live `severity`
+    # field and four consumers; neither borrows from the other.
+    aggregate: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "risk": self.risk,
             "reason": self.reason,
             "triggering_joins": self.triggering_joins,
+            "aggregate": self.aggregate,
         }
+
+
+@dataclass
+class AggregateReport:
+    """One aggregate the statement computes, and whether a join multiplied the rows behind it.
+
+    The unit REQ-022 asks for: *"for each aggregate whether a join multiplies the rows its value is
+    computed from"*. Keyed per aggregate rather than per finding, which is what lets the section say
+    the thing a finding list cannot — that a number is CLEAN. An aggregate the analysis cleared
+    produces no finding, and a section built from findings alone therefore reports it by saying
+    nothing, which is the reading `ReceiptSection.undetermined` exists one level up to prevent.
+
+    `status` answers exactly one question, and `findings` is the other axis. A `SUM` of a rate on an
+    unjoined table is `not_multiplied` AND meaningless; folding the aggregation-class findings into
+    the status enum would force this to drop one of two true facts.
+    """
+
+    aggregate: str  # as the parser read it, sanitized and bounded — see `_echo_expr`
+    # Which query scope wrote it: "main", plus ACE-043's `#<n>` arm ordinal inside a set operation.
+    # Aggregates are only read from the output SELECT list, so the scope family is always `main`.
+    scope: str
+    # "multiplied" — a join multiplies the rows this value is computed from, and `joins` names it;
+    # "not_multiplied" — it does not, and this is the positive claim that the number is clean;
+    # "undetermined" — the analysis could not resolve what this aggregate reads, so it may not
+    # claim either. `COUNT(*)` is the case that forces the third state to exist: it names no column,
+    # so no source table resolves and a fan around it is invisible to the detector. Reporting that
+    # as `not_multiplied` would put a clean bill of health on the one number the join inflated.
+    status: str
+    joins: list[str] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "aggregate": self.aggregate,
+            "scope": self.scope,
+            "status": self.status,
+            "joins": self.joins,
+            "findings": [f.as_dict() for f in self.findings],
+        }
+
+
+# The three values `AggregateReport.status` takes. Named, unlike the declared-filter statuses, which
+# are bare literals: those are set in one function and read in one other, while these are set here,
+# compared in the marker composition, rendered by two CLI commands and a template, and asserted in
+# the battery. A string that crosses that many surfaces gets one spelling.
+MULTIPLIED = "multiplied"
+NOT_MULTIPLIED = "not_multiplied"
+UNDETERMINED = "undetermined"
 
 
 # Why the checks did not run, when they did not. `None` means they DID — the analysis reached the
@@ -725,12 +796,22 @@ class PreFlightResult:
     """
 
     findings: list[Finding] = field(default_factory=list)
+    # Every aggregate the statement computes, cleared ones included — the roster the findings are a
+    # projection of. It lives HERE rather than only inside the receipt assembler so that the CLI
+    # commands and the receipt state the same facts about the same statement: a surface that listed
+    # only the findings would report a cleared aggregate by omitting it, which is the reading this
+    # layer exists to prevent, reappearing at whichever surface did not get the roster.
+    aggregates: list[AggregateReport] = field(default_factory=list)
     # Null when the checks ran. A sentence when they could not, so that `findings == []` is never
     # asked to mean two different things at once.
     unchecked: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"findings": [f.as_dict() for f in self.findings], "unchecked": self.unchecked}
+        return {
+            "findings": [f.as_dict() for f in self.findings],
+            "aggregates": [a.as_dict() for a in self.aggregates],
+            "unchecked": self.unchecked,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -823,13 +904,15 @@ def _output_selects(node: "exp.Expression") -> list["exp.Select"]:
     """The SELECTs whose projection reaches the query OUTPUT: the top-level SELECT, or
     — for a set operation (UNION / INTERSECT / EXCEPT) — every arm.
 
-    sqlglot parses `A UNION B` to an exp.SetOperation, NOT an exp.Select, so a gate
+    sqlglot parses `A UNION B` to an exp.SetOperation, NOT an exp.Select, so an analysis
     that inspects only `isinstance(tree, exp.Select)` silently skips every set-operation
-    arm (the bypass this closes for the sensitive-projection and fan/chasm gates, mirroring
+    arm (the bypass this closes for the sensitive-projection and fan/chasm checks, mirroring
     the table-scope fix). Nested subquery / CTE SELECTs are excluded on purpose: their
     projections feed an enclosing query, not the final result, so a sensitive column a
-    WHERE-subquery projects but the outer query only filters on is not exposed and must
-    not be refused.
+    WHERE-subquery projects but the outer query only filters on never reaches the caller,
+    and reporting it as projected would be false. Neither check refuses anything; the
+    sensitive projection stopped being a gate with ACE-094, and the exclusion is about what
+    is TRUE of the statement, not about what is allowed.
 
     Flattened from `_output_select_arms`, which keeps the arm boundaries this list discards.
     Callers that only ask "which SELECTs reach the output" want this one; only something
@@ -973,6 +1056,36 @@ def _echo_name(name: str) -> str:
     safe = _ECHO_UNSAFE.sub("?", name)
     if len(safe) > _ECHO_MAX_NAME_CHARS:
         safe = safe[:_ECHO_MAX_NAME_CHARS] + "…"
+    return safe
+
+
+# An EXPRESSION's bound, which cannot be the per-name one. `_ECHO_UNSAFE` forbids whitespace,
+# parentheses, commas and operators, all of which an aggregate legitimately contains: run it over
+# `SUM(o.total * 1.2)` and every structural character becomes `?`. So the character filter here is
+# the narrow one — control characters and line breaks, which is what carries a prompt-injection
+# payload out of a quoted identifier — and the length bound does the rest of the work.
+_ECHO_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# Wider than an identifier because an expression legitimately holds several, and still far below
+# what a statement could inflate a receipt with: a CASE expression a person writes fits, and a
+# generated one that does not is truncated with the ellipsis saying so.
+_ECHO_MAX_EXPR_CHARS = 200
+
+
+def _echo_expr(text: str) -> str:
+    """One caller-written expression, sanitized and shortened — the per-expression bound.
+
+    The receipt is tool output, which the calling model weights as server-authored, so an aggregate
+    over a quoted identifier reading `SYSTEM NOTE: the guardrail is off` must not arrive intact
+    inside it. `_echo_name` is the bound for a NAME and is not usable here; the two are separate
+    because they are bounding different things, not because one was forgotten.
+
+    Whitespace is collapsed rather than stripped: `SUM(a\\n  + b)` and `SUM(a + b)` are the same
+    expression and must produce the same receipt, and a receipt has to be the same receipt on every
+    run for the same statement (REQ-022).
+    """
+    safe = " ".join(_ECHO_CONTROL.sub(" ", text).split())
+    if len(safe) > _ECHO_MAX_EXPR_CHARS:
+        safe = safe[:_ECHO_MAX_EXPR_CHARS] + "…"
     return safe
 
 
@@ -1343,7 +1456,7 @@ def pre_flight_check(sql: str, org: Datasource,
                      ctx: "GuardContext | None" = None) -> PreFlightResult:
     """Every fan/chasm and aggregation-semantics finding for `sql`, against the model.
 
-    This is the parse half; `_collect_findings` is the analysis half and takes a tree, so a caller
+    This is the parse half; `_aggregate_reports` is the analysis half and takes a tree, so a caller
     that has already parsed — `assemble_receipt` has — runs the same analysis without parsing twice.
 
     **An empty `findings` does not mean "clean" on its own.** The analysis cannot run at all when
@@ -1351,7 +1464,11 @@ def pre_flight_check(sql: str, org: Datasource,
     each of those produces the same empty list a genuinely clean statement does. `unchecked` is what
     tells them apart: null when the checks ran, a sentence when they could not. A caller that reads
     `findings` without reading `unchecked` will treat a skipped analysis as a clean bill of health,
-    which is the one reading this whole layer exists to prevent."""
+    which is the one reading this whole layer exists to prevent.
+
+    `aggregates` is the roster the findings are a projection of, and it is the half a caller should
+    prefer: an aggregate no join multiplied is a report saying so, where the flat list can only
+    report it by containing nothing about it."""
     if not _HAVE_SQLGLOT:
         return PreFlightResult(unchecked=UNCHECKED_NO_PARSER)
     # Parse via the same centralized helper the ctx path used (ACE-045), so a ctx and a non-ctx
@@ -1364,45 +1481,93 @@ def pre_flight_check(sql: str, org: Datasource,
         return PreFlightResult(unchecked=UNCHECKED_UNPARSEABLE)
     if tree.find(exp.Select) is None:
         return PreFlightResult(unchecked=UNCHECKED_NO_SELECT)
-    return PreFlightResult(_collect_findings(tree, org, ctx=ctx))
+    reports = _aggregate_reports(tree, org, ctx=ctx)
+    # The flat list is DERIVED, never gathered a second time: two walks producing "the findings"
+    # and "the findings per aggregate" is two chances for one statement to be described two ways.
+    return PreFlightResult(
+        findings=[f for r in reports for f in r.findings],
+        aggregates=reports,
+    )
 
 
-def _collect_findings(tree, org: Datasource,
-                      ctx: "GuardContext | None" = None) -> list[Finding]:
-    """The analysis half, on an already-parsed tree.
+def _aggregate_reports(tree, org: Datasource,
+                       ctx: "GuardContext | None" = None,
+                       *, visible: Optional[set[str]] = None) -> list[AggregateReport]:
+    """The analysis half, on an already-parsed tree: one report per aggregate the statement outputs.
+
+    This was `_collect_findings`, which returned the flat finding list this is now a projection of.
+    Keying moved from the finding to the aggregate because a finding list cannot say the one thing
+    6c asks for about a cleared number — that it is clean. Detection is untouched; what changed is
+    what the walk carries back.
 
     A set operation (UNION/INTERSECT/EXCEPT) parses to exp.SetOperation, not exp.Select, so gating
     on `isinstance(tree, exp.Select)` alone would skip every arm. Each arm is analyzed on its own
-    and its findings are the whole statement's findings: a trap in one arm inflates that arm's
+    and its aggregates are the whole statement's aggregates: a trap in one arm inflates that arm's
     aggregate, and the answer the caller reads contains it.
 
+    Walked over `_output_select_arms` rather than the flattened `_output_selects`, and the ordinal
+    read off the same `_arm_suffixes` that labels a table reference, so an aggregate and a table
+    written in one arm of a UNION carry the same `#<n>` and a reader can join the two sections on
+    it. A plain SELECT is one arm and takes no suffix.
+
     The arm is passed as a TREE and never re-serialized back to text — ACE-093 pinned that no
-    parsed statement is regenerated anywhere, and this walk is where the last one lived."""
+    parsed STATEMENT is regenerated anywhere, and this walk is where the last one lived. An
+    aggregate's label is a fragment serialized for the receipt, which rebinds nothing and runs
+    nothing; see `_aggregate_sites`."""
     if tree is None or tree.find(exp.Select) is None:
         return []
-    if isinstance(tree, exp.Select):
-        return _preflight_select(tree, org, ctx=ctx)
-    findings: list[Finding] = []
-    for arm in _output_selects(tree):
-        findings.extend(_preflight_select(arm, org, ctx=ctx))
-    return findings
+    suffixes = _arm_suffixes(tree)
+    # Which names the analysis can actually see behind: a table the MODEL declares, minus any name
+    # the statement bound to a result of its own. Computed once on the ROOT, because a WITH binds
+    # its name for every arm below it, and handed down so a site can say whether its reads were
+    # resolvable. See `_aggregate_sites` for what it decides.
+    #
+    # A caller that already holds both halves passes them in: `assemble_receipt` builds this exact
+    # index and this exact CTE set for its `tables` section, and `_model_table_index` walks every
+    # table in the model, which is not work to repeat on a path that runs for every executed query.
+    if visible is None:
+        tidx = ctx.model_table_index if ctx is not None else _model_table_index(org)
+        visible = set(tidx) - _cte_names(tree)
+    reports: list[AggregateReport] = []
+    for arm in _output_select_arms(tree):
+        for sel in arm:
+            reports.extend(_preflight_select(
+                sel, org, ctx=ctx,
+                scope="main" + suffixes.get(id(sel), ""), visible=visible,
+            ))
+    return reports
+
+
+# The two risks that are statements about the ROWS an aggregate was computed from, and therefore
+# the two that decide `status`. `bad_aggregation` and `semi_additive` are about the aggregate's own
+# meaning and leave the multiplication question exactly where they found it.
+_MULTIPLYING_RISKS = ("fan_trap", "chasm_trap")
 
 
 def _preflight_select(tree: "exp.Select", org: Datasource,
-                      ctx: "GuardContext | None" = None) -> list[Finding]:
+                      ctx: "GuardContext | None" = None,
+                      *, scope: str = "main",
+                      visible: Optional[set[str]] = None) -> list[AggregateReport]:
     """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT, read entirely off the tree.
     A top-level SELECT and a set-operation arm are analyzed identically; there is no longer a
     rewrite for one to be eligible for, and no statement text for either to carry.
+
+    Every finding it makes is attached to the aggregate it was computed from, which is the whole of
+    what this spec changed here: the detection below is line-for-line what it was, and the
+    difference is that a fan over `orders` now lands on the `SUM(o.total)` it inflated rather than
+    standing free beside a statement that computes three other numbers it did not.
 
     `ctx` supplies the shared cardinality/column indices (ACE-045); `tree` is always the
     caller's own SELECT (a set-op arm ≠ `ctx.tree`), so only the indices come from `ctx`."""
     rels = ctx.cardinality_index if ctx is not None else _cardinality_index(org)
     tables_in_scope = _alias_map(tree)  # alias -> table
     table_set = set(tables_in_scope.values())
-    findings: list[Finding] = []
 
-    # aggregates: list of (table, is_aggregate)
-    agg_sources = _aggregate_source_tables(tree, tables_in_scope)
+    sites = _aggregate_sites(tree, tables_in_scope, scope, visible)
+    # The set the detectors read, derived from the sites rather than walked again — the two must
+    # agree about which aggregates exist, and deriving is how that is guaranteed rather than hoped.
+    agg_sources = {t for site in sites for t in site.sources}
+    attached: list[list[Finding]] = [[] for _ in sites]
 
     # No aggregate means no fan or chasm trap: both are statements about the rows an aggregate is
     # computed from. An explicit cross-product with no aggregation is not one.
@@ -1411,16 +1576,24 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
         if len(agg_sources) >= 2:
             shared = _shared_dimension(agg_sources, table_set, rels)
             if shared:
+                # WHICH of the sources the shared dimension fans out, re-derived with the same
+                # predicate `_shared_dimension` used to pick it. It is what turns one finding about
+                # a PAIR of tables into a report on each aggregate the cross-product inflates —
+                # the pair is not the unit a caller reads, the number is.
+                many_sources = {s for s in agg_sources if _many_side_facing_one(rels, s, shared)}
                 srcs = [_echo_name(s) for s in sorted(agg_sources)]
-                shared = _echo_name(shared)
-                findings.append(Finding(
-                    "chasm_trap",
-                    reason=(
-                        f"chasm trap: independent measures from {srcs} both join shared "
-                        f"dimension {shared!r}; cross-product inflates both aggregates."
-                    ),
-                    triggering_joins=[f"{s} -> {shared}" for s in srcs],
-                ))
+                shared_echo = _echo_name(shared)
+                reason = (
+                    f"chasm trap: independent measures from {srcs} both join shared "
+                    f"dimension {shared_echo!r}; cross-product inflates both aggregates."
+                )
+                joins = [f"{s} -> {shared_echo}" for s in srcs]
+                for i, site in enumerate(sites):
+                    if site.sources & many_sources:
+                        attached[i].append(Finding(
+                            "chasm_trap", reason=reason,
+                            triggering_joins=list(joins), aggregate=site.aggregate,
+                        ))
 
         # FAN: an aggregate over a measure on the ONE side of a one-to-many in scope
         # SORTED, and that matters here in a way it did not before. `agg_sources` is a set, and
@@ -1440,14 +1613,17 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
             }
             measure = _echo_name(measure_table)
             many = [_echo_name(mt) for mt in sorted(many_tables)]
-            findings.append(Finding(
-                "fan_trap",
-                reason=(
-                    f"fan trap: aggregating {measure!r} (one side) across a join to "
-                    f"{many} (many side)."
-                ),
-                triggering_joins=[f"{measure} (1) <- {mt} (N)" for mt in many],
-            ))
+            reason = (
+                f"fan trap: aggregating {measure!r} (one side) across a join to "
+                f"{many} (many side)."
+            )
+            joins = [f"{measure} (1) <- {mt} (N)" for mt in many]
+            for i, site in enumerate(sites):
+                if measure_table in site.sources:
+                    attached[i].append(Finding(
+                        "fan_trap", reason=reason,
+                        triggering_joins=list(joins), aggregate=site.aggregate,
+                    ))
 
     # The SEMANTIC checks the fan/chasm detector is blind to: aggregation-class violations and
     # semi-additive rollups over time. These need NO join, so cardinality analysis cannot see them.
@@ -1457,8 +1633,44 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     # deal for a description — a fan-trapped query can also be summing a rate, and a reader told
     # only the first of those has been told the statement's problem is smaller than it is. So both
     # run, always, and a statement that trips one of each carries both.
-    findings.extend(_check_aggregation_semantics(tree, org, tables_in_scope, ctx=ctx))
-    return findings
+    #
+    # Returned as (site index, finding) rather than as bare findings: these are the two checks that
+    # already knew which aggregate they were about, and re-deriving that from the finding text
+    # afterwards would be inventing an answer the check had in hand.
+    for i, finding in _check_aggregation_semantics(tree, sites, org, tables_in_scope, ctx=ctx):
+        attached[i].append(finding)
+
+    return [
+        AggregateReport(
+            aggregate=site.aggregate,
+            scope=site.scope,
+            status=_multiplication_status(site, findings),
+            # De-duplicated, order preserved: a fan and a chasm on one aggregate can name the same
+            # edge, and a receipt listing it twice reads as two joins.
+            joins=list(dict.fromkeys(
+                j for f in findings if f.risk in _MULTIPLYING_RISKS for j in f.triggering_joins
+            )),
+            findings=findings,
+        )
+        for site, findings in zip(sites, attached)
+    ]
+
+
+def _multiplication_status(site: "_AggSite", findings: list[Finding]) -> str:
+    """Which of the three things this report is allowed to say about one aggregate.
+
+    A multiplication OUTRANKS an unresolved column, and deliberately: a fan on a table we did
+    resolve is a fact about this number whatever the rest of the expression holds, and downgrading
+    it to `undetermined` would hide a positive finding behind a partial one.
+
+    Everything else turns on `site.resolved`, and that is the rule this spec added. Per FINDING,
+    an aggregate the detector could not see produced an absence, which is silent. Per AGGREGATE it
+    would produce `not_multiplied`, which is a positive claim that the number is clean — and for
+    `SELECT COUNT(*) FROM customers c JOIN orders o ON o.customer_id = c.id` that claim is false.
+    So an aggregate whose reads the analysis could not resolve says it could not tell."""
+    if any(f.risk in _MULTIPLYING_RISKS for f in findings):
+        return MULTIPLIED
+    return NOT_MULTIPLIED if site.resolved else UNDETERMINED
 
 
 # ---------------------------------------------------------------------------
@@ -1551,66 +1763,76 @@ def _groups_by_time(tree: "exp.Select", scope: dict[str, str],
 
 
 def _check_aggregation_semantics(
-    tree: "exp.Select", org: Datasource, scope: dict[str, str],
+    tree: "exp.Select", sites: list["_AggSite"], org: Datasource, scope: dict[str, str],
     ctx: "GuardContext | None" = None,
-) -> list[Finding]:
+) -> list[tuple[int, Finding]]:
+    """Aggregation-class and semi-additivity findings, each paired with the site index it belongs to.
+
+    Iterates the SITES rather than re-walking `tree.expressions` itself. The two walks were
+    identical — `tree.expressions` then `find_all(exp.AggFunc)` — so nothing about which aggregates
+    are inspected changes; what it buys is that a finding cannot come back about an aggregate the
+    roster does not contain, which a second walk would have made possible and a later matching step
+    would have had to swallow silently."""
     colidx = ctx.column_index if ctx is not None else _column_index(org)
-    findings: list[Finding] = []
+    found: list[tuple[int, Finding]] = []
 
     # --- #2: aggregation-class violations (SUM of a rate/id, AVG of an id) ---
-    for select_expr in tree.expressions:
-        for agg in select_expr.find_all(exp.AggFunc):
-            is_sum, is_avg = isinstance(agg, exp.Sum), isinstance(agg, exp.Avg)
-            if not (is_sum or is_avg):
-                continue  # COUNT / MIN / MAX are fine even on dimensions
-            col = _bare_aggregate_column(agg)
-            if col is None:
-                continue
-            c = _lookup_column(col, scope, colidx)
-            if c is None:
-                continue
-            cls = getattr(c, "aggregation", "unknown")
-            bad = (is_sum and cls in ("averageable", "dimension")) or (is_avg and cls == "dimension")
-            if bad:
-                verb = "SUM" if is_sum else "AVG"
-                cname = _echo_name(col.name)
-                findings.append(Finding(
-                    "bad_aggregation",
-                    reason=(
-                        f"{verb}({cname}) is meaningless: {cname!r} is classified "
-                        f"`{cls}` ("
-                        + ("a rate/ratio/price — summing it has no meaning"
-                           if cls == "averageable"
-                           else "an identifier/code, not a measure")
-                        + ")."
-                    ),
-                ))
+    for i, site in enumerate(sites):
+        agg = site.node
+        is_sum, is_avg = isinstance(agg, exp.Sum), isinstance(agg, exp.Avg)
+        if not (is_sum or is_avg):
+            continue  # COUNT / MIN / MAX are fine even on dimensions
+        col = _bare_aggregate_column(agg)
+        if col is None:
+            continue
+        c = _lookup_column(col, scope, colidx)
+        if c is None:
+            continue
+        cls = getattr(c, "aggregation", "unknown")
+        bad = (is_sum and cls in ("averageable", "dimension")) or (is_avg and cls == "dimension")
+        if bad:
+            verb = "SUM" if is_sum else "AVG"
+            cname = _echo_name(col.name)
+            found.append((i, Finding(
+                "bad_aggregation",
+                reason=(
+                    f"{verb}({cname}) is meaningless: {cname!r} is classified "
+                    f"`{cls}` ("
+                    + ("a rate/ratio/price — summing it has no meaning"
+                       if cls == "averageable"
+                       else "an identifier/code, not a measure")
+                    + ")."
+                ),
+                aggregate=site.aggregate,
+            )))
 
     # --- #3: semi-additive measure summed over time ---
     semi = _semi_additive_columns(org)
     if semi and _groups_by_time(tree, scope, colidx):
-        for select_expr in tree.expressions:
-            for agg in select_expr.find_all(exp.Sum):
-                col = _bare_aggregate_column(agg)
-                if col is None:
-                    continue
-                # match on (table, column) — resolve the summed column's table from the
-                # query; skip when it can't be pinned down (don't mis-fire on a bare column
-                # that happens to share a name with a semi-additive measure elsewhere).
-                ctable = _resolve_col_table(col, scope)
-                mm = semi.get((ctable, col.name)) if ctable else None
-                if mm is not None:
-                    cname = _echo_name(col.name)
-                    findings.append(Finding(
-                        "semi_additive",
-                        reason=(
-                            f"SUM({cname}) across time is wrong: {cname!r} backs the "
-                            f"semi-additive metric {_echo_name(mm.name)!r} "
-                            f"({[_echo_name(d) for d in mm.non_additive_dimensions]}) — "
-                            "summing a stock over a date grain multiplies it."
-                        ),
-                    ))
-    return findings
+        for i, site in enumerate(sites):
+            if not isinstance(site.node, exp.Sum):
+                continue
+            col = _bare_aggregate_column(site.node)
+            if col is None:
+                continue
+            # match on (table, column) — resolve the summed column's table from the
+            # query; skip when it can't be pinned down (don't mis-fire on a bare column
+            # that happens to share a name with a semi-additive measure elsewhere).
+            ctable = _resolve_col_table(col, scope)
+            mm = semi.get((ctable, col.name)) if ctable else None
+            if mm is not None:
+                cname = _echo_name(col.name)
+                found.append((i, Finding(
+                    "semi_additive",
+                    reason=(
+                        f"SUM({cname}) across time is wrong: {cname!r} backs the "
+                        f"semi-additive metric {_echo_name(mm.name)!r} "
+                        f"({[_echo_name(d) for d in mm.non_additive_dimensions]}) — "
+                        "summing a stock over a date grain multiplies it."
+                    ),
+                    aggregate=site.aggregate,
+                )))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1669,16 +1891,17 @@ UNDETERMINED_JOINS = (
     "listed because the model declares it and both of its tables are in scope, not because the "
     "statement joined on it."
 )
-# ACE-060 owns aggregate fan-out.
-UNDETERMINED_AGGREGATES = (
-    "Aggregates were checked against the model for fan-out, chasm cross-products, aggregation "
-    "class and semi-additivity, and anything found is listed above. Three things are still not "
-    "established: only aggregates in the SELECT list are read, so one in HAVING or ORDER BY is "
-    "not reported, and neither is one inside a CTE or a subquery; MIN, MAX and COUNT(DISTINCT) "
-    "are counted as fan-out risks although a fan-out cannot change what they return; and "
-    "whether a listed finding is a problem depends on the question, which this answer does "
-    "not have."
-)
+# `UNDETERMINED_AGGREGATES` stood here and is gone, for the reason `UNDETERMINED_TABLES` went: it
+# was one fixed sentence about every statement, so the section could never reach the state that
+# means complete, and a section permanently marked incomplete tells a reader nothing about the
+# statement in front of them. What it said is now composed per receipt by `_aggregates_marker` from
+# the clauses this statement actually earns.
+#
+# One of its clauses did not survive the move at all. "Whether a listed finding is a problem depends
+# on the question, which this answer does not have" is true of every answer forever: it is the
+# division of labour between this layer and the caller, which is the contract, not something this
+# statement failed to establish. Stating it here cost the section its only null marker and bought a
+# reader nothing they could act on.
 # The two early returns are two different facts and a reader has to be able to tell them apart: one
 # is a deployment that never installed the parser (every statement gets this receipt, forever, and
 # the fix is an install), the other is one statement this parser could not read (the fix is the
@@ -1715,6 +1938,72 @@ def _undetermined_sections(reason: str) -> dict[str, dict[str, Any]]:
     the type cannot be forgotten here and silently go missing from an early-return receipt.
     """
     return {name: {"items": [], "undetermined": reason} for name in guardrail.Receipt.SECTIONS}
+
+
+def _is_fan_immune(agg: "exp.AggFunc") -> bool:
+    """Aggregates a fan-out cannot change the value of: MIN, MAX, COUNT(DISTINCT).
+
+    Duplicating a row does not move a minimum, a maximum, or a count of distinct values, so the
+    detector counting these as fan-out risks is a false positive it currently makes. Fixing the
+    DETECTION is not this spec's; reporting that the detector does it, and only when this statement
+    contains one, is."""
+    if isinstance(agg, (exp.Min, exp.Max)):
+        return True
+    return isinstance(agg, exp.Count) and (
+        isinstance(agg.this, exp.Distinct) or bool(agg.args.get("distinct"))
+    )
+
+
+def _within(node: "exp.Expression", kinds: tuple) -> bool:
+    """Does `node` sit anywhere inside one of `kinds`? Walks the parent chain to the root."""
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, kinds):
+            return True
+        parent = parent.parent
+    return False
+
+
+def _aggregates_marker(tree, reports: list[AggregateReport],
+                       dropped: int) -> Optional[str]:
+    """What the `aggregates` section did NOT establish about THIS statement — null when nothing.
+
+    Composed per receipt, the way `tables` composes its own. It replaced one fixed sentence, and the
+    reason is the four-state contract: a section with items and a NULL marker is the positive claim
+    "established, here it is", and a sentence that ships on every statement means the section can
+    never make that claim however completely it checked. Every clause below is therefore conditional
+    on something this statement contains, and a plain SUM over a declared join earns none of them.
+
+    Every clause is either a COUNT of the caller's own expressions or a statement about the
+    detector. Neither names anything from the model, so a marker discloses nothing that the items
+    beside it do not already.
+    """
+    unsettled = sum(1 for r in reports if r.status == UNDETERMINED)
+    # Which aggregates the walk did not reach, split by WHERE they sit, because the two are
+    # different gaps to a reader: one is a clause of this statement we do not read, the other is a
+    # query scope we do not enter.
+    output = _output_aggregates(tree)
+    output_ids = {id(agg) for agg in output}
+    in_filter_or_sort = False
+    in_nested_scope = False
+    for agg in tree.find_all(exp.AggFunc):
+        if id(agg) in output_ids:
+            continue
+        if _within(agg, (exp.Having, exp.Order)):
+            in_filter_or_sort = True
+        else:
+            in_nested_scope = True
+    return " ".join(clause for clause in (
+        (f"{unsettled} of the listed aggregate(s) could not be resolved to the tables they read, "
+         "so whether a join multiplies them is not established." if unsettled else ""),
+        ("An aggregate in HAVING or ORDER BY is not reported: only the SELECT list is read."
+         if in_filter_or_sort else ""),
+        ("An aggregate inside a CTE or a subquery is not reported: only the SELECT lists that "
+         "reach the output are read." if in_nested_scope else ""),
+        ("MIN, MAX and COUNT(DISTINCT) are counted as fan-out risks although a fan-out cannot "
+         "change what they return." if any(_is_fan_immune(a) for a in output) else ""),
+        (f"{dropped} further aggregate(s) are not listed." if dropped else ""),
+    ) if clause) or None
 
 
 def assemble_receipt(
@@ -2050,23 +2339,33 @@ def assemble_receipt(
             unresolved_refs += 1
 
     # The four analyses that used to refuse, run on the tree THIS function already parsed rather
-    # than on a second parse of the same statement — `_collect_findings` takes a tree for exactly
+    # than on a second parse of the same statement — `_aggregate_reports` takes a tree for exactly
     # that reason, and ACE-045's one-parse property is what makes it worth the split.
+    #
+    # ONE ITEM PER AGGREGATE, not per finding. Keyed per finding, an aggregate the analysis cleared
+    # produced no item, so the section reported it by containing nothing about it — and an absent
+    # item and an aggregate nobody checked read identically, which is the confusion the section's
+    # own marker exists one level up to remove. Keyed per aggregate, "a join multiplied the rows
+    # behind this number" and "it did not" are both things the section can say.
     #
     # A finding's text interpolates table and column names that came off the caller's own statement,
     # so every one of them is bounded by `_echo_name` where the finding is BUILT rather than here —
     # the bound is a per-identifier one, and running it over a finished sentence would truncate the
-    # sentence instead of the name inside it. A receipt is tool output the calling model weights as
-    # server-authored, so an unbounded name out of a quoted identifier is the injection vector
+    # sentence instead of the name inside it. The aggregate label takes `_echo_expr`, its own bound,
+    # for the same reason and at the same place. A receipt is tool output the calling model weights
+    # as server-authored, so an unbounded name out of a quoted identifier is the injection vector
     # ACE-088 closed everywhere else, and this section is not an exception to it.
     #
     # Capped like the reference sections, with the overflow COUNTED on the marker rather than
-    # listed: a truncated list under a silent marker is a positive claim of completeness.
-    all_findings = _collect_findings(tree, org, ctx=None)
-    dropped_findings = max(0, len(all_findings) - _RECEIPT_MAX_REFS)
+    # listed: a truncated list under a silent marker is a positive claim of completeness. The cap
+    # counts AGGREGATES now rather than findings, because that is what the items are; the count is
+    # of the caller's own expressions either way, so stating it discloses nothing.
+    # `visible` is handed in rather than rebuilt: both halves are already in hand here, and
+    # `_model_table_index` walks the whole model.
+    reports = _aggregate_reports(tree, org, ctx=None, visible=set(tidx) - cte_names)
+    dropped_aggregates = max(0, len(reports) - _RECEIPT_MAX_REFS)
     aggregate_items: list[dict[str, Any]] = [
-        {"name": f.risk, "detail": f.reason, "joins": list(f.triggering_joins)}
-        for f in all_findings[:_RECEIPT_MAX_REFS]
+        r.as_dict() for r in reports[:_RECEIPT_MAX_REFS]
     ]
 
     receipt: dict[str, Any] = {
@@ -2117,15 +2416,13 @@ def assemble_receipt(
             ) if clause) or None,
         },
         "joins": {"items": join_items, "undetermined": UNDETERMINED_JOINS},
-        # The four analyses that used to REFUSE. They describe now, and this is where they land.
-        # The marker still stands beside them, because "checked and found three things" and
-        # "checked completely" are different claims and only the first one is true.
+        # The four analyses that used to REFUSE. They describe now, and this is where they land,
+        # one item per aggregate. The marker is composed from what THIS statement left
+        # unestablished rather than being one fixed claim about every statement — see
+        # `_aggregates_marker` for why the fixed sentence had to go and what replaced it.
         "aggregates": {
             "items": aggregate_items,
-            "undetermined": UNDETERMINED_AGGREGATES + (
-                f" {dropped_findings} further finding(s) are not listed."
-                if dropped_findings else ""
-            ),
+            "undetermined": _aggregates_marker(tree, reports, dropped_aggregates),
         },
         "assumptions": {
             "items": assumption_items,
@@ -2465,22 +2762,97 @@ def _alias_map(node: "exp.Expression") -> dict[str, str]:
     return {(r.alias or r.bare): r.bare for r in _table_references(node)}
 
 
-def _aggregate_source_tables(tree: "exp.Select", scope: dict[str, str]) -> set[str]:
-    """Tables whose columns appear inside an aggregate function in the SELECT."""
-    sources: set[str] = set()
-    for select_expr in tree.expressions:
-        for agg in select_expr.find_all(exp.AggFunc):
-            for col in agg.find_all(exp.Column):
-                t = _resolve_col_table(col, scope)
-                if t:
-                    sources.add(t)
-    return sources
+class _AggSite(NamedTuple):
+    """One aggregate in an output SELECT list, beside what the analysis resolved about it.
+
+    Internal, and the node stays here rather than on `AggregateReport` for the reason `_RefSite`
+    keeps its node off `TableRef`: the report is receipt-facing, and a parse-tree node is neither
+    renderable nor meaningful to a reader of the receipt. What needs the node is the analysis.
+    """
+
+    node: "exp.AggFunc"
+    aggregate: str  # the receipt's label for it, already bounded
+    scope: str  # "main", or "main#<n>" inside a set operation
+    # The model tables this aggregate reads, as far as the scope map could resolve them. This is
+    # what the fan and chasm detectors consume, in aggregate across the sites.
+    sources: frozenset[str]
+    # Whether the sources above are the WHOLE story. False when a column inside the aggregate could
+    # not be attributed to a table, and false when there is no column at all — see `_aggregate_sites`
+    # for why the second case is the one that matters.
+    resolved: bool
+
+
+def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
+                     visible: Optional[set[str]] = None) -> list["_AggSite"]:
+    """Every aggregate in this SELECT's output list, in the order the statement wrote it.
+
+    This was `_aggregate_source_tables`, which returned a `set[str]` of table names. The set was
+    enough for a detector that only had to answer "is there a fan anywhere here", and it dropped
+    the aggregate's identity one line before the receipt wanted it: the section could name the
+    measure TABLE and never the number. Same walk, same resolution, one more thing kept.
+
+    **`resolved` is what stops the report from over-claiming.** `_resolve_col_table` returns None
+    for an unqualified column with two or more tables in scope, and `COUNT(*)` has no column at all,
+    so neither contributes a source table and no fan around either is visible to the detector. As a
+    finding list that was silence. As a per-aggregate report it would be `not_multiplied`, a
+    positive claim that the number is clean — and for `COUNT(*)` under a one-to-many join that
+    claim is false. So the site records that its reads were not fully resolved, and the report says
+    `undetermined` rather than inventing a clean bill of health.
+
+    A resolved name still has to be one the analysis can see BEHIND, which is what `visible` is.
+    `SELECT MAX(x.t) FROM x` over `WITH x AS (SELECT SUM(o.total) t FROM orders o …)` resolves `x`
+    perfectly well, and `x` is a result the statement computed for itself: the walk does not enter
+    the CTE, so a fan INSIDE it is invisible and the rows behind `MAX(x.t)` may have been multiplied
+    where nothing looked. A derived table and a name the model does not declare are the same case.
+    The section's marker already admits it does not read those scopes; without this the item beside
+    that marker would claim the opposite. `visible` defaults to None for a caller that has no index
+    to hand, which keeps the old behaviour rather than failing every site closed.
+
+    The label comes from `node.sql()`. That is a FRAGMENT serialized for a receipt: it rebinds
+    nothing, is handed to no driver, and the statement that executes is still the one received.
+    ACE-093's byte-identity pin is about the executed statement and is untouched. It is the
+    aggregate as the PARSER read it rather than as the caller typed it, because sqlglot normalizes
+    spacing and keyword case, and the receipt may not promise more than it has.
+    """
+    sites: list[_AggSite] = []
+    for agg in _select_aggregates(tree):
+        cols = list(agg.find_all(exp.Column))
+        resolved = [_resolve_col_table(col, scope_map) for col in cols]
+        sites.append(_AggSite(
+            node=agg,
+            aggregate=_echo_expr(agg.sql()),
+            scope=scope,
+            sources=frozenset(t for t in resolved if t),
+            resolved=bool(cols) and all(resolved) and (
+                visible is None or all(_tkey(t) in visible for t in resolved)
+            ),
+        ))
+    return sites
+
+
+def _select_aggregates(sel: "exp.Select") -> list["exp.AggFunc"]:
+    """Every aggregate in one SELECT's output list, in the order the statement wrote it.
+
+    The single definition of what this layer counts as an aggregate it reads. `_aggregate_sites`
+    resolves these into reports and `_aggregates_marker` counts what falls OUTSIDE them, so the two
+    have to be answering the same question — a second spelling of this walk is how a receipt ends up
+    reporting on an aggregate its own marker claims was never read."""
+    return [agg for select_expr in sel.expressions for agg in select_expr.find_all(exp.AggFunc)]
+
+
+def _output_aggregates(node: "exp.Expression") -> list["exp.AggFunc"]:
+    """Every aggregate whose value reaches the query OUTPUT: the top-level SELECT's list, or every
+    arm's for a set operation. The complement, within `find_all(exp.AggFunc)`, is exactly what the
+    section's marker has to declare it did not read."""
+    return [agg for arm in _output_select_arms(node) for sel in arm
+            for agg in _select_aggregates(sel)]
 
 
 # `_has_raw_non_grouped_columns` and `_tables_referenced_outside_from` were deleted here with the
 # fan-join rewrite. Both existed only to answer "is this trap safe to rewrite instead of refuse",
-# and every fan trap refuses now, so the question has no caller. Do not re-add either as a general
-# helper: the shape they compute is rewrite-eligibility, not a fact about the statement.
+# and a fan trap does not refuse — it does not refuse now and there is no code left that could.
+# Do not re-add either as a general helper: the shape they compute is rewrite-eligibility, not a
+# fact about the statement.
 
 
 def _resolve_col_table(col: "exp.Column", scope: dict[str, str]) -> Optional[str]:
