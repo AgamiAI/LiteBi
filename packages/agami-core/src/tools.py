@@ -1996,7 +1996,21 @@ def _record_tool_call(rec: dict[str, Any]) -> None:
     of the two swallows this spec closes, and the reason neither had been closed before is that they
     masked each other exactly: this one hid inside the transport's, and the transport's had nothing
     to catch once this one stopped raising. Removing either alone was a PR with no observable
-    change, which is indistinguishable from not having done the work."""
+    change, which is indistinguishable from not having done the work.
+
+    The `audit_unavailable` exemption applies here too, and it has to. `_record_execution` skipping
+    the query row is not enough on its own: the HTTP transport writes a tool-call row in a `finally`
+    for EVERY call, so on that surface the row this exemption exists to avoid was written anyway,
+    failed, and raised — replacing the clean fail-closed refusal with a transport error and losing
+    the remediation that tells the operator what to restore. On the surface where an operator most
+    needs it. Found by driving a real server whose store died under it; no unit test saw it, because
+    the exemption looked complete at the one write path a unit test drives.
+
+    Read off `error_kind` because that IS the rule for a refusal — `record_tool_call` derives it as
+    `refusal["rule"]`. ACE-098 replaces that derivation with the typed refusal, and this check moves
+    with it rather than needing its own signal."""
+    if rec.get("error_kind") == RULE_AUDIT_UNAVAILABLE:
+        return
     try:
         from store import Store
 

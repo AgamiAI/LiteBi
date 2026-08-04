@@ -315,6 +315,35 @@ def test_the_audit_unavailable_refusal_itself_writes_no_row(env, monkeypatch):
     assert json.loads(body)["status"] == "refused"
 
 
+def test_the_tool_call_row_is_exempt_too_or_the_refusal_never_arrives(env, monkeypatch):
+    """The exemption has to cover BOTH writes, and this is the test that says why.
+
+    Exempting only the query row looks complete from the in-process path a unit test usually drives.
+    It is not: the HTTP transport writes a tool-call row in a `finally` for EVERY call, so the row
+    this exemption exists to avoid was written anyway, failed against the unreachable store, and
+    raised — replacing the clean fail-closed refusal with a transport error and losing the
+    remediation naming what the operator must restore. On the served surface, where they most need
+    it.
+
+    Found by driving a real server whose audit store died under it (testbed step 11b), not here.
+    This is that finding, brought back as a unit test.
+    """
+    monkeypatch.setenv("AGAMI_DB_URL", BROKEN_DB_URL)
+    envelope = execute_sql.execute_guarded(
+        "SELECT id FROM orders", PROFILE, "sales", executor=_SpyExecutor()
+    )
+    body = tools._emit(envelope, sql="SELECT id FROM orders", execution_ms=None, profile=PROFILE)
+
+    # The transport's own call, verbatim in shape: it hands over the serialized body and lets the
+    # recorder classify it. Must not raise, or the refusal above never reaches the caller.
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT id FROM orders"}, result_text=body,
+        execution_ms=1, actor=None,
+    )
+
+    assert json.loads(body)["refusal"]["rule"] == guardrail.RULE_AUDIT_UNAVAILABLE
+
+
 def test_every_other_refusal_still_records(env):
     """The exemption is exactly one rule wide, asserted rather than assumed.
 
