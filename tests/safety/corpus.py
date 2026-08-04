@@ -159,10 +159,10 @@ CASES: list[Case] = [
         "set-op-arm-col",
     ),
     # ── class 3: fail-closed scopability → unscopable ───────────────────────────────────────────
-    # The rule HAS a producer — `runtime.check_readable` — so these are classified one at a time.
-    # A statement that parses, reads from something and resolves to no named table is refused
-    # today; the forms that still slip a table function or a comma-joined VALUES past the walk are
-    # the two red ones, and the degrade-to-allow tail that closes them is owned elsewhere.
+    # The rule has TWO producers, deliberately: `runtime.check_readable` refuses a statement that
+    # resolves to no named table, and `runtime.check_scopable` refuses a FROM/JOIN source the scope
+    # walk cannot read. All three vectors are green; the table function and the comma-joined VALUES
+    # were red until the second producer landed, and the strict markers are what caught it.
     Case(
         "unscopable",
         "SELECT x FROM (VALUES (1), (2)) AS v(x)",
@@ -174,14 +174,12 @@ CASES: list[Case] = [
         "SELECT g FROM generate_series(1, 10) AS t(g)",
         guardrail.RULE_UNSCOPABLE,
         "table-fn",
-        red_on_main=True,
     ),
     Case(
         "unscopable",
         "SELECT o.id FROM orders o, (VALUES (1)) AS v(x)",
         guardrail.RULE_UNSCOPABLE,
         "comma-join-values",
-        red_on_main=True,
     ),
     # ── class 4: recon / metadata ───────────────────────────────────────────────────────────────
     # The attack class is one thing and the rule that stops it is two, deliberately. The recon

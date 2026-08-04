@@ -127,14 +127,15 @@ def test_the_corpus_is_the_shape_the_coverage_claim_rests_on():
     assert len({c.id for c in CASES}) == len(CASES), "a duplicate id would silently drop a vector"
 
 
-def test_only_the_measured_forms_are_red_and_the_dialect_quoted_ones_are_not():
+def test_no_vector_is_red_and_the_red_set_is_empty_on_purpose():
     """A strict xfail that PASSES fails the build, so the red set is a claim about this branch and
-    has to be exactly right.
+    has to be exactly right. Right now it is empty: every vector's owning gate has landed.
 
-    The dialect-quoted vectors are the ones this pins hardest. They were the corpus's largest
-    expected-red group until the readability gate shipped, and marking them now would fail the
-    build on four vectors that pass. The two that remain red both parse cleanly and still slip a
-    source past the scope walk, which is the narrow tail the readability gate does not yet reach.
+    It was not empty an hour ago. The table function and the comma-joined VALUES were both red,
+    and both flipped green when the scopable gate merged mid-build — the strict markers failed the
+    suite on the rebase, which is the whole reason they are strict. Keep this assertion exact
+    rather than loosening it to a subset check: an empty expected set is what makes a NEW red
+    vector, silently added later, fail here instead of blending in.
     """
-    assert {c.note for c in CASES if c.red_on_main} == {"table-fn", "comma-join-values"}
+    assert {c.note for c in CASES if c.red_on_main} == set()
     assert not any(c.red_on_main for c in CASES if c.cls == "quoting")
