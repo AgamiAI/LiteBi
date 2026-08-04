@@ -42,7 +42,8 @@ from pathlib import Path
 import pytest
 
 TESTS_ROOT = Path(__file__).resolve().parent.parent
-for _path in (TESTS_ROOT, Path(__file__).resolve().parent):
+E2E_DIR = Path(__file__).resolve().parent
+for _path in (TESTS_ROOT, E2E_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
@@ -118,6 +119,21 @@ def pytest_collection_modifyitems(session, config, items) -> None:
             )
 
 
+def _in_this_directory(report) -> bool:
+    """Whether the report belongs to a test in THIS directory.
+
+    A conftest's hooks are registered for the whole session rather than for its own subtree, so
+    without this the no-skips rule below would be a claim about every test in the repository. That
+    happens to be true of the jobs that set the sentinel — both run `pytest tests/e2e` — and it
+    would be a trap for the first person to set it on a wider run.
+    """
+    path = getattr(report, "path", None) or str(report.fspath)
+    try:
+        return Path(path).resolve().is_relative_to(E2E_DIR)
+    except (OSError, ValueError):
+        return False
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_logreport(report) -> None:
     """Tally what each item actually did, so the session hook can compare execution to collection.
@@ -135,7 +151,8 @@ def pytest_runtest_logreport(report) -> None:
     else:
         # Setup/teardown passes carry no verdict, and failures already fail the session on their own.
         return
-    _RAN_ANY[outcome] += 1
+    if _in_this_directory(report):
+        _RAN_ANY[outcome] += 1
     for marker in _GUARDED:
         if marker in report.keywords:
             _RAN[marker][outcome] += 1
