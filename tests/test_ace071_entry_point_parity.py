@@ -383,3 +383,92 @@ def test_a_package_that_raises_is_not_reported_as_a_package_that_is_absent(
     text = json.dumps({"reason": refusal.reason, "rule": refusal.rule,
                        "detail": refusal.detail, "remediation": refusal.remediation})
     assert str(tmp_path) not in text
+
+
+# A broken vendored slice, built by shadowing the runtime module the real one does not ship. Writing
+# `semantic_model/runtime.py` into a COPY of the vendored dir is the only way to reach the
+# broken-package arm through the CLI: the arm is chosen by what the import raises, and a child
+# process cannot be monkeypatched.
+_BROKEN_RUNTIME = "raise RuntimeError('forced: installed and raising while importing')\n"
+
+
+def _broken_slice(root: Path) -> Path:
+    """A copy of the vendored slice whose `semantic_model.runtime` raises a non-ImportError."""
+    import shutil
+
+    lib = root / "brokenlib"
+    shutil.copytree(VENDORED_LIB, lib, ignore=shutil.ignore_patterns("__pycache__"))
+    (lib / "semantic_model" / "runtime.py").write_text(_BROKEN_RUNTIME)
+    return lib
+
+
+def test_the_broken_package_refusal_survives_the_wire_it_travels(tmp_path: Path) -> None:
+    """The refusal is only worth adding if the caller can still read it.
+
+    On this entry point stderr IS the wire: `_write_refusal` puts one JSON object there and several
+    callers, plus the fail-closed suite, parse the WHOLE stream as that object. A traceback printed
+    alongside it does not merely add noise, it destroys the refusal — and the parent relays the
+    child's stderr into `failure.message`, so the traceback's absolute paths would arrive in the
+    caller's answer, which is the ACE-039 leak class through a different logger.
+
+    The broken-package arm logs, so it is the arm that can break this. It only stayed readable
+    because `main` silences `_LOG` as well as `_RAW_LOG`.
+    """
+    _require_a_package_less_interpreter()
+    artifacts = tmp_path / "art"
+    _write_model(artifacts / PROFILE)
+    lib = _broken_slice(tmp_path)
+
+    proc = subprocess.run([*_NOPKG, "-m", "execute_sql", "--profile", PROFILE, "--sql", IN_SCOPE_SQL],
+                          env=_child_env(artifacts, pythonpath=str(lib)),
+                          capture_output=True, text=True)
+
+    assert proc.returncode == 1, proc.stderr
+    assert proc.stdout == ""  # no partial CSV alongside a refusal
+    assert proc.stderr.count("\n") == 1, proc.stderr  # one line, so no traceback rode along
+    payload = json.loads(proc.stderr)  # parses WHOLE -> a single object
+    assert set(payload) == {"refusal"}
+    refusal = guardrail.Refusal(**payload["refusal"])
+    assert refusal.rule == guardrail.RULE_MODEL_UNAVAILABLE
+    # And it is the broken-package wording, not the absent-package one.
+    assert "not importable" not in refusal.detail
+    # Nothing about where anything lives reached the caller — the traceback would have carried the
+    # slice's and the artifacts' absolute paths.
+    assert str(tmp_path) not in proc.stderr
+
+
+def test_a_probe_that_cannot_read_the_disk_refuses_rather_than_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Path.exists()` answers False only for a path that is absent. For one it may not read at all
+    — EACCES under macOS TCC, EPERM on a locked volume, ESTALE on NFS — it raises, and this probe
+    runs INSIDE an `except` arm, where a raise escapes the enclosing `try` entirely.
+
+    Unhandled, that surfaces as `failed`/`other` with no remediation and a traceback carrying the
+    resolved artifacts path. Handled the wrong way — answering None — it is worse than either: the
+    statement runs unchecked on a machine where we could not read whether there was a model to
+    check it against. So doubt counts as declared, and the caller gets the refusal.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_runtime(name, _globals=None, _locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+        if name == "semantic_model" and fromlist and "runtime" in fromlist:
+            raise ImportError("forced: semantic_model.runtime unavailable")
+        return real_import(name, _globals, _locals, fromlist, level)
+
+    def unreadable(_self: Path) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "art"))
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    monkeypatch.setattr(builtins, "__import__", no_runtime)
+    monkeypatch.setattr(Path, "exists", unreadable)
+
+    _, verdict = execute_sql._model_safety(IN_SCOPE_SQL, PROFILE, None)
+
+    refusal = _refusal(verdict)  # a refusal, not an escaped PermissionError
+    assert refusal.rule == guardrail.RULE_MODEL_UNAVAILABLE
+    _silent(capsys)

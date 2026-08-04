@@ -6,11 +6,16 @@ meaningful is that there is nowhere else for the battery to be assembled. A call
 gates through its own sequence is a second composition whether or not it happens to be correct
 today, and the next gate added to `_model_safety` would silently not be in it.
 
-So this is a structural test over the package source rather than a behavioural one: every call of
-every gate lives inside `_model_safety`, each appears exactly once, and they appear in the order the
-battery depends on. It reads `packages/agami-core/src/` alone; `plugins/agami/lib/execute_sql.py` is
-generated from it by `dev.py sync-lib` and held byte-identical by the drift gate, so a second scan
-would assert the drift gate rather than this property.
+So this is a structural test over the source rather than a behavioural one: every call of every gate
+lives inside `_model_safety`, each appears exactly once, and they appear in the order the battery
+depends on.
+
+It reads `packages/agami-core/src/` and `plugins/agami/scripts/`. The second is not the package and
+is not generated, but it is the importable plugin code on precisely the local path this spec is
+about, so a battery assembled there would be the same defect wearing a different directory. Nothing
+there calls a gate today; the point is to notice if that changes. `plugins/agami/lib/` is excluded
+because it is `dev.py sync-lib` output held byte-identical by the drift gate, so scanning it would
+assert the drift gate rather than this property.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
+SCANNED_ROOTS = (PKG_SRC, REPO_ROOT / "plugins" / "agami" / "scripts")
 COMPOSER = PKG_SRC / "execute_sql.py"
 COMPOSING_FUNCTION = "_model_safety"
 
@@ -72,7 +78,7 @@ def _composing_function() -> ast.FunctionDef:
 
 
 def test_the_guard_battery_is_called_only_from_the_one_composing_function() -> None:
-    """No module in the package calls a gate outside `_model_safety`.
+    """No module in the package or the plugin scripts calls a gate outside `_model_safety`.
 
     A gate reached from anywhere else is a second battery: it can be assembled in the wrong order,
     miss a member, or run against a model the receipt was not built from, and none of those is
@@ -80,10 +86,11 @@ def test_the_guard_battery_is_called_only_from_the_one_composing_function() -> N
     """
     inside = _call_sites(_composing_function())
 
-    for path in sorted(PKG_SRC.rglob("*.py")):
-        sites = _call_sites(ast.parse(path.read_text(), filename=str(path)))
-        expected = inside if path == COMPOSER else []
-        assert sites == expected, f"{path.relative_to(REPO_ROOT)} calls a guard gate: {sites}"
+    for root in SCANNED_ROOTS:
+        for path in sorted(root.rglob("*.py")):
+            sites = _call_sites(ast.parse(path.read_text(), filename=str(path)))
+            expected = inside if path == COMPOSER else []
+            assert sites == expected, f"{path.relative_to(REPO_ROOT)} calls a guard gate: {sites}"
 
 
 def test_the_guard_battery_is_composed_once_in_a_fixed_order() -> None:

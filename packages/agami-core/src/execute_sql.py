@@ -1919,7 +1919,20 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
         # surface and believes it is being enforced, and 4b reach is exactly what is unchecked here.
         # `_hosted()` is deliberately not consulted — both interpreters in question are local, and
         # what separates them is which one can import the guards, not where they run.
-        if _disk_model_root(profile) is not None:
+        try:
+            declared = _disk_model_root(profile) is not None
+        except OSError:
+            # `Path.exists()` re-raises a non-ignorable OSError rather than answering False —
+            # EACCES on a TCC-protected folder, EPERM on a locked volume, ESTALE on NFS. Left to
+            # propagate it would escape this except arm entirely (an exception raised inside one is
+            # not caught by its own try), surface as `failed`/`other` with no remediation, and put
+            # the resolved artifacts path on stderr in a traceback.
+            #
+            # So treat "cannot tell" as declared. That is the fail-closed direction: the fail-open
+            # one is answering None, which returns the statement unchecked on a machine where we
+            # could not even read whether there was a model to check it against.
+            declared = True
+        if declared:
             # Absent and broken are two different facts, and `_receipt_for` below already refuses to
             # report them as one — it answers `RECEIPT_NO_RUNTIME` to an ImportError and
             # `RECEIPT_BUILD_FAILED`, logged, to anything else. This arm catches `Exception`, so the
@@ -1943,8 +1956,13 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
                 _LOG.error("the semantic-model runtime failed to import", exc_info=True)
                 detail = ("the semantic-model package failed to load, so table and column scope "
                           "could not run against the model declared for this profile")
-                remediation = ("Check the server log for the import error, repair the "
-                               "semantic-model installation, then retry.")
+                # Not "check the server log": `_hosted()` returned above, so this arm is local by
+                # construction and there is no server. The CLI child silences `_LOG` because its
+                # stderr is the refusal wire, so the traceback reaches a log only for an in-process
+                # caller that configured one. What is always true, and is the actionable half, is
+                # that the installation on this interpreter is broken rather than absent.
+                remediation = ("Reinstall the semantic-model package and its dependencies on this "
+                               "interpreter, then retry.")
             return sql, refuse(RULE_MODEL_UNAVAILABLE, detail=detail, remediation=remediation)
         # And stay inert with no model on disk. A bare install between `pip install` and its first
         # `agami-connect` has no declared surface, so there is nothing 4b could be exceeded against
@@ -2621,6 +2639,17 @@ def main() -> int:
     # recorder were not in one process.
     _RAW_LOG.addHandler(logging.NullHandler())
     _RAW_LOG.propagate = False
+
+    # `_LOG` is silenced for the same reason and it is not a lesser one. This module never configures
+    # logging, so an unsilenced `_LOG.error(..., exc_info=True)` also falls through to
+    # `logging.lastResort` and onto stderr — where a traceback, absolute paths and all, both breaks
+    # the single-JSON-object contract `_write_refusal` owns and rides back into the caller's answer
+    # via the parent's stderr relay. Two call sites reach it on a refusing path: the broken-package
+    # arm of `_model_safety` and `_receipt_for`'s build-failure arm. Neither can write here, because
+    # on this entry point stderr IS the wire. An in-process caller that configures logging still gets
+    # both records; the CLI child drops them, exactly as it drops raw driver detail above.
+    _LOG.addHandler(logging.NullHandler())
+    _LOG.propagate = False
 
     if args.sql_file:
         sql = Path(os.path.expanduser(args.sql_file)).read_text()
