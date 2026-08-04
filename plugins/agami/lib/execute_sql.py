@@ -1468,14 +1468,23 @@ _NARROW_IT = ("Narrow the time range, reduce the grouping, or add a selective fi
 #     rows you asked for", and it is named first for that reason.
 #   * An AGGREGATE cannot. `LIMIT` on a grouped result silently drops groups, and a partial breakdown
 #     reads exactly like a complete one: no row is wrong, the total is. That is a worse outcome than
-#     the refusal the caller just got. The text does not warn against `LIMIT`; it does not mention it
-#     at all. The reader here is usually an LLM, negation is what an LLM follows least reliably, and
-#     "do not add a LIMIT" puts the token in front of it either way. Absence is the stronger control,
-#     and it is also what makes the acceptance check a plain one.
+#     the refusal the caller just got. The REMEDIATION does not warn against `LIMIT`; it does not
+#     mention it at all. The reader here is usually an LLM, negation is what an LLM follows least
+#     reliably, and "do not add a LIMIT" puts the token in front of it either way. Absence is the
+#     stronger control, and it is also what makes the acceptance check a plain one.
+#
+#     Scoped to the remediation deliberately: the shared `detail` says "the {N}-row limit", and that
+#     stays. It is prose naming the ceiling, not an instruction to write a clause — the same thing
+#     ACE-038's timeout detail does with its seconds — and the remediation is the field a caller acts
+#     on. Stripping the word from the detail too would cost the caller the one number they need.
 #   * None means nothing parsed the statement — the vendored mirror has no `runtime` to call, and
 #     `no_safety=True` skips the pass that sets the shape. Guessing "listing" here would hand an
 #     aggregate caller the one instruction that corrupts their answer, so this text hands the fork
 #     back to the caller, who does know which they wrote, and makes `LIMIT` conditional on it.
+# The keys are exactly `runtime.statement_shape`'s return domain, and the lookup below is direct
+# rather than defaulted on purpose: a fifth shape added there without a text here should fail loudly
+# in the first test that runs it, not quietly serve the neutral wording and let a shape ship with no
+# advice of its own. Adding a shape means adding an entry.
 _RESULT_BOUND_REMEDIATION = {
     "listing": "Bound the result with LIMIT, and add an ORDER BY so the rows you get back are the "
                "ones you meant to ask for.",
@@ -2251,8 +2260,11 @@ def execute_guarded(
         # mechanism and for the leaked worker it costs on expiry.
         result = _execute_bounded(executor, sql, creds, profile=profile)
         # Inside the try on purpose: an executor that returns `None` (or anything else the contract
-        # does not accept) fails the present-iff check in `Envelope.__post_init__`, and that is a
-        # broken adapter, not a reason for the chokepoint to raise at its caller.
+        # does not accept) breaks here rather than at the chokepoint's caller — that is a broken
+        # adapter, not a reason for `execute_guarded` to stop being total. It used to fail the
+        # present-iff check in `Envelope.__post_init__`; since ACE-087 the `truncated` read below
+        # reaches it first and raises `AttributeError` instead. Same outcome by the same handler
+        # (`failed`/`other`, logged, audit row written), one line earlier.
         # The transfer bound, checked BEFORE the `ok` envelope can be built (ACE-087). It sits here
         # rather than in `_collect_cursor` because that function is only one of three ways a result
         # arrives: BigQuery has no DB-API cursor and bounds itself, and an injected `ports.Executor`

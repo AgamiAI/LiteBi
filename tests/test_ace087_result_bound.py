@@ -367,6 +367,34 @@ def test_an_aggregate_is_told_to_narrow_the_grouping(shop):
     assert "grouping" in remediation
 
 
+def test_a_shape_from_an_earlier_call_never_words_this_ones_refusal(shop, monkeypatch):
+    """The entry-clear in `execute_guarded`, which the rest of the suite leaves unpinned.
+
+    A ContextVar outlives the call that set it. The second call below reaches the chokepoint without
+    ever running the classify — `no_safety=True` skips the pass, and so does a local install with no
+    model built — so without the clear it inherits the first call's shape and a plain row listing is
+    told to "narrow the grouping" and never shown `LIMIT`. That is the wrong instruction delivered
+    confidently, which is the failure this whole spec exists to stop.
+
+    Deleting `_guard_shape.set(None)` leaves every other test in the repo green.
+    """
+    grouped = _refuse("SELECT grp, COUNT(*) FROM orders GROUP BY grp")
+    assert "grouping" in grouped.remediation  # the shape is set, and stays set in this context
+
+    # Same context, second call, nothing to classify with.
+    monkeypatch.setattr(
+        execute_sql, "_load_credentials", lambda p, org_id="local": {"type": "sqlite"},
+    )
+    env = execute_sql.execute_guarded(
+        "SELECT id FROM orders", _PROFILE, None,
+        executor=_Executor(truncated=True), no_safety=True,
+    )
+
+    assert env.status == "refused"
+    assert "grouping" not in env.refusal.remediation  # not the previous call's shape
+    assert "if it is a plain row listing" in env.refusal.remediation.lower()
+
+
 def test_the_tool_surface_advertises_neither_max_rows_nor_truncated():
     """Both halves of what a client can see: the argument it may send and the shape it is promised.
 
