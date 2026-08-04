@@ -61,15 +61,25 @@ if not harness.PG_ENABLED:
 
 import psycopg2  # noqa: E402
 
-# The five ways to change or destroy data, one per statement class. `TRUNCATE` and `DROP` are here
-# and not only `INSERT`/`UPDATE`/`DELETE` because a grant that stopped DML and left DDL alone would
-# pass a three-statement test while leaving the table droppable.
+# The ways to change or destroy data, one per statement class. `TRUNCATE` and `DROP` are here and
+# not only `INSERT`/`UPDATE`/`DELETE` because a grant that stopped DML and left DDL alone would pass
+# a three-statement test while leaving the table droppable.
+#
+# `create` is the one that is not about `orders` at all, and it closes a different gap: the five
+# above prove the role cannot modify an EXISTING declared table, which is not the same claim as "the
+# role cannot make new objects". A role that can create its own table in the schema the model
+# declares can materialize whatever it can read, wherever it likes, and every statement above would
+# still be refused. On PostgreSQL 16 this is refused by the server's own default — `CREATE ON SCHEMA
+# public` is no longer granted to `PUBLIC` — which is exactly why it needs asserting rather than
+# assuming: the recipe does not revoke it, so the floor here rests on a server default that older
+# majors and Redshift do not share. See the grants fixture's header for the measured residual.
 WRITES = [
     ("insert", "INSERT INTO orders (id, customer_id, amount, status) VALUES (99, 10, 1.0, 'x')"),
     ("update", "UPDATE orders SET amount = 0"),
     ("delete", "DELETE FROM orders"),
     ("truncate", "TRUNCATE TABLE orders"),
     ("drop", "DROP TABLE orders"),
+    ("create", "CREATE TABLE floor_probe (x int)"),
 ]
 
 # PostgreSQL's class 42 code for a privilege decision. Named as the constant it is because the whole

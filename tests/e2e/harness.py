@@ -290,6 +290,14 @@ PG_DATABASE = "corpus"
 # Postgres integration tests use, so one password turns them all on.
 PG_ENABLED = bool(PG_PASSWORD)
 
+# The only hosts `seed_postgres` will issue `DROP TABLE` against. `AGAMI_IT_PG_HOST` is an ordinary
+# environment variable, and the seeder drops and recreates `orders` and `customers` at whatever it
+# points at — two of the most ordinary table names there are. Someone with that variable exported
+# for another purpose, or a copy-pasted invocation carrying a real hostname, would have a test suite
+# quietly destroy two tables on a server nobody meant to touch. The compose fixture is a container
+# on this machine, so a loopback address is the whole of what this ever legitimately needs.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 def pg_dsn(user: str, password: str) -> str:
     """The DSN for `user` against the corpus database."""
@@ -314,6 +322,13 @@ def seed_postgres() -> None:
     warehouses rather than two that happen to line up.
     """
     import psycopg2
+
+    # Refused rather than skipped: a run pointed at a non-loopback host has been misconfigured, and
+    # the safe response to "I am about to DROP TABLE somewhere unexpected" is to stop, loudly.
+    assert PG_HOST in LOOPBACK_HOSTS, (
+        f"AGAMI_IT_PG_HOST is {PG_HOST!r}; this fixture drops and recreates tables and will only "
+        f"do that against a local container ({', '.join(sorted(LOOPBACK_HOSTS))})"
+    )
 
     conn = psycopg2.connect(pg_dsn(PG_USER, PG_PASSWORD))
     try:

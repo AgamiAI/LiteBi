@@ -64,7 +64,6 @@ itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
 
 import guardrail  # noqa: E402
 import harness  # noqa: E402
-import tools  # noqa: E402
 
 from safety.corpus import CASES  # noqa: E402
 
@@ -389,7 +388,6 @@ def test_the_vendored_executor_returns_the_same_verdict_as_the_package(marketpla
         assert reason == guardrail.REASON_FOR_RULE[case.rule], reason
         assert not stdout, "a refused statement returned a result"
 
-    tools.set_injected_executor(None)
     assert (status, rule, reason) == package_verdict(case.sql)
 
 
@@ -423,7 +421,6 @@ def test_a_vendored_deployment_that_cannot_record_refuses(marketplace, monkeypat
     assert not stdout
 
     monkeypatch.setenv("AGAMI_DB_URL", BROKEN_DB_URL)
-    tools.set_injected_executor(None)
     assert package_verdict(governed.sql) == (status, rule, reason)
 
 
@@ -443,9 +440,22 @@ def test_a_served_vendored_deployment_refuses_before_it_can_miss_the_model(marke
     a statement in a served deployment at all. Read as a parity claim it is the boundary of one —
     `model_unavailable` is asserted on the package surface, where it can happen, and asserting it
     here would be asserting something structurally impossible.
+
+    The store is CREATED and MIGRATED here, which it was not: the path was pointed at a file nothing
+    had made, so "a real, openable SQLite store" was a claim the test did not arrange and the case it
+    says it rules out — the broken URL reaching this verdict for the ordinary reason — was exactly
+    the case being run. `test_safety_envelope.py::served` builds one the same way, and its existence
+    is asserted before the verdict so a store that failed to appear cannot pass this quietly.
     """
+    from store import Store
+
     root, env = marketplace
     healthy_store = Path(env["AGAMI_ARTIFACTS_DIR"]).parent / "app.db"
+    store = Store.connect(f"sqlite://{healthy_store}")
+    store.run_migrations()
+    store.close()
+    assert healthy_store.exists(), "the store this test calls healthy was never created"
+
     governed = next(case for case in CASES if case.rule is None)
 
     status, rule, _reason, stdout = vendored_verdict(
@@ -476,7 +486,6 @@ def test_the_scope_rules_have_no_producer_on_the_vendored_surface(marketplace):
     assert "amount" in stdout.splitlines()[0], stdout
     # And the package surface refuses the very same statement, which is what makes the line above a
     # measured asymmetry rather than a note about a surface nobody compared.
-    tools.set_injected_executor(None)
     assert package_verdict(star.sql) == (
         "refused",
         guardrail.RULE_SELECT_STAR,

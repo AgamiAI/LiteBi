@@ -60,15 +60,15 @@ DB_PATH_MARKER = "db_path"
 ROLE_FLOOR_MARKER = "role_floor"
 HTTP_PATH_MARKER = "http_path"
 
-# The five ways to change or destroy data that `test_role_floor_pg.py::WRITES` issues at the raw
-# connection. A literal here rather than an import from that file, and deliberately so: the number
-# has to survive the file being DELETED, which is one of the ways the role floor went missing before.
-# A constant computed from the thing it is checking cannot fail when the thing is gone.
+# The six ways to change data or create objects that `test_role_floor_pg.py::WRITES` issues at the
+# raw connection. A literal here rather than an import from that file, and deliberately so: the
+# number has to survive the file being DELETED, which is one of the ways the role floor went missing
+# before. A constant computed from the thing it is checking cannot fail when the thing is gone.
 #
 # It is therefore a second number, and the only defence against two numbers drifting is that they
-# cannot drift QUIETLY: adding a sixth write class turns the DB job red until this line is updated,
-# with a message that names both counts. That is the intended cost, not an oversight.
-EXPECTED_ROLE_FLOOR_VECTORS = 5
+# cannot drift QUIETLY: it read 5 until `create` was added, and the DB run ended red with a message
+# naming both counts rather than passing on five of six. That is the intended cost, not an oversight.
+EXPECTED_ROLE_FLOOR_VECTORS = 6
 
 # Marker -> (how many items carrying it a declared run must collect AND pass, which sentinel
 # declares it). The sentinel is part of the entry because the two jobs carry different evidence and
