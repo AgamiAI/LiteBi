@@ -76,6 +76,16 @@ jobs:
   safety-corpus-file-path:
     name: safety corpus (file path, no database)
     runs-on: ubuntu-latest
+    env:
+      # This job's own declaration that it must RUN its half, and it needs a name of its own: the
+      # DB sentinel below would demand a Postgres this job deliberately does not have. It turns a
+      # missing model dependency into a failure (`tests/e2e/itdeps.py`) and forbids a run-time skip
+      # anywhere in the directory (`tests/e2e/conftest.py`).
+      #
+      # Measured before it existed: with `sqlglot` unimportable, `pytest tests/e2e` reported
+      # `4 passed, 6 skipped` and exited 0 — every corpus module opened with `pytest.importorskip`,
+      # so the required check passed having collected almost none of the corpus.
+      AGAMI_E2E_REQUIRED: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
@@ -105,9 +115,17 @@ jobs:
       AGAMI_IT_PG_USER: agami_test
       AGAMI_IT_PG_PASSWORD: agami_test_pw
       # The whole point of this job. It makes a missing driver a FAILURE rather than a skip, and it
-      # arms the collection sentinel — so a run that cannot execute the DB-backed evidence ends red
-      # instead of reporting green for work it never selected.
+      # arms both halves of the sentinel — the collection count and the session count — so a run that
+      # cannot execute the DB-backed evidence ends red instead of reporting green for work it never
+      # selected.
+      #
+      # These two lines and the password above are the one place all of that can be switched off
+      # from, which is why `tests/e2e/test_suite_integrity.py` reads this file and asserts they are
+      # here. That test runs in `lint + test`, not in this job, so the edit that disarms this job
+      # cannot also disarm the check on it.
       AGAMI_IT_PG_REQUIRED: "1"
+      # This job runs the file-path half too, so it holds itself to the same no-skips rule.
+      AGAMI_E2E_REQUIRED: "1"
     services:
       postgres:
         image: postgres:16
