@@ -68,6 +68,11 @@ NONCE_FROM_TO_ENCODED = "shipments \\u2192 carriers"
 NONCE_REVIEW_STATE = '"review_state": "unreviewed"'
 NONCE_AD_HOC_ORIGIN = '"origin": "ad_hoc"'
 NONCE_EMPTY_SECTION = '"assumptions": {"items": [], "undetermined": null}'
+# The written ON of the join nothing matched to a declaration, and the status that says so. The
+# predicate names a column pair no other fixture here writes, so it reaches the page only from the
+# receipt that carries it.
+NONCE_UNDECLARED_PREDICATE = "shipments.carrier_code = carriers.code"
+NONCE_UNDECLARED_STATUS = '"status": "undeclared"'
 
 # Construction sites. Each of these exists exactly once in the template, inside the block that
 # builds the thing it names, and vanishes with that block.
@@ -78,6 +83,14 @@ MARKER_CONSTRUCTION = "el('div', { class: 'receipt-undetermined' })"
 MARKER_LABEL = "el('span', { class: 'lbl', text: 'Not established' })"
 MARKER_READ = "const marker = markerOf(name);"
 EMPTY_STATE_CONSTRUCTION = "text: 'Checked, and there was nothing to report.'"
+# The joins block: where it starts, the status badge it draws for every item, the written predicate
+# it draws for every item, and the guard that keeps the sign-off trail to the items that matched a
+# declaration.
+JOINS_SECTION_CONSTRUCTION = "renderSection('joins', 'Joins this query made', null, list => {"
+JOIN_STATUS_BADGE = "const said = JOIN_BADGE[r.status] || ['stale', r.status || 'unknown'];"
+JOIN_PREDICATE_LABEL = "text: 'joined on: '"
+JOIN_NO_PREDICATE = "text: 'this join wrote no condition of its own'"
+JOIN_DECLARED_GUARD = "if (r.status === 'declared') {"
 
 
 def _section(items=None, undetermined=None) -> dict:
@@ -124,31 +137,69 @@ def _receipt_clean() -> dict:
              "rows": 12000, "rows_as_of": "2026-05-01",
              "freshness": "2026-05-09T23:00:00Z (nightly batch)"},
         ]),
-        joins=_section([
-            {"name": "orders_to_customers", "from_to": "orders → customers",
-             "cardinality": "many_to_one", "confidence": "confirmed",
-             "review_state": "approved", "origin": "fk",
-             "signed_off_by": "you@example.com", "signed_off_role": "data_lead",
-             "signed_off_at": "2026-03-15T10:00:00Z", "cross_schema": False,
-             "on": "orders.customer_id = customers.id"},
-        ]),
+        joins=_section([_declared_join()]),
     )
 
 
+def _declared_join(**overrides) -> dict:
+    """One join the statement wrote, matched to a declared relationship.
+
+    The shape `assemble_receipt` emits: the written half (`predicate`, `scope`, `status`, `from_to`)
+    first, then the block the MATCHED declaration contributes. The fixtures here carried only the
+    second half, which is the shape the section had when it was one item per declared relationship —
+    so the one surface a user reads was tested against a receipt the runtime no longer produces.
+    """
+    return {
+        "predicate": "o.customer_id = c.id", "scope": "main", "status": "declared",
+        "from_to": "orders → customers", "name": "orders_to_customers",
+        "cardinality": "many_to_one", "confidence": "confirmed",
+        "review_state": "approved", "origin": "fk",
+        "signed_off_by": "you@example.com", "signed_off_role": "data_lead",
+        "signed_off_at": "2026-03-15T10:00:00Z", "cross_schema": False,
+        "on": "orders.customer_id = customers.id",
+        **overrides,
+    }
+
+
+def _undeclared_join(**overrides) -> dict:
+    """A join nothing matched to a declaration: every key the declaration would have filled is null,
+    which is the state the panel used to render as "unreviewed, not signed off"."""
+    return {
+        "predicate": NONCE_UNDECLARED_PREDICATE, "scope": "main", "status": "undeclared",
+        "from_to": NONCE_FROM_TO, "name": None,
+        "cardinality": None, "confidence": None, "review_state": None, "origin": None,
+        "signed_off_by": None, "signed_off_role": None, "signed_off_at": None,
+        "cross_schema": None, "on": None,
+        **overrides,
+    }
+
+
 def _receipt_with_unreviewed_join() -> dict:
+    """A join that DID match a declaration, and the declaration is unreviewed — which is the only
+    state the trust banner may be raised on. A null `review_state` is a different fact."""
     return _receipt(
         model_version="abc123",
         tables=_section([
             {"ref": "shipments", "alias": "s", "qname": "public.shipments", "declared": True,
              "rows": 1000, "rows_as_of": None, "freshness": None},
         ]),
-        joins=_section([
-            {"name": NONCE_JOIN, "from_to": NONCE_FROM_TO,
-             "cardinality": "many_to_one", "confidence": "inferred",
-             "review_state": "unreviewed", "origin": "introspect_heuristic",
-             "signed_off_by": None, "signed_off_role": None, "signed_off_at": None,
-             "cross_schema": False, "on": "shipments.carrier_id = carriers.id"},
+        joins=_section([_declared_join(
+            predicate="s.carrier_id = c.id", from_to=NONCE_FROM_TO, name=NONCE_JOIN,
+            confidence="inferred", review_state="unreviewed", origin="introspect_heuristic",
+            signed_off_by=None, signed_off_role=None, signed_off_at=None,
+            on="shipments.carrier_id = carriers.id",
+        )]),
+    )
+
+
+def _receipt_with_undeclared_join() -> dict:
+    return _receipt(
+        model_version="abc123",
+        tables=_section([
+            {"ref": "shipments", "alias": "s", "qname": "public.shipments", "declared": True,
+             "rows": 1000, "rows_as_of": None, "freshness": None},
         ]),
+        joins=_section([_undeclared_join()]),
     )
 
 
@@ -246,7 +297,8 @@ def test_the_receipt_derived_assertions_use_values_the_template_never_contains()
     """
     template = TEMPLATE_PATH.read_text()
     for nonce in (AGGREGATES_MARKER, NONCE_JOIN, NONCE_FROM_TO, NONCE_FROM_TO_ENCODED,
-                  NONCE_REVIEW_STATE, NONCE_AD_HOC_ORIGIN, NONCE_EMPTY_SECTION):
+                  NONCE_REVIEW_STATE, NONCE_AD_HOC_ORIGIN, NONCE_EMPTY_SECTION,
+                  NONCE_UNDECLARED_PREDICATE, NONCE_UNDECLARED_STATUS):
         assert nonce not in template, f"{nonce!r} is template text, so it proves nothing"
 
 
@@ -256,7 +308,9 @@ def test_the_construction_sites_the_assertions_stand_on_are_each_unique():
     longer fails the test."""
     template = TEMPLATE_PATH.read_text()
     for site in (BANNER_CONSTRUCTION, BANNER_DERIVATION, BANNER_CTA, MARKER_CONSTRUCTION,
-                 MARKER_LABEL, MARKER_READ, EMPTY_STATE_CONSTRUCTION):
+                 MARKER_LABEL, MARKER_READ, EMPTY_STATE_CONSTRUCTION,
+                 JOINS_SECTION_CONSTRUCTION, JOIN_STATUS_BADGE, JOIN_PREDICATE_LABEL,
+                 JOIN_NO_PREDICATE, JOIN_DECLARED_GUARD):
         assert template.count(site) == 1, f"{site!r} appears {template.count(site)}x, not once"
 
 
@@ -332,6 +386,89 @@ def test_the_join_predicate_is_labelled_as_the_declared_one():
 
     assert "text: 'declared predicate: '" in html
     assert '"on": "orders.customer_id = customers.id"' in html
+
+
+def _joins_block(html: str) -> str:
+    """The source of the joins renderer, from its own `renderSection` call to the next one.
+
+    A slice rather than a whole-page search, for the reason
+    `test_the_assumptions_blurb_is_drawn_only_when_there_is_something_to_explain` slices: there is no
+    JS runtime here, so "drawn only for a declared item" is provable only as "drawn only inside the
+    branch that tests for one", and `approvalPhrase` and `badge` are called from three other blocks
+    on the page.
+    """
+    start = html.index(JOINS_SECTION_CONSTRUCTION)
+    return html[start:html.index("renderSection('columns'", start)]
+
+
+def test_a_declared_join_still_badges_and_phrases_the_relationship_it_matched():
+    """The half of the panel that was right stays right. An item that MATCHED a declaration has a
+    sign-off trail to show, so it keeps the approval phrase, the review badge and the labelled
+    declared predicate — now under the status that says why it has them."""
+    html = render(title="Test", summary="", sections=[_chart_section()], receipt=_receipt_clean())
+
+    # The written half reached the page, which is what the section is one item per.
+    assert '"status": "declared"' in html
+    assert '"predicate": "o.customer_id = c.id"' in html
+    # And the matched declaration's trail is still drawn, inside the branch that tests for a match.
+    block = _joins_block(html)
+    guard = block.index(JOIN_DECLARED_GUARD)
+    for site in ("approvalPhrase(r)", "badge(r.review_state)", "text: 'declared predicate: '"):
+        assert block.index(site) > guard, f"{site!r} is drawn outside the declared branch"
+
+
+@pytest.mark.parametrize("status", ["undeclared", "undeclarable", "undetermined"])
+def test_a_join_that_matched_no_declaration_is_not_drawn_as_an_unreviewed_relationship(status):
+    """The user-visible defect this fixes.
+
+    `review_state`, `confidence`, `origin`, `cardinality` and `on` are all null on an item whose
+    status is not `declared` — by design, because nothing matched it to a declaration. The panel
+    read those nulls through `badge`'s and `approvalPhrase`'s shared default and drew
+    `orders → customers — unreviewed, not signed off [unreviewed]` under a heading claiming a
+    relationship: a missing SIGNATURE reported where what is missing is the declaration itself.
+
+    Both defaults are `|| 'unreviewed'` expressions the page still needs for metrics, so the fix is
+    the guard, and the guard is what is asserted — plus the two fields that now carry the fact
+    instead.
+    """
+    receipt = _receipt_with_undeclared_join()
+    receipt["joins"]["items"][0]["status"] = status
+    html = render(title="Test", summary="", sections=[_chart_section()], receipt=receipt)
+
+    # The item reached the page with its status and the ON it actually wrote, which is the fact the
+    # section exists to report and which nothing in the block drew before.
+    assert f'"status": "{status}"' in html
+    assert NONCE_UNDECLARED_PREDICATE in html
+    assert JOIN_STATUS_BADGE in html
+    assert JOIN_PREDICATE_LABEL in html
+    # Nothing describes it as a sign-off state: the two calls that would are behind the guard.
+    block = _joins_block(html)
+    guard = block.index(JOIN_DECLARED_GUARD)
+    assert block.index("approvalPhrase(r)") > guard
+    assert block.index("badge(r.review_state)") > guard
+
+
+def test_the_joins_heading_does_not_call_every_item_a_relationship():
+    """The heading is read before any badge is. "Relationships used" over a list that now includes
+    joins the model declares no relationship for is the section's own claim contradicting its
+    items."""
+    html = render(title="Test", summary="", sections=[_chart_section()],
+                  receipt=_receipt_with_undeclared_join())
+
+    assert "'Relationships used'" not in html
+    assert JOINS_SECTION_CONSTRUCTION in html
+
+
+def test_a_join_that_wrote_no_condition_says_so_rather_than_showing_nothing():
+    """`predicate` is null for a `CROSS JOIN` and for the comma join, and a blank where a condition
+    goes reads as "agami forgot" — the same reason the tables list spells out an undeclared
+    reference rather than leaving three empty cells."""
+    receipt = _receipt_with_undeclared_join()
+    receipt["joins"]["items"][0]["predicate"] = None
+    html = render(title="Test", summary="", sections=[_chart_section()], receipt=receipt)
+
+    assert '"predicate": null' in html
+    assert JOIN_NO_PREDICATE in html
 
 
 def test_the_assumptions_blurb_is_drawn_only_when_there_is_something_to_explain():
