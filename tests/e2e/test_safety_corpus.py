@@ -31,12 +31,17 @@ pytest.importorskip("yaml")
 
 TESTS_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = TESTS_ROOT.parent
-for _path in (TESTS_ROOT, Path(__file__).resolve().parent, REPO_ROOT / "packages" / "agami-core" / "src"):
+for _path in (
+    TESTS_ROOT,
+    Path(__file__).resolve().parent,
+    REPO_ROOT / "packages" / "agami-core" / "src",
+):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
 import guardrail  # noqa: E402
 import harness  # noqa: E402
+
 from safety.corpus import CASES  # noqa: E402
 
 
