@@ -619,6 +619,23 @@ def test_an_explicit_cross_join_is_undeclared(org):
     assert item["from_to"] == "orders → customers"
 
 
+def test_status_is_what_tells_the_two_predicate_less_joins_apart(org):
+    """A comma join and a `CROSS JOIN` over the same two tables agree on every other field.
+
+    The skill tells a caller merging a multi-section report to dedup joins on
+    `from_to`+`scope`+`predicate`+`status`, and `status` is in that key because of exactly this: both
+    of these wrote no `ON`, so both carry a null predicate, and over the same pair in the same scope
+    the other three fields are identical. Without `status` the merge drops one of two different
+    facts. That guidance ships, so the property it rests on is pinned here rather than left to be
+    rediscovered when one of these two statuses moves.
+    """
+    (comma,) = _items(org, COMMA_JOIN)
+    (cross,) = _items(org, CROSS_JOIN)
+    reduced = ("from_to", "scope", "predicate")
+    assert {k: comma[k] for k in reduced} == {k: cross[k] for k in reduced}
+    assert comma["status"] != cross["status"]
+
+
 @pytest.mark.parametrize("sql,predicate", [
     (USING_JOIN, "USING (id)"),
     (USING_JOIN_MULTI, "USING (id, region_id)"),
