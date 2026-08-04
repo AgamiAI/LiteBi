@@ -3232,7 +3232,17 @@ def _declared_pairs(rel: Relationship,
     predicate = _parse_declared_predicate(text, dialect)
     if predicate is None:
         return None
-    return _predicate_pairs(predicate, {}) or None
+    # And refused whenever the reduction lost anything, which is the general form of the bind-marker
+    # guard above rather than a second rule. `_predicate_pairs` keeps equalities between two
+    # qualified columns and drops the rest, so `orders.region_id = regions.id AND regions.name =
+    # 'EU'` reduces to the unrestricted half of itself — and that half matches a statement that
+    # wrote no restriction at all, under the whole declared predicate printed beside it. Every
+    # top-level conjunct has to survive or none of them counts. `IS NULL`, an inequality and a
+    # function call are the same case as the bind marker in three other spellings.
+    reduced = [_predicate_pairs(conj, {}) for conj in _and_conjuncts(predicate)]
+    if not reduced or not all(reduced):
+        return None
+    return frozenset().union(*reduced)
 
 
 def _rel_tables(rel: Relationship) -> frozenset[str]:

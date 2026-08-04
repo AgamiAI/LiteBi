@@ -190,6 +190,25 @@ def org(tmp_path):
     return L.load_datasource(root)
 
 
+def _org_with_declared_on(tmp_path, on_text: str):
+    """The fixture model with the `orders` -> `regions` `on:` edge rewritten to `on_text`.
+
+    The model is what is under test here, not the statement: `Relationship.on` is author text
+    nothing validates as SQL, and each text these tests write is a shape a real model arrives in.
+    """
+    yaml = __import__("yaml")
+    root = tmp_path / "variant"
+    root.mkdir(parents=True)
+    _write_model(root)
+    path = root / "subject_areas" / "s" / "relationships.yaml"
+    doc = yaml.safe_load(path.read_text())
+    for rel in doc["relationships"]:
+        if rel.get("on") == "orders.region_id = regions.id":
+            rel["on"] = on_text
+    path.write_text(yaml.safe_dump(doc))
+    return L.load_datasource(root)
+
+
 def _section(org, sql: str) -> dict:
     return rt.assemble_receipt(org, sql)["joins"]
 
@@ -472,6 +491,48 @@ def test_a_declaration_the_analysis_could_not_read_leaves_the_question_open(org)
     (other,) = _items(org, WRONG_COLUMN)
     assert other["status"] == rt.UNDECLARED
     assert _section(org, WRONG_COLUMN)["undetermined"] is None
+
+
+@pytest.mark.parametrize("on_text", [
+    "orders.region_id = regions.id AND regions.name = 'EU'",
+    "orders.region_id = regions.id AND regions.name IS NULL",
+    "orders.region_id = regions.id AND orders.tenant_id > regions.id",
+    "orders.region_id = regions.id AND LOWER(regions.name) = LOWER(orders.tenant_id)",
+    "orders.region_id = CAST(regions.id AS INT)",
+], ids=["literal-equality", "is-null", "inequality", "function-call", "unreducible-equality"])
+def test_a_declaration_that_did_not_reduce_whole_matches_nothing(tmp_path, on_text):
+    """The reduction is lossy on the WRITTEN side by design and may not be on the DECLARED side.
+
+    Dropping a conjunct the SQL author added is right: a soft-delete or as-of predicate beyond the
+    declared join is not a reason to withhold the match. Dropping one the MODEL AUTHOR declared is
+    the opposite — the declaration becomes a strict subset of itself, and the subset matches a
+    statement that wrote none of the rest. Every text here declares a RESTRICTED join, the statement
+    writes only the unrestricted half of it, and the item came back `declared` with the whole
+    declared predicate printed beside it: a reader concludes the restriction applied.
+
+    The `:param` guard already refused exactly one instance of this. These are the others.
+
+    The last text is the case that was always right and has to stay right: its only equality does
+    not reduce either, so there is nothing to be a subset of and it degrades whole.
+    """
+    org = _org_with_declared_on(tmp_path, on_text)
+    section = _section(org, DECLARED_ON)
+    (item,) = section["items"]
+    assert item["status"] == rt.UNDETERMINED
+    assert item["name"] is None
+    assert item["on"] is None
+    assert "could not be matched against the model" in (section["undetermined"] or "")
+
+
+def test_a_declaration_that_reduced_whole_still_matches(tmp_path):
+    """The guard is a subset test, not a conjunct count: a multi-conjunct `on:` every part of which
+    IS a column equality reduces without loss and matches exactly as it did."""
+    org = _org_with_declared_on(
+        tmp_path, "orders.region_id = regions.id AND orders.tenant_id = regions.id")
+    (item,) = _items(org, "SELECT r.name FROM orders o JOIN regions r "
+                          "ON o.region_id = r.id AND o.tenant_id = r.id")
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_regions"
 
 
 @pytest.mark.parametrize("sql", [ON_AN_EXPRESSION, ON_UNQUALIFIED],
