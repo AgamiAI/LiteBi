@@ -23,6 +23,10 @@ services:
       - "55432:5432"
     volumes:
       - ./fixtures/postgres-init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      # The read-only role the safety corpus connects as, plus the database it reads. Init scripts
+      # only run on an EMPTY data directory, so adding this needs the container recreated
+      # (`docker compose ... down -v`) rather than restarted.
+      - ./fixtures/postgres-readonly-grants.sql:/docker-entrypoint-initdb.d/02-readonly-grants.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agami_test -d shop"]
       interval: 2s

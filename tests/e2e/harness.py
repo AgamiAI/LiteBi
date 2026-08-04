@@ -46,13 +46,15 @@ for _path in (TESTS_ROOT, REPO_ROOT / "packages" / "agami-core" / "src"):
 import execute_sql  # noqa: E402
 import tools  # noqa: E402
 
-from safety.corpus import SCHEMA  # noqa: E402
+from safety.corpus import DB_PATH_ENGINE, FILE_PATH_ENGINE, SCHEMA  # noqa: E402
 
 PROFILE = "acme"
 AREA = "sales"
 # The engine the model DECLARES, and the one the warehouse actually is. They have to agree or the
-# chokepoint refuses every vector with `engine_mismatch` before any gate under test runs.
-ENGINE = "SQLite"
+# chokepoint refuses every vector with `engine_mismatch` before any gate under test runs. Both names
+# come from the corpus, which is where the vectors' own `engines` pins are compared against them.
+ENGINE = FILE_PATH_ENGINE
+PG_ENGINE = DB_PATH_ENGINE
 
 # The deployment ceiling the availability vectors are driven under, derived from the seed data so
 # it cannot go stale: `orders` seeds three rows, so a ceiling one below that is over-run by the
@@ -76,8 +78,15 @@ ROW_ESTIMATE = 1200
 ROWS_AS_OF = "2026-01-01T00:00:00Z"
 
 
-def write_model(root: Path) -> None:
-    """Write the disk YAML for `SCHEMA` under `root` (a profile directory)."""
+def write_model(root: Path, engine: str = ENGINE) -> None:
+    """Write the disk YAML for `SCHEMA` under `root` (a profile directory).
+
+    `engine` is the storage type the model DECLARES. It is a parameter rather than the module
+    constant because the DB path's warehouse is Postgres and the declared engine has to match the
+    engine the credentials connect to — a model that still said SQLite would be refused with
+    `engine_mismatch` before a single gate under test ran, and every vector would come back with the
+    same wrong verdict.
+    """
     import yaml
 
     tables = root / "subject_areas" / AREA / "tables"
@@ -89,7 +98,7 @@ def write_model(root: Path) -> None:
             {
                 "datasource": "Shop",
                 "version": 1,
-                "storage_connections": [{"name": "c", "storage_type": ENGINE}],
+                "storage_connections": [{"name": "c", "storage_type": engine}],
                 "subject_areas": [f"subject_areas/{AREA}"],
             }
         )
@@ -146,7 +155,7 @@ def write_model(root: Path) -> None:
             {
                 "name": "revenue",
                 "calculation": "sum of order amount",
-                "bindings": {ENGINE: "SUM(amount)"},
+                "bindings": {engine: "SUM(amount)"},
                 "source_tables": ["orders"],
                 "confidence": "proposed",
                 "review_state": "unreviewed",
@@ -221,6 +230,135 @@ def reset_injected_executor() -> None:
     """`tools._INJECTED_EXECUTOR` is a process global — both routes set it — so it must not leak
     between vectors."""
     tools.set_injected_executor(None)
+
+
+# ---------------------------------------------------------------------------
+# The DB-served model path, on a Postgres warehouse reached as the read-only role
+# ---------------------------------------------------------------------------
+#
+# TWO axes change here and they are orthogonal, so they are named separately rather than folded into
+# one "DB path" word:
+#
+#   * where the MODEL comes from — disk YAML (`build_file_path`) or the app database
+#     (`build_db_path`, via `model_deploy.deploy_one` and read back by `model_store.load_datasource`);
+#   * what the WAREHOUSE is — a SQLite file, or the Postgres container connected as `agami_ro`.
+#
+# They are moved together deliberately: the served deployment this corpus is about is the one that
+# has both, and running the corpus under it is what proves the verdicts do not depend on either.
+# What must NOT be folded in is the consequence: `AGAMI_DB_URL` is also what `execute_sql._hosted()`
+# reads, so setting it changes fail-closed behaviour for `model_unavailable` by design. That class is
+# asserted per path rather than held to the identical-verdicts claim.
+
+# Matching `tests/test_postgres_timeout_integration.py`: host/port/user/db default to the compose
+# fixture's values, and the password is the opt-in switch with no default, so no test password for a
+# writing identity lives in the source.
+PG_HOST = os.environ.get("AGAMI_IT_PG_HOST", "127.0.0.1")
+PG_PORT = os.environ.get("AGAMI_IT_PG_PORT", "55432")
+PG_USER = os.environ.get("AGAMI_IT_PG_USER", "agami_test")
+PG_PASSWORD = os.environ.get("AGAMI_IT_PG_PASSWORD", "")
+
+# The read-only role's own credentials. Unlike the owner's password above these DO default, because
+# the role is created by `fixtures/postgres-readonly-grants.sql` with a value that only exists inside
+# a throwaway local container — the same standing as the `agami_test_pw` already in the compose file.
+# Overridable for a cluster that made the role by hand.
+PG_RO_USER = os.environ.get("AGAMI_IT_PG_RO_USER", "agami_ro")
+PG_RO_PASSWORD = os.environ.get("AGAMI_IT_PG_RO_PASSWORD", "agami_ro_pw")
+
+# The database the grants fixture creates for the corpus. A constant, not an env var: the fixture
+# creates it under this name, so a second spelling would only ever be wrong.
+PG_DATABASE = "corpus"
+
+# The switch that decides whether the DB-backed half runs at all. The same variable the existing
+# Postgres integration tests use, so one password turns them all on.
+PG_ENABLED = bool(PG_PASSWORD)
+
+
+def pg_dsn(user: str, password: str) -> str:
+    """The DSN for `user` against the corpus database."""
+    return f"postgresql://{user}:{password}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}"
+
+
+def pg_readonly_dsn() -> str:
+    """The DSN the SERVER is given: the least-privilege role, and nothing else."""
+    return pg_dsn(PG_RO_USER, PG_RO_PASSWORD)
+
+
+def seed_postgres() -> None:
+    """Create and seed the Postgres warehouse `SCHEMA` describes, as the OWNER.
+
+    Connected as the owner rather than the read-only role for the obvious reason and one that is
+    easy to miss: this is also what exercises the `ALTER DEFAULT PRIVILEGES` line in the grants
+    fixture. The tables are created after the grants ran, so the role can only read them if that
+    line worked, and a fixture that seeded through some privileged back door would hide its absence.
+
+    `SCHEMA`'s column types are written in SQLite's spelling and reused verbatim — `INTEGER`, `REAL`
+    and `TEXT` are all Postgres types too, so the one declaration really does describe both
+    warehouses rather than two that happen to line up.
+    """
+    import psycopg2
+
+    conn = psycopg2.connect(pg_dsn(PG_USER, PG_PASSWORD))
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for name, spec in SCHEMA.items():
+                columns = ", ".join(f"{column} {type_}" for column, type_ in spec["columns"])
+                cur.execute(f"DROP TABLE IF EXISTS {name}")
+                cur.execute(f"CREATE TABLE {name} ({columns})")
+                placeholders = ", ".join(["%s"] * len(spec["columns"]))
+                cur.executemany(f"INSERT INTO {name} VALUES ({placeholders})", spec["rows"])
+    finally:
+        conn.close()
+
+
+def build_db_path(tmp_path: Path, monkeypatch) -> SimpleNamespace:
+    """Wire the DB-served model path against the Postgres warehouse, and return where it landed.
+
+    The model is written to disk once, deployed into the app database, and then left where nothing
+    reads it: `AGAMI_ARTIFACTS_DIR` points at an EMPTY directory for the run. So a model that failed
+    to deploy does not quietly fall back to disk and pass — the disk has nothing to fall back to, and
+    every vector would refuse with `model_unavailable` instead. The read-back below turns that from a
+    consequence a reader has to trace into an assertion at the point of setup.
+    """
+    import model_deploy
+    import model_store
+    from store import Store
+    from tools import resolved_org_id
+
+    served = tmp_path / "artifacts-empty"
+    served.mkdir()
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(served))
+    monkeypatch.delenv("AGAMI_ORG_ID", raising=False)
+
+    staging = tmp_path / "staging"
+    write_model(staging / PROFILE, engine=PG_ENGINE)
+
+    app_db_url = "sqlite://" + str(tmp_path / "app.db")
+    store = Store.connect(app_db_url)
+    try:
+        store.run_migrations()
+        model_deploy.deploy_one(store, PROFILE, staging / PROFILE)
+        # The read-back the whole path rests on, made where a failure still names its cause. `org_id`
+        # is the resolver both sides share: `deploy_one` stamps rows with `resolved_org_id()` and
+        # `execute_sql._resolve_guard_model` reads them back with it, so a mismatch here would be a
+        # served deployment that finds no model for any tenant.
+        served_model = model_store.load_datasource(store, PROFILE, org_id=resolved_org_id())
+        assert served_model is not None, "the model did not come back out of the app database"
+    finally:
+        store.close()
+
+    monkeypatch.setenv("AGAMI_DB_URL", app_db_url)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    monkeypatch.setenv(f"DATASOURCE_URL__{PROFILE.upper()}", pg_readonly_dsn())
+    monkeypatch.setenv("PUBLIC_BASE_URL", BASE_URL)
+    monkeypatch.setenv("AGAMI_SIGNING_SECRET", SIGNING_SECRET)
+    for name in ("AGAMI_SQL_MAX_ROWS", "AGAMI_SQL_TIMEOUT_S"):
+        monkeypatch.delenv(name, raising=False)
+
+    reset_injected_executor()
+    return SimpleNamespace(
+        app_db_url=app_db_url, artifacts=served, dsn=pg_readonly_dsn(), profile=PROFILE
+    )
 
 
 # ---------------------------------------------------------------------------

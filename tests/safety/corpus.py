@@ -360,6 +360,23 @@ CASES: list[Case] = [
 ]
 
 
+# The two engines the corpus is driven on. They are named HERE, next to the `engines` field they are
+# compared against, so a vector pinned to one engine and a path that claims to be that engine are
+# spelling the same string — and so the DB-path count below can be derived rather than restated.
+FILE_PATH_ENGINE = "SQLite"
+DB_PATH_ENGINE = "PostgreSQL"
+
+# The number of vectors the DB-backed run must collect, and the ONLY place that number exists.
+#
+# It is read by the parametrizer that produces those vectors AND by the session hook that refuses to
+# let the run finish short, so the two cannot disagree — and neither can be edited into agreement
+# with a thinned corpus, because both read the corpus. That is the whole point: the job this
+# replaces selected its work with `pytest -k "db_path or role"`, a substring match on the node id,
+# so renaming a test dropped 102 of 108 vectors and the job still exited 0. A count derived from
+# `CASES` cannot be renamed out of existence — it can only be wrong, loudly.
+EXPECTED_DB_VECTORS = len([case for case in CASES if case.runs_on(DB_PATH_ENGINE)])
+
+
 # The stdio bound, derived from `CASES` so it cannot be restated wrong. The stdio route spawns a
 # process per call, so driving the whole corpus on it is ~56 subprocess spawns on the critical path
 # of every PR; what stdio is there to prove is that the chokepoint's verdict does not depend on the
