@@ -225,7 +225,16 @@ def build_file_path(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     monkeypatch.setenv(f"DATASOURCE_URL__{PROFILE.upper()}", f"sqlite:///{warehouse}")
     monkeypatch.setenv("PUBLIC_BASE_URL", BASE_URL)
     monkeypatch.setenv("AGAMI_SIGNING_SECRET", SIGNING_SECRET)
-    for name in ("AGAMI_DB_URL", "APP_DATABASE_URL", "AGAMI_ORG_ID", "AGAMI_SQL_MAX_ROWS"):
+    # `AGAMI_PROFILE` is scrubbed with the rest because the stdio child inherits this environment
+    # wholesale: `tools._resolve_profile` reads it, and a developer who happens to have it exported
+    # would have the child answer for a profile no vector named.
+    for name in (
+        "AGAMI_DB_URL",
+        "APP_DATABASE_URL",
+        "AGAMI_ORG_ID",
+        "AGAMI_PROFILE",
+        "AGAMI_SQL_MAX_ROWS",
+    ):
         monkeypatch.delenv(name, raising=False)
     # Not a per-session budget: only the availability vectors want a tightened bound and they set
     # their own, so a stall on a loaded runner cannot turn an expected verdict into a timeout.
@@ -361,7 +370,7 @@ def build_db_path(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     monkeypatch.setenv(f"DATASOURCE_URL__{PROFILE.upper()}", pg_readonly_dsn())
     monkeypatch.setenv("PUBLIC_BASE_URL", BASE_URL)
     monkeypatch.setenv("AGAMI_SIGNING_SECRET", SIGNING_SECRET)
-    for name in ("AGAMI_SQL_MAX_ROWS", "AGAMI_SQL_TIMEOUT_S"):
+    for name in ("AGAMI_PROFILE", "AGAMI_SQL_MAX_ROWS", "AGAMI_SQL_TIMEOUT_S"):
         monkeypatch.delenv(name, raising=False)
 
     reset_injected_executor()
@@ -379,6 +388,26 @@ def route_in_process(sql: str, profile: str = PROFILE) -> dict:
     """`execute_guarded` runs in THIS process and the gate's own object reaches the serializer."""
     tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
     return json.loads(tools.tool_execute_sql({"sql": sql, "datasource": profile}))
+
+
+def stdio_child_env() -> dict:
+    """The environment `route_stdio` hands its child, and the one line that decides WHICH CHECKOUT
+    the child is.
+
+    **`PYTHONPATH` is load-bearing and it was missing.** The parent reaches this branch's executor
+    through the `sys.path` insertion at the top of this module; a child process inherits no such
+    thing, so with a bare environment it resolved `mcp_harness` and `execute_sql` from whatever
+    `agami-core` happened to be pip-installed. On the machine this was found on that was a DIFFERENT
+    worktree's checkout — so "one verdict across transports" was comparing this branch's HTTP answer
+    against another branch's stdio answer. A divergence introduced here would have been invisible,
+    and an unrelated branch's regression could have failed this suite. The child now reads the same
+    source tree the parent imported, by construction.
+
+    A function rather than a literal inside the call because
+    `test_suite_integrity.py` asserts on it: a guard nobody can inspect is a guard nobody can watch
+    fail.
+    """
+    return {**os.environ, "PYTHONPATH": str(SRC)}
 
 
 def route_stdio(sql: str, profile: str = PROFILE) -> dict:
@@ -408,7 +437,7 @@ def route_stdio(sql: str, profile: str = PROFILE) -> dict:
         capture_output=True,
         text=True,
         timeout=180,
-        env={**os.environ},
+        env=stdio_child_env(),
     )
     replies = {
         message.get("id"): message
