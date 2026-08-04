@@ -869,6 +869,52 @@ def test_the_http_surface_returns_the_undeclared_join_on_the_body(served):
     _assert_undeclared_answer(json.loads(resp.json()["result"]["content"][0]["text"]))
 
 
+def test_one_envelope_reaches_both_the_returned_body_and_the_recorder(warehouse, monkeypatch):
+    """The `joins` analogue of ACE-099's identity assertion, and a separate claim from either
+    surface test above.
+
+    `_emit` attaches `env.receipt` to the body and then hands the SAME `env` to `_record_execution`.
+    Nothing enforces that ordering except the control flow, and it is exactly what a later refactor
+    reorders: re-derive the receipt for the record, or record before the receipt is resolved, and
+    the trail describes a different answer from the one the caller was given while both stay
+    well-formed. A join is where that would matter most — the answer saying the model declares
+    nothing about this join while the trail says it was the approved one.
+
+    The row itself is read, not only the recorder's argument. `QueryExecutionRecord` carries the
+    whole receipt as of ACE-098, so "what the caller was told" and "what a reviewer will find" are
+    both observable here and both are asserted — against each other, and against the item. Compare
+    only the Envelope against the body it was used to build and the assertion cannot fail on its
+    own.
+    """
+    log = warehouse / "query_log.jsonl"
+    monkeypatch.setattr(tools, "QUERY_LOG", log)
+    recorded: list[guardrail.Envelope] = []
+    real = tools._record_execution
+    monkeypatch.setattr(
+        tools, "_record_execution",
+        lambda env, **kw: (recorded.append(env), real(env, **kw))[1],
+    )
+    tools.set_injected_executor(execute_sql.BUILTIN_EXECUTOR)
+
+    body = json.loads(tools.tool_execute_sql({"sql": WRONG_COLUMN, "datasource": "p"}))
+
+    assert body["status"] == "ok", body
+    assert len(recorded) == 1, recorded
+    # Through `json` because `ReceiptSection.items` is a tuple — frozen types hold no lists — and
+    # the wire has no tuple.
+    recorded_joins = json.loads(json.dumps(asdict(recorded[0].receipt)))["joins"]
+    assert recorded_joins == body["receipt"]["joins"]
+    assert recorded_joins["items"] == [EXPECTED_UNDECLARED]
+
+    # And the row a reviewer can actually find, located by the id the caller carried away. The
+    # section it holds is the section the caller was handed — an answer saying the model declares
+    # nothing about this join and a trail saying it was the approved one is the disagreement the one
+    # Envelope exists to make impossible.
+    rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    assert [r["id"] for r in rows] == [body["audit_id"]], rows
+    assert json.loads(rows[0]["receipt"])["joins"] == body["receipt"]["joins"]
+
+
 # --- SC-8: the same section on every run ------------------------------------
 
 

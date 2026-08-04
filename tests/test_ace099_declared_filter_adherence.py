@@ -477,13 +477,12 @@ def test_one_envelope_reaches_both_the_returned_body_and_the_recorder(
     received, and the persisted row is located by the `audit_id` the caller carried away — which is
     what makes "recorded" mean a row a reviewer can actually find rather than a call that happened.
 
-    WHAT THIS DOES NOT SHOW, stated plainly because the name used to imply otherwise: the receipt is
-    not STORED. `QueryExecutionRecord` has no receipt column — it holds the id, the timestamp, the
-    profile, the question, the statement, the row count, the source, the status, the reason, the
-    rule and the error detail — so no assertion made here can observe a persisted receipt, and
-    comparing the captured Envelope against the body it was already used to build cannot fail on its
-    own. Persisting the receipt beside the row is a different spec's job; what is observable today
-    is the identity above, and that is what is named.
+    WHAT THIS DOES NOT SHOW, stated as narrowly as it now has to be: this test does not read the
+    PERSISTED receipt. It used to say the receipt was not stored at all, which was true when it was
+    written and stopped being true with ACE-098 — `QueryExecutionRecord` carries the whole receipt
+    and its `model_version`, and `_record_execution` writes them to the same row this test locates
+    by `audit_id`. What is asserted here is still the identity above, between the body and the
+    Envelope the recorder was handed, plus the row's id; the row's own `receipt` column is not read.
     """
     log = tmp_path / "query_log.jsonl"
     monkeypatch.setattr(tools, "QUERY_LOG", log)
