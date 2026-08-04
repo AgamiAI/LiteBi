@@ -42,6 +42,12 @@ import tools  # noqa: E402
 from safety.corpus import CASES  # noqa: E402
 
 
+# A governed vector's own SQL, taken from the corpus rather than written again here: the tests
+# below that need a statement every gate allows must use one the corpus agrees is allowed, or they
+# would prove their point against a statement that was refused for an unrelated reason.
+_GOVERNED_SQL = next(c.sql for c in CASES if c.rule is None)
+
+
 @pytest.fixture()
 def file_path(tmp_path, monkeypatch):
     """The file-served path, built by the slice-1 harness. Three lines of pytest glue around
@@ -105,4 +111,52 @@ def test_a_refused_vector_still_carries_a_whole_receipt(file_path, case, monkeyp
     body = _drive(case, monkeypatch)
 
     assert body["status"] == "refused", body
+    _assert_receipt_is_whole(body)
+
+
+# ---------------------------------------------------------------------------
+# An audit id on every vector, on all three statuses
+# ---------------------------------------------------------------------------
+
+
+def _failed_body(file_path, monkeypatch) -> dict:
+    """The third status, provoked without touching a gate.
+
+    The model on disk keeps declaring `orders`, so every gate passes and the statement is a
+    governed one — then the warehouse it reaches has no such table and the executor fails. That is
+    the shape a caller actually meets on `failed`: a decision to run, followed by a database that
+    could not. Injecting a raising executor would produce the same status without the chokepoint
+    ever having agreed to execute, which is a different path.
+    """
+    empty = file_path.warehouse.parent / "empty-warehouse.db"
+    sqlite3.connect(empty).close()
+    monkeypatch.setenv(f"DATASOURCE_URL__{harness.PROFILE.upper()}", f"sqlite:///{empty}")
+    return harness.ROUTES["http"](_GOVERNED_SQL)
+
+
+@pytest.mark.parametrize("case", _vectors())
+def test_every_vector_comes_back_with_an_audit_id(file_path, case, monkeypatch):
+    """The id a caller reads off its own answer is the primary key of its own audit row.
+
+    Which makes it the whole of a caller's ability to find the record of what it just did. It is
+    attached in the same place as the receipt and for the same reason, so it is asserted over the
+    same population: every vector, on whichever status it produces.
+    """
+    body = _drive(case, monkeypatch)
+
+    assert body["status"] in ("ok", "refused"), body
+    assert body["audit_id"], body
+
+
+def test_a_failed_execution_carries_an_audit_id_and_a_receipt_too(file_path, monkeypatch):
+    """`failed` is the status the corpus cannot reach, and the one most likely to be forgotten.
+
+    Every vector above lands on `ok` or `refused` — a corpus of adversarial statements has no
+    reason to produce a database that breaks. So the third status gets its own vector here rather
+    than being assumed to behave like the two that are covered.
+    """
+    body = _failed_body(file_path, monkeypatch)
+
+    assert body["status"] == "failed", body
+    assert body["audit_id"], body
     _assert_receipt_is_whole(body)
