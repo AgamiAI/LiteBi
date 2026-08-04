@@ -2239,11 +2239,18 @@ def assemble_receipt(
     dropped_joins = max(0, len(join_sites) - _RECEIPT_MAX_REFS)
     join_items: list[dict[str, Any]] = []
     for js in join_sites[:_RECEIPT_MAX_REFS]:
-        if not js.resolvable:
+        if not js.declarable:
             # An endpoint the STATEMENT bound — a CTE name, a derived table, a CTE shadowing a
             # declared table — cannot be what any declaration is about, so this is settled rather
-            # than open.
+            # than open. It is asked FIRST because a structural impossibility outranks a failure to
+            # resolve: there is nothing here for a better analysis to establish later.
             status = UNDECLARABLE
+        elif not js.pinned:
+            # The ON did not reduce to a pair of endpoints. Unlike the branch above this is a fact
+            # about the ANALYSIS, so it stays open and `_joins_marker` counts it: reporting it
+            # `undeclarable` would claim the model cannot declare a join it may well declare, and
+            # would let the marker reach null with something genuinely unestablished under it.
+            status = UNDETERMINED
         elif js.predicate is None and js.node.args.get("kind") == "CROSS":
             # It wrote no predicate, which is a fact about the statement and not a gap in the
             # analysis: there is nothing here for a declaration to match.
@@ -2992,8 +2999,16 @@ class _JoinSite(NamedTuple):
     # composes the label, the way every other caller-written name in the receipt is bounded.
     endpoints: tuple[str, str]
     # Whether both endpoints are names the MODEL could have a declaration about. False for a name
-    # the statement bound for itself, and false when the ON could not be reduced to a pair.
-    resolvable: bool
+    # the statement bound for itself — a CTE alias, a derived table, a CTE shadowing a declared
+    # table. A SETTLED structural fact: no declaration will ever be about a name the statement
+    # invented, however the analysis improves.
+    declarable: bool
+    # Whether the ON reduced to a pair of endpoints. False for a compound ON reaching over three or
+    # more relations, and for one naming no column at all. That is a failure of THIS ANALYSIS rather
+    # than a fact about the statement — the model may well declare the join — and the two are kept
+    # apart because the assembler turns the first into a settled status and the second into an open
+    # one, and `_joins_marker` counts only the open ones.
+    pinned: bool
 
 
 def _relation_name(rel: "exp.Expression") -> str:
@@ -3066,7 +3081,8 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
             predicate=_echo_expr(on.sql()) if on is not None else None,
             scope=_scope_label(sel, node, cte_scopes, arm_suffixes, output_ids),
             endpoints=(left, right),
-            resolvable=pinned and _tkey(left) in visible and _tkey(right) in visible,
+            declarable=_tkey(left) in visible and _tkey(right) in visible,
+            pinned=pinned,
         ))
     return sites
 

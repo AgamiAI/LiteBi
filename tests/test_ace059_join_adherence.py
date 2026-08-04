@@ -140,6 +140,12 @@ JOIN_IN_CTE = ("WITH joined AS (SELECT o.id FROM orders o JOIN customers c "
 JOIN_IN_ARMS = (ONE_JOIN + " UNION ALL " + ONE_JOIN)
 JOIN_IN_SUBQUERY = ("SELECT o.id FROM orders o WHERE o.customer_id IN "
                     "(SELECT c.id FROM customers c JOIN regions r ON c.region_id = r.id)")
+# The second join's ON reaches back over three relations, so it does not reduce to a pair of
+# endpoints. Both of its candidate left relations are declared tables, which is what makes this a
+# failure to RESOLVE rather than a statement no declaration could be about.
+COMPOUND_ON = ("SELECT r.name FROM orders o "
+               "JOIN customers c ON o.customer_id = c.id "
+               "JOIN regions r ON c.region_id = r.id AND o.id = r.id")
 
 
 # --- SC-1: one item per join the statement wrote ----------------------------
@@ -249,16 +255,33 @@ def test_an_on_reaching_over_more_than_two_relations_is_not_reduced_to_a_pair(or
     than picking one of the candidates — a `from_to` that names the wrong left endpoint is not a
     weaker version of the fact, it is a false one, and a reader has no way to tell.
 
+    It is `undetermined` and NOT `undeclarable`, which is the distinction the first cut of this
+    battery got wrong. `undeclarable` is a claim about the SHAPE of the statement — this endpoint is
+    a name the statement bound for itself, so no declaration can ever be about it — and that is
+    settled forever. Failing to reduce an ON to a pair is a claim about THIS ANALYSIS: the model may
+    well declare the join and we could not tell. Reporting the second as the first states a settled
+    fact the analysis does not have.
+
     The label still names the FROM relation, because a reader needs to find the join in their own
     SQL whatever the status says about it. The status is the claim; the label is the address.
     """
-    compound = ("SELECT r.name FROM orders o "
-                "JOIN customers c ON o.customer_id = c.id "
-                "JOIN regions r ON c.region_id = r.id AND o.id = r.id")
-    first, second = _items(org, compound)
+    first, second = _items(org, COMPOUND_ON)
     assert first["status"] == rt.UNDETERMINED
-    assert second["status"] == rt.UNDECLARABLE
+    assert second["status"] == rt.UNDETERMINED
     assert second["from_to"] == "orders → regions"
+
+
+def test_an_unreducible_on_keeps_the_marker_honest(org):
+    """The other half of the same defect, and the one that made it more than a mislabel.
+
+    `_joins_marker` counts only `undetermined`, because `undeclared` and `undeclarable` are settled.
+    Reporting an unreduced ON as `undeclarable` therefore let a statement whose join was genuinely
+    not established reach a NULL marker — the section claiming "established, here it is" about a
+    join it could not read.
+    """
+    section = _section(org, COMPOUND_ON)
+    assert section["items"][1]["status"] == rt.UNDETERMINED
+    assert "could not be matched against the model" in (section["undetermined"] or "")
 
 
 def test_the_shadowing_cte_case_still_lists_the_join_it_wrote(org):
