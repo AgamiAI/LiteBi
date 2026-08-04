@@ -371,3 +371,59 @@ def test_a_governed_statement_reaches_the_executor_unaltered(guarded, engine):
 
     assert env.status == "ok", f"{engine}: {env}"
     assert spy.calls and spy.calls[0][0] == sql, f"{engine}: the executor got {spy.calls}"
+
+
+@pytest.mark.parametrize("engine", BACKTICK_ENGINES)
+def test_the_ambiguity_probe_costs_nothing_when_there_is_no_double_quote(engine, monkeypatch):
+    """The ambiguity check needs a SECOND parse of the same statement, and it is the only part of
+    this change with a per-request cost. It can only find something when the statement contains the
+    character whose meaning is in doubt, so a statement without one must not pay for it.
+
+    Pinned by counting parses rather than by timing, which would be flaky. Without the guard this
+    reads 2 on every statement on these three engines — measured at 0.38 ms against 0.18 ms per
+    guard context before it was added.
+
+    Counts calls to `_parse_reporting`, the module's own entry point, rather than to
+    `sqlglot.parse_one`. sqlglot parses internally the first time it builds a dialect, so counting
+    at its door makes the result depend on whether some earlier test already warmed that engine —
+    which is exactly how this test first failed: three calls for Databricks in isolation, one when
+    the file ran in order.
+    """
+    calls = []
+    real = rt._parse_reporting
+    monkeypatch.setattr(
+        rt,
+        "_parse_reporting",
+        lambda sql, dialect=None: (calls.append(dialect), real(sql, dialect))[1],
+    )
+
+    rt.build_guard_context("SELECT id FROM customers WHERE name = 'acme'", _org(engine))
+    assert len(calls) == 1, f"{engine}: parsed {len(calls)}x for a statement with no double quote"
+
+    calls.clear()
+    rt.build_guard_context('SELECT "id" FROM customers', _org(engine))
+    assert len(calls) == 2, f"{engine}: the ambiguity probe did not run where it was needed"
+
+
+def test_an_unreadable_second_opinion_falls_back_to_the_native_reading():
+    """The ambiguity probe's one permissive branch, pinned so it stays narrow.
+
+    A statement that mixes a double-quoted token with the engine's own backtick quoting parses
+    under MySQL and not under the ANSI-quoting grammar the probe compares against — the backticks
+    are what the second grammar cannot read — so there is no second opinion. Refusing on the
+    strength of a comparison that never happened would reject valid MySQL; the native reading, the
+    engine's own declared default, is what the gates judge instead, and they still judge it in full.
+
+    (`LIMIT 1, 2` looks like the obvious case for this and is not: sqlglot's postgres grammar reads
+    MySQL's two-argument form and rewrites it to LIMIT/OFFSET.)
+    """
+    org = _org("MySQL")
+    sql = 'SELECT "id" FROM `customers`'
+
+    assert rt._parse_reporting(sql, "postgres")[0] is None, "the premise: no ANSI second opinion"
+    assert rt._parse_reporting(sql, "mysql")[0] is not None, "the premise: MySQL reads it fine"
+    assert rt.check_readable(sql, org) is None
+
+    # ...and the scope gates still get their say on that reading.
+    assert rt.check_table_scope(sql, org) is None
+    assert rt.check_table_scope('SELECT "id" FROM `undeclared_table`', org) is not None

@@ -149,8 +149,20 @@ def _quote_ambiguous(sql: str, dialect: "str | None", tree: "exp.Expression | No
     """
     if tree is None or dialect not in _BACKTICK_QUOTING_DIALECTS:
         return False
+    # The second parse is the expensive part of this whole change, and it can only find something
+    # when the statement actually contains a double quote — the character whose meaning is in
+    # doubt. Without this test every statement on a backtick engine pays it: measured at 0.38 ms
+    # against 0.18 ms per guard context, on the hosted server's per-request path.
+    if '"' not in sql:
+        return False
     ansi = _parse_sql(sql, _ANSI_QUOTING_DIALECT)
     if ansi is None:
+        # No second opinion available: the statement parsed in its own grammar but uses something
+        # the ANSI-quoting grammar cannot read (MySQL's two-argument LIMIT, say). Reporting
+        # "ambiguous" here would refuse a statement on the strength of a comparison that never
+        # happened, so the native reading — the engine's own declared default — is what the gates
+        # judge. Deliberately the permissive branch, and narrow: the statement still has to pass
+        # every scope gate on that reading.
         return False
     native_cols = {c.name.lower() for c in tree.find_all(exp.Column)}
     ansi_cols = {c.name.lower() for c in ansi.find_all(exp.Column)}
