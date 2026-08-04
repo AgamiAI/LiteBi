@@ -137,6 +137,18 @@ REASON_FOR_RULE: dict[str, RefusalReason] = {
     # gate that imposes the per-statement timeout filled a constant rather than inventing one.
     RULE_RESOURCE_LIMIT: "undetermined",
     RULE_UNPARSEABLE: "undetermined",
+    # Both pinned by the gate that finally produces them: the readability gate, which refuses a
+    # statement the guard cannot read in the datasource's own grammar. They were declared above
+    # without a reason so this diff would be the one that chose it, and the choice is the same for
+    # both, on the same argument as their three siblings here — we did not determine the statement
+    # was safe or in scope, because we could not read it well enough to ask.
+    #
+    # `unscopable` is the narrower of the two: the statement parsed, and still resolved to no named
+    # table, so there is nothing for the scope walk to accept or reject. `engine_mismatch` says
+    # nothing about the statement at all — the model declares one engine and the credentials connect
+    # to another, so whichever grammar was used, one of them was wrong.
+    RULE_UNSCOPABLE: "undetermined",
+    RULE_ENGINE_MISMATCH: "undetermined",
 }
 
 

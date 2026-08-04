@@ -12,6 +12,43 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The guard now reads your SQL in your database's own grammar, and refuses what it cannot read
+  (ACE-079).** Every model-scoping check decided by parsing the statement, and every one of them
+  parsed in a generic SQL dialect rather than your engine's. On MySQL, BigQuery, Databricks and SQL
+  Server that is not a subtlety: a backtick is not an identifier quote in the generic grammar, so
+  `` SELECT `ssn` FROM `customers` `` parsed to **no tables and no columns**. The scope checks were
+  not bypassed by a trick — they inspected the tree, found nothing to object to, and passed. So on
+  those engines a query could read any table in the database regardless of what your model declared,
+  and the trust receipt reported no tables read, which made the answer look clean.
+
+  The error posture was the other half. `error_level="ignore"` was not a lenient setting, it was no
+  setting at all: sqlglot compares that argument against enum members, so a string matched no branch
+  and every parse error was silently discarded, leaving a truncated tree that read as valid. Both
+  halves are fixed together, because either alone leaves a hole.
+
+  Four situations are now refused rather than run blind, each with the next step it actually needs:
+
+  - the datasource does not say which engine it runs on (undeclared, unmapped, or two connections
+    disagreeing) — `model_unavailable`, and the fix is the operator's: declare
+    `storage_connections[].storage_type`. It does not invite you to retry the query, because no
+    rewrite of the query helps.
+  - the statement does not parse in that engine's grammar — `unparseable`, and you can re-emit it.
+  - a double-quoted token on a backtick-quoting engine, which means a column under `ANSI_QUOTES` and
+    a string literal otherwise. The server setting is not visible to the guard, so rather than guess
+    it asks for the statement in the engine's own quoting.
+  - the statement parses, reads from something, and resolves to no named table at all — `unscopable`.
+    A backstop that does not depend on the engine map being complete.
+
+  A model that declares one engine while its credentials connect to another is also refused
+  (`engine_mismatch`): those are two independent pieces of configuration, and a mismatch means the
+  statement was checked against the wrong grammar.
+
+  **If your model does not declare a `storage_type`, queries against it now refuse** with the
+  message above. This is deliberate: a datasource whose engine is unknown cannot be governed, and
+  the alternative was to keep parsing it in a grammar no engine uses.
+
 ### Changed
 
 - **The receipt now reports on every number your query computes, not just the ones with a problem

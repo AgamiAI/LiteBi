@@ -127,6 +127,7 @@ def _write_model(root: Path) -> None:
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
     (root / "datasource.yaml").write_text(
         yaml.safe_dump({"datasource": "Shop", "version": 1,
+                        "storage_connections": [{"name": "c", "storage_type": "SQLite"}],
                         "subject_areas": ["subject_areas/sales"]})
     )
     (root / "subject_areas" / "sales" / "subject_area.yaml").write_text(
@@ -335,6 +336,14 @@ VECTORS = (
     # declared AND sent by the caller, so echoing them is legitimate; the token the detail actually
     # echoes is `version`, which is the caller's own.
     (guardrail.RULE_RECON, "SELECT id, version() FROM orders"),
+    # unparseable — a SELECT the read-only lexer passes and sqlglot cannot read, so the readability
+    # gate fires first. This is the vector `_NO_VECTOR` said the rule would need once the
+    # sqlglot-level fail-open became a refusal. The unbalanced parens are the caller's own text.
+    (guardrail.RULE_UNPARSEABLE, "SELECT id FROM orders WHERE ((("),
+    # unscopable — parses cleanly, reads from something, and names no table at all, so there is
+    # nothing for the scope walk to accept or reject. Every identifier in it is the caller's own
+    # invention, which is what makes a detail naming anything declared a failure here.
+    (guardrail.RULE_UNSCOPABLE, "SELECT c.x FROM (VALUES (1)) AS c(x)"),
 )
 
 UNAVAILABLE_SQL = "SELECT id FROM orders"
@@ -748,16 +757,18 @@ _NO_VECTOR = {
         "and the app database url. A future gate that interpolates anything into this rule's text "
         "has to delete this entry and earn a vector."
     ),
-    guardrail.RULE_UNPARSEABLE: (
-        "One producer, unreachable on every route. `sql_guard.check_no_recon` refuses `unparseable` "
-        "when the neutralizer cannot read the statement (ACE-039) — but at the chokepoint "
-        "`check_read_only` runs the SAME neutralizer first and refuses as `read_only`, so no route "
-        "reaches it and a vector here could not drive it. Its detail is the neutralizer's own static "
-        "prose, carrying no model-derived text. Covered as a standalone call by "
-        "test_ace039_recon.py::test_an_unreadable_statement_is_undetermined_not_recon. The "
-        "sqlglot-level gates still degrade to ALLOW rather than refusing; turning that fail-open "
-        "into a refusal is the unparseable-statement slice's job, and the refusal it introduces "
-        "will be reachable and will need a vector here."
+    guardrail.RULE_ENGINE_MISMATCH: (
+        "Not drivable from this matrix, for a reason that is structural rather than awkward: no "
+        "STATEMENT produces it. It fires when the model's declared engine and the credentials' "
+        "engine disagree, which is a property of how the deployment is configured, and every vector "
+        "here runs against one model and one credential set that agree. A vector for it would have "
+        "to mis-declare the fixture, and then every OTHER vector would refuse on that same mismatch "
+        "before reaching the gate it exists to test. What makes the exemption safe is the property "
+        "that excuses `audit_unavailable`: this refusal interpolates NOTHING. Its detail and "
+        "remediation are two authored sentences naming neither the model, the statement, nor the "
+        "engines involved — deliberately, since naming the declared engine would hand a model fact "
+        "to a caller who only sent SQL. Driven directly, in both spellings, by "
+        "test_ungovernable_engine_fails_closed.py."
     ),
     # `RULE_MODEL_SAFETY` sat here and its note said THIS IS THE ENTRY TO DELETE FIRST, because the
     # branch it stood in for included the sensitive-column refusal, whose `sens.columns` listed every
@@ -786,7 +797,7 @@ def test_every_rule_and_every_route_is_covered():
     assert not covered & set(_NO_VECTOR)
     assert all(reason.strip() for reason in _NO_VECTOR.values())
     assert set(ROUTES) == {"in_process", "fork", "stdio", "http"}
-    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 24
+    assert len(_MATRIX) == len(VECTORS) * len(ROUTES) == 32
     # The `failed` channel is covered by its own matrix rather than this one, because it has no
     # rule. Its vector must not be one of these: a statement that a gate refuses would report on the
     # refusal channel a second time and leave `failure.message` unscanned again, which is exactly

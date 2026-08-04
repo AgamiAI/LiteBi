@@ -87,6 +87,7 @@ from guardrail import (
     RECEIPT_NO_MODEL,
     RECEIPT_NO_RUNTIME,
     RULE_AUDIT_UNAVAILABLE,
+    RULE_ENGINE_MISMATCH,
     RULE_MODEL_UNAVAILABLE,
     RULE_RESOURCE_LIMIT,
     Envelope,
@@ -1742,6 +1743,40 @@ def _audit_store_reachable() -> bool:
     return True
 
 
+def _engine_mismatch(profile: str, creds: dict) -> "Refusal | None":
+    """Refuse when the model's declared engine is not the engine the credentials connect to.
+
+    Silent when either side is absent or unmapped, and that is not laziness on the second one: the
+    executor rejects an unusable credential type itself, with a message about the credential, and
+    refusing here as well would relabel a plain configuration error as a governance refusal that
+    misdescribes it. A missing declaration is already refused upstream by the readability gate.
+
+    `getattr` throughout because this file is vendored into the plugin while runtime.py resolves
+    from the separately-versioned installed package: an older runtime skips the check rather than
+    raising AttributeError.
+    """
+    try:
+        from semantic_model import runtime as RT
+    except Exception:
+        return None
+    engines_disagree = getattr(RT, "engines_disagree", None)
+    dialect_of = getattr(RT, "_dialect_of", None)
+    if engines_disagree is None or dialect_of is None:
+        return None
+    org = _resolve_guard_model(profile)
+    if org is None:
+        return None
+    if not engines_disagree(dialect_of(org)[0], creds.get("type", "")):
+        return None
+    return refuse(
+        RULE_ENGINE_MISMATCH,
+        detail="the datasource's declared engine is not the engine its credentials connect to, so "
+               "the statement was checked against the wrong SQL grammar",
+        remediation="Make the model's storage_connections[].storage_type match the engine the "
+                    "credentials point at.",
+    )
+
+
 def _resolve_guard_model(profile: str):
     """Resolve the semantic model for the safety pass, mirroring `tools._load_org` (ACE-051): from
     the DB when one is configured (hosted — the `/artifacts` disk mount may be absent), else the
@@ -1887,6 +1922,20 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     # one. Set here and not at the chokepoint because the chokepoint cannot import sqlglot — see
     # `_guard_shape`. Stays None when `ctx` is None (no sqlglot) or the statement did not parse.
     _guard_shape.set(RT.statement_shape(ctx))
+
+    # Readability gate — refuse a statement the guard cannot read in this datasource's own grammar,
+    # BEFORE any gate below is asked to judge it. Each gate below degrades to allow when it has no
+    # tree, so an unreadable statement reaches all three looking clean: on a backtick-quoting engine
+    # the old generic parse returned no tables and no columns, and table scope, the star ban and
+    # column scope each found nothing to object to while the statement read whatever it liked.
+    # `getattr` because this file is vendored into the plugin while runtime.py resolves from the
+    # separately-versioned installed package, so a newer plugin meeting an older runtime skips the
+    # gate instead of raising AttributeError.
+    check_readable = getattr(RT, "check_readable", None)
+    if check_readable is not None:
+        unreadable = check_readable(sql, org, ctx=ctx)
+        if unreadable is not None:
+            return sql, unreadable
 
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
@@ -2367,6 +2416,17 @@ def execute_guarded(
                 return _envelope("refused", refusal=verdict,
                                  receipt=_refusal_receipt(verdict, received_sql, profile))
         creds = _load_credentials(profile, org_id or "local")
+        if not no_safety:
+            # The guard picked its grammar from the model's declared engine; the executor picks its
+            # driver from these credentials. Two independent pieces of operator configuration with
+            # nothing reconciling them, so a mis-declared model has the guard vet a statement in a
+            # grammar the database does not speak — this defect again, by a different door.
+            # Credentials resolve after the gates by design, so this is the first point at which
+            # both are known.
+            mismatch = _engine_mismatch(profile, creds)
+            if mismatch is not None:
+                return _envelope("refused", refusal=mismatch,
+                                 receipt=_refusal_receipt(mismatch, received_sql, profile))
         # Bounded at the CHOKEPOINT, so the limit reaches every executor rather than only the
         # built-in one whose engines carry the inner watchdog. See `_execute_bounded` for the
         # mechanism and for the leaked worker it costs on expiry.
