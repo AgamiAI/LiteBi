@@ -53,9 +53,19 @@ def pg_warehouse() -> None:
     harness.seed_postgres()
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(session, config, items) -> None:
     """End the session when a run that declared it carries the DB-backed evidence has not collected
-    it. Counted off the marker, compared against the corpus's own constant, and never a `-k`."""
+    it. Counted off the marker, compared against the corpus's own constant, and never a `-k`.
+
+    `trylast` is load-bearing and was measured, not assumed. `-k`, `-m` and `--deselect` are all
+    implemented as `pytest_collection_modifyitems` hooks in pytest's own plugins, and a conftest
+    registers LATER than those, so by default this hook runs BEFORE them and sees the unfiltered
+    list. A sentinel positioned there counts the vectors a run was going to drop and reports itself
+    satisfied — which is the very failure it exists to catch, reproduced inside the fix. Running last
+    puts the count after every deselection, where the number is what the session will actually
+    execute.
+    """
     if not os.environ.get(itdeps.REQUIRED):
         return
     collected = [item for item in items if item.get_closest_marker(DB_PATH_MARKER)]
