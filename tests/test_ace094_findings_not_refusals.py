@@ -61,6 +61,7 @@ def _write_model(root: Path) -> None:
     (root / "subject_areas" / AREA / "tables").mkdir(parents=True)
     (root / "datasource.yaml").write_text(
         yaml.safe_dump({"datasource": "Shop", "version": 1,
+                        "storage_connections": [{"name": "c", "storage_type": "SQLite"}],
                         "subject_areas": [f"subject_areas/{AREA}"]})
     )
     (root / "subject_areas" / AREA / "subject_area.yaml").write_text(

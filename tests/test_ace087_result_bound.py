@@ -306,6 +306,7 @@ def shop(tmp_path, monkeypatch):
     (root / "subject_areas" / _AREA / "tables").mkdir(parents=True)
     (root / "datasource.yaml").write_text(
         yaml.safe_dump({"datasource": "Shop", "version": 1,
+                        "storage_connections": [{"name": "c", "storage_type": "SQLite"}],
                         "subject_areas": [f"subject_areas/{_AREA}"]})
     )
     (root / "subject_areas" / _AREA / "subject_area.yaml").write_text(

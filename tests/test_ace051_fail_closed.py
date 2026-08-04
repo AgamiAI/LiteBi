@@ -65,6 +65,11 @@ def _org() -> m.Datasource:
                        description=name, columns=[m.Column(name="id", type="integer")])
     return m.Datasource(
         datasource="Shop",
+        # Declared because the guard reads every statement in this engine's grammar and refuses a
+        # datasource naming none. It must match `_write_disk`'s declaration, or the two sources
+        # would resolve different grammars and the disk/DB parity assertion below would be
+        # measuring that rather than what it means to.
+        storage_connections=[m.StorageConnection(name="c", storage_type="PostgreSQL")],
         subject_areas=[m.SubjectArea(name="sales", tables_defined=[_t("orders"), _t("customers")])],
     )
 
@@ -84,7 +89,9 @@ def _write_disk(root: Path) -> None:
 
     (root / "subject_areas" / "sales" / "tables").mkdir(parents=True)
     (root / "datasource.yaml").write_text(
-        yaml.safe_dump({"datasource": "Shop", "version": 1, "subject_areas": ["subject_areas/sales"]})
+        yaml.safe_dump({"datasource": "Shop", "version": 1,
+                        "storage_connections": [{"name": "c", "storage_type": "PostgreSQL"}],
+                        "subject_areas": ["subject_areas/sales"]})
     )
     (root / "subject_areas" / "sales" / "subject_area.yaml").write_text(
         yaml.safe_dump({"name": "sales", "tables": [

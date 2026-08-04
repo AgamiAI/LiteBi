@@ -245,30 +245,30 @@ def test_the_declared_rules_are_exactly_the_contract():
 # --- the pinned reason-for-rule table ---------------------------------------
 
 
-def test_every_rule_this_slice_can_emit_has_a_pinned_reason():
+def test_every_declared_rule_has_a_pinned_reason():
     """`refuse()` raises KeyError on an unpinned rule, so `REASON_FOR_RULE` is the list a new gate
-    must extend. Everything emittable today is pinned."""
-    assert _declared_rules() - set(REASON_FOR_RULE) == {
-        guardrail.RULE_ENGINE_MISMATCH,
-        guardrail.RULE_UNSCOPABLE,
-    }
+    must extend. Every declared rule now has a producer, so every one is pinned.
+
+    `engine_mismatch` and `unscopable` were the last two holdouts, named by the contract and
+    declared without a reason so that the gate first emitting them would write that line in a diff
+    a reviewer sees. The readability gate emits both, so both are pinned in the table below and this
+    set is empty. Asserted as empty rather than deleted, because the emptiness IS the invariant: a
+    rule declared without a reason is one `refuse()` raises on at runtime.
+    """
+    assert _declared_rules() - set(REASON_FOR_RULE) == set()
 
 
-@pytest.mark.parametrize("rule", ["engine_mismatch", "unscopable"])
-def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
-    """`engine_mismatch` and `unscopable` are named by the contract but produced by later slices.
-    For the first the reason is genuinely that slice's call. `unscopable` is a different case: the
-    contract already says `undetermined`, so leaving it out of `REASON_FOR_RULE` is not deferring a
-    decision, it is making the owning gate write the one line the contract dictates in a diff a
-    reviewer sees, alongside the gate that first emits it. Either way `refuse()` fails loudly rather
-    than letting a slice pick a reason without pinning it here.
+def test_an_unpinned_rule_still_fails_loudly():
+    """The mechanism the two holdouts demonstrated, kept now that they are pinned.
 
-    `recon` LEFT this list in ACE-039, which is the slice that produces it. Its reason was the one
-    genuinely arguable case — a recon call is a reach in one framing and a hazard in another — and
-    it settled as `unsafe`, pinned in the table below."""
-    assert rule not in REASON_FOR_RULE
+    A rule with no `REASON_FOR_RULE` entry raises rather than defaulting to a reason, which is what
+    stops a future gate picking one silently at its call site. `recon` proved the same thing until
+    ACE-039 landed and pinned it; asserting on a synthetic rule keeps the guarantee under test
+    without needing a real rule to stay unproduced forever.
+    """
+    assert "not_a_rule" not in REASON_FOR_RULE
     with pytest.raises(KeyError):
-        refuse(rule, detail="d", remediation="r")
+        refuse("not_a_rule", detail="d", remediation="r")
 
 
 @pytest.mark.parametrize(
@@ -292,6 +292,14 @@ def test_a_named_but_unproduced_rule_is_deliberately_unpinned(rule):
         # because a model declares tables and columns and never declares functions, so there is
         # no in-scope spelling of `version()` for an out-of-scope refusal to point toward.
         ("recon", "unsafe"),
+        # The last two to get a producer, both from the readability gate, and both `undetermined`
+        # on the same argument as `select_star` above: neither says the statement reached outside
+        # the declared surface, only that we could not establish whether it did. `unscopable` is the
+        # statement that parsed and still named no table for the scope walk to judge;
+        # `engine_mismatch` says nothing about the statement at all — the model and the credentials
+        # name different engines, so one of the two grammars was the wrong one.
+        ("unscopable", "undetermined"),
+        ("engine_mismatch", "undetermined"),
     ],
 )
 def test_the_reason_for_each_rule_is_pinned(rule, reason):
