@@ -5,7 +5,9 @@ Two things live here and nothing else.
 **The routes.** A route takes `(sql, profile)` and returns the parsed tool-edge body — the JSON a
 caller actually receives. `in_process` calls the tool directly with the built-in executor injected;
 `http` goes through `mcp_http.create_app()`'s authenticated `/mcp` over `TestClient`, which is the
-transport the hosted deployment serves. They are shaped after the four-route matrix in
+transport the hosted deployment serves; `stdio` runs `python -m mcp_harness` as a real child
+process, which is the transport a local client launches. They are shaped after the four-route
+matrix in
 `tests/test_ace035_no_enumeration.py` and deliberately copied rather than imported: a harness whose
 transports can be re-pointed by an edit to another test file is not a harness, and that file's
 routes are bound to its own model fixture.
@@ -26,7 +28,9 @@ output, not its empty case.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -230,6 +234,45 @@ def route_in_process(sql: str, profile: str = PROFILE) -> dict:
     return json.loads(tools.tool_execute_sql({"sql": sql, "datasource": profile}))
 
 
+def route_stdio(sql: str, profile: str = PROFILE) -> dict:
+    """The stdio transport, for real: `python -m mcp_harness` over JSON-RPC on stdin.
+
+    A genuine child process, not an in-process shim — which is the point, because the model root,
+    the warehouse DSN and the row ceiling all reach it the way they reach a deployed server, through
+    the environment. `build_file_path` sets them with `monkeypatch.setenv`, so `os.environ` already
+    carries them and the child inherits the same view the parent's HTTP app reads.
+
+    A process per call is why the corpus does not run whole on this route; see
+    `safety.corpus.STDIO_SUBSET`.
+    """
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "execute_sql", "arguments": {"sql": sql, "datasource": profile}},
+        },
+    ]
+    proc = subprocess.run(
+        [sys.executable, "-m", "mcp_harness"],
+        input="".join(json.dumps(message) + "\n" for message in messages),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={**os.environ},
+    )
+    replies = {
+        message.get("id"): message
+        for message in (json.loads(line) for line in proc.stdout.splitlines() if line.strip())
+    }
+    # `stderr` is the diagnostic channel, so it is what says WHY when the call never came back —
+    # without it a child that died on import reads as a bare KeyError.
+    assert 2 in replies, proc.stderr
+    return json.loads(replies[2]["result"]["content"][0]["text"])
+
+
 def route_http(sql: str, profile: str = PROFILE) -> dict:
     """The HTTP transport, for real: `TestClient` over `create_app()`'s authenticated `/mcp`."""
     pytest.importorskip("starlette")
@@ -280,5 +323,6 @@ def route_http(sql: str, profile: str = PROFILE) -> dict:
 
 ROUTES = {
     "in_process": route_in_process,
+    "stdio": route_stdio,
     "http": route_http,
 }
