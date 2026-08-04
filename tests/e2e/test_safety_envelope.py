@@ -222,3 +222,77 @@ def test_a_deployment_that_cannot_record_refuses_and_never_executes(file_path, m
         guardrail.RULE_AUDIT_UNAVAILABLE
     ], body
     assert spy.called is False, "the statement ran on a deployment that could not record it"
+
+
+@pytest.fixture()
+def served(file_path, tmp_path, monkeypatch):
+    """The same file-served model, on a deployment whose audit store works. Returns its URL.
+
+    Depends on `file_path` so it runs after it: that fixture removes `AGAMI_DB_URL` to keep the
+    model on disk, and this puts one back. The two are not in conflict — model resolution tries
+    the database, finds no deployed datasource in this empty store, and falls through to disk — so
+    what changes is only whether the outcomes are recorded, which is this section's whole subject.
+    """
+    from store import Store
+
+    url = "sqlite://" + str(tmp_path / "app.db")
+    store = Store.connect(url)
+    store.run_migrations()
+    store.close()
+
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    return url
+
+
+def _audit_rows(url: str) -> list[dict]:
+    from store import Store
+
+    store = Store.connect(url)
+    try:
+        return store.query("SELECT id, status, rule FROM query_executions")
+    finally:
+        store.close()
+
+
+def test_the_unrecordable_refusal_is_the_one_outcome_that_writes_no_row(served, monkeypatch):
+    """The carve-out, asserted as a row count rather than as an absence of an exception.
+
+    This refusal means the store could not be opened, so writing a row to say so is the same write
+    failing a second time. The store is created healthy and broken only for the call, so the count
+    afterwards is read from a store that was perfectly capable of holding a row and does not.
+    """
+    monkeypatch.setenv("AGAMI_DB_URL", BROKEN_DB_URL)
+
+    body = _emit_through_the_tool_edge(_GOVERNED_SQL, _SpyExecutor())
+    assert body["refusal"]["rule"] == guardrail.RULE_AUDIT_UNAVAILABLE, body
+
+    assert _audit_rows(served) == []
+
+
+@pytest.mark.parametrize("case", _vectors())
+def test_every_other_outcome_writes_exactly_one_row_keyed_by_its_audit_id(
+    served, case, monkeypatch
+):
+    """One row per call, on every vector — which is what makes the carve-out exactly one rule wide.
+
+    Asserted per vector rather than once per status, because the failure this guards against is
+    rule-shaped: an exemption keyed on "it is a refusal", or one that grew a second rule, would
+    stop recording the outcomes worth reviewing and every status-level count would still balance.
+    Exactly one row, and its primary key is the id the answer carried back — so the record and the
+    answer are the same call rather than two plausible ones.
+    """
+    body = _drive(case, monkeypatch, route=harness.route_in_process)
+
+    rows = _audit_rows(served)
+    assert [row["id"] for row in rows] == [body["audit_id"]], (case.id, rows, body)
+    assert rows[0]["status"] == body["status"], (case.id, rows)
+
+
+def test_a_failed_execution_writes_its_row_too(served, file_path, monkeypatch):
+    """The third status again: a call that reached the database and broke is still an outcome."""
+    body = _failed_body(file_path, monkeypatch)
+
+    rows = _audit_rows(served)
+    assert [row["id"] for row in rows] == [body["audit_id"]], (rows, body)
+    assert rows[0]["status"] == "failed", rows
