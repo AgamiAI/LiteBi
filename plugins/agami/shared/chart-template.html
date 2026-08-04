@@ -74,11 +74,13 @@
                                        {"expr":"orders.region <> 'sandbox'","status":"omitted"}]}],
                  "undetermined": "..."},
 
-      // One entry per join the STATEMENT wrote. `status` is "declared", "undeclared" (it wrote no
-      // predicate for a declaration to match), "undeclarable" (an endpoint is a name the statement
-      // bound for itself, so no relationship can be about it), or "undetermined". The trust block
-      // below `status` is what a MATCHED declaration contributes and is null until one is matched —
-      // a null `review_state` is "not matched yet", NOT "not signed off".
+      // One entry per join the STATEMENT wrote. `status` is "declared" (the predicate it wrote
+      // matches a declared relationship, named on `name`), "undeclared" (it matches none, or it
+      // wrote no predicate for one to match), "undeclarable" (an endpoint is a name the statement
+      // bound for itself, so no relationship can be about it), or "undetermined" (the analysis
+      // could not read the join, which is NOT a claim that the model does not declare it). The
+      // trust block below `status` is what the MATCHED declaration contributes, and it is null on
+      // every other status — a null `review_state` is "not matched", NOT "not signed off".
       "joins": {"items": [{"predicate":"orders.customer_id = customers.id",
                            "scope":"main","status":"declared",
                            "name":"orders_to_customers","from_to":"orders → customers",
