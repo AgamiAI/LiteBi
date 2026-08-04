@@ -158,11 +158,17 @@ BYTE_IDENTICAL = {
 }
 
 # Bracket quoting is deliberately NOT in the battery above, and the reason is worth writing down.
-# It reaches the executor today only because the default sqlglot dialect parses `[orders]` as an
-# array literal rather than a table, so the scope gate finds no table to object to — a fail-open
-# this slice reports and does not own. A byte-identity case resting on that would be a contract test
-# coupled to a bug: dialect-aware parsing lands and the statement starts being refused, and this
-# file fails for a reason that has nothing to do with re-serialisation.
+# It used to reach the executor only because the default sqlglot dialect parsed `[orders]` as an
+# array literal rather than a table, so the scope gate found no table to object to — a fail-open
+# this slice reported and did not own. A byte-identity case resting on that would have been a
+# contract test coupled to a bug.
+#
+# That fail-open is gone: the guard now reads the statement in the datasource's own grammar, and
+# sqlglot's `sqlite` grammar reads `[orders]` as the table it is. The prediction this note carried —
+# that the statement would "start being refused" — was wrong in the useful direction, because the
+# table is one the model declares, so it clears the gate for the real reason. It keeps its own pair
+# of tests below rather than joining the battery, since what it pins is that reading rather than
+# re-serialisation.
 BRACKET_QUOTED = "SELECT id FROM [orders]"
 
 
