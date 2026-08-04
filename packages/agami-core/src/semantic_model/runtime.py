@@ -46,6 +46,7 @@ exposure. So the analysis stays, and both the authoring and the refusing go.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -3253,7 +3254,25 @@ def _declared_pairs(rel: Relationship,
             (_tkey(_bare(rel.from_table)), rel.from_column.lower()),
             (_tkey(_bare(rel.to_table)), rel.to_column.lower()),
         })})
-    text = rel.on or ""
+    return _reduced_on(rel.on or "", dialect)
+
+
+@functools.lru_cache(maxsize=1024)
+def _reduced_on(text: str, dialect: "str | None") -> "frozenset[frozenset[tuple[str, str]]] | None":
+    """The `on:` half of `_declared_pairs`, remembered across requests.
+
+    A pure function of MODEL-author text and the engine it is read in — the two arguments are
+    everything it looks at — and model text does not change between requests, while `assemble_receipt`
+    runs on the `ok` path of every executed query and reduces every declaration the model holds.
+    Each `on:` costs a sqlglot parse, so on a model that declares its edges through this hatch rather
+    than as column pairs the reduction was the receipt: 18 ms of it against 0.6 ms for the same
+    statement over the same number of FK-form edges. The FK form above stays uncached because it
+    builds a dict and parses nothing.
+
+    Returns a FROZENSET or None, so a cached answer is not a shared object a later caller can
+    mutate out from under an earlier one. Bounded rather than unbounded because the keys are a
+    deployment's model text and a process may serve more than one deployment.
+    """
     if _BIND_MARKER.search(text):
         return None
     predicate = _parse_declared_predicate(text, dialect)

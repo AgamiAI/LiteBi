@@ -672,6 +672,38 @@ def test_a_statement_with_no_join_pays_nothing_to_match_one(org, monkeypatch):
     assert called, "and a statement that wrote one still gets matched against them"
 
 
+def test_a_declaration_is_reduced_once_and_not_once_per_request(org, monkeypatch):
+    """The other half of that argument: the statements that DO write a join paid it every time.
+
+    Reducing an `on:`-form declaration costs a sqlglot parse, and `assemble_receipt` reduced every
+    declaration the model holds on every executed query. `Relationship.on` is MODEL text — it is the
+    same bytes on the next request and the one after — so the parse is a constant the deployment
+    pays per query for an answer it already had. On a model declaring its edges through the hatch
+    rather than as column pairs, it was the receipt: most of the time spent producing one.
+
+    Counted at the parse rather than timed, and the counting is restricted to the texts the model's
+    RELATIONSHIPS carry: a declared FILTER reaches the same helper and is a different question with
+    its own lifetime.
+    """
+    rt._reduced_on.cache_clear()
+    on_texts = {rel.on for rel in rt._cardinality_index(org) if rel.on}
+    assert on_texts, "the fixture has to declare through the hatch for this to measure anything"
+    parsed: list[str] = []
+    real = rt._parse_declared_predicate
+    monkeypatch.setattr(rt, "_parse_declared_predicate",
+                        lambda text, dialect=None: (parsed.append(text), real(text, dialect))[1])
+
+    (item,) = _items(org, ONE_JOIN)
+    assert item["status"] == rt.DECLARED
+    first = [t for t in parsed if t in on_texts]
+    assert first, "the declarations are reduced for the statement that arrives first"
+
+    (item,) = _items(org, ONE_JOIN)
+    assert item["status"] == rt.DECLARED, "and the answer is the same one"
+    assert [t for t in parsed if t in on_texts] == first, (
+        "the same model text was parsed again for the next request")
+
+
 # --- SC-3: an endpoint the statement bound for itself -----------------------
 
 
