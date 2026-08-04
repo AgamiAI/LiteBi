@@ -957,6 +957,73 @@ def test_the_cap_alone_is_enough_to_deny_completeness(org):
     assert section["undetermined"] == "2 further join(s) are not listed."
 
 
+# --- the section's cost is bounded by the tree, not by how deeply it nests ---
+
+
+def _nested_joins(depth: int) -> str:
+    """`depth` derived tables nested one inside the next, each writing one join.
+
+    Both of this section's cost axes at once, and both of them the CALLER's: how many joins the
+    statement wrote, and how deeply its SELECTs nest. Nothing exotic — an engine runs this shape in
+    milliseconds — and at the depths used below it stays a few kilobytes, well inside the executor's
+    own statement-length cap.
+    """
+    sql = "SELECT o.id AS id, o.customer_id AS customer_id FROM orders o"
+    for i in range(depth):
+        sql = (f"SELECT t{i}.id AS id, c{i}.id AS customer_id FROM ({sql}) t{i} "
+               f"JOIN customers c{i} ON t{i}.customer_id = c{i}.id")
+    return sql
+
+
+def _descents(monkeypatch, sql: str) -> tuple[int, int]:
+    """(nodes in the parse tree, nodes `_join_sites` descended into) for `sql`.
+
+    Counted rather than TIMED. A wall-clock assertion on a shared CI runner is a flake generator,
+    and the thing that actually went wrong is not slowness but a walk shape — the same subtree
+    traversed once per SELECT above it — which the descent count states exactly and a stopwatch only
+    hints at. `iter_expressions` is where sqlglot's own walk descends, so counting its calls counts
+    the work whichever of this module's helpers asked for it.
+    """
+    tree = rt._parse_sql(sql)
+    assert tree is not None
+    nodes = sum(1 for _ in tree.walk())
+    real = rt.exp.Expression.iter_expressions
+    descents = [0]
+
+    def counted(self, *args, **kwargs):
+        descents[0] += 1
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(rt.exp.Expression, "iter_expressions", counted)
+    rt._join_sites(tree, {"orders", "customers"})
+    monkeypatch.undo()
+    return nodes, descents[0]
+
+
+def test_the_join_walk_costs_the_tree_once_however_deeply_it_nests(monkeypatch):
+    """Doubling the nesting doubles the work, rather than quadrupling it.
+
+    Each join is resolved through its own SELECT's sources, and that map used to be built by walking
+    that SELECT's WHOLE subtree and keeping the tables whose nearest enclosing SELECT was this one.
+    The answer is right and the walk is not: a descendant subtree is re-walked once per SELECT above
+    it, so the cost is the product of two axes the CALLER picks — how deep the nesting goes and how
+    big the tree is. `assemble_receipt` runs on the `ok` path of every executed query, so a
+    statement well inside the length cap bought a second of pure-Python CPU on the shared server.
+
+    Asserted as a RATIO between two depths rather than against a fixed constant, so it does not
+    become a test of sqlglot's node count: linear work doubles when the depth doubles, and the
+    product form roughly quadrupled. Anything under the threshold here is a walk that visits the
+    tree a bounded number of times.
+    """
+    small_nodes, small = _descents(monkeypatch, _nested_joins(20))
+    large_nodes, large = _descents(monkeypatch, _nested_joins(40))
+
+    assert large_nodes < small_nodes * 2.5, "the two statements differ by ~2x of tree, not more"
+    assert large < small * 2.5, (
+        f"{small} descents at depth 20 and {large} at depth 40: the walk is growing with the "
+        "product of nesting depth and tree size, not with the tree")
+
+
 # --- SC-7: the predicate is bounded -----------------------------------------
 
 

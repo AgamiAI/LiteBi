@@ -3085,11 +3085,23 @@ def _own_alias_map(sel: "exp.Select | None") -> dict[str, str]:
     table, a `VALUES` list) is not an `exp.Table` and so is absent here on purpose: a qualifier
     naming one then resolves to itself, which is the name the endpoint walk and the receipt's label
     both want for it.
+
+    That test is made by STOPPING at the boundary rather than by walking past it and filtering.
+    "Its nearest enclosing SELECT is this one" and "reachable from this one without crossing another
+    SELECT" describe the same set of tables, so the two forms agree on every statement — but the
+    filtering form walked this SELECT's WHOLE subtree, once per enclosing SELECT, and how deeply
+    SELECTs nest is the caller's choice. On a statement of 110 nested derived tables that product
+    was the receipt's dominant cost, several times the parse it was describing. Pruning makes each
+    SELECT pay for its own region only, so the walk across all of them is linear in the tree.
+
+    `walk` yields the node it prunes at, hence the `isinstance` on the way out: the nested SELECT
+    itself comes back, and it is not a table reference.
     """
     if sel is None:
         return {}
+    boundary = sel.walk(prune=lambda node: isinstance(node, exp.Select) and node is not sel)
     return {(tbl.alias or tbl.name): tbl.name
-            for tbl in sel.find_all(exp.Table) if _enclosing_select(tbl) is sel}
+            for tbl in boundary if isinstance(tbl, exp.Table)}
 
 
 def _computed_relations(sel: "exp.Select | None") -> frozenset[str]:
