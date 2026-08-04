@@ -19,10 +19,13 @@ tables cannot describe different columns; a governed vector that returns rows is
 rows this module seeded, against the model the gates read.
 
 The model is written RICH rather than minimal — a declared relationship, an unreviewed metric, an
-AI-written column description, a declared filter and a row estimate — because the governed vectors
-assert that every receipt section is present, and a model that declares nothing produces sections
-that are present but say nothing. The point of a receipt assertion is to reach the assembler's real
-output, not its empty case.
+AI-written column description, a declared filter and a row estimate — because a model that declares
+nothing produces receipt sections that are present and say nothing, and the point of a receipt
+assertion is to reach the assembler's real output rather than its empty case. That richness is now
+ENFORCED rather than merely intended:
+`test_safety_corpus.py::test_every_receipt_section_says_something_on_some_governed_vector` requires
+each section to carry real items on some governed vector, so dropping any of the five declarations
+above turns this file's cost into a failing test instead of a quietly empty receipt.
 """
 
 from __future__ import annotations
