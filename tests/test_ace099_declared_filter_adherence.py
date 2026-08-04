@@ -217,6 +217,28 @@ EXPECTED_FILTER_ITEMS = [
 ]
 
 
+# One table read twice, in two arms of a set operation, under different aliases. The leading arm
+# writes the first declared filter and the trailing arm writes nothing, so the two references
+# disagree — which is exactly the pair that read identically before the arm ordinal existed.
+ARMED_SQL = (
+    "SELECT o.id FROM orders o WHERE o.is_deleted = false "
+    "UNION ALL SELECT o2.id FROM orders o2"
+)
+
+# What every route must agree on for `ARMED_SQL`. The two entries differ ONLY by alias, ordinal and
+# verdict, so a route that dropped the ordinal would produce two rows a reader cannot tell apart.
+EXPECTED_ARM_ITEMS = [
+    ("orders", "main#1", [
+        ("o.is_deleted = false", "applied"),
+        (f"o.{CANARY_COLUMN} <> '{CANARY_LITERAL}'", "omitted"),
+    ]),
+    ("orders", "main#2", [
+        ("o2.is_deleted = false", "omitted"),
+        (f"o2.{CANARY_COLUMN} <> '{CANARY_LITERAL}'", "omitted"),
+    ]),
+]
+
+
 def _filter_items(receipt: dict) -> list[tuple[str, str, list[tuple[str, str]]]]:
     """(ref, scope, [(declared text, status), …]) per listed reference, in the section's own order."""
     return [
@@ -398,6 +420,27 @@ def test_each_execution_path_reports_the_filters_each_reference_applied(declared
 
     assert body["status"] == "ok", body
     assert _filter_items(body["receipt"]) == EXPECTED_FILTER_ITEMS
+
+
+@pytest.mark.parametrize("route", list(ROUTES), ids=list(ROUTES))
+def test_each_execution_path_numbers_the_arms_of_a_set_operation(declared, route):
+    """The arm ordinal, delivered rather than merely computed.
+
+    One table read in two arms, one applying the declared soft-delete predicate and one not. Before
+    the ordinal both references reported `scope: "main"`, so the receipt held two rows that differed
+    only in a verdict with nothing to attribute it to — a reader could see that some arm dropped the
+    filter and not which. The ordinal is the whole of what distinguishes them here, which is why the
+    two expected entries are otherwise near-identical.
+
+    Parametrized over both routes for the reason the sibling test above gives: the ordinal is
+    composed below the point where the two builders diverge, so they cannot disagree by
+    construction — and this is what keeps that true rather than assumed. Forking is the default
+    path, so a fact that reached only the in-process builder would reach no local user at all.
+    """
+    body = ROUTES[route](ARMED_SQL)
+
+    assert body["status"] == "ok", body
+    assert _filter_items(body["receipt"]) == EXPECTED_ARM_ITEMS
 
 
 def test_the_two_execution_paths_report_identical_filter_items(declared):
