@@ -1876,9 +1876,8 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     except Exception:
         # The model package (pydantic) isn't importable, so the guards can't run at all. On the
         # hosted served path that is the same "can't guarantee safety" condition as a missing model
-        # — fail closed. Locally it stays a no-op (a bare install legitimately has no model). (The
-        # sqlglot-unavailable / unparseable-SQL degrade-to-allow is a distinct fail-open owned by
-        # ACE-037, not closed here.)
+        # — fail closed. Locally it stays a no-op (a bare install legitimately has no model). The
+        # two siblings of this branch are below: an unresolvable model, and an absent SQL parser.
         if _hosted():
             # `remediation` is authored here rather than carried across: this branch had no
             # `suggestion` at all, and the contract makes an unactionable refusal a construction
@@ -1913,6 +1912,24 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
         # The non-hosted twin again: locally a not-yet-built model is expected, so no refusal.
         return sql, None  # local: no model yet -> no-op (unchanged)
 
+    # No parser, no guard — the third member of the family above, and the last of them to be closed.
+    # Every gate below opens with `if not _HAVE_SQLGLOT: return None`, so a hosted server whose
+    # sqlglot import failed resolves a model, reports itself guarded, and then runs the statement
+    # with table scope, column scope, the star ban and the readability gate all silently inert. It is
+    # the same "cannot guarantee safety" condition as the two branches above and takes the same rule:
+    # a deployment-state fact that says nothing about the statement, so no re-emission fixes it.
+    #
+    # The local twin stays a no-op for the third time, and for the same reason — a bare install
+    # legitimately has no sqlglot, and refusing there would break every local user to close a hole
+    # that only exists on a served path.
+    if _hosted() and not getattr(RT, "_HAVE_SQLGLOT", True):
+        return sql, refuse(
+            RULE_MODEL_UNAVAILABLE,
+            detail="the SQL parser is not installed, so no guard could read the statement; "
+                   "refusing to run unguarded on the hosted server",
+            remediation="Install the semantic-model dependencies on the server and retry.",
+        )
+
     # Build the shared guard context ONCE — parse the SQL + build each model index a single
     # time — and thread it through the battery below, instead of every guard re-parsing and
     # rebuilding its index (audit P2 / ACE-045). Behaviour-preserving: a guard given `ctx`
@@ -1936,6 +1953,18 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
         unreadable = check_readable(sql, org, ctx=ctx)
         if unreadable is not None:
             return sql, unreadable
+
+    # Scopability gate — the readable statement that still cannot be checked. It runs between the
+    # readability gate and the scope gates because that is exactly the gap it fills: the gate above
+    # asks whether we could read the statement, the gates below ask what the statement reaches, and
+    # a table function is readable while reaching something neither one can name. Table scope skips
+    # an empty-name table so that a CTE reference passes, and a table function arrives as precisely
+    # that node, so it went through both. Same `getattr` reason as the gate above.
+    check_scopable = getattr(RT, "check_scopable", None)
+    if check_scopable is not None:
+        unscopable = check_scopable(sql, org, ctx=ctx)
+        if unscopable is not None:
+            return sql, unscopable
 
     # Table-scope guard — a query may only reference tables the semantic model
     # declares; any other table in the connected database is refused. Runs FIRST
