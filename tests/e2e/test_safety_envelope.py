@@ -41,7 +41,6 @@ import tools  # noqa: E402
 
 from safety.corpus import CASES  # noqa: E402
 
-
 # A governed vector's own SQL, taken from the corpus rather than written again here: the tests
 # below that need a statement every gate allows must use one the corpus agrees is allowed, or they
 # would prove their point against a statement that was refused for an unrelated reason.
@@ -218,9 +217,8 @@ def test_a_deployment_that_cannot_record_refuses_and_never_executes(file_path, m
 
     assert body["status"] == "refused", body
     assert body["refusal"]["rule"] == guardrail.RULE_AUDIT_UNAVAILABLE, body
-    assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[
-        guardrail.RULE_AUDIT_UNAVAILABLE
-    ], body
+    expected_reason = guardrail.REASON_FOR_RULE[guardrail.RULE_AUDIT_UNAVAILABLE]
+    assert body["refusal"]["reason"] == expected_reason, body
     assert spy.called is False, "the statement ran on a deployment that could not record it"
 
 
@@ -320,9 +318,8 @@ def test_an_over_ceiling_result_is_refused_with_no_data_at_all(file_path, case, 
 
     assert body["status"] == "refused", body
     assert body["refusal"]["rule"] == guardrail.RULE_RESOURCE_LIMIT, body
-    assert body["refusal"]["reason"] == guardrail.REASON_FOR_RULE[
-        guardrail.RULE_RESOURCE_LIMIT
-    ], body
+    expected_reason = guardrail.REASON_FOR_RULE[guardrail.RULE_RESOURCE_LIMIT]
+    assert body["refusal"]["reason"] == expected_reason, body
     for key in _RESULT_KEYS:
         assert key not in body, (key, body)
 
