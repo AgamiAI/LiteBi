@@ -296,6 +296,162 @@ def test_the_refusal_says_nothing_about_where_the_store_lives(env, monkeypatch):
     assert envelope.refusal.remediation.strip(), "a refusal the caller cannot act on is a dead end"
 
 
+def test_the_audit_unavailable_refusal_itself_writes_no_row(env, monkeypatch):
+    """The exemption, and the reason it is load-bearing rather than tidy.
+
+    This refusal means the store could not be opened. Writing a row to say so is the same write
+    failing a second time — and on the served path a failing write now RAISES, so without the
+    exemption the clean fail-closed refusal would arrive at the caller as an unhandled exception
+    from the serializer. `_emit` returning normally here is the whole assertion.
+    """
+    monkeypatch.setenv("AGAMI_DB_URL", BROKEN_DB_URL)
+    envelope = execute_sql.execute_guarded(
+        "SELECT id FROM orders", PROFILE, "sales", executor=_SpyExecutor()
+    )
+    assert envelope.refusal.rule == guardrail.RULE_AUDIT_UNAVAILABLE
+
+    body = tools._emit(envelope, sql="SELECT id FROM orders", execution_ms=None, profile=PROFILE)
+
+    assert json.loads(body)["status"] == "refused"
+
+
+def test_every_other_refusal_still_records(env):
+    """The exemption is exactly one rule wide, asserted rather than assumed.
+
+    An exemption keyed on "it is a refusal" would have quietly stopped recording the outcomes
+    principle 7 most wants kept, and this file would still be green.
+    """
+    _seed_warehouse(env.warehouse)
+
+    envelope = execute_sql.execute_guarded(
+        "DROP TABLE orders", PROFILE, "sales", executor=execute_sql.BUILTIN_EXECUTOR
+    )
+    assert envelope.refusal.rule == guardrail.RULE_READ_ONLY
+
+    tools._emit(envelope, sql="DROP TABLE orders", execution_ms=None, profile=PROFILE)
+
+    store = Store.connect(env.app_db)
+    try:
+        rows = store.query("SELECT id, status, rule FROM query_executions")
+    finally:
+        store.close()
+    assert [(r["status"], r["rule"]) for r in rows] == [("refused", guardrail.RULE_READ_ONLY)]
+
+
+# ---------------------------------------------------------------------------
+# 4. The two swallows on the tool-call path
+# ---------------------------------------------------------------------------
+
+
+def _jsonrpc_result(text: str) -> dict:
+    """The `result` object out of a JSON-RPC reply, whether it arrived plain or SSE-framed.
+
+    The streamable-HTTP transport may negotiate either, and which one it picks is not this test's
+    subject — so the frame is stripped here rather than asserted on.
+    """
+    payload = text.strip()
+    if payload.startswith("event:") or payload.startswith("data:"):
+        payload = next(
+            line[len("data:"):].strip()
+            for line in payload.splitlines()
+            if line.startswith("data:")
+        )
+    return json.loads(payload)["result"]
+
+
+def _break_the_tool_call_sink(monkeypatch) -> None:
+    import model_store
+
+    def _boom(self, record):
+        raise RuntimeError("the tool_calls table is unreachable")
+
+    monkeypatch.setattr(model_store.DbActivitySink, "record_tool_call", _boom)
+
+
+def test_the_recorder_no_longer_swallows_its_own_failure(env, monkeypatch):
+    """The first of the two masking swallows: `_record_tool_call`'s `except Exception: pass`.
+
+    Asserted on behaviour rather than by grepping for a bare `except`. A grep would have passed
+    before this spec started — there is no bare `except:` anywhere in the package, and never was.
+    Both swallows were `except Exception:`, which a grep for the bare form does not see.
+    """
+    _break_the_tool_call_sink(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        tools.record_tool_call(
+            name="execute_sql", arguments={"sql": "SELECT 1"}, result_text=None,
+            execution_ms=1, actor=None,
+        )
+
+
+def test_the_transport_no_longer_swallows_it_either(env, monkeypatch):
+    """The second: the `except Exception: pass` around the call, in the HTTP transport's `finally`.
+
+    The two are why neither had been closed. Removing this one alone changes nothing, because
+    `_record_tool_call` swallowed internally and never raised anything for it to catch; removing
+    that one alone changes nothing, because this caught what it then raised. Each made the other
+    unobservable. So this drives the real transport with the sink broken and asserts the failure
+    reaches the wire — which is only true once BOTH are gone.
+    """
+    import mcp_http
+    from oauth_server import issue_jwt
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://your-host.example.com")
+    monkeypatch.setenv("AGAMI_SIGNING_SECRET", "x" * 40)
+    _seed_warehouse(env.warehouse)
+    _break_the_tool_call_sink(monkeypatch)
+
+    headers = {
+        "Authorization": f"Bearer {issue_jwt('jordan@example.com')}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(mcp_http.create_app(), raise_server_exceptions=False) as client:
+        init = client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        session = init.headers.get("mcp-session-id")
+        headers2 = {**headers, **({"mcp-session-id": session} if session else {})}
+        client.post("/mcp", headers=headers2,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        reply = client.post("/mcp", headers=headers2, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "execute_sql", "arguments": {
+                "sql": "SELECT id FROM orders", "datasource": PROFILE}}})
+
+    result = _jsonrpc_result(reply.text)
+
+    # `isError` is read as a parsed boolean, not by scanning the body for "error". The substring is
+    # present either way — `"isError":false` contains it — so a text search passes whether or not
+    # the swallow is back, which is the one thing this test exists to tell apart. Caught by
+    # restoring the swallow and watching this test stay green.
+    assert result["isError"] is True, (
+        "the tool call returned an answer with its audit row lost — a swallow is back"
+    )
+    assert "unreachable" in result["content"][0]["text"]
+
+
+def test_locally_the_tool_call_recorder_is_still_best_effort(env, monkeypatch, caplog):
+    """The local half of the same split, so the swallow's removal does not reach a laptop."""
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+
+    def _boom(path, record):
+        raise OSError("the log directory is read-only")
+
+    monkeypatch.setattr(tools, "_append_jsonl", _boom)
+
+    with caplog.at_level("WARNING", logger="tools"):
+        tools.record_tool_call(
+            name="execute_sql", arguments={"sql": "SELECT 1"}, result_text=None,
+            execution_ms=1, actor=None,
+        )  # must NOT raise
+
+    assert [r.levelname for r in caplog.records if r.name == "tools"] == ["WARNING"]
+
+
 def test_the_refusal_carries_the_before_the_model_receipt(env, monkeypatch):
     """It is in `PRE_MODEL_RULES`, so its receipt says the model was never consulted.
 

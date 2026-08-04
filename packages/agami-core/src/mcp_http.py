@@ -440,19 +440,28 @@ def build_server(
         finally:
             # The per-call audit write opens a fresh Store + INSERT + close; run it off the event loop so
             # it doesn't add DB latency to every tool call on the loop (ACE-048). `_actor_ctx.get()` is read
-            # here (on the loop) and passed in. Still best-effort — a logging failure never breaks the tool.
-            try:
-                await run_blocking(
-                    record_tool_call,
-                    name=name,
-                    arguments=arguments,
-                    result_text=result_text,
-                    execution_ms=int((time.monotonic() - started) * 1000),
-                    actor=_actor_ctx.get(),
-                    raised=raised,
-                )
-            except Exception:
-                pass
+            # here (on the loop) and passed in.
+            #
+            # NOT wrapped (ACE-097). This `try` held an `except Exception: pass`, the second of the
+            # two swallows that made a lost audit row invisible: it caught whatever
+            # `_record_tool_call` raised, and `_record_tool_call` swallowed internally so it never
+            # raised anything for this to catch. Each made the other unobservable, which is why
+            # removing either alone changed nothing and neither was ever removed.
+            #
+            # `record_tool_call` decides what a failure means, by deployment: served, it raises and
+            # the call fails; local, it warns and returns. That decision belongs there, beside the
+            # write, rather than being pre-empted here by a transport that cannot tell the two
+            # deployments apart. Raising from a `finally` replaces the handler's own result, which is
+            # the intended outcome: a call whose record was lost must not read as a success.
+            await run_blocking(
+                record_tool_call,
+                name=name,
+                arguments=arguments,
+                result_text=result_text,
+                execution_ms=int((time.monotonic() - started) * 1000),
+                actor=_actor_ctx.get(),
+                raised=raised,
+            )
 
     return server
 
