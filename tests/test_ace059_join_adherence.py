@@ -262,6 +262,16 @@ CTE_BODY_REBINDS_ALIAS = ("WITH t AS (SELECT id, customer_id FROM orders o) "
 SUBQUERY_REBINDS_ALIAS = (
     "SELECT c.id FROM (SELECT id, customer_id FROM orders) o JOIN customers c "
     "ON o.customer_id = c.id WHERE c.id IN (SELECT o.customer_id FROM orders o)")
+# A relation the statement COMPUTED, aliased with the name of a declared table. The alias is the
+# only string an ON qualifier can name it by, so declarability decided on the string alone reads it
+# as the model's own `customers` — the CTE-shadowing hazard, in two other syntaxes and on either
+# side of the join.
+DERIVED_NAMED_AS_DECLARED = ("SELECT o.id FROM orders o JOIN (SELECT 1 AS id) AS customers "
+                             "ON o.customer_id = customers.id")
+VALUES_NAMED_AS_DECLARED = ("SELECT o.id FROM orders o JOIN (VALUES (1)) AS customers(id) "
+                            "ON o.customer_id = customers.id")
+DERIVED_NAMED_AS_DECLARED_IN_FROM = ("SELECT o.id FROM (SELECT 1 AS id) AS customers "
+                                     "JOIN orders o ON o.customer_id = customers.id")
 
 
 # --- SC-1: one item per join the statement wrote ----------------------------
@@ -543,6 +553,34 @@ def test_a_self_bound_endpoint_cannot_carry_a_declaration(org, sql):
     it — however closely the name resembles one the model declares."""
     (item,) = _items(org, sql)
     assert item["status"] == rt.UNDECLARABLE
+
+
+@pytest.mark.parametrize("sql,from_to", [
+    (DERIVED_NAMED_AS_DECLARED, "orders → customers"),
+    (VALUES_NAMED_AS_DECLARED, "orders → customers"),
+    (DERIVED_NAMED_AS_DECLARED_IN_FROM, "customers → orders"),
+], ids=["derived-right", "values-right", "derived-left"])
+def test_a_computed_relation_cannot_borrow_a_declared_tables_name(org, sql, from_to):
+    """The SHADOWING-CTE case in two other syntaxes, and the one the CTE check does not cover.
+
+    `visible` subtracts the statement's CTE names, so `WITH orders AS (…)` is already refused. A
+    derived table and a `VALUES` list are the same thing said differently — a relation the statement
+    computed, known only by the alias it was given — and nothing subtracts those, so an alias
+    spelled like a declared table walked straight into `declared` with an approved sign-off trail
+    beside it.
+
+    The name is the wrong thing to decide this on, because the statement chooses it. What decides it
+    is STRUCTURE: an endpoint can carry a declaration only where the source it came from IS a table
+    reference. Then no alias can collide, whatever it is spelled.
+
+    The label still names the relation as the statement did, on both sides: the status is the claim,
+    the label is the address.
+    """
+    (item,) = _items(org, sql)
+    assert item["from_to"] == from_to
+    assert item["status"] == rt.UNDECLARABLE
+    assert item["name"] is None
+    assert item["review_state"] is None
 
 
 def test_a_self_join_resolves_to_the_one_table_on_both_sides(org):

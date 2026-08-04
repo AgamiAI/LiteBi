@@ -2253,11 +2253,12 @@ def assemble_receipt(
     join_items: list[dict[str, Any]] = []
     for js in join_sites[:_RECEIPT_MAX_REFS]:
         match: Optional[Relationship] = None
-        if not js.declarable:
-            # An endpoint the STATEMENT bound — a CTE name, a derived table, a CTE shadowing a
-            # declared table — cannot be what any declaration is about, so this is settled rather
-            # than open. It is asked FIRST because a structural impossibility outranks a failure to
-            # resolve: there is nothing here for a better analysis to establish later.
+        if not (js.left_declarable and js.right_declarable):
+            # An endpoint the STATEMENT bound — a CTE name, a derived table, a `VALUES` list, a CTE
+            # shadowing a declared table — cannot be what any declaration is about, so this is
+            # settled rather than open. It is asked FIRST because a structural impossibility
+            # outranks a failure to resolve: there is nothing here for a better analysis to
+            # establish later.
             status = UNDECLARABLE
         elif not js.pinned:
             # The ON did not reduce to a pair of endpoints. Unlike the branch above this is a fact
@@ -3042,6 +3043,34 @@ def _own_alias_map(sel: "exp.Select | None") -> dict[str, str]:
             for tbl in sel.find_all(exp.Table) if _enclosing_select(tbl) is sel}
 
 
+def _computed_relations(sel: "exp.Select | None") -> frozenset[str]:
+    """The names THIS SELECT binds to a relation it COMPUTED, folded through `_tkey`.
+
+    The complement of `_own_alias_map` over the same sources: a derived table, a `VALUES` list —
+    anything a FROM or a JOIN introduces that is not an `exp.Table`. All the statement gave it is an
+    alias, and an alias may be spelled exactly like a table the model declares:
+
+        SELECT o.id FROM orders o JOIN (SELECT 1 AS id) AS customers ON o.customer_id = customers.id
+
+    Deciding declarability on that STRING reads `customers` as the model's own, so the join reports
+    `declared` and carries the sign-off of a relationship between two tables, one of which the
+    statement never read. `visible` already subtracts the statement's CTE names, which is the same
+    hazard in the one syntax that happens to be named; this is the rest of them. Deciding it
+    STRUCTURALLY — is this endpoint's source a table REFERENCE — leaves no name for an alias to
+    collide with.
+
+    Folded through `_tkey` because `visible` is: a scope that refused `customers` while admitting
+    `Customers` would be answering one question two ways.
+    """
+    if sel is None:
+        return frozenset()
+    return frozenset(
+        _tkey(child.this.alias_or_name)
+        for child in sel.iter_expressions()
+        if isinstance(child, (exp.From, exp.Join))
+        and child.this is not None and not isinstance(child.this, exp.Table))
+
+
 class _JoinSite(NamedTuple):
     """One join the statement WROTE, beside the `exp.Join` node it was read from.
 
@@ -3061,11 +3090,19 @@ class _JoinSite(NamedTuple):
     # (a CTE name, a derived table's alias). Unbounded here; the assembler bounds them where it
     # composes the label, the way every other caller-written name in the receipt is bounded.
     endpoints: tuple[str, str]
-    # Whether both endpoints are names the MODEL could have a declaration about. False for a name
-    # the statement bound for itself — a CTE alias, a derived table, a CTE shadowing a declared
-    # table. A SETTLED structural fact: no declaration will ever be about a name the statement
-    # invented, however the analysis improves.
-    declarable: bool
+    # Whether each endpoint is one the MODEL could have a declaration about. False for a relation
+    # the statement bound for itself — a CTE, a derived table, a `VALUES` list, a CTE shadowing a
+    # declared table. A SETTLED structural fact: no declaration will ever be about a relation the
+    # statement invented, however the analysis improves.
+    #
+    # Kept PER ENDPOINT because the two are established differently. `right` comes from `join.this`,
+    # which is the join's own right input and is therefore always established. `left` is only
+    # established when the ON pinned it — see `pinned` — and until then it holds the FROM fallback,
+    # which is a LABEL and not a resolution. One combined flag folded those together and let a join
+    # whose ON we could not read reach a settled status off a relation we never established was
+    # party to it.
+    left_declarable: bool
+    right_declarable: bool
     # Whether the ON reduced to a pair of endpoints. False for a compound ON reaching over three or
     # more relations, and for one naming no column at all. That is a failure of THIS ANALYSIS rather
     # than a fact about the statement — the model may well declare the join — and the two are kept
@@ -3187,13 +3224,13 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
     cte_scopes = _cte_body_scopes(node)
     arm_suffixes = _arm_suffixes(node)
     output_ids = {id(sel) for sel in _output_selects(node)}
-    scope_maps: dict[int, dict[str, str]] = {}
+    scopes: dict[int, tuple[dict[str, str], frozenset[str]]] = {}
     sites: list[_JoinSite] = []
     for join in node.find_all(exp.Join):
         sel = _enclosing_select(join)
-        if id(sel) not in scope_maps:
-            scope_maps[id(sel)] = _own_alias_map(sel)
-        scope_map = scope_maps[id(sel)]
+        if id(sel) not in scopes:
+            scopes[id(sel)] = (_own_alias_map(sel), _computed_relations(sel))
+        scope_map, computed = scopes[id(sel)]
         on = join.args.get("on")
         right = _relation_name(join.this)
         # The join's LEFT input, when the ON does not say which relation it is: whatever the FROM
@@ -3224,7 +3261,13 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
             predicate=_echo_expr(on.sql()) if on is not None else None,
             scope=_scope_label(sel, node, cte_scopes, arm_suffixes, output_ids),
             endpoints=(left, right),
-            declarable=_tkey(left) in visible and _tkey(right) in visible,
+            # STRUCTURAL on the right, where the source node is in hand: only a table REFERENCE can
+            # be what a declaration is about, so a derived table or a `VALUES` list aliased with a
+            # declared table's name cannot pass by spelling. The left endpoint is a NAME by the time
+            # it is known — resolved out of the ON through the scope map — so its structural half is
+            # `computed`, the names this SELECT bound to relations of its own.
+            left_declarable=_tkey(left) not in computed and _tkey(left) in visible,
+            right_declarable=isinstance(join.this, exp.Table) and _tkey(right) in visible,
             pinned=pinned,
             # Resolved through THIS join's own enclosing scope, which is the map already in hand.
             pairs=_predicate_pairs(on, scope_map) if on is not None else frozenset(),
