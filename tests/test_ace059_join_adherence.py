@@ -983,6 +983,9 @@ def _descents(monkeypatch, sql: str) -> tuple[int, int]:
     traversed once per SELECT above it — which the descent count states exactly and a stopwatch only
     hints at. `iter_expressions` is where sqlglot's own walk descends, so counting its calls counts
     the work whichever of this module's helpers asked for it.
+
+    Under the receipt's own cap, which is what the caller passes: the depths below both write fewer
+    joins than it admits, so the walk shape is the only thing this measures.
     """
     tree = rt._parse_sql(sql)
     assert tree is not None
@@ -995,8 +998,9 @@ def _descents(monkeypatch, sql: str) -> tuple[int, int]:
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(rt.exp.Expression, "iter_expressions", counted)
-    rt._join_sites(tree, {"orders", "customers"})
+    _, written = rt._join_sites(tree, {"orders", "customers"}, rt._RECEIPT_MAX_REFS)
     monkeypatch.undo()
+    assert written < rt._RECEIPT_MAX_REFS, "the cap must not be what bounds this"
     return nodes, descents[0]
 
 
@@ -1022,6 +1026,33 @@ def test_the_join_walk_costs_the_tree_once_however_deeply_it_nests(monkeypatch):
     assert large < small * 2.5, (
         f"{small} descents at depth 20 and {large} at depth 40: the walk is growing with the "
         "product of nesting depth and tree size, not with the tree")
+
+
+def test_a_join_the_cap_drops_is_never_built(org, monkeypatch):
+    """The cap used to be a slice of a list that had already been built in full.
+
+    So a statement writing hundreds of joins paid a scope map, a serialized predicate and a
+    reduction for every one of them, and the section then listed fifty. The bound the cap exists to
+    hold is on the WORK as much as on the output — the length of that list is the caller's to
+    choose, and the section is on the `ok` path of every executed query.
+
+    Counted through `_join_condition`, which is per SITE and runs nowhere else, so the count is the
+    number of sites built. Paired with the assertions above it, which are what stop this from being
+    satisfiable by building fewer joins than the receipt reports.
+    """
+    built: list[object] = []
+    real = rt._join_condition
+    monkeypatch.setattr(rt, "_join_condition",
+                        lambda join: (built.append(join), real(join))[1])
+
+    over = rt._RECEIPT_MAX_REFS + 7
+    section = _section(org, _many_comma_joins(over))
+    assert len(section["items"]) == rt._RECEIPT_MAX_REFS
+    assert section["undetermined"].endswith("7 further join(s) are not listed."), (
+        "the dropped joins are still counted, which is what the walk has to finish for")
+    assert len(built) == rt._RECEIPT_MAX_REFS, (
+        f"{len(built)} sites built for {over} joins, of which "
+        f"{rt._RECEIPT_MAX_REFS} are listed")
 
 
 # --- SC-7: the predicate is bounded -----------------------------------------

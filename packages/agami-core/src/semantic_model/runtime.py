@@ -2244,8 +2244,12 @@ def assemble_receipt(
     # section. (`metric_items` below is exempt for the opposite reason: its length is the number of
     # metrics the DEPLOYMENT declared.) The count is the caller's own number, so stating it
     # discloses nothing.
-    join_sites = _join_sites(tree, visible)
-    dropped_joins = max(0, len(join_sites) - _RECEIPT_MAX_REFS)
+    #
+    # The cap goes IN rather than being a slice of what came back. Every join past it was resolved,
+    # serialized and reduced only to be dropped here, and how many of those there are is the
+    # caller's choice — which is the whole reason the section is capped in the first place.
+    join_sites, joins_written = _join_sites(tree, visible, _RECEIPT_MAX_REFS)
+    dropped_joins = joins_written - len(join_sites)
     # Every relationship the model declares, through `_cardinality_index` — per subject area PLUS
     # `org.cross_subject_area_relationships`. The old walk read only the subject areas, so a
     # genuinely declared cross-area join was missing from a section that claimed to list declared
@@ -2259,7 +2263,7 @@ def assemble_receipt(
     declared_pairs = ([(rel, _declared_pairs(rel, dialect)) for rel in _cardinality_index(org)]
                       if join_sites else [])
     join_items: list[dict[str, Any]] = []
-    for js in join_sites[:_RECEIPT_MAX_REFS]:
+    for js in join_sites:
         match: Optional[Relationship] = None
         if not js.right_declarable:
             # An endpoint the STATEMENT bound — a CTE name, a derived table, a `VALUES` list, a CTE
@@ -3316,8 +3320,10 @@ def _relation_name(rel: "exp.Expression") -> str:
     return rel.name if isinstance(rel, exp.Table) else rel.alias_or_name
 
 
-def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
-    """The one walk of `exp.Join`: every join the STATEMENT wrote, resolved to its scope.
+def _join_sites(node: "exp.Expression", visible: set[str],
+                limit: int) -> "tuple[list[_JoinSite], int]":
+    """The one walk of `exp.Join`: the first `limit` joins the STATEMENT wrote, resolved to their
+    scope, beside the number of joins it wrote in total.
 
     Over `find_all(exp.Join)` rather than each SELECT's own `joins` argument. That argument is
     per-SELECT, so reading it off the statement root finds the outer joins and silently misses
@@ -3337,13 +3343,27 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
     statement may write up to the receipt's cap of joins into one SELECT and each lookup would
     otherwise re-walk that SELECT's whole subtree — and by `id()` rather than by the node because exp
     nodes hash by STRUCTURE, so two identically written arms would collide.
+
+    `limit` is the receipt's own cap, applied HERE rather than by slicing the result. The caller
+    lists that many items and reports the rest as a count, so every site past the cap was built and
+    thrown away — a scope map, a serialized predicate and a reduction each, on a list whose length
+    is the CALLER's to choose. WHICH joins are listed and how many were dropped are unchanged: the
+    walk order is the same, the survivors are the same prefix of it, and the total returned beside
+    them is counted over every join whether or not a site was built for it.
     """
     cte_scopes = _cte_body_scopes(node)
     arm_suffixes = _arm_suffixes(node)
     output_ids = {id(sel) for sel in _output_selects(node)}
     scopes: dict[int, tuple[dict[str, str], frozenset[str]]] = {}
     sites: list[_JoinSite] = []
+    written = 0
     for join in node.find_all(exp.Join):
+        written += 1
+        if len(sites) >= limit:
+            # Counted and nothing more. The walk still has to finish, because the number of joins
+            # the statement wrote is what the caller's "further join(s) are not listed" clause
+            # states, and a count of the ones we happened to build is not that number.
+            continue
         sel = _enclosing_select(join)
         if id(sel) not in scopes:
             scopes[id(sel)] = (_own_alias_map(sel), _computed_relations(sel))
@@ -3392,7 +3412,7 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
             # Resolved through THIS join's own enclosing scope, which is the map already in hand.
             pairs=_predicate_pairs(on, scope_map) if on is not None else frozenset(),
         ))
-    return sites
+    return sites, written
 
 
 class _AggSite(NamedTuple):
