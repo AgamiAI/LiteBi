@@ -14,6 +14,27 @@ below corresponds to one such version.
 
 ### Changed
 
+- **The receipt now reports on every number your query computes, not just the ones with a problem
+  (ACE-060).** The `aggregates` section listed findings, so a total no join had multiplied produced
+  no entry at all — and an entry that is absent looks exactly like a check that never ran. It also
+  named the measure *table*, so a query computing two numbers over one table told you a join
+  multiplied "orders" and left you to work out which of your two numbers it meant.
+
+  There is now one entry per aggregate, saying the aggregate as parsed, whether a join multiplies
+  the rows behind it, and which join does. A number nothing multiplied **says so**, which is the
+  point: reading "not multiplied" beside a total is the difference between a clean answer and an
+  unchecked one.
+
+  An aggregate whose reads could not be resolved reports `undetermined` rather than clean.
+  `COUNT(*)` is the case that matters: it names no column, so nothing tells us which table's rows it
+  counts, and a fan-out around it is invisible to the check. Reporting that as clean would put a
+  clean bill of health on the one number a join had multiplied.
+
+  The section's `undetermined` line is now composed per query from what *that* query left open, so
+  it can finally be empty. It used to carry a sentence on every answer, including "whether this is a
+  problem depends on the question" — true of every answer forever, and the reason the section could
+  never say "checked, and complete". A trap is still reported and still never refused.
+
 - **The audit row now says what the decision was made against, and what you were told (ACE-098).**
   A row recorded the verdict — `ok` / `refused` / `failed`, and for a refusal which rule under which
   reason — but nothing about the basis for it, so nobody could take a row and check the decision

@@ -57,12 +57,20 @@ def test_the_aggregation_only_fan_trap_is_reported_not_rewritten_and_not_refused
 
 
 def test_chasm_trap_is_reported():
+    """One entry per AGGREGATE the cross-product inflates, not one for the pair of tables.
+
+    This asserted a single finding, which was right when a finding was about the pair. The caller
+    holds two totals and both are inflated, so both are reported — and `pf.aggregates` is the shape
+    that says which is which.
+    """
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
         "LEFT JOIN orders o ON o.customer_id=c.id LEFT JOIN tickets t ON t.customer_id=c.id "
         "GROUP BY c.id", org)
-    assert [f.risk for f in pf.findings] == ["chasm_trap"]
+    assert [f.risk for f in pf.findings] == ["chasm_trap", "chasm_trap"]
+    assert [(a.aggregate, a.status) for a in pf.aggregates] == [
+        ("SUM(o.revenue)", rt.MULTIPLIED), ("COUNT(t.id)", rt.MULTIPLIED)]
 
 
 def test_fan_trap_mixed_raw_and_aggregate_is_reported():
