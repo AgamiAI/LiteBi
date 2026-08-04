@@ -8,11 +8,16 @@ gate that fired on one transport and not the other would be a hole in the shape 
 likely to look for, because the per-gate unit tests all pass and the HTTP corpus is entirely green.
 
 **The subset is deliberate, and it is bounded from both sides.** The stdio route spawns a process
-per call, so the whole corpus over both transports is ~112 spawns on the critical path of every PR.
-`safety.corpus.STDIO_SUBSET` therefore carries one vector per distinct rule plus the read-only class
-whole — the largest attack surface, whose vectors take genuinely different paths into the same gate
-(bare keyword, comment-hidden separator, CTE body). Widening it to all 56 buys a slower gate and no
-new rule; narrowing it drops a rule's only stdio evidence. The shape test below pins both ends.
+per call and the HTTP route it is compared against does not, so the cost of this dimension is
+`safety.corpus.STDIO_SPAWNS` child processes on the critical path of every PR — one number, stated
+once, next to the subset it is derived from. It used to be written out here as a figure and a
+different figure appeared in the corpus, both of them arrived at by hand and one of them double
+counting a transport that spawns nothing.
+
+`STDIO_SUBSET` carries one vector per distinct rule plus the read-only class whole — the largest
+attack surface, whose vectors take genuinely different paths into the same gate. Widening it to the
+whole corpus buys a slower gate and no new rule; narrowing it drops a rule's only stdio evidence.
+The shape test below pins both ends.
 
 The red set is empty on this branch and `test_safety_corpus.py` asserts it stays that way, so no
 xfail machinery is duplicated here; a vector that went red would fail there first and loudest.
@@ -44,7 +49,7 @@ itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
 import guardrail  # noqa: E402
 import harness  # noqa: E402
 
-from safety.corpus import CASES, STDIO_SUBSET  # noqa: E402
+from safety.corpus import CASES, STDIO_SPAWNS, STDIO_SUBSET  # noqa: E402
 
 
 @pytest.fixture()
@@ -95,8 +100,11 @@ def test_the_stdio_subset_is_bounded_from_both_sides():
     """The subset is a claim about coverage, so it needs an assertion or it is a comment.
 
     Both bounds matter. Missing a rule means that rule has no stdio evidence at all; growing to the
-    whole corpus means the bound was quietly abandoned and every PR pays ~112 spawns for it.
+    whole corpus means the bound was quietly abandoned and every PR pays a child process per vector
+    for it. `STDIO_SPAWNS` is that cost, and it is asserted here rather than described in prose, so
+    the bound is a number this file reads rather than a number this file repeats.
     """
+    assert STDIO_SPAWNS == len(STDIO_SUBSET)
     assert {case.rule for case in STDIO_SUBSET} == {case.rule for case in CASES}
     # The read-only class rides along whole — the vectors reach the same gate by different routes.
     read_only = guardrail.RULE_READ_ONLY

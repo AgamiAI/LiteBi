@@ -25,6 +25,12 @@ sameness it was never supposed to have.
 The five backtick/bracket-quoted vectors do not run here: identifier quoting is engine-specific and
 those are pinned to SQLite, where the same text means something. `Case.runs_on` is what filters
 them, and `safety.corpus.EXPECTED_DB_VECTORS` counts what is left.
+
+Note the direction of that filter, because it bounds what a vector may be pinned to. Every vector
+this file collects runs on BOTH paths — the comparison is the point — so a vector pinned to
+PostgreSQL alone would be asserting that the two paths agree about a statement the SQLite path
+cannot parse. Engine pins therefore only ever remove a vector from here, never add one; the
+array-literal `UNNEST` spelling is the case that ran into it, and `safety.corpus` records why.
 """
 
 from __future__ import annotations

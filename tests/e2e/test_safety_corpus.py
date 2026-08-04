@@ -154,18 +154,51 @@ def test_every_receipt_section_says_something_on_some_governed_vector(file_path)
 # ---------------------------------------------------------------------------
 
 
+# The rules NO vector in this corpus can produce, each named individually with the reason it is
+# exempt. Deliberately a list of three rather than "whatever the corpus does not happen to cover":
+# the assertion below is an equality against `REASON_FOR_RULE` minus this set, so a rule that stops
+# being exercised has to be added here, in the open, with a reason.
+#
+#   * `model_unavailable` needs a deployment with no resolvable model, which is a configuration
+#     rather than a statement. Covered per path by
+#     `test_safety_corpus_db_path.py::test_the_served_path_refuses_when_its_model_is_gone` and its
+#     local counterpart.
+#   * `audit_unavailable` needs a deployment whose audit store will not open, likewise a
+#     configuration. Covered by `test_safety_envelope.py` on the package surface and by
+#     `test_vendored_surface_parity.py` on the plugin's.
+#   * `engine_mismatch` is covered by NOTHING yet. It is named here rather than quietly folded into
+#     the corpus because an exemption with a reason is a known gap and an unnamed one is an
+#     accident: it fires when the model's declared `storage_type` disagrees with the engine the
+#     credentials connect to, which every harness build is careful to keep in step — so provoking it
+#     means building a deliberately mismatched model, which no test does.
+_RULES_NO_VECTOR_CAN_PRODUCE = frozenset(
+    {
+        guardrail.RULE_MODEL_UNAVAILABLE,
+        guardrail.RULE_AUDIT_UNAVAILABLE,
+        guardrail.RULE_ENGINE_MISMATCH,
+    }
+)
+
+
 def test_the_corpus_is_the_shape_the_coverage_claim_rests_on():
     """The parametrization above is only as good as the list it reads.
 
-    Three facts a thinned corpus would quietly lose: the vector count, the fifteen governed vectors
-    that carry the no-false-refusal half, and that every rule a vector expects is one the guardrail
-    actually pins — a vector expecting an unpinned rule could never pass, and a vector expecting a
-    misspelt one would xfail forever without anyone noticing.
+    Four facts a thinned corpus would quietly lose: the vector count, the governed vectors that
+    carry the no-false-refusal half, that ids are unique, and — the one that was not being checked —
+    that the rules the corpus exercises are EXACTLY the pinned vocabulary minus a named exemption
+    list.
+
+    That last assertion used to be `expected_rules <= set(REASON_FOR_RULE)`, a subset check, which
+    is satisfied by a corpus covering one rule. It was measured passing while four pinned rules had
+    no vector at all, `unparseable` among them — a rule with two live producers and the canonical
+    bypass class for this architecture, since a statement the guard and the engine read differently
+    is exactly how a gate gets walked around. An equality is what turns "this rule has no vector"
+    from an invisible state into a red build.
     """
-    assert len(CASES) == 56
-    assert len([c for c in CASES if c.rule is None]) == 15
+    assert len(CASES) == 84
+    assert len([c for c in CASES if c.rule is None]) == 16
     expected_rules = {c.rule for c in CASES if c.rule is not None}
-    assert expected_rules <= set(guardrail.REASON_FOR_RULE)
+    assert expected_rules == set(guardrail.REASON_FOR_RULE) - _RULES_NO_VECTOR_CAN_PRODUCE
     assert len({c.id for c in CASES}) == len(CASES), "a duplicate id would silently drop a vector"
 
 
