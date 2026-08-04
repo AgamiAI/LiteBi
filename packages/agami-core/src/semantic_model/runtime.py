@@ -2243,7 +2243,13 @@ def assemble_receipt(
     # genuinely declared cross-area join was missing from a section that claimed to list declared
     # ones. Reduced to pairs ONCE, before the loop: an `on:` costs a parse, and a statement may write
     # up to the cap of joins against a model that may declare hundreds of edges.
-    declared_pairs = [(rel, _declared_pairs(rel, dialect)) for rel in _cardinality_index(org)]
+    #
+    # And not at all when the statement wrote NO join, which is the other half of the same argument
+    # and the half the hoist missed. This path runs for every executed query, the single-table
+    # statement included, and there the whole reduction — a walk of every subject area plus a
+    # sqlglot parse per `on:`-form edge — is paid to match against nothing.
+    declared_pairs = ([(rel, _declared_pairs(rel, dialect)) for rel in _cardinality_index(org)]
+                      if join_sites else [])
     join_items: list[dict[str, Any]] = []
     for js in join_sites[:_RECEIPT_MAX_REFS]:
         match: Optional[Relationship] = None

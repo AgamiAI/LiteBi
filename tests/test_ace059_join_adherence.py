@@ -497,6 +497,31 @@ def test_a_statement_with_no_join_reports_nothing_and_claims_completeness(org):
     assert section["undetermined"] is None
 
 
+def test_a_statement_with_no_join_pays_nothing_to_match_one(org, monkeypatch):
+    """The matching's expensive half ran on every receipt, including the ones with nothing to match.
+
+    `_declared_pairs` parses `Relationship.on` through sqlglot once per `on:`-form edge, over every
+    relationship `_cardinality_index` can reach — and `assemble_receipt` is on the path of EVERY
+    executed query, most of which write no join at all. The reduction was hoisted out of the loop
+    for cost and then left running above it unconditionally.
+
+    Asserted as the absence of the work rather than as a duration, which is the only form of this
+    claim a test can hold, and paired with the case that still pays it — a guard that turned out to
+    be a deletion would pass the first half alone.
+    """
+    called: list[object] = []
+    real = rt._declared_pairs
+    monkeypatch.setattr(rt, "_declared_pairs",
+                        lambda rel, dialect: (called.append(rel), real(rel, dialect))[1])
+
+    assert _section(org, SINGLE_TABLE)["items"] == []
+    assert called == [], "the declarations were reduced for a statement that wrote no join"
+
+    (item,) = _items(org, ONE_JOIN)
+    assert item["status"] == rt.DECLARED
+    assert called, "and a statement that wrote one still gets matched against them"
+
+
 # --- SC-3: an endpoint the statement bound for itself -----------------------
 
 
