@@ -86,14 +86,60 @@ UNSCOPABLE = [
     pytest.param("SELECT g FROM generate_series(1, 10) AS t(g)", id="table-function"),
     pytest.param("SELECT a FROM ROWS FROM (generate_series(1,3)) AS t(a)", id="rows-from"),
     pytest.param("SELECT x FROM (VALUES (1), (2)) AS v(x)", id="values"),
+    pytest.param("SELECT x FROM ((VALUES (1), (2))) AS v(x)", id="values-wrapped-in-a-subquery"),
     pytest.param("SELECT x FROM UNNEST(ARRAY[1,2]) AS t(x)", id="unnest"),
     pytest.param("SELECT o.id FROM orders o, LATERAL (SELECT 1 AS a) l", id="lateral"),
-    pytest.param("SELECT x FROM orders LATERAL VIEW explode(arr) t AS x", id="hive-lateral-view"),
 ]
 
 
 @pytest.mark.parametrize("sql", UNSCOPABLE)
 def test_an_unscopable_source_is_refused(sql):
+    _assert_unscopable(rt.check_scopable(sql, _scope_org()))
+
+
+def test_the_hive_lateral_view_spelling_is_refused_on_a_hive_family_engine():
+    """`LATERAL VIEW` is Hive's spelling, so it is asserted on Databricks rather than on the
+    PostgreSQL default.
+
+    Both dialects happen to parse it today, so this passed either way — but on PostgreSQL it was
+    passing because sqlglot is lenient about a construct that engine does not have, not because the
+    guard read the statement in its own grammar. A vector whose premise is an accident tells you
+    nothing the day the accident stops. It also exercises the half of the LATERAL sweep the Postgres
+    spelling does not: sqlglot hangs `LATERAL VIEW` off the Select rather than under a From/Join.
+    """
+    sql = "SELECT x FROM orders LATERAL VIEW explode(arr) t AS x"
+    _assert_unscopable(rt.check_scopable(sql, _scope_org("Databricks")))
+
+
+def test_a_values_arm_of_a_set_operation_is_refused():
+    """Found by review on this PR, and it executed against a real Postgres with all three gates
+    silent — `check_scopable`, `check_readable` and `check_table_scope` each returned `None`.
+
+    A parenthesized `VALUES` used as a set-operation arm is **not a FROM/JOIN source**: sqlglot
+    hangs it off the `Union` beside the select, so a walk over `From`/`Join` sources never reaches
+    it — while it contributes rows to the result exactly as an arm reading a table would. This is
+    why `VALUES` is a whole-tree sweep rather than a case in the source walk.
+    """
+    _assert_unscopable(rt.check_scopable("SELECT id FROM orders UNION ALL (VALUES (1))",
+                                         _scope_org()))
+
+
+@pytest.mark.parametrize("sql", [
+    pytest.param("SELECT o.id FROM orders o JOIN (VALUES (1),(2)) AS v(x) ON true", id="join"),
+    pytest.param("SELECT o.id FROM orders o CROSS JOIN (VALUES (1)) AS v(x)", id="cross-join"),
+    pytest.param("SELECT o.id FROM orders o WHERE o.id IN (SELECT x FROM (VALUES (1)) AS v(x))",
+                 id="in-subquery"),
+    pytest.param("SELECT o.id FROM orders o JOIN (SELECT * FROM (VALUES (1)) AS v(x)) s ON true",
+                 id="nested-in-a-derived-table"),
+    pytest.param("WITH v AS (SELECT * FROM (VALUES (1)) AS t(x)) SELECT o.id FROM orders o "
+                 "JOIN v ON true", id="cte-body"),
+    pytest.param("SELECT o.id FROM orders o JOIN UNNEST(ARRAY[1,2]) AS u(x) ON true",
+                 id="unnest-join"),
+])
+def test_every_placement_of_a_row_building_source_is_refused(sql):
+    """One declared table plus a row-building source, in each place SQL lets you put one. The gate
+    must not depend on which of them sqlglot chose to represent as a `Subquery` wrapper, which
+    varies by shape and by version."""
     _assert_unscopable(rt.check_scopable(sql, _scope_org()))
 
 

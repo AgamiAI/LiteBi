@@ -416,14 +416,20 @@ def check_scopable(sql: str, org: Datasource,
     a table function arrives as. The gate cannot be taught the difference without breaking the case
     it exists for, which is why this is a separate slice rather than a condition bolted onto it.
 
-    Refuses four source shapes, each anywhere in the tree so every set-operation arm and nested
-    subquery is covered by the same walk:
+    Refuses four shapes, each looked for anywhere in the tree so that every set-operation arm and
+    nested subquery is covered by the same walk:
 
     * a table function or `ROWS FROM` — an `exp.Table` carrying a function rather than a name.
-    * a `LATERAL` source, in both the Postgres `LATERAL (...)` and Hive `LATERAL VIEW` spellings.
-    * `VALUES`, `UNNEST`, or any other FROM/JOIN source that is neither an `exp.Table` nor a derived
+    * a `LATERAL`, in both the Postgres `LATERAL (...)` and Hive `LATERAL VIEW` spellings.
+    * a `VALUES` list, which is not always a FROM/JOIN source: as a set-operation arm it hangs off
+      the `Union` instead, contributing rows while the source walk below cannot see it.
+    * `UNNEST`, or any other FROM/JOIN source that is neither an `exp.Table` nor a derived
       `exp.Subquery` — including one reached through a comma-join, whose extra sources some sqlglot
       versions hang off `From.expressions` rather than normalizing into a `Join`.
+
+    The first three are whole-tree `find`s rather than source-walk cases on purpose: each has at
+    least one spelling that is not a FROM/JOIN source, so a walk that only visited sources would
+    miss it while it still shaped the result.
 
     Reuses `ctx.tree` and never parses a second time: a gate that re-parsed could disagree with the
     tree every other gate judged, which is the divergence this whole family exists to prevent.
@@ -455,6 +461,18 @@ def check_scopable(sql: str, org: Datasource,
         return _unscopable(
             "a FROM/JOIN source is a LATERAL rather than a named table, so there is nothing to "
             "check against the declared surface"
+        )
+    # `VALUES` is swept whole-tree for the same reason, and the reason is not symmetry.
+    # A parenthesized `VALUES` used as a set-operation ARM — `SELECT id FROM orders UNION ALL
+    # (VALUES (1))` — is not a FROM/JOIN source at all: it hangs off the `Union` beside the select,
+    # so the source walk below never reaches it while it contributes rows to the result exactly as
+    # an arm reading a table would. Found by review, and it executed against a real engine with all
+    # three gates silent. A read-only SELECT over declared tables carries no `Values` node —
+    # `IN (1, 2, 3)` is an `exp.In` over expressions, not this — so the sweep costs no false refusal.
+    if tree.find(exp.Values) is not None:
+        return _unscopable(
+            "the query builds rows from a VALUES list rather than reading a named table, so there "
+            "is nothing to check against the declared surface"
         )
     # Every remaining non-`Table`, non-derived-subquery source. `From.expressions` carries the extra
     # sources of a comma-join on the sqlglot versions that do not normalize them into a `Join`, so a

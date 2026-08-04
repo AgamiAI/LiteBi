@@ -340,6 +340,7 @@ _UNSCOPABLE_CORPUS = [
     "SELECT o.id FROM orders o, (VALUES (1),(2)) AS v(x)",              # shielded by a declared table
     "SELECT o.id FROM orders o, generate_series(1,10) AS t(g)",         # ditto, table function
     "SELECT id FROM orders UNION SELECT g FROM generate_series(1,3) AS t(g)",  # hidden in an arm
+    "SELECT id FROM orders UNION ALL (VALUES (1))",                     # an arm that is not a source
 ]
 
 
