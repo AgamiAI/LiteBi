@@ -374,6 +374,121 @@ def check_readable(
     return None
 
 
+# A statement whose sources the scope walk cannot reason about. The remediation names the shape that
+# would scope and never the declared names, for the same reason every other refusal does not: a
+# refusal that lists the alternatives is a schema-listing endpoint reachable by one wrong query.
+_DECLARED_SOURCE_REMEDIATION = (
+    "Query declared tables directly — replace the table function, VALUES, UNNEST or LATERAL source "
+    "with a plain FROM/JOIN on a declared table, or add the source to the model if it should be "
+    "queryable."
+)
+
+
+def _unscopable(detail: str) -> "guardrail.Refusal":
+    return guardrail.refuse(
+        guardrail.RULE_UNSCOPABLE,
+        detail=detail,
+        remediation=_DECLARED_SOURCE_REMEDIATION,
+    )
+
+
+def check_scopable(sql: str, org: Datasource,
+                   ctx: "GuardContext | None" = None) -> "guardrail.Refusal | None":
+    """Refuse a statement that parses perfectly and still presents a source the scope walk cannot
+    reason about.
+
+    **The boundary, stated: this is a 4c gate**, and it is the second half of a split the contract
+    makes on purpose. `unparseable` is a statement sqlglot cannot read at all and belongs to
+    `check_readable` above; `unscopable` is one that reads fine and offers the scope walk nothing to
+    accept or reject. Collapsing them would make the remediation a guess — "re-emit the query" is
+    useless advice to someone whose query parsed.
+
+    **Why the gate above does not already cover this.** `check_readable`'s backstop refuses a
+    statement that resolves to NO named table, which is the right shape for a quoting style nobody
+    has mapped. It is not the right shape here, twice over: a table function parses to an
+    `exp.Table` with an EMPTY name, so the backstop's `find(exp.Table) is None` sees a table and
+    passes; and one declared table leading a comma-join is enough to satisfy it while every source
+    after the comma goes unexamined. Measured on this tree, six such statements reached the database
+    with every gate silent.
+
+    **Why the scope gates do not catch it either.** `check_table_scope` skips an empty-name table by
+    design — that is how it lets a CTE reference through — so the same node it must ignore is the one
+    a table function arrives as. The gate cannot be taught the difference without breaking the case
+    it exists for, which is why this is a separate slice rather than a condition bolted onto it.
+
+    Refuses four shapes, each looked for anywhere in the tree so that every set-operation arm and
+    nested subquery is covered by the same walk:
+
+    * a table function or `ROWS FROM` — an `exp.Table` carrying a function rather than a name.
+    * a `LATERAL`, in both the Postgres `LATERAL (...)` and Hive `LATERAL VIEW` spellings.
+    * a `VALUES` list, which is not always a FROM/JOIN source: as a set-operation arm it hangs off
+      the `Union` instead, contributing rows while the source walk below cannot see it.
+    * `UNNEST`, or any other FROM/JOIN source that is neither an `exp.Table` nor a derived
+      `exp.Subquery` — including one reached through a comma-join, whose extra sources some sqlglot
+      versions hang off `From.expressions` rather than normalizing into a `Join`.
+
+    The first three are whole-tree `find`s rather than source-walk cases on purpose: each has at
+    least one spelling that is not a FROM/JOIN source, so a walk that only visited sources would
+    miss it while it still shaped the result.
+
+    Reuses `ctx.tree` and never parses a second time: a gate that re-parsed could disagree with the
+    tree every other gate judged, which is the divergence this whole family exists to prevent.
+
+    Inert when the model declares no tables, matching `check_table_scope` — a deployment with no
+    declared surface is not scoping anything. Returns `None` when satisfied.
+    """
+    if not _HAVE_SQLGLOT:
+        return None
+    if not (ctx.model_table_index if ctx is not None else _model_table_index(org)):
+        return None
+    tree = ctx.tree if ctx is not None else _parse_sql(sql, _dialect_of(org)[0])
+    # An unparseable statement and a non-SELECT are both somebody else's refusal — `check_readable`
+    # above and the read-only guard respectively. Passing here says nothing about them.
+    if tree is None or tree.find(exp.Select) is None:
+        return None
+    # A table function and `ROWS FROM` parse to an `exp.Table` whose name is empty, the function
+    # sitting in `.this`. Checked first because it is the shape the two gates above each look
+    # straight through.
+    for tbl in tree.find_all(exp.Table):
+        if not tbl.name:
+            return _unscopable(
+                "a FROM/JOIN source is a table function rather than a named table, so there is "
+                "nothing to check against the declared surface"
+            )
+    # sqlglot attaches a LATERAL under the From/Join for Postgres' `LATERAL (...)` and as a Select
+    # property for Hive's `LATERAL VIEW`, so sweep the whole tree rather than the sources alone.
+    if tree.find(exp.Lateral) is not None:
+        return _unscopable(
+            "a FROM/JOIN source is a LATERAL rather than a named table, so there is nothing to "
+            "check against the declared surface"
+        )
+    # `VALUES` is swept whole-tree for the same reason, and the reason is not symmetry.
+    # A parenthesized `VALUES` used as a set-operation ARM — `SELECT id FROM orders UNION ALL
+    # (VALUES (1))` — is not a FROM/JOIN source at all: it hangs off the `Union` beside the select,
+    # so the source walk below never reaches it while it contributes rows to the result exactly as
+    # an arm reading a table would. Found by review, and it executed against a real engine with all
+    # three gates silent. A read-only SELECT over declared tables carries no `Values` node —
+    # `IN (1, 2, 3)` is an `exp.In` over expressions, not this — so the sweep costs no false refusal.
+    if tree.find(exp.Values) is not None:
+        return _unscopable(
+            "the query builds rows from a VALUES list rather than reading a named table, so there "
+            "is nothing to check against the declared surface"
+        )
+    # Every remaining non-`Table`, non-derived-subquery source. `From.expressions` carries the extra
+    # sources of a comma-join on the sqlglot versions that do not normalize them into a `Join`, so a
+    # declared table written first cannot shield what follows it.
+    for node in tree.find_all(exp.From, exp.Join):
+        for src in [node.this, *(node.args.get("expressions") or [])]:
+            if src is not None and not isinstance(src, (exp.Table, exp.Subquery)):
+                # The node's class name describes the SQL construct the caller wrote, not a value
+                # from it or a name from the model — value-free in the sense the contract means.
+                return _unscopable(
+                    f"a FROM/JOIN source is a {type(src).__name__.upper()} rather than a named "
+                    "table, so there is nothing to check against the declared surface"
+                )
+    return None
+
+
 def statement_shape(ctx: "GuardContext | None") -> "str | None":
     """`"aggregate"` when the statement groups, `"listing"` otherwise, `None` when there is no
     tree to read (sqlglot absent, or the SQL did not parse).

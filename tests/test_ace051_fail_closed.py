@@ -288,6 +288,110 @@ def test_hosted_fail_closed_when_model_package_unimportable(tmp_path, monkeypatc
     _silent(capsys)
 
 
+# ── ACE-037: the third member of the family — no parser, and the scopability gate ──
+
+def test_hosted_fail_closed_when_the_sql_parser_is_unavailable(tmp_path, monkeypatch, capsys):
+    """Every gate opens with `if not _HAVE_SQLGLOT: return None`, so without sqlglot a served
+    deployment resolves a model, reports itself guarded, and runs the statement with table scope,
+    column scope, the star ban and the readability gate all silently inert.
+
+    The sibling of the two branches above and pinned to the same rule: a deployment-state fact that
+    says nothing about the statement, so no re-emission fixes it. The model here resolves fine —
+    that is the point, since a missing model would refuse for the other reason and the assertion
+    would pass while measuring nothing.
+    """
+    from semantic_model import runtime as RT
+
+    url = "sqlite://" + str(tmp_path / "seeded.db")
+    _seed_db(url)
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+    monkeypatch.setattr(RT, "_HAVE_SQLGLOT", False)
+
+    sql, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert _refusal(verdict).rule == guardrail.RULE_MODEL_UNAVAILABLE
+    assert verdict.reason == "undetermined"
+    assert sql == "SELECT id FROM orders"  # refused, and never rewritten on the way out
+    _silent(capsys)
+
+
+def test_local_missing_sql_parser_is_noop(tmp_path, monkeypatch):
+    """The local twin, for the third time and for the same reason: a bare install legitimately has
+    no sqlglot, and refusing there would break every local user to close a hole that only exists on
+    a served path."""
+    from semantic_model import runtime as RT
+
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "art"))
+    _write_disk(tmp_path / "art" / "acme")
+    monkeypatch.setattr(RT, "_HAVE_SQLGLOT", False)
+
+    sql, verdict = execute_sql._model_safety("SELECT id FROM orders", "acme", None)
+    assert verdict is None and sql == "SELECT id FROM orders"
+
+
+_UNSCOPABLE_CORPUS = [
+    "SELECT g FROM generate_series(1, 10) AS t(g)",                     # table function
+    "SELECT a FROM ROWS FROM (generate_series(1,3)) AS t(a)",           # ROWS FROM
+    "SELECT x FROM (VALUES (1), (2)) AS v(x)",                          # VALUES source
+    "SELECT x FROM UNNEST(ARRAY[1,2]) AS t(x)",                         # UNNEST source
+    "SELECT o.id FROM orders o, LATERAL (SELECT 1 AS a) l",             # LATERAL source
+    "SELECT o.id FROM orders o, (VALUES (1),(2)) AS v(x)",              # shielded by a declared table
+    "SELECT o.id FROM orders o, generate_series(1,10) AS t(g)",         # ditto, table function
+    "SELECT id FROM orders UNION SELECT g FROM generate_series(1,3) AS t(g)",  # hidden in an arm
+    "SELECT id FROM orders UNION ALL (VALUES (1))",                     # an arm that is not a source
+]
+
+
+@pytest.mark.parametrize("sql", _UNSCOPABLE_CORPUS)
+def test_the_unscopable_corpus_is_refused_at_the_chokepoint(tmp_path, monkeypatch, capsys, sql):
+    """The gate is wired, not merely written.
+
+    `test_scopable_gate.py` calls the gate directly; this asserts each construct is refused where it
+    matters — the one pass every surface goes through. Six of these eight reached the database
+    before this gate existed, with the readability gate and both scope gates silent, so a unit test
+    alone would have proved a function nobody called.
+    """
+    url = "sqlite://" + str(tmp_path / "seeded.db")
+    _seed_db(url)
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+
+    out_sql, verdict = execute_sql._model_safety(sql, "acme", None)
+    refusal = _refusal(verdict)
+    assert refusal.rule == guardrail.RULE_UNSCOPABLE
+    assert refusal.reason == "undetermined"
+    assert out_sql == sql  # refused, never rewritten
+    _silent(capsys)
+
+
+def test_the_scopability_gate_runs_after_readability_and_before_table_scope(tmp_path, monkeypatch,
+                                                                            capsys):
+    """Ordering, asserted by the verdicts three statements get rather than by reading the source.
+
+    An unreadable statement must still be `unparseable` (the gate above owns it), an undeclared
+    table must still be `table_scope` (the gate below owns it), and only the readable-but-unscopable
+    one is this gate's. A gate inserted in the wrong place returns the right refusal for the wrong
+    statement, which no single-case test would catch.
+    """
+    url = "sqlite://" + str(tmp_path / "seeded.db")
+    _seed_db(url)
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path / "no_disk"))
+
+    _, unreadable = execute_sql._model_safety("SELECT FROM WHERE ((", "acme", None)
+    assert _refusal(unreadable).rule == guardrail.RULE_UNPARSEABLE
+
+    _, unscopable = execute_sql._model_safety(
+        "SELECT o.id FROM orders o, generate_series(1,3) AS t(g)", "acme", None)
+    assert _refusal(unscopable).rule == guardrail.RULE_UNSCOPABLE
+
+    _, out_of_scope = execute_sql._model_safety("SELECT id FROM secret", "acme", None)
+    assert _refusal(out_of_scope).rule == guardrail.RULE_TABLE_SCOPE
+    _silent(capsys)
+
+
 def test_db_model_resolves_under_the_requests_org(tmp_path, monkeypatch, capsys):
     """The guard must look up the model under the REQUEST's org, not the 'local' sentinel.
 
