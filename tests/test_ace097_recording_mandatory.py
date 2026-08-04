@@ -277,6 +277,42 @@ def test_a_healthy_store_is_reachable_and_the_call_proceeds(env):
     assert envelope.status == "ok"
 
 
+def test_the_cause_reaches_the_operator_even_though_the_caller_never_sees_it(env, monkeypatch, caplog):
+    """The refusal is one sentence for every cause, so the cause has to land in the server log.
+
+    Without this, the spec reintroduces its own defect somewhere new: a bad DSN scheme, an
+    unreachable host and a missing driver would all read as one opaque refusal, and the operator
+    told to "restore the audit database" would have nothing to work from. Same treatment
+    `_record_query` gives a swallowed write, and the same split ACE-039 draws — raw text is the
+    operator's, the classified sentence is the caller's.
+
+    It goes on `_RAW_LOG` rather than `_LOG`, which is not a detail:
+    `test_the_subprocess_path_never_opens_the_warehouse` caught the first version of this on `_LOG`,
+    where it fell through to `logging.lastResort`, landed on the child's stderr and made the
+    refusal unparseable. `main` silences `_RAW_LOG` for the child's lifetime.
+    """
+    monkeypatch.setenv("AGAMI_DB_URL", BROKEN_DB_URL)
+
+    with caplog.at_level("WARNING", logger="execute_sql.raw"):
+        assert execute_sql._audit_store_reachable() is False
+
+    warnings = [r for r in caplog.records if r.name == "execute_sql.raw"]
+    assert [r.levelname for r in warnings] == ["WARNING"]
+    assert warnings[0].exc_info is not None  # the cause, not just the fact
+
+
+def test_a_configured_but_empty_store_url_reads_as_unreachable(env, monkeypatch):
+    """`_hosted()` tests truthiness, `Store.from_env()` strips — so whitespace lands between them.
+
+    Not a defensive branch: a whitespace-only `AGAMI_DB_URL` reaches it, and on a security gate a
+    misconfiguration has to read as unreachable rather than as fine.
+    """
+    monkeypatch.setenv("AGAMI_DB_URL", "   ")
+
+    assert execute_sql._hosted() is True
+    assert execute_sql._audit_store_reachable() is False
+
+
 def test_the_refusal_says_nothing_about_where_the_store_lives(env, monkeypatch):
     """`Refusal.detail` and `remediation` are value-free — never a DSN, a host, a path or a scheme.
 

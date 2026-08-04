@@ -1623,14 +1623,31 @@ def _audit_store_reachable() -> bool:
 
         store = Store.from_env()
     except Exception:
-        # Every way the store can be unopenable arrives here as one answer, because there is only
-        # one thing to do about any of them. The cause is the operator's to read in the refusal's
-        # remediation and their own logs; it is deliberately NOT relayed to the caller, since a DSN
-        # scheme, a driver name or a host is exactly what `Refusal.detail` may never carry.
+        # Every way the store can be unopenable produces the same refusal, because there is only one
+        # thing a caller can do about any of them. But the CAUSE has to land somewhere, or this
+        # reintroduces the defect the spec exists to remove in a new place: a bad DSN scheme, an
+        # unreachable host and a missing driver would all read as one opaque refusal and an operator
+        # would have nothing to work from. Server log, with the traceback — the same treatment
+        # `_record_query` gives a swallowed write, and for the same reason.
+        #
+        # `_RAW_LOG`, not `_LOG`, and for BOTH of that logger's reasons. The exception text carries
+        # the host, the port and the DSN scheme — raw text, the operator's and never the caller's
+        # (ACE-039). And this module never calls `basicConfig`, so a record on `_LOG` falls through
+        # to `logging.lastResort` and lands on STDERR, which on the CLI/fork path is a wire carrying
+        # exactly one JSON object: a diagnostic line there does not merely add noise, it makes the
+        # refusal unparseable and the parent loses it entirely. `main` silences `_RAW_LOG` for the
+        # child's lifetime, so the child stays clean while in-process and hosted still get the cause
+        # on the server's root logger — which is where the operator being told to "restore the audit
+        # database" actually reads it.
+        _RAW_LOG.warning("audit store is not reachable; refusing to execute unrecorded",
+                         exc_info=True)
         return False
     if store is None:
-        # `_hosted()` was true, so a URL is configured and `from_env` cannot return None. Belt and
-        # braces on a security gate: an unexpected None must read as unreachable, never as fine.
+        # Reachable, not defensive: `_hosted()` tests the variable for truthiness while `from_env`
+        # strips it, so a whitespace-only `AGAMI_DB_URL` lands exactly here. A configured-but-empty
+        # store is a misconfiguration, and on a security gate a misconfiguration reads as
+        # unreachable, never as fine.
+        _RAW_LOG.warning("the audit store url is set but empty; treating it as unreachable")
         return False
     store.close()
     return True
