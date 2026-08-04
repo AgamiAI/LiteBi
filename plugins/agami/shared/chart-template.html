@@ -1562,9 +1562,11 @@
           const said = JOIN_BADGE[r.status] || ['stale', r.status || 'unknown'];
           li.appendChild(document.createTextNode(' '));
           li.appendChild(el('span', { class: 'conf-badge ' + said[0], text: said[1] }));
-          // The ON as the parser read it — the condition that actually ran, and the one fact a
-          // reader can check against their own SQL. Null when the join wrote none, which is a
-          // different thing from a condition we failed to read and says so.
+          // The condition the join wrote, as the parser read it — an ON, a USING column list, or
+          // NATURAL. It is the condition that actually ran, and the one fact a reader can check
+          // against their own SQL. Null when the join wrote none of its own (a CROSS join, or a
+          // comma join whose predicate went to the WHERE), which is a different thing from a
+          // condition we failed to read and says so.
           li.appendChild(el('br'));
           if (r.predicate) {
             li.appendChild(el('span', { class: 'receipt-meta', text: 'joined on: ' }));

@@ -2285,6 +2285,13 @@ def assemble_receipt(
         elif js.predicate is None and js.node.args.get("kind") == "CROSS":
             # It wrote no predicate, which is a fact about the statement and not a gap in the
             # analysis: there is nothing here for a declaration to match.
+            #
+            # `kind` is the ONLY thing separating this settled status from the open one two branches
+            # down, where the comma join lands. The battery is what pins that distinction: the
+            # sqlglot pin is an open `>=`, and a future version that normalized `FROM a, b` to a
+            # `CROSS` kind would move every comma join from `undetermined` to a settled claim that
+            # the model does not declare it — silently, since both shapes already report a null
+            # predicate. `test_the_comma_join_is_undetermined_and_reports_no_predicate` fails first.
             status = UNDECLARED
         elif not js.pairs:
             # Two shapes reach here and both leave the question open. The comma join
@@ -3121,8 +3128,10 @@ class _JoinSite(NamedTuple):
     """
 
     node: "exp.Join"
-    # The ON as the PARSER read it, bounded — `None` when the join wrote no ON at all, which is a
-    # different fact from an ON this layer failed to render and has to stay tellable apart.
+    # The condition the join WROTE, as the parser read it and bounded — an ON, a `USING` column
+    # list, or `NATURAL`; see `_join_condition`. `None` means it wrote no condition of its own,
+    # which is a different fact from a condition this layer failed to render and has to stay
+    # tellable apart.
     predicate: Optional[str]
     scope: str  # `_scope_label`'s vocabulary, the same one `TableRef.scope` carries.
     # The two relations the join brings together, named as the enclosing scope names them: a bare
@@ -3245,6 +3254,32 @@ def _declared_pairs(rel: Relationship,
     return frozenset().union(*reduced)
 
 
+def _join_condition(join: "exp.Join") -> "str | None":
+    """The condition THIS join wrote, serialized for a label — None when it wrote none.
+
+    Three spellings rather than one. Reading `args["on"]` alone reported `USING (id)` and
+    `NATURAL JOIN` as conditionless, and a null predicate is not a quiet field: the receipt panel
+    turns it into "this join wrote no condition of its own", which is a false statement about a join
+    that plainly wrote one. `USING` puts its columns on `args["using"]`; a natural join carries no
+    column list at all, its condition being every column the two relations share, so the label says
+    that much and no more.
+
+    Bounded through `_echo_expr`, the same bound the ON takes: a `USING` column list is
+    caller-written text and the receipt is tool output the calling model weights as server-authored.
+    """
+    on = join.args.get("on")
+    if on is not None:
+        # The ON is serialized as a FRAGMENT for a label — see `_aggregate_sites` for the whole of
+        # that argument, and `tests/test_ace093_byte_identity.py` for where it is spent.
+        return _echo_expr(on.sql())
+    using = join.args.get("using")
+    if using:
+        return _echo_expr("USING (" + ", ".join(col.sql() for col in using) + ")")
+    if join.args.get("method") == "NATURAL":
+        return "NATURAL"
+    return None
+
+
 def _rel_tables(rel: Relationship) -> frozenset[str]:
     """The two tables a declaration is between, keyed the way a join's endpoints are.
 
@@ -3329,9 +3364,7 @@ def _join_sites(node: "exp.Expression", visible: set[str]) -> list["_JoinSite"]:
         pinned = pinned and bool(left)
         sites.append(_JoinSite(
             node=join,
-            # The ON is serialized as a FRAGMENT for a label — see `_aggregate_sites` for the whole
-            # of that argument, and `tests/test_ace093_byte_identity.py` for where it is spent.
-            predicate=_echo_expr(on.sql()) if on is not None else None,
+            predicate=_join_condition(join),
             scope=_scope_label(sel, node, cte_scopes, arm_suffixes, output_ids),
             endpoints=(left, right),
             # STRUCTURAL on the right, where the source node is in hand: only a table REFERENCE can

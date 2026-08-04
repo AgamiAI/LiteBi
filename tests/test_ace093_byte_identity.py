@@ -381,7 +381,7 @@ def test_no_shipped_prose_promises_a_rewrite():
 # that. See the docstring below for what earns each one.
 _RESERIALISE_EXEMPT = {
     ("packages/agami-core/src/semantic_model/runtime.py", "_aggregate_sites"),
-    ("packages/agami-core/src/semantic_model/runtime.py", "_join_sites"),
+    ("packages/agami-core/src/semantic_model/runtime.py", "_join_condition"),
 }
 
 
@@ -405,13 +405,16 @@ def test_nothing_re_serialises_a_parsed_statement():
     written". What it does cost is the strong form of the claim, which is why the exemption is
     named here rather than argued at the call site.
 
-    **`_join_sites` is the second, and it is the same argument about the same kind of string.** It
-    renders a single `exp.Condition` — one join's ON — into the `predicate` field of the receipt's
-    `joins` items, so there is nothing in it a driver could execute even if one were handed it.
-    That string is bound to a receipt field and is never assigned anywhere a driver reads, so it is
-    not one assignment away from execution either. sqlglot's normalization of spacing and keyword
-    case is, again, a property of a LABEL — which is why ACE-059's criterion reads "the predicate as
-    the parser read it" rather than "as the caller typed it".
+    **`_join_condition` is the second, and it is the same argument about the same kind of string.**
+    It renders one join's condition — an `exp.Condition` ON, or the identifiers of a `USING` column
+    list — into the `predicate` field of the receipt's `joins` items, so there is nothing in it a
+    driver could execute even if one were handed it. That string is bound to a receipt field and is
+    never assigned anywhere a driver reads, so it is not one assignment away from execution either.
+    sqlglot's normalization of spacing and keyword case is, again, a property of a LABEL — which is
+    why ACE-059's criterion reads "the predicate as the parser read it" rather than "as the caller
+    typed it". The entry names `_join_condition` rather than its `_join_sites` caller because the
+    exemption is a claim about the CALL, and the call moved when the three spellings of a written
+    join condition were given one reader.
 
     Two entries is not a quota and this list is not full. What each entry costs is the strong form
     of the claim, and what earns one is the argument above made in full for a FRAGMENT that reaches

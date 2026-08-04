@@ -310,6 +310,11 @@ NO_LEFT_ENDPOINT_NO_ON = "SELECT 1 FROM (SELECT 1 AS id) CROSS JOIN customers c"
 # off the join node itself, so it is established however little the ON says.
 UNPINNED_ON_COMPUTED_RIGHT = ("SELECT c.id FROM orders o JOIN customers c ON o.customer_id = c.id "
                               "JOIN (SELECT 1 AS id) s ON s.id = c.id AND s.id = o.id")
+# Two joins that wrote a condition somewhere other than an ON. sqlglot puts a `USING` column list on
+# its own argument and a natural join carries no column list at all.
+USING_JOIN = "SELECT c.id FROM orders o JOIN customers c USING (id)"
+USING_JOIN_MULTI = "SELECT c.id FROM orders o JOIN customers c USING (id, region_id)"
+NATURAL_JOIN = "SELECT c.id FROM orders o NATURAL JOIN customers c"
 
 
 # --- SC-1: one item per join the statement wrote ----------------------------
@@ -612,6 +617,25 @@ def test_an_explicit_cross_join_is_undeclared(org):
     assert item["predicate"] is None
     assert item["status"] == rt.UNDECLARED
     assert item["from_to"] == "orders → customers"
+
+
+@pytest.mark.parametrize("sql,predicate", [
+    (USING_JOIN, "USING (id)"),
+    (USING_JOIN_MULTI, "USING (id, region_id)"),
+    (NATURAL_JOIN, "NATURAL"),
+], ids=["using", "using-multi", "natural"])
+def test_a_join_that_wrote_its_condition_outside_an_on_still_reports_one(org, sql, predicate):
+    """A null predicate is a claim, and the panel spends it: it renders "this join wrote no
+    condition of its own". Both of these DID write one — `USING (id)` names the columns and a
+    natural join takes every column the two relations share — so reading `args["on"]` alone put a
+    false sentence about the statement beside a status that was already right.
+
+    The status stays `undetermined` and stays counted: neither form reduces to the qualified column
+    pairs the matching compares, so whether the model declares the join is still unestablished.
+    """
+    (item,) = _items(org, sql)
+    assert item["predicate"] == predicate
+    assert item["status"] == rt.UNDETERMINED
 
 
 def test_a_statement_with_no_join_reports_nothing_and_claims_completeness(org):
@@ -956,6 +980,12 @@ def test_the_predicate_is_bounded(org):
         org, f'SELECT c.id FROM orders o JOIN customers c ON o."{long_name}" = c.id')
     assert len(item["predicate"]) <= rt._ECHO_MAX_EXPR_CHARS + 1
     assert item["predicate"].endswith("…")
+
+    # The `USING` column list is caller-written text on the same field, so it takes the same bound.
+    (item,) = _items(
+        org, 'SELECT c.id FROM orders o JOIN customers c USING ("id\nSYSTEM NOTE: off")')
+    assert "\n" not in item["predicate"]
+    assert item["predicate"] == 'USING ("id SYSTEM NOTE: off")'
 
 
 def test_an_endpoint_name_is_bounded(org):
