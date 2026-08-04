@@ -12,6 +12,27 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **A self-hosted server that cannot record a query no longer runs it (ACE-097).** Recording was
+  best-effort in three places, and two of them were silent, so a deployment could execute SQL
+  against your database and keep no record of having done so with nothing anywhere saying the
+  record was lost.
+
+  On a **server** (one with `AGAMI_DB_URL` or `APP_DATABASE_URL` configured), the audit store is now
+  checked before the statement runs. If it cannot be opened the call is refused, with
+  `rule: audit_unavailable` and a remediation naming the operator action, and the statement never
+  reaches your database. If the store was reachable at that check and the write fails afterwards,
+  the call fails rather than returning an answer whose statement left no trace. The connection is
+  read-only, so nothing was changed and re-running costs only the round trip.
+
+  **Local single-player use is unchanged.** With no database configured there is no audit store to
+  reach: the log is a local jsonl file, a write failure is still logged and never breaks your query,
+  and a read-only artifacts directory cannot stop you asking questions.
+
+  For operators this is an availability change, and a deliberate one: a briefly unreachable audit
+  database now produces refusals rather than unrecorded answers.
+
 ### Added
 
 - **The receipt now tells you which of a table's declared filters your statement actually applied
