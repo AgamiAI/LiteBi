@@ -1768,7 +1768,11 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
             }
             joins = [f"{measure} (1) <- {mt} (N)" for mt in many]
             for i, site in enumerate(sites):
-                if measure_table in site.sources:
+                # A many-side column ON THE VALUE PATH means the value is already one row per
+                # many-side row, so this edge's duplication IS its grain and multiplies nothing.
+                # Scoped per fan edge deliberately: `many_tables` is the many side of THIS edge, and
+                # a many-side column belonging to some other edge must not suppress this one.
+                if measure_table in site.sources and not (site.sources & many_tables):
                     risk = "fan_out_invariant" if _is_fan_immune(site.node) else "fan_trap"
                     attached[i].append(Finding(
                         risk, reason=reason_for[risk],
@@ -3520,18 +3524,76 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
     """
     sites: list[_AggSite] = []
     for agg in _select_aggregates(tree):
+        # TWO column walks over one aggregate, and the split is the point. `sources` is what the
+        # fan and chasm detectors attribute the multiplication by, so it takes only the columns the
+        # VALUE is computed from — a many-side column in a CASE predicate or an ORDER BY arm does
+        # not put the value at the many side's grain. `resolved` is a different question, "did the
+        # analysis understand everything this aggregate reads", and that one wants every column:
+        # narrowing it to the value path would turn `COUNT(CASE WHEN i.quantity > 0 THEN 1 END)`
+        # from a clean answer into `undetermined`, because a value path of one literal is
+        # indistinguishable from no columns at all to the `bool(...)` test below.
+        value_tables = [_resolve_col_table(col, scope_map) for col in _value_columns(agg)]
         cols = list(agg.find_all(exp.Column))
         resolved = [_resolve_col_table(col, scope_map) for col in cols]
         sites.append(_AggSite(
             node=agg,
             aggregate=_echo_expr(agg.sql()),
             scope=scope,
-            sources=frozenset(t for t in resolved if t),
+            sources=frozenset(t for t in value_tables if t),
             resolved=bool(cols) and all(resolved) and (
                 visible is None or all(_tkey(t) in visible for t in resolved)
             ),
         ))
     return sites
+
+
+def _value_columns(node: "exp.Expression") -> list["exp.Column"]:
+    """Every column on an expression's VALUE path: the ones whose values the result is built from.
+
+    The complement is the columns that only decide WHICH rows or in WHAT ORDER, and the difference
+    is what a fan means for the number. `SUM(order_items.quantity * orders.total_amount)` is one
+    product per order item, so the duplication the join performs is the grain the value was already
+    at and multiplies nothing; `SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount
+    END)` sums a one-side amount once per item, so the same duplication really does inflate it. A
+    walk that took every column inside the aggregate cannot tell those apart — it sees
+    `order_items` in both — which is why attribution is by POSITION and never by presence.
+
+    Two node types put a column somewhere that is not the value, and each gets a case:
+
+    - `exp.Case`. `ifs[].this` is the branch predicate and `Case.this` is the simple-CASE operand
+      compared against them, so both are inputs to the choice rather than to the result. The value
+      is `ifs[].true` and `default`.
+    - `exp.Order`. `STRING_AGG(x ORDER BY y)` parses to `GroupConcat(this=Order(this=x,
+      expressions=[Ordered(y)]))`, so the ordering arms hang off `expressions` and are neither
+      predicate nor value: reordering a concatenation changes the string but the fan is not what
+      reordered it, and `y` is not a value the aggregate folds.
+
+    Everything else recurses over `node.args` unchanged, which is what keeps this honest by default:
+    a node type nobody thought about contributes its columns rather than silently dropping them, and
+    dropping is the direction that manufactures a false clean. `exp.Distinct` needs no case for
+    exactly that reason — it holds its argument under `args["expressions"]` and the generic branch
+    already reaches it. Neither does `exp.Filter`: `SUM(x) FILTER (WHERE y)` parses to
+    `Filter(this=Sum, expression=Where)`, so the predicate is structurally OUTSIDE the aggregate and
+    `find_all(exp.AggFunc)` never hands it here at all.
+
+    `node.args` is iterated by hand rather than through `iter_expressions()`. Four lines that cannot
+    drift, against a package that pins only `sqlglot>=20`.
+    """
+    if not isinstance(node, exp.Expression):
+        return []
+    if isinstance(node, exp.Column):
+        return [node]
+    if isinstance(node, exp.Case):
+        cols = [c for branch in node.args.get("ifs") or []
+                for c in _value_columns(branch.args.get("true"))]
+        return cols + _value_columns(node.args.get("default"))
+    if isinstance(node, exp.Order):
+        return _value_columns(node.this)
+    cols = []
+    for arg in node.args.values():
+        for child in (arg if isinstance(arg, list) else [arg]):
+            cols.extend(_value_columns(child))
+    return cols
 
 
 def _select_aggregates(sel: "exp.Select") -> list["exp.AggFunc"]:

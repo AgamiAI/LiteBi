@@ -19,16 +19,26 @@ rather than in files of their own so that a loosening and the pins guarding it a
 
 Slice 2 (S1) is here: an aggregate a duplication cannot move keeps the multiplication and loses the
 word trap, and the marker sentence that reported the detector's old shortcoming is deleted.
+
+Slice 3 (S2) is here: the fan is attributed by where a column sits on the aggregate's VALUE path
+rather than by its presence anywhere inside the aggregate.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import get_args
 
 import pytest
 
 pytest.importorskip("pydantic")
 pytest.importorskip("sqlglot")
+
+from sqlglot import exp, parse_one  # noqa: E402
 
 # `rt` is imported FROM the fixture's module rather than beside it, and that is load-bearing.
 # `test_semantic_model_runtime` puts `plugins/agami/scripts` on `sys.path`, while the ACE-060 and
@@ -37,6 +47,13 @@ pytest.importorskip("sqlglot")
 # `MULTIPLIED` / `NOT_MULTIPLIED` string objects and its own detector — so an assertion here could
 # compare a status produced by one copy against a constant defined by the other. One import.
 from test_semantic_model_runtime import _sales_org, rt  # noqa: E402
+
+# Where the subprocess probe below finds the SAME source `rt` was imported from, derived from the
+# module object rather than rebuilt from the repo root. The header above explains why two copies of
+# `semantic_model` reached down two `sys.path` entries is a real hazard in this file; a determinism
+# test that compared a child process running one copy against a parent running the other would be
+# measuring the wrong difference.
+PKG_SRC = Path(rt.__file__).resolve().parents[1]
 
 # The one-to-many the whole corpus is built on: `orders` is the ONE side, `order_items` the MANY,
 # and the model declares that edge. Written once so "the same fan join in every member" is a fact
@@ -103,6 +120,56 @@ CONDITIONAL_SUM = (
 )
 
 FAN_EDGE = "orders (1) <- order_items (N)"
+
+# --- S2: the value path ----------------------------------------------------
+#
+# The statement S2 is about. Its value is a product computed once per `order_items` row, so the
+# duplication the join performs is the grain the value was already at.
+VALUE_AT_MANY_GRAIN = f"SELECT SUM(order_items.quantity * orders.total_amount) {FAN_JOIN}"
+
+# The same one-side measure with the many-side column moved OUT of the aggregate entirely, into a
+# `FILTER (WHERE …)` clause. Structurally different from every other member here — see the test.
+FILTERED_FAN = (
+    f"SELECT SUM(orders.total_amount) FILTER (WHERE order_items.quantity > 0) {FAN_JOIN}"
+)
+
+# One statement carrying all three statuses and both risk labels, for the cross-process pin. Four
+# aggregates over one fan: a value already at the many side's grain, a one-side measure the join
+# inflates, a one-side measure the duplication cannot move, and one that names no column at all.
+EVERY_STATUS_SQL = (
+    "SELECT SUM(i.quantity * o.total_amount), SUM(o.total_amount), MIN(o.total_amount), COUNT(*) "
+    "FROM orders o JOIN order_items i ON i.order_id = o.id"
+)
+
+# Every branch of `_value_columns`, exercised on the function directly. `expected` is a LIST and not
+# a set: the walk's order decides the order of nothing the receipt renders today, but `sources` is
+# built from it and a list says what was measured rather than what happened to be enough.
+VALUE_COLUMN_CASES = [
+    ("a bare column", "orders.total_amount", ["orders.total_amount"]),
+    ("arithmetic, the generic branch",
+     "SUM(order_items.quantity * orders.total_amount)",
+     ["order_items.quantity", "orders.total_amount"]),
+    ("a searched CASE, whose WHEN is a predicate",
+     "SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount END)",
+     ["orders.total_amount"]),
+    ("a searched CASE with an ELSE, which is a value",
+     "SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount ELSE orders.revenue END)",
+     ["orders.total_amount", "orders.revenue"]),
+    ("a simple CASE, whose operand is a predicate input",
+     "SUM(CASE orders.status WHEN 'x' THEN order_items.quantity END)",
+     ["order_items.quantity"]),
+    ("a CASE inside a CASE branch",
+     "SUM(CASE WHEN order_items.quantity > 0 "
+     "THEN CASE WHEN orders.flag THEN orders.total_amount END END)",
+     ["orders.total_amount"]),
+    ("an ordering arm, which is neither predicate nor value",
+     "STRING_AGG(orders.status, ',' ORDER BY order_items.id)",
+     ["orders.status"]),
+    ("DISTINCT, which the generic branch reaches with no case of its own",
+     "SUM(DISTINCT orders.total_amount)",
+     ["orders.total_amount"]),
+    ("no column at all", "COUNT(*)", []),
+]
 
 # --- S1: the aggregates a duplication cannot move --------------------------
 #
@@ -399,3 +466,138 @@ def test_no_correctness_finding_can_become_a_refusal():
     pf = rt.pre_flight_check(MIN_OVER_FAN, _sales_org())
     assert {f.risk for f in pf.findings} == {"fan_out_invariant"}, pf.findings
     assert pf.unchecked is None, pf.unchecked
+
+
+# --- S2: the fan is attributed by position on the value path ----------------
+
+
+def test_a_value_at_many_side_grain_is_not_multiplied_by_the_fan():
+    """A7. The join duplicates the rows, and the value was already one per duplicated row.
+
+    `SUM(order_items.quantity * orders.total_amount)` computes one product per `order_items` row.
+    `orders.total_amount` appears in it as a scalar co-factor: the join hands the expression the
+    same amount once per item, and multiplying each item's quantity by it and summing is the same
+    number the statement asked for. The duplication IS the grain the value is defined at, so there
+    is nothing for the fan to inflate.
+
+    The old rule attributed the fan by SYNTACTIC presence — every table with a column anywhere
+    inside the aggregate — so this reported `fan_trap` on the strength of `orders` being named. That
+    is a false statement on the receipt about a correct statement, and the cost of it is the one
+    that matters: a reader who is told a sound number was inflated learns to discount the report.
+
+    `joins` is asserted empty as well as the status, because the two are separable. A report that
+    said `not_multiplied` while still naming the edge would be internally contradictory, and it is
+    the second half of that pair that a rule attributing by presence would leave behind.
+    """
+    reports = _reports(VALUE_AT_MANY_GRAIN)
+    assert [a.status for a in reports] == [rt.NOT_MULTIPLIED], reports
+    assert reports[0].joins == [], reports[0].joins
+    assert [f.risk for f in reports[0].findings] == [], reports[0].findings
+
+
+def test_a_filter_clause_predicate_is_outside_the_aggregate_the_analysis_reads():
+    """`_value_columns` has no `exp.Filter` branch because the parse makes one unnecessary.
+
+    `SUM(orders.total_amount) FILTER (WHERE order_items.quantity > 0)` parses to
+    `Filter(this=Sum(...), expression=Where(...))` — the `Filter` is the PARENT of the aggregate, so
+    `order_items.quantity` is not in the `Sum` subtree at all. `_select_aggregates` collects
+    `exp.AggFunc` nodes, so the aggregate that reaches `_value_columns` is the bare `Sum` and the
+    predicate is structurally invisible to it. A branch for `exp.Filter` would be dead code.
+
+    That is a fact about sqlglot's tree and not about this module, which is exactly why it is pinned
+    here rather than trusted. If a future sqlglot re-parented the predicate under the aggregate, or
+    if this layer started reading `exp.Filter` as the aggregate node, the predicate's many-side
+    column would silently join the value path and clear a genuinely inflated total. The measured
+    behaviour is asserted through the analysis so that either change fails: the summed value is a
+    one-side amount, once per surviving order item, and the join multiplies it.
+    """
+    agg = parse_one(FILTERED_FAN).find(exp.AggFunc)
+    assert isinstance(agg, exp.Sum), agg
+    assert isinstance(agg.parent, exp.Filter), agg.parent
+    assert [c.sql() for c in agg.find_all(exp.Column)] == ["orders.total_amount"], agg
+
+    reports = _reports(FILTERED_FAN)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert reports[0].joins == [FAN_EDGE], reports[0].joins
+
+
+@pytest.mark.parametrize("label,expression,expected", VALUE_COLUMN_CASES)
+def test_the_value_path_holds_only_the_columns_the_result_is_built_from(label, expression, expected):
+    """A7. Every branch of `_value_columns`, asserted on the function rather than through a receipt.
+
+    The analysis reaches most of these branches, but it reaches them in combination and reports one
+    status per statement, so a branch that dropped a column the value does use and a branch that
+    kept one it does not can cancel out in the answer. Called directly, each shape says which
+    columns it thinks the value is built from, and a wrong one is wrong visibly.
+
+    The two guard branches are the reason this is a unit test at all. A simple `CASE`'s operand
+    (`CASE orders.status WHEN 'x' THEN …`) is an input to the branch CHOICE, not to the result, so
+    it belongs with the `WHEN` predicates and not with the `THEN` values — and it lives under
+    `Case.this`, which the generic branch would have taken. The nested case proves the recursion
+    applies the same rule at depth rather than only at the top. `DISTINCT` is the opposite check:
+    it carries a genuine value column under `args["expressions"]`, so the generic branch must reach
+    it and no case may intercept it.
+    """
+    node = parse_one(f"SELECT {expression} FROM orders").expressions[0]
+    assert [c.sql() for c in rt._value_columns(node)] == expected, label
+
+
+def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
+    """The guard that lets the generic branch iterate `node.args` without inspecting what it holds.
+
+    Argument values are not all nodes: `Count(big_int=True)` and `Ordered(nulls_first=True)` carry
+    bools, and an absent optional argument is `None`. The alternative to this guard is a type check
+    at every call site inside the walk, which is the same test written four times.
+    """
+    assert rt._value_columns(None) == []
+    assert rt._value_columns(True) == []
+
+
+# --- A24: the same report in every process ---------------------------------
+
+_PROBE = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from semantic_model import models as m
+from semantic_model import runtime as rt
+org = m.Datasource.model_validate_json(sys.argv[3])
+print(json.dumps([a.as_dict() for a in rt.pre_flight_check(sys.argv[2], org).aggregates]))
+"""
+
+
+def test_the_aggregate_report_is_the_same_in_every_process():
+    """A24 / REQ-022: the receipt is "the same for the same SQL and model version".
+
+    That is a claim about PROCESSES, so nothing inside one can check it. The hazards it names are
+    invisible under a fixed seed: `sources` is a `frozenset` and `many_tables` is a `set`, the fan
+    branch iterates a sorted copy of one of them and intersects the other, and `_shared_dimension`
+    picks its dimension by walking a set. Any answer derived from one of those is stable within an
+    interpreter and free to differ in the next. Four seeds, four processes, one answer.
+
+    The whole serialized item list is compared rather than the statuses alone, and it is NOT sorted:
+    the aggregates are reported in the order the statement wrote them, so a re-ordered list is as
+    much a difference as a flipped status and sorting here would hide exactly one of the two modes
+    this exists to catch.
+
+    `EVERY_STATUS_SQL` carries all three statuses and both risk labels over a single fan, so one
+    comparison covers the value-path attribution that produced `not_multiplied`, the fan that
+    produced `multiplied`, and the unresolved read that produced `undetermined`.
+
+    The model crosses the process boundary as JSON rather than as a path, because this fixture is
+    built in Python and has no profile on disk; `model_validate_json` of `model_dump_json` is the
+    same object by construction, so the child analyses the model the parent declared.
+    """
+    payload = _sales_org().model_dump_json()
+    seen = set()
+    for seed in ("0", "1", "42", "12345"):
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE, str(PKG_SRC), EVERY_STATUS_SQL, payload],
+            capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": seed},
+        )
+        assert proc.returncode == 0, proc.stderr
+        seen.add(proc.stdout.strip())
+
+    assert len(seen) == 1, f"the aggregate report differed across hash seeds: {seen}"
+    # And it is the answer this process gets, so four children agreeing on something wrong would
+    # still fail rather than agree quietly.
+    assert json.loads(seen.pop()) == [a.as_dict() for a in _reports(EVERY_STATUS_SQL)]
