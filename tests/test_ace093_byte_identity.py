@@ -375,12 +375,13 @@ def test_no_shipped_prose_promises_a_rewrite():
 # --- SC-4: nothing re-serialises a parsed statement onto the execution path --
 
 
-# The ONE place a `.sql()` call is permitted, by file and by the function that makes it. Adding a
-# second entry is a decision about this invariant and belongs in a spec, not in a diff: the value of
-# the rule is that no call site has to be judged on its merits, and every entry here spends some of
-# that. See the docstring below for what earns this one.
+# The places a `.sql()` call is permitted, by file and by the function that makes it. Adding an
+# entry is a decision about this invariant and belongs in a spec, not in a diff: the value of the
+# rule is that no call site has to be judged on its merits, and every entry here spends some of
+# that. See the docstring below for what earns each one.
 _RESERIALISE_EXEMPT = {
     ("packages/agami-core/src/semantic_model/runtime.py", "_aggregate_sites"),
+    ("packages/agami-core/src/semantic_model/runtime.py", "_join_sites"),
 }
 
 
@@ -403,6 +404,18 @@ def test_nothing_re_serialises_a_parsed_statement():
     property of a LABEL, which is why ACE-060 says "the aggregate as parsed" rather than "as
     written". What it does cost is the strong form of the claim, which is why the exemption is
     named here rather than argued at the call site.
+
+    **`_join_sites` is the second, and it is the same argument about the same kind of string.** It
+    renders a single `exp.Condition` — one join's ON — into the `predicate` field of the receipt's
+    `joins` items, so there is nothing in it a driver could execute even if one were handed it.
+    That string is bound to a receipt field and is never assigned anywhere a driver reads, so it is
+    not one assignment away from execution either. sqlglot's normalization of spacing and keyword
+    case is, again, a property of a LABEL — which is why ACE-059's criterion reads "the predicate as
+    the parser read it" rather than "as the caller typed it".
+
+    Two entries is not a quota and this list is not full. What each entry costs is the strong form
+    of the claim, and what earns one is the argument above made in full for a FRAGMENT that reaches
+    only a receipt field; a third call site earns its entry the same way or does not get one.
 
     Scanned at module level as well as inside functions: a re-serialiser hoisted to a module
     constant would reach the driver the same way one inside a function does, and takes no

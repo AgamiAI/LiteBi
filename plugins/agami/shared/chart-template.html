@@ -74,7 +74,14 @@
                                        {"expr":"orders.region <> 'sandbox'","status":"omitted"}]}],
                  "undetermined": "..."},
 
-      "joins": {"items": [{"name":"orders_to_customers","from_to":"orders → customers",
+      // One entry per join the STATEMENT wrote. `status` is "declared", "undeclared" (it wrote no
+      // predicate for a declaration to match), "undeclarable" (an endpoint is a name the statement
+      // bound for itself, so no relationship can be about it), or "undetermined". The trust block
+      // below `status` is what a MATCHED declaration contributes and is null until one is matched —
+      // a null `review_state` is "not matched yet", NOT "not signed off".
+      "joins": {"items": [{"predicate":"orders.customer_id = customers.id",
+                           "scope":"main","status":"declared",
+                           "name":"orders_to_customers","from_to":"orders → customers",
                            "cardinality":"many_to_one","confidence":"inferred",
                            "review_state":"unreviewed","origin":"introspect_heuristic",
                            "signed_off_by":null,"signed_off_role":null,"signed_off_at":null,
@@ -120,8 +127,11 @@
   unresolved, or sits somewhere the walk does not read, and not that nothing was checked.
 
   There is no `warnings` key. The unreviewed-join banner is DERIVED here, from `joins.items`
-  filtered to review_state != "approved": a review state can be counted, grouped and linked back
-  to the join it is about, and a pre-rendered sentence cannot. There is no `named_filters` key
+  filtered to the entries that HAVE a review_state and whose review_state != "approved": a review
+  state can be counted, grouped and linked back to the join it is about, and a pre-rendered
+  sentence cannot. A null one is excluded because it is a join nothing matched to a declaration,
+  which is a gap in the analysis rather than a missing signature — the section's `undetermined`
+  marker is what reports it. There is no `named_filters` key
   (nothing ever produced one) and no `sql` key (each section carries its own `sql` in
   SECTIONS_JSON, and the tool response carries the statement on the body).
 
@@ -653,9 +663,16 @@
     // The joins the answer leaned on that nobody has signed off. This is DERIVED rather than read
     // from a pre-rendered list of warning sentences: a review state can be counted, grouped and
     // linked back to the relationship it is about; a string cannot.
+    //
+    // A MISSING review_state is not an unreviewed one, and the default used to say it was. The
+    // section is one item per join the STATEMENT wrote now, and a join nothing has matched to a
+    // declared relationship carries no sign-off state — so defaulting to 'unreviewed' raised this
+    // banner on every answer with a join in it, including one whose joins are all approved. What
+    // that statement left unestablished is the section's own `undetermined` marker, which this
+    // surface renders below.
     function unreviewedJoins() {
       return itemsOf('joins').filter(
-        j => j && (j.review_state || 'unreviewed').toLowerCase() !== 'approved');
+        j => j && j.review_state && String(j.review_state).toLowerCase() !== 'approved');
     }
     // A metric the answer used but the user hasn't signed off — either unreviewed in the model
     // or calculated on the fly (origin "ad_hoc"). approved/rejected don't need the banner.
@@ -1523,10 +1540,10 @@
           li.appendChild(document.createTextNode(' '));
           li.appendChild(badge(r.review_state));
           if (r.on) {
-            // LABELLED, and labelled "declared": this is the predicate the MODEL declares, and the
-            // marker directly under this list says the predicate the statement actually joined on
-            // was not read out of the SQL. Drawn bare, the two sat next to each other and a reader
-            // took this string for the condition that ran.
+            // LABELLED, and labelled "declared": this is the predicate the MODEL declares, which is
+            // not necessarily the one the statement wrote — the item's own `predicate` field is
+            // that one. Drawn bare, the two sat next to each other and a reader took this string
+            // for the condition that ran.
             li.appendChild(el('br'));
             li.appendChild(el('span', { class: 'receipt-meta', text: 'declared predicate: ' }));
             li.appendChild(el('code', { class: 'receipt-meta', text: r.on }));

@@ -311,7 +311,8 @@ def _write_rich_model(tmp_path):
 SQL = "SELECT c.id, SUM(amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id"
 
 
-def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
+def test_mcp_receipt_surfaces_unapproved_metric_and_the_join_the_statement_wrote(
+        monkeypatch, tmp_path):
     import pytest
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, _ = _write_rich_model(tmp_path)
@@ -323,9 +324,15 @@ def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
     rev = next(i["metric"] for i in r.columns.items
                if i["metric"] and i["metric"]["name"] == "revenue")
     assert rev["review_state"] == "unreviewed"
-    # The unreviewed join is a `review_state` on the join itself rather than a pre-rendered warning
-    # sentence, so a client can group, count and link it back to the relationship it is about.
-    assert [j["review_state"] for j in r.joins.items] == ["unreviewed"]
+    # The join half of this used to read `review_state == "unreviewed"`, borrowed from the declared
+    # relationship the two in-scope tables happened to have. The section is one item per join the
+    # STATEMENT wrote now, and nothing has yet matched a written join to a declaration — so there is
+    # no sign-off state to surface and inventing one would put a trail on a join nobody matched. The
+    # `review_state` assertion returns here when matching lands; what the server can carry today is
+    # the join itself, which is what is pinned.
+    assert [j["from_to"] for j in r.joins.items] == ["orders → customers"]
+    assert [j["predicate"] for j in r.joins.items] == ["o.customer_id = c.id"]
+    assert [j["review_state"] for j in r.joins.items] == [None]
     # The ai-written column is flagged as an assumption.
     assert any(a["column"].endswith("orders.amount") for a in r.assumptions.items)
 
