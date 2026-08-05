@@ -33,6 +33,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -279,13 +280,20 @@ def test_both_safety_jobs_still_select_their_work_by_path():
     """The regression that started all of this: the retired job selected with
     `pytest -k "db_path or role"`, a substring match on the node id, and a rename dropped 102 of 108
     vectors while it still exited 0. Selection is a path plus a marker now, and `-k` must not come
-    back."""
+    back.
+
+    Tokenize rather than searching for `" -k "`. `-k` binds its argument three ways — `-k expr`,
+    `-kexpr` and `-k"expr"` — and only the first contains that substring, so the cheap spelling of
+    this check would have waved through two of the three. A test against a substring match, defeated
+    by a spelling, is the very shape of the bug it is here to prevent.
+    """
     workflow = _workflow()
     for name in (FILE_PATH_JOB, DB_PATH_JOB):
         commands = _run_commands(workflow["jobs"][name])
         assert any("pytest tests/e2e" in command for command in commands), name
         for command in commands:
-            assert " -k " not in command, (name, command)
+            offenders = [tok for tok in shlex.split(command) if tok.startswith("-k")]
+            assert not offenders, (name, offenders, command)
 
 
 def test_this_file_runs_inside_the_required_job():

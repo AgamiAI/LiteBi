@@ -176,6 +176,10 @@ def vendored_verdict(root: Path, env: dict, sql: str, **overrides) -> tuple:
         env={**env, **overrides},
         capture_output=True,
         text=True,
+        # Bounded for the same reason `harness.route_stdio` is, and to the same 180s: a child that
+        # deadlocks or blocks on I/O would otherwise hang until the job-level timeout kills the
+        # whole run, which reports as an infrastructure flake rather than as this vector stalling.
+        timeout=180,
     )
     if proc.returncode == 0:
         return ("ok", None, None, proc.stdout)
