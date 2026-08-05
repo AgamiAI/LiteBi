@@ -84,6 +84,7 @@ from guardrail import (
     PRE_MODEL_RULES,
     RECEIPT_BEFORE_MODEL,
     RECEIPT_BUILD_FAILED,
+    RECEIPT_GOVERNANCE_DISABLED,
     RECEIPT_NO_MODEL,
     RECEIPT_NO_RUNTIME,
     RULE_AUDIT_UNAVAILABLE,
@@ -1681,6 +1682,35 @@ def _hosted() -> bool:
     return bool(os.environ.get("AGAMI_DB_URL") or os.environ.get("APP_DATABASE_URL"))
 
 
+def _governance_enforced() -> bool:
+    """Whether the semantic-model pass runs on this deployment (ACE-101). Default OFF.
+
+    The one place a deployment can turn off the 4b/4c half of the guard: table scope, column scope,
+    the star ban, the readability and scopability gates, the three `model_unavailable` branches, and
+    the engine-mismatch check. It exists because those refuse on facts about OUR parser and OUR model
+    resolution rather than about the caller's statement — a dialect drift or a model that will not
+    resolve refuses EVERY query on the server until an operator intervenes, and until this switch
+    there was no way to bring a server up without them.
+
+    **It cannot reach 4a**, and that is structural rather than a rule to remember: `check_read_only`
+    and `check_no_recon` are composed in `execute_guarded` ABOVE the semantic-model pass, and the
+    resource bounds are applied around the executor below it. Nothing this function gates is on the
+    write / RCE / probe / exhaust path, and the least-privilege read-only DB role — the primary
+    control that F9 names, with this layer as defense-in-depth — is untouched either way.
+
+    Default OFF deliberately inverts the fail-closed default every other gate takes, and the
+    inversion is written into REQ-014 rather than left as drift between the register and this file.
+    The carve-out is standing, not time-boxed: no trigger retires it.
+
+    Read per call rather than cached at import, like `_hosted()` above and
+    `oidc.public_signup_enabled` whose parsing this copies, so flipping the variable on a running
+    deployment takes effect on the next request with no redeploy, and a test can `monkeypatch.setenv`
+    it. Anything unrecognized is OFF, which is the direction that cannot surprise an operator who
+    typo'd the value into a server they believed was enforcing.
+    """
+    return os.environ.get("AGAMI_GOVERNANCE_ENFORCED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _audit_store_reachable() -> bool:
     """Whether the audit store can be opened right now — the pre-execution half of principle 7
     (ACE-097).
@@ -1879,8 +1909,9 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
 
     Returns ``(sql_to_run, verdict)``. ``verdict`` is ``None`` to continue or a ``Refusal`` from
     whichever gate chose it — there is no third thing, so every refusal names its own rule. Inert
-    (returns the SQL unchanged) only when no model is DECLARED for the profile: a local install with
-    nothing built yet has no declared surface, so no gate has anything to enforce. Every other
+    (returns the SQL unchanged) in two cases: when no model is DECLARED for the profile (a local
+    install with nothing built yet has no declared surface, so no gate has anything to enforce), and
+    when a hosted deployment has turned this pass off (ACE-101, below). Every other
     "cannot guarantee safety" state refuses — on the HOSTED path when the model cannot be resolved or
     the package/parser is missing (ACE-051), and on the LOCAL path when the guards cannot be imported
     while a model does exist on disk (ACE-071).
@@ -1890,6 +1921,21 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     pre-flight and the sensitive-column check were the two exceptions, writing their own diagnostic
     and returning a bare int. Both became receipt facts, so neither is here at all now.
     """
+    if _hosted() and not _governance_enforced():
+        # The deployment switch (ACE-101). ABOVE the import on purpose: an off deployment pays
+        # neither the `semantic_model.runtime` import nor the parse it would drive, so turning the
+        # pass off costs nothing rather than costing slightly less.
+        #
+        # Returning `(sql, None)` and not a Refusal is the whole point — the caller's statement is
+        # handed on untouched, exactly as on the no-model-declared branch below. What this must NOT
+        # do is let the receipt claim the gates ran: `_receipt_for` answers
+        # `RECEIPT_GOVERNANCE_DISABLED` under this same condition, as its FIRST statement, because
+        # the two context vars the gates below publish (`_guard_model`, `_guard_shape`) are never set
+        # on this path and a receipt built without them reports a cause that is not happening.
+        #
+        # `_hosted()` guards it so the local and OSS path is untouched: the plugin, a laptop install
+        # and ACE-071's vendored-slice refusal all behave exactly as they do with the switch absent.
+        return sql, None
     try:
         from semantic_model import runtime as RT
     except Exception as exc:
@@ -2187,6 +2233,18 @@ def _receipt_for(sql: str, profile: str, *, bounded: bool) -> Receipt:
     install legitimately has no model yet; and an assembler that raises must cost the caller its
     receipt, never its answer.
     """
+    if _hosted() and not _governance_enforced():
+        # ACE-101, and it is the FIRST statement for a reason that is easy to get wrong and silent
+        # when wrong. `_model_safety` returns before it can `_guard_model.set(org)`, so the var below
+        # is still the `None` `execute_guarded` cleared on entry — and the `org is None` branch answers
+        # `RECEIPT_NO_MODEL`, "no semantic model could be resolved", on a deployment whose model
+        # resolves perfectly. Placing this after the import instead trades that for `RECEIPT_NO_RUNTIME`
+        # on a vendored deployment. Both are false causes stated with confidence, which is worse than
+        # saying nothing; only first-statement reports the cause that is actually happening.
+        #
+        # This is the same defect `_refusal_receipt` below already documents for the `PRE_MODEL_RULES`
+        # gates, which is why `RECEIPT_BEFORE_MODEL` exists. Fifth reason, same lesson.
+        return undetermined_receipt(RECEIPT_GOVERNANCE_DISABLED)
     try:
         from semantic_model import runtime as RT
     except ImportError:
@@ -2522,13 +2580,21 @@ def execute_guarded(
                 return _envelope("refused", refusal=verdict,
                                  receipt=_refusal_receipt(verdict, received_sql, profile))
         creds = _load_credentials(profile, org_id or "local")
-        if not no_safety:
+        if not no_safety and not (_hosted() and not _governance_enforced()):
             # The guard picked its grammar from the model's declared engine; the executor picks its
             # driver from these credentials. Two independent pieces of operator configuration with
             # nothing reconciling them, so a mis-declared model has the guard vet a statement in a
             # grammar the database does not speak — this defect again, by a different door.
             # Credentials resolve after the gates by design, so this is the first point at which
             # both are known.
+            #
+            # It carries the ACE-101 switch too, and needs its own copy of the condition rather than
+            # riding `_model_safety`'s: this is a SECOND `if not no_safety:` block, so scoping the
+            # switch to that function alone would leave this gate enforcing on a deployment that had
+            # turned the pass off. It belongs with the pass because it is the same class of finding —
+            # `engine_mismatch` reports OUR configuration drift, a model declaring an engine its own
+            # credentials do not speak, and it refuses every statement on that datasource until an
+            # operator fixes it. That is 4c, not 4a: nothing here is about what the statement can do.
             mismatch = _engine_mismatch(profile, creds)
             if mismatch is not None:
                 return _envelope("refused", refusal=mismatch,

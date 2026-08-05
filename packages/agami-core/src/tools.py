@@ -51,6 +51,7 @@ from guardrail import (
     PRE_MODEL_RULES,
     RECEIPT_BEFORE_MODEL,
     RECEIPT_BUILD_FAILED,
+    RECEIPT_GOVERNANCE_DISABLED,
     RECEIPT_NO_MODEL,
     RULE_AUDIT_UNAVAILABLE,
     Envelope,
@@ -617,6 +618,17 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
     Keep the invariant in mind before adding one back: a rewrite anywhere below the fork makes this
     receipt describe the wrong statement again, and the fork path has no channel to learn about it.
     """
+    from execute_sql import _governance_enforced, _hosted  # sibling module; no import cycle
+
+    if _hosted() and not _governance_enforced():
+        # ACE-101, first statement here too — and this side is the more dangerous of the two. The
+        # in-process twin reaches a `_guard_model is None` branch and reports a FALSE cause; this one
+        # does not read `_guard_model` at all. It resolves the model itself, one line down, and on a
+        # deployment with the pass off that resolve SUCCEEDS — so left alone it would assemble a full,
+        # clean receipt describing checks that never ran. A receipt that reads as clean is exactly what
+        # the fifth reason exists to prevent, and it would also make the fork path and the in-process
+        # path describe one call two different ways, which REQ-002 forbids.
+        return undetermined_receipt(RECEIPT_GOVERNANCE_DISABLED)
     try:
         org = get_cached_org(profile)
     except Exception:
