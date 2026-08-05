@@ -125,10 +125,23 @@ def test_fan_trap_mixed_raw_and_aggregate_is_reported():
 
 
 def test_explicit_cross_product_is_not_a_trap():
+    """A cross-product with nothing aggregated over it multiplies no number, so there is nothing
+    to report — both traps are statements about the rows an aggregate is computed from.
+
+    `unchecked` is asserted beside the empty finding list for the reason
+    `test_aggregating_many_side_is_allowed` states: an empty list is also what a statement that did
+    not parse returns, so on its own it cannot tell "nothing is wrong" from "nothing was
+    established". This statement is a comma join with a `SELECT *` and no GROUP BY, which is exactly
+    the shape a parser or a scope gate is most likely to give up on quietly.
+
+    The empty aggregate roster is the other half, and it is the premise rather than a bonus: the
+    finding list is empty BECAUSE there is no aggregate, not because a fan was cleared."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT * FROM orders, tickets WHERE orders.customer_id = tickets.customer_id", org)
+    assert pf.unchecked is None, pf.unchecked
     assert pf.findings == []
+    assert pf.aggregates == []
 
 
 def test_fan_trap_in_a_set_operation_arm_is_reported():
@@ -157,11 +170,21 @@ def test_every_trapped_arm_is_reported():
 
 
 def test_clean_set_operation_passes_preflight():
-    """A set operation with no trapped arm reports nothing — arm-walking must not over-report."""
+    """A set operation with no trapped arm reports nothing — arm-walking must not over-report.
+
+    A set operation parses to `exp.SetOperation` rather than to `exp.Select`, so a walk that gave up
+    on it would report nothing too, and this test's whole subject is the walk. `unchecked` is what
+    separates the two readings: null says the analysis ran over both arms and found nothing, where
+    the empty finding list on its own says only that nothing came back.
+
+    Neither arm aggregates, so the roster is empty as well, and that is the reason the finding list
+    is: no aggregate means no fan and no chasm before either arm's tables are considered."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT id FROM orders UNION SELECT id FROM customers", org)
+    assert pf.unchecked is None, pf.unchecked
     assert pf.findings == []
+    assert pf.aggregates == []
 
 
 def test_aggregating_many_side_is_allowed():
