@@ -39,6 +39,20 @@ below corresponds to one such version.
 
 ### Fixed
 
+- **Catalog and dictionary reads no longer hit the row cap that exists to bound your queries.** The
+  executor refuses (never truncates) any result over `AGAMI_SQL_MAX_ROWS`, default 1000. That bound
+  is sized for a question someone asks; a *catalog* read exceeds it on schema size alone. The visible
+  symptom was `sm enrich-metadata` dying on any platform whose data dictionary is a real table
+  (`RuntimeError: … "rule": "resource_limit"`), but the quieter cases were worse: the bulk
+  `information_schema.columns` read behind `sm discover`, and the table/foreign-key reads behind
+  `sm introspect`, are wrapped in a swallow — so on a wide catalog they degraded to one round-trip
+  per table, or produced a model with no join graph, with nothing said about either.
+
+  The connect skill now runs those three commands with a raised cap and **tells you it did, along
+  with your unchanged query-time cap**. Nothing about the bound on an ordinary question changes: a
+  query returning more than the cap is still refused rather than quietly truncated, and no new lever
+  is reachable from a generated query.
+
 - **The guard now reads your SQL in your database's own grammar, and refuses what it cannot read
   (ACE-079).** Every model-scoping check decided by parsing the statement, and every one of them
   parsed in a generic SQL dialect rather than your engine's. On MySQL, BigQuery, Databricks and SQL
