@@ -911,6 +911,22 @@ DECLARED = "declared"
 UNDECLARED = "undeclared"
 UNDECLARABLE = "undeclarable"
 
+# And the values a `columns` output item's status takes, named for the same reason again: set in the
+# assembler, counted by `_columns_marker`, read by the chart template's approve/change banner and
+# asserted in the battery.
+#
+# `UNDETERMINED` is reused a third time rather than given its own spelling. All three sections ask
+# different questions — was the value multiplied, is the join declared, which metric is this column —
+# but "the analysis could not settle it" is one state, and three constants holding one string is
+# three things to keep in step.
+#
+# There is no fourth value here answering to `UNDECLARABLE`. A join can have an endpoint no
+# declaration could ever be about; an output column cannot be a thing no metric could ever compute,
+# because a metric's binding is an arbitrary expression. So the settled negative is `UNMATCHED` and
+# it means exactly one thing: every candidate binding was read, and none of them is this column.
+MATCHED = "matched"
+UNMATCHED = "unmatched"
+
 
 # Why the checks did not run, when they did not. `None` means they DID — the analysis reached the
 # statement and an empty `findings` is then a real "nothing found". These sentences are the same
@@ -5021,6 +5037,172 @@ def check_declared_filters(
         )
         out.append((site.ref, filters))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Metric adherence
+#
+# Which declared metric an OUTPUT COLUMN computes, and whether that metric is signed off. The key is
+# the projection rather than the statement: a metric computes a value the caller READS, so a match
+# that cannot say which of five returned values it is about has not answered the question. When no
+# metric matches, that none matched is itself the report — silence there reads as "no governed
+# definition was involved", which is indistinguishable from "nobody looked".
+#
+# What this replaced was a substring containment test (`_norm_sql`) over the whole statement, and it
+# was wrong in three directions at once: a match had no owning column, a column matching nothing was
+# absent rather than reported, and containment credited text that never reached the output — a
+# binding inside a CTE body counted for the statement that merely read the CTE.
+#
+# The comparison here is STRUCTURAL and there is no implication check. Two expressions match when
+# their parsed trees are equal after the same normalization on both sides; a solver deciding whether
+# one expression implies another would make the answer depend on how hard we tried, and a receipt
+# has to give the same answer every run.
+#
+# NOTHING HERE REFUSES. A metric mismatch is none of principle 4's three refusal reasons, and
+# whether a hand-rolled value is WRONG depends on the question, which this layer never has. The item
+# states the match or its absence and stops.
+# ---------------------------------------------------------------------------
+
+
+def _strip_qualifiers(node: "exp.Expression") -> "exp.Expression":
+    """A COPY of `node` with every column's table qualifier dropped.
+
+    A metric's binding is written unqualified — `SUM(total_amount)` — because the model author is
+    naming a column on a declared table, not writing against some statement's aliases. A generated
+    statement writes `SUM(o.total_amount)`. Those compute the same value, and a comparison that
+    called them different would report "none matched" on the query that most plainly DOES use the
+    organisation's definition, which is the positive half of this section failing quietly.
+
+    The cost is admitted rather than hidden: with qualifiers gone, `SUM(a.amount)` and `SUM(b.amount)`
+    both match a binding `SUM(amount)`. Closing that needs the metric's `source_tables` as a guard,
+    which is declined while that field is optional and empty across much of the model — an inert
+    guard buys nothing and reads as though it were working. It is the first thing to add if a false
+    match shows up.
+
+    Copied rather than mutated in place, exactly as `_fold_unquoted_identifiers` is and for the same
+    reason: the nodes belong to the caller's parse tree, which other analyses in the same receipt
+    still read.
+    """
+    stripped = node.copy()
+    for col in stripped.find_all(exp.Column):
+        if col.args.get("table"):
+            col.set("table", None)
+    return stripped
+
+
+@functools.lru_cache(maxsize=1024)
+def _reduced_binding(text: str, dialect: "str | None") -> "exp.Expression | None":
+    """A metric binding parsed and normalized for comparison — None when it will not parse.
+
+    Cached for the reason `_reduced_on` is: a pure function of MODEL-author text and the engine it
+    is read in, and model text does not change between requests, while this runs on the `ok` path of
+    every executed query against every metric the deployment declares. Uncached, a model with a
+    hundred metrics pays a hundred sqlglot parses per query to compare against text that has not
+    changed since the process started. ACE-059 measured 10.6x `main` on a 47 KB statement before its
+    own reduction was cached; this is the same trap one section over.
+
+    None means "this binding could not be read", and the caller must treat that as OUR gap rather
+    than a fact about the model — a column may not read `unmatched` while a binding that could have
+    been its match is unread. That is ACE-059's rule ("a failure to read the model is never a fact
+    about the model") applied to declarations rather than to relationships.
+    """
+    parsed = _parse_sql(text, dialect)
+    if parsed is None:
+        return None
+    # A statement-shaped binding is not an expression, and comparing one to a projection would be a
+    # category error rather than a mismatch. sqlglot wraps a bare expression it cannot classify, so
+    # the unwrap has to happen before the comparison and not after.
+    if isinstance(parsed, exp.Select):
+        return None
+    return _strip_qualifiers(_fold_unquoted_identifiers(parsed))
+
+
+def _reduced_projection(node: "exp.Expression", dialect: "str | None") -> "exp.Expression":
+    """One output column's expression, normalized the SAME way a binding is.
+
+    Same two steps in the same order, which is the whole contract of this pair: normalizing the two
+    sides differently is how a comparison starts reporting differences that are not there. Not
+    cached — this is the caller's own text and changes every request, so a cache keyed by it would
+    grow without bound on a public server.
+
+    `dialect` is unused and deliberately in the signature: the node is already parsed, in that
+    dialect, by the single parse `assemble_receipt` made. Taking the argument keeps the two halves
+    reading as a pair and makes it a compile error rather than a silent divergence if this ever has
+    to re-parse.
+    """
+    return _strip_qualifiers(_fold_unquoted_identifiers(node))
+
+
+class MetricCandidate(NamedTuple):
+    """One declared metric that could be what an output column computes, with its binding read.
+
+    `reduced` is None when the binding is declared for this engine and will not parse. That is
+    carried rather than dropped because it is the difference between "no metric matched" and "a
+    metric we could not read might have", and only the second of those has to hold a column open.
+    """
+
+    metric: "Metric"
+    area: Optional[str]        # the subject area's name; None for a cross-area metric
+    binding: str               # the binding text as the model author wrote it, for the item
+    reduced: "exp.Expression | None"
+
+
+def _metric_candidates(org: Datasource, storage_type: "str | None",
+                       dialect: "str | None") -> list[MetricCandidate]:
+    """Every declared metric that declares a binding for THIS engine, reduced for comparison.
+
+    Reads `org.cross_subject_area_metrics` as well as each area's own `metrics`. The walk this
+    replaced read only the areas, so a declared cross-area metric could never match however plainly
+    the statement computed it — the section could not report a fact the model states outright.
+
+    ONE binding per metric, the one declared for this deployment's `storage_type`. `bindings` is a
+    per-engine dict, and the containment test this replaced tried every value in it, so a Snowflake
+    binding could be reported as the definition a Postgres statement used. A metric declaring no
+    binding for this engine is simply absent from this list: that is a fact about the MODEL's
+    coverage, not a declaration we failed to read, so it is not a candidate and it does not hold any
+    column open.
+
+    A derived or second-order metric's binding is EXPANDED first, exactly as `resolve_metrics` does
+    — the placeholder form (`AVG({daily_revenue})`) is not what a statement would ever write, so
+    comparing against it unexpanded could only ever fail. A metric whose expansion raises falls back
+    to the raw binding rather than disappearing: the validator gates the model, and a candidate that
+    reduces to nothing lands in the unread-binding branch where it belongs.
+    """
+    from . import derived as _D
+
+    if not storage_type:
+        return []
+    idx = _D.metric_index(org)
+    pairs: list[tuple[Optional[str], "Metric"]] = [
+        (sa.name, mm) for sa in org.subject_areas for mm in sa.metrics
+    ]
+    pairs += [(None, mm) for mm in (getattr(org, "cross_subject_area_metrics", None) or [])]
+    out: list[MetricCandidate] = []
+    for area, mm in pairs:
+        bindings = mm.bindings or {}
+        if _D.is_derived(mm) or _D.is_second_order(mm):
+            try:
+                bindings = _D.expanded_bindings(mm, idx)
+            except _D.DerivedError:
+                bindings = mm.bindings or {}
+        text = (bindings or {}).get(storage_type)
+        if not text or not text.strip():
+            continue
+        out.append(MetricCandidate(mm, area, text, _reduced_binding(text, dialect)))
+    return out
+
+
+def _storage_type_of(org: Datasource) -> "str | None":
+    """The one engine this datasource's SQL runs on, as `Metric.bindings` spells it.
+
+    `_dialect_of` answers the same question in sqlglot's vocabulary and cannot be reused here: it
+    returns `postgres` where a binding is keyed `PostgreSQL`. Both come off the same declared
+    connections, so they agree or both fail — and the ambiguity rules are `resolve_datasource_dialect`'s,
+    restated in one place rather than re-decided: no connection or more than one engine means we do
+    not know, and not knowing yields no candidates rather than a guess at which engine was meant.
+    """
+    engines = {sc.storage_type for sc in getattr(org, "storage_connections", None) or []}
+    return engines.pop() if len(engines) == 1 else None
 
 
 __all__ = [
