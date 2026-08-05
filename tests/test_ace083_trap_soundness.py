@@ -628,9 +628,14 @@ def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
     Argument values are not all nodes: `Count(big_int=True)` and `Ordered(nulls_first=True)` carry
     bools, and an absent optional argument is `None`. The alternative to this guard is a type check
     at every call site inside the walk, which is the same test written four times.
+
+    An alternation with no branch at all is the same guard on the other arm. `frozenset.intersection`
+    with no argument at all is a `TypeError`, not an empty set, so a `CASE` node carrying neither an
+    `ifs` list nor a `default` has to be answered before the fold rather than inside it.
     """
     assert rt._value_sources(None, VALUE_SCOPE) == frozenset()
     assert rt._value_sources(True, VALUE_SCOPE) == frozenset()
+    assert rt._value_sources(exp.Case(), VALUE_SCOPE) == frozenset()
 
 
 # --- the direction the corpus above cannot reach ---------------------------

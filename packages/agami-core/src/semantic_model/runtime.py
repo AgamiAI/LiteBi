@@ -1687,7 +1687,7 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
                       ctx: "GuardContext | None" = None,
                       *, scope: str = "main",
                       visible: Optional[set[str]] = None,
-                      tidx: Optional[dict[str, tuple]] = None) -> list[AggregateReport]:
+                      tidx: dict[str, tuple]) -> list[AggregateReport]:
     """Fan/chasm + aggregation-semantics analysis of a SINGLE SELECT, read entirely off the tree.
     A top-level SELECT and a set-operation arm are analyzed identically; there is no longer a
     rewrite for one to be eligible for, and no statement text for either to carry.
@@ -1699,9 +1699,9 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
 
     `ctx` supplies the shared cardinality/column indices (ACE-045); `tree` is always the
     caller's own SELECT (a set-op arm ≠ `ctx.tree`), so only the indices come from `ctx`. `tidx` is
-    the same model table index under a second name, for the `assemble_receipt` path that has no
-    `ctx` and has already built one: without it, a statement whose arms read a CTE rebuilt the whole
-    model's index once per arm."""
+    REQUIRED and comes from `_aggregate_reports`, which resolves it once per statement from `ctx` or
+    from the caller: rebuilt here it walked every table in the model once per set-operation arm, on
+    the `assemble_receipt` path that has no `ctx` and has already built one."""
     rels = ctx.cardinality_index if ctx is not None else _cardinality_index(org)
     # Filtered to what THIS SELECT's own FROM/JOIN clauses bind, and derived once: every consumer
     # below reads this one map. Asking for it twice with two flags would be the second tree walk
@@ -1729,8 +1729,6 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     # CTE anywhere spent 5.4 of their 5.5 seconds proving there was nothing to resolve.
     bodies = _visible_cte_bodies(tree)
     if bodies.keys() & {_tkey(v) for v in tables_in_scope.values()}:
-        if tidx is None:
-            tidx = ctx.model_table_index if ctx is not None else _model_table_index(org)
         tables_in_scope, cte_rels = _resolve_cte_scope(tree, bodies, tables_in_scope, tidx)
         # A NEW list. `ctx.cardinality_index` is the model's own edges, shared across every guard
         # in the battery and across every arm of a set operation; appending a statement-derived
