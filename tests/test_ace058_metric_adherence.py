@@ -37,8 +37,21 @@ PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
 if str(PKG_SRC) not in sys.path:
     sys.path.insert(0, str(PKG_SRC))
 
+import execute_sql  # noqa: E402
+import guardrail  # noqa: E402
 from semantic_model import loader as L  # noqa: E402
 from semantic_model import runtime as rt  # noqa: E402
+
+# The end-to-end fixture: a model on disk, a sqlite warehouse and the environment
+# `execute_guarded` reads. Borrowed rather than rebuilt, exactly as ACE-060 borrows it, so that
+# "never refused" is asserted against the SAME caller path the other governance batteries use.
+from test_ace094_findings_not_refusals import (  # noqa: E402
+    _SpyExecutor,
+    shop,  # noqa: F401  — imported for pytest to resolve, not called here
+)
+
+E2E_PROFILE = "acme"
+E2E_AREA = "sales"
 
 # --- fixture ----------------------------------------------------------------
 
@@ -510,13 +523,73 @@ def test_the_deleted_containment_test_is_grep_clean():
     assert "UNDETERMINED_COLUMNS = " not in src
 
 
-def test_a_hand_rolled_metric_executes_and_is_never_refused(org):
-    """SC-10 / F11 §3. A metric mismatch is none of principle 4's three refusal reasons, and this
-    section reports a fact on an answer that RAN."""
+def test_the_receipt_is_still_the_five_sections_and_the_pin(org):
     receipt = rt.assemble_receipt(org, "SELECT SUM(total_amount) AS revenue FROM orders")
     assert set(receipt) == {"model_version", "columns", "tables", "joins", "aggregates",
                             "assumptions"}
-    assert any(i["kind"] == "output" for i in receipt["columns"]["items"])
+
+
+# --- SC-10: reported, never refused -----------------------------------------
+
+
+def test_a_hand_rolled_metric_executes_and_is_never_refused(shop):  # noqa: F811
+    """SC-10 / F11 §3, asserted against the refusal vocabulary rather than by convention.
+
+    `RefusalReason` is closed at three members and a metric mismatch is none of them. A change that
+    reintroduced a correctness refusal would have to widen that enum to do it, and this fails first.
+    """
+    assert set(guardrail.get_args(guardrail.RefusalReason)) == {
+        "unsafe", "out_of_scope", "undetermined"
+    }, "the refusal vocabulary widened — a metric mismatch is still none of these"
+
+    sql = "SELECT SUM(o.total) AS revenue FROM orders o"
+    spy = _SpyExecutor()
+    env = execute_sql.execute_guarded(sql, E2E_PROFILE, E2E_AREA, executor=spy)
+    assert env.status == "ok", env
+    assert env.refusal is None
+    # Byte-identical, per ACE-093: this section describes the statement, it never authors one.
+    assert spy.calls and spy.calls[0][0] == sql
+
+
+def test_what_was_reported_rides_the_envelope_receipt(shop):  # noqa: F811
+    """The receipt on the envelope is the one the record stores wholesale (ACE-098 pins the second
+    half), so an item that reaches here reaches the audit row.
+
+    The fixture declares `closing balance` as `SUM(orders.balance)`. The statement below computes
+    `SUM(o.total)`, a different column, so the honest answer is that it matches no declared metric —
+    and saying that is the whole point of the section.
+    """
+    spy = _SpyExecutor()
+    env = execute_sql.execute_guarded(
+        "SELECT SUM(o.total) AS revenue FROM orders o", E2E_PROFILE, E2E_AREA, executor=spy)
+    outputs = [i for i in env.receipt.columns.items if i["kind"] == "output"]
+    assert [i["column"] for i in outputs] == ["revenue"]
+    assert outputs[0]["status"] == rt.UNMATCHED
+    assert outputs[0]["name"] is None
+
+
+def test_a_binding_for_another_engine_is_not_matched_through_the_caller_path(shop):  # noqa: F811
+    """The engine rule, end to end, on a deployment that is not Postgres.
+
+    This fixture's `closing balance` declares exactly one binding, `{"PostgreSQL":
+    "SUM(orders.balance)"}`, and the datasource's `storage_type` is `SQLite`. So the statement below
+    computes precisely that expression, modulo the qualifier, and still reads `unmatched` — because
+    the model declares no binding for the engine this deployment actually runs on.
+
+    That is the correct answer and it is worth pinning end to end rather than only in the candidate
+    unit test: the containment matcher this replaced tried every value in `bindings` regardless of
+    engine, so it would have reported a Postgres definition as the one a SQLite statement used.
+
+    `unmatched` rather than `undetermined` is also deliberate: an absent binding is a fact about the
+    MODEL's coverage, not a declaration the analysis failed to read, so it settles.
+    """
+    spy = _SpyExecutor()
+    env = execute_sql.execute_guarded(
+        "SELECT SUM(o.balance) AS bal FROM orders o", E2E_PROFILE, E2E_AREA, executor=spy)
+    (out,) = [i for i in env.receipt.columns.items if i["kind"] == "output"]
+    assert out["status"] == rt.UNMATCHED
+    assert out["name"] is None
+    assert env.refusal is None
 
 
 # --- cost -------------------------------------------------------------------
