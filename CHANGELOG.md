@@ -12,6 +12,31 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Added
+
+- **A server can now run with the semantic-model pass off, and always says so
+  (`AGAMI_GOVERNANCE_ENFORCED`, ACE-101).** The model-scoping checks refuse on facts about *our*
+  parser and *our* model resolution rather than about your SQL, so a dialect drift or a model that
+  will not resolve could refuse every query on a server until an operator intervened, and there was
+  no way to bring that server up without them. There is now one switch, read per request so flipping
+  it takes effect on the next query with no redeploy.
+
+  **It is off by default,** which means a fresh server does not enforce table scope, column scope,
+  the `SELECT *` ban, or the engine-mismatch check until you turn it on. With it off, a query may
+  read anything the connecting role is granted, including columns you excluded from the model, and
+  may enumerate your schema through catalog relations. Turn it on once the checks have been
+  validated against your data; see the [self-hosting reference](docs/self-hosting.md) and
+  [SECURITY.md](SECURITY.md).
+
+  **What the switch cannot reach:** the read-only guard, the dangerous-function guard, the statement
+  timeout and the row cap. Those are composed outside the pass and enforce in both postures, as does
+  the read-only database role. And nothing ever claims the checks ran: every answer and every audit
+  row carries "the semantic-model checks are turned off in this deployment", on all five receipt
+  sections, with no findings attached.
+
+  The server logs one warning at startup naming the variable and the exposure whenever it boots with
+  the pass off.
+
 ### Fixed
 
 - **The guard now reads your SQL in your database's own grammar, and refuses what it cannot read

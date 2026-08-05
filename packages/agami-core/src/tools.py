@@ -51,6 +51,7 @@ from guardrail import (
     PRE_MODEL_RULES,
     RECEIPT_BEFORE_MODEL,
     RECEIPT_BUILD_FAILED,
+    RECEIPT_GOVERNANCE_DISABLED,
     RECEIPT_NO_MODEL,
     RULE_AUDIT_UNAVAILABLE,
     Envelope,
@@ -617,6 +618,21 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
     Keep the invariant in mind before adding one back: a rewrite anywhere below the fork makes this
     receipt describe the wrong statement again, and the fork path has no channel to learn about it.
     """
+    from execute_sql import _model_pass_disabled  # sibling module; no import cycle
+
+    if _model_pass_disabled():
+        # ACE-101, first statement here too, and this side is the more dangerous of the two. The
+        # in-process twin reaches a `_guard_model is None` branch and reports a FALSE cause; this one
+        # does not read `_guard_model` at all. It resolves the model itself, one line down, and when
+        # that model is deployed to the STORE (the normal hosted shape, since `_load_org` reads the DB
+        # and raises rather than falling back to disk once `AGAMI_DB_URL` is set), the resolve succeeds
+        # with the pass off. Left alone it would then assemble a full, CLEAN receipt describing checks
+        # that never ran, which is exactly what the fifth reason exists to prevent, and it would make
+        # the fork path and the in-process path describe one call two different ways (REQ-002).
+        #
+        # On a hosted deployment whose model is only on disk the resolve raises instead and the arm
+        # below answers `RECEIPT_NO_MODEL`, still a false cause, just a quieter one.
+        return undetermined_receipt(RECEIPT_GOVERNANCE_DISABLED)
     try:
         org = get_cached_org(profile)
     except Exception:
@@ -1631,6 +1647,26 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
         end_request_cache(cache_token)
 
 
+def _pass_child_env() -> dict[str, str]:
+    """The child's environment: this process's, with the ACE-101 posture written in explicitly.
+
+    Everything else is inherited untouched, which the fork depends on: the child re-resolves its own
+    timeout, row cap and credentials from the environment, and the supervisor bound computed on this
+    side is only correct because the child reaches the identical number. This adds one key and
+    overrides nothing else.
+
+    The one key is added because the posture is the one value the two processes must agree on that
+    they would otherwise each read at a different MOMENT. `_pin_model_pass_posture` fixed it on this
+    side; writing the same answer into the child's environment fixes it on the other, so a flip
+    landing between the two reads cannot make the gates and the receipt disagree about one call.
+    Spelled as the canonical `true`/`false` rather than passing the operator's own text through, so
+    the child parses a value this process has already resolved rather than repeating the resolution.
+    """
+    from execute_sql import _model_pass_disabled
+
+    return {**os.environ, "AGAMI_GOVERNANCE_ENFORCED": "false" if _model_pass_disabled() else "true"}
+
+
 def _tool_execute_sql(args: dict[str, Any]) -> str:
     """`tool_execute_sql`'s body, inside the per-request scope its caller opens."""
     # Clear the raw-detail carrier for THIS call, at the one point both paths pass through.
@@ -1638,9 +1674,18 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
     # fork the parent never calls it, so without this a forked call would record the driver text
     # left behind by an earlier IN-PROCESS failure in the same server process. Two paths, one
     # ContextVar, so the reset belongs where the call begins rather than where one of them does.
-    from execute_sql import _last_error_detail
+    from execute_sql import _last_error_detail, _pin_model_pass_posture
 
     _last_error_detail.set(None)
+    # And pin the ACE-101 posture here, for the same "one point both paths pass through" reason and
+    # against a sharper failure. `execute_guarded` pins it too, but on the fork that call happens in
+    # the CHILD: the child decides whether the gates run, exits, and only then does this process build
+    # the receipt. Without a pin the two reads are separated by a whole subprocess, so an operator
+    # turning the switch on mid-flight (the operation the per-call read exists to allow) would have
+    # the child execute unguarded and this side assemble a populated receipt saying it did not.
+    # Pinned here, the parent reaches whatever its child reached, and `_pass_child_env` below hands
+    # the child that same value so the agreement is enforced rather than assumed.
+    _pin_model_pass_posture()
 
     sql = args.get("sql")
     if not isinstance(sql, str) or not sql.strip():
@@ -1722,6 +1767,7 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
             capture_output=True,
             text=True,
             timeout=supervisor_timeout_s,
+            env=_pass_child_env(),
         )
     except subprocess.TimeoutExpired:
         # A `failed`/`timeout`, NOT a `refused`/`resource_limit` — and the reason is what we can

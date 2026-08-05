@@ -223,7 +223,23 @@ def test_the_budget_has_exactly_one_configuration_surface():
     # safety pass read off the statement across to the refusal builder, within one call, and is
     # cleared at entry beside `_guard_model`. It is read only to choose the WORDING of a refusal
     # that has already been decided — never to compute a bound, and never before one is spent.
-    context_vars -= {"_last_error_detail", "_guard_model", "_last_outcome", "_guard_shape"}
+    #
+    # `_pass_posture` (ACE-101) is the fifth, and it is the only one that needed reading twice before
+    # being allowed through, because on its face it is exactly the hazard: a request-scoped value that
+    # outranks the environment. The difference is that it is not an INPUT anyone configures and it is
+    # not invisible across the fork. It holds the answer this process already computed from the
+    # environment, so it can never disagree with what the environment says at the moment it was
+    # pinned; and `tools._pass_child_env` writes that same answer into the child's environment, so the
+    # fork carries it EXPLICITLY rather than losing it. It exists for the inverse of this test's
+    # concern: parent and child reading the environment at two different moments is the defect, and
+    # pinning is the fix. It is never read to compute a bound.
+    context_vars -= {
+        "_last_error_detail",
+        "_guard_model",
+        "_last_outcome",
+        "_guard_shape",
+        "_pass_posture",
+    }
     assert context_vars == set(), (
         "a second, higher-precedence configuration surface for the budget cannot cross the fork; "
         f"found {sorted(context_vars)}"
@@ -1242,7 +1258,24 @@ def test_the_supervisor_bound_is_derived_from_the_statement_budget(warehouse, mo
     assert captured["timeout"] > 300, "the supervisor must fire AFTER the statement bound, not before"
     assert captured["timeout"] != 240, "the fixed bound this replaces"
     # And nothing was passed that would stop the child inheriting the same configuration.
-    assert "env" not in captured
+    #
+    # This asserted `"env" not in captured` until ACE-101, and the property it was defending is
+    # unchanged: the child must reach the identical timeout by re-resolving it from an environment
+    # this side did not disturb. What changed is that an env IS now passed, so "no env at all" stopped
+    # being a way to state that property and started being a proxy for it. Asserted directly instead:
+    # the child's environment is this process's, differing in exactly one key, and that key is not a
+    # budget input. A second difference of any kind fails here, which is strictly more than the old
+    # assertion caught (it could not have seen a change made by adding `env=` and then mutating it).
+    child_env = captured["env"]
+    differing = {
+        key
+        for key in set(child_env) | set(os.environ)
+        if child_env.get(key) != os.environ.get(key)
+    }
+    # A subset rather than equality: the pinned key matches the environment whenever the environment
+    # already spells the same posture, which is the ordinary case and the case this suite runs in. The
+    # property being defended is that NOTHING ELSE differs.
+    assert differing <= {"AGAMI_GOVERNANCE_ENFORCED"}, differing
 
 
 def test_the_supervisors_verdict_is_unchanged(warehouse, monkeypatch):

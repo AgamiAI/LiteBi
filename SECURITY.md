@@ -53,4 +53,24 @@ This is defense in depth at the application layer; you should still connect with
 read-only database role. A guard bypass — SQL that mutates data or reaches a blocked
 function yet passes the gate — is in scope for a report.
 
+### The semantic-model pass is separately switchable
+
+A second layer runs after the gate above: the **semantic-model pass**, which confines a
+query to the tables and columns your model declares, bans `SELECT *`, and refuses a model
+whose declared engine disagrees with its credentials. On a server it is controlled by
+`AGAMI_GOVERNANCE_ENFORCED`, and **it is off by default**.
+
+With it off, a query may read anything the connecting role is granted, including columns
+you deliberately excluded from the model, and may enumerate your schema through catalog
+*relations* (`information_schema.tables`, `pg_catalog.pg_class`, `sqlite_master`). Catalog
+*functions* are denied by the gate above in both postures; catalog relations are not, and
+the read-only grant recipe we publish does not revoke them. Every answer and every audit
+row states that the checks did not run, so a result is never presented as governed when it
+was not.
+
+Everything in the list above (read-only, confinement to safe functions, and the resource
+bounds) is unaffected by this setting, as is your database role. **A statement that the
+read-only or dangerous-function gate would refuse must never become executable because this
+setting is off; if you find one, that is a guard bypass and in scope for a report.**
+
 Thank you for helping keep agami-core and its users safe.

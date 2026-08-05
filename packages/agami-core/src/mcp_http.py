@@ -565,6 +565,42 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        # Say the posture out loud before serving anything (ACE-101). `AGAMI_GOVERNANCE_ENFORCED`
+        # defaults OFF, so a server can be brought up with table scope, column scope, the star ban and
+        # the engine-mismatch check all inert, which is a supported deployment and a surprising one.
+        # The only other place it is visible is the absence of a refusal, and nobody reads an absence.
+        #
+        # Here rather than in `create_app`'s body because this runs when the process SERVES, while the
+        # body also runs for every embedding harness and every test that builds an app. Once per
+        # worker process, not once per deployment: `main()` runs uvicorn with `WORKERS=N` and uvicorn
+        # re-invokes the factory in each child, so N workers legitimately log N lines.
+        from execute_sql import _model_pass_disabled_by_env
+
+        if _model_pass_disabled_by_env():
+            # The SAME predicate every enforcement site reads, not a second spelling of it. An earlier
+            # draft dropped the `_hosted()` half and so announced "the gates are off" on a file-mode
+            # server where they were fully on. A warning that is wrong in the safe direction is still
+            # a warning an operator learns to discount, which is the one thing this line cannot afford.
+            #
+            # The `_by_env` reader rather than the pinned one, and that distinction is the point of
+            # its existing: this runs ONCE at startup, before any request, so there is no call for it
+            # to be scoped to. Reading the pinned value would make a startup statement depend on
+            # request-scoped state, which is None in a served process but need not be in an embedding
+            # harness that ran a query before building an app. Found by driving the boot path after a
+            # query in one process, where the stale pin made this line fire on all four postures.
+            #
+            # `is not enabled` rather than `is not set`: the variable is also not enabled when it IS
+            # set to `false`, `0`, or a typo like `ture`, and telling an operator who typed something
+            # that they typed nothing sends them to check env plumbing instead of their own value.
+            _log.warning(
+                "AGAMI_GOVERNANCE_ENFORCED is not enabled (value: %r): the semantic-model pass is "
+                "OFF, so table scope, column scope, the SELECT * ban and the engine-mismatch check "
+                "will not run. This server can read any table and any column the connecting role is "
+                "granted, including columns excluded from the model, and can enumerate the schema "
+                "through catalog relations. Read-only, dangerous-function and resource-bound "
+                "protection are unaffected.",
+                os.environ.get("AGAMI_GOVERNANCE_ENFORCED", ""),
+            )
         # Heal the schema before serving: apply any pending migrations so freshly-deployed code never hits
         # an old DB shape (a column a migration adds, selected before it's applied, 500s the admin). This
         # is fail-closed — a failing migration propagates and aborts startup; a half-migrated DB never

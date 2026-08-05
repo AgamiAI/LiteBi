@@ -348,6 +348,23 @@ RECEIPT_BEFORE_MODEL = (
     "The statement was refused before any semantic model was consulted, so nothing in it was checked "
     "against one."
 )
+# The fifth is a DEPLOYMENT POSTURE, and it may not borrow any of the four above for the same reason
+# the fourth may not: each of them names a cause, and on this path none of those causes is happening.
+# The runtime is importable, a model resolves, the assembler works, and the statement was not
+# refused. An operator turned the semantic-model pass off (`AGAMI_GOVERNANCE_ENFORCED`, ACE-101) and the
+# gates never ran. Answering `RECEIPT_NO_MODEL` here, which is what a builder reaching its
+# `_guard_model is None` branch would do, sends that operator looking for a model-resolution failure
+# that does not exist.
+#
+# It says WHY rather than only THAT, and that was weighed: the sentence tells any caller the
+# deployment is not enforcing its declared surface. The alternative is a receipt that cannot account
+# for what it established, which is a step back toward the clean-looking receipt this whole family of
+# constants exists to prevent, and REQ-021's posture is that a residual is stated, not hidden. It
+# names no variable, path or host, like its four siblings.
+RECEIPT_GOVERNANCE_DISABLED = (
+    "The semantic-model checks are turned off in this deployment, so nothing in the statement was "
+    "checked against the model."
+)
 
 
 def undetermined_receipt(reason: str, *, model_version: str | None = None) -> Receipt:
