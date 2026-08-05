@@ -45,8 +45,9 @@ below corresponds to one such version.
   symptom was `sm enrich-metadata` dying on any platform whose data dictionary is a real table
   (`RuntimeError: … "rule": "resource_limit"`), but the quieter cases were worse: the bulk
   `information_schema.columns` read behind `sm discover`, and the table/foreign-key reads behind
-  `sm introspect`, are wrapped in a swallow — so on a wide catalog they degraded to one round-trip
-  per table, or produced a model with no join graph, with nothing said about either.
+  `sm introspect`, discard a refused read instead of reporting it — so on a wide catalog they
+  degraded to one round-trip per table, or produced a model with no join graph, and said nothing
+  about either.
 
   The connect skill now runs those three commands with a raised cap and **tells you it did, along
   with your unchanged query-time cap**. Nothing about the bound on an ordinary question changes: a
