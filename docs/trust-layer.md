@@ -122,10 +122,13 @@ are two different facts, and keeping them apart is the whole point:
 | set | set | partly established, and here is what is missing |
 
 Before this, an unchecked section and a clean one were both the empty list, so
-silence read as clean. Today an analysis that has not shipped says so where you
-read the answer. Aggregate fan-out is the live example: the receipt reports that
-whether a join multiplies the rows an aggregate is computed from **was not
-checked**, rather than shipping an empty section you would read as "no problem".
+silence read as clean. Today what a section could not establish says so where you
+read the answer, and it says it in the caller's own numbers rather than naming
+anything. A `COUNT(*)` whose source tables cannot be resolved is the live example:
+the aggregates section reports that whether a join multiplies it is **not
+established**, rather than leaving it off a list you would read as "no problem".
+The same line goes null the moment there is genuinely nothing left to say, which
+is what makes it worth reading.
 
 Every `agami-query` answer includes a "Provenance for this answer" panel drawing
 all of it:
@@ -134,7 +137,11 @@ all of it:
   is listed twice; each with the name as written, the name the model resolved it
   to, and a row estimate. A reference the model does not declare (a CTE, say) says
   so instead of showing blanks
-- Relationships used, each with its cardinality, confidence + review state
+- Joins this query made — **one row per join the statement wrote**, each with the
+  condition it joined on and whether your model declares a relationship for it. A
+  join that matched one carries that relationship's cardinality, confidence +
+  review state; one that matched none carries no sign-off trail, because there is
+  no declaration for a signature to be about
 - Metric definitions invoked, with author + sign-off date
 - The columns the statement referenced
 - Source-data freshness per table (when the DB exposes it)

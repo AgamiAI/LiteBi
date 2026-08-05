@@ -335,26 +335,58 @@ def test_the_tables_section_names_the_query_scope_each_reference_was_written_in(
     }
 
 
-# --- joins (ACE-059 owns the gap) -------------------------------------------
+# --- joins -------------------------------------------------------------------
+#
+# The section was one item per DECLARED relationship whose two tables were both in scope, and the
+# two tests below asserted that shape. It is one item per join the STATEMENT wrote now, so both are
+# rewritten onto the per-join key rather than dropped: what each was really guarding — that a
+# consumer can filter joins on a structured field, and that the marker tells the truth about what
+# the section read — survives the change and is pinned here. The sign-off half of the first one is
+# the part that could not survive: nothing has matched this join to a declaration yet, so there is
+# no `review_state` to report and reporting the model's would put a sign-off trail on a join nobody
+# matched. `tests/test_ace059_join_adherence.py` is the battery for the new shape.
 
 
-def test_joins_section_names_the_declared_relationship_and_its_review_state(org):
-    """`review_state` is what a client filters on to raise its own unreviewed-join banner. It
-    replaced a `warnings` list of pre-rendered sentences ("Used an unreviewed join (…)."), which
-    said strictly less: a string cannot be grouped, counted, or linked back to the relationship it
-    is about, and a consumer that wanted anything other than that exact sentence could not have it.
+def test_joins_section_is_one_item_per_join_the_statement_wrote(org):
+    """`SQL` writes one join and the model declares one relationship between its two tables, so the
+    old build and this one agree on the COUNT — and on nothing else. The item is the statement's
+    join, carrying the predicate it wrote and the scope it wrote it in."""
+    section = _sections(org)["joins"]
+    assert [i["from_to"] for i in section["items"]] == ["orders → customers"]
+    assert [i["predicate"] for i in section["items"]] == ["o.customer_id = c.id"]
+    assert [i["scope"] for i in section["items"]] == ["main"]
+
+
+def test_joins_section_carries_the_signoff_of_the_relationship_it_matched(org):
+    """The sign-off keys are still on the item, and still the fields a client filters on to raise
+    its own unreviewed-join banner — a structured state can be grouped, counted and linked back to
+    the relationship it is about, which the `warnings` sentences it replaced could not.
+
+    They are filled because the written predicate MATCHED the declaration, which is a stronger claim
+    than the one the per-relationship build made. "The model declares a relationship between these
+    two tables" and "this join is that relationship" are different claims, and the item now carries
+    a trail only for the second — `test_ace059_join_adherence.py` pins the statement that joins the
+    same two declared tables on the wrong column and gets none of this."""
+    (item,) = _sections(org)["joins"]["items"]
+    assert item["status"] == rt.DECLARED
+    assert item["name"] == "orders_to_customers"
+    assert item["review_state"] == "unreviewed"
+    assert item["on"] is None  # this relationship is declared in the FK form
+
+
+def test_joins_section_reads_the_predicate_out_of_the_sql(org):
+    """The marker used to say the predicate was not read out of the SQL and that a relationship was
+    listed because the model declares it. Both halves stopped being true, and a section shipping
+    under a marker denying what it now does is the one way it could contradict itself.
+
+    Asserted as the marker's VALUE. `"not read out of the SQL" not in (marker or "")` was the first
+    form of this and it was vacuous: `or ""` makes the assertion hold for a null marker, which is
+    the answer here, so it would have passed against a section that established nothing at all.
+    `SQL`'s one join matched a declaration, so null is the positive claim "established, here it is".
     """
     section = _sections(org)["joins"]
-    assert [i["name"] for i in section["items"]] == ["orders_to_customers"]
-    assert section["items"][0]["review_state"] == "unreviewed"
-    unreviewed = [j for j in section["items"] if j["review_state"] != "approved"]
-    assert [j["from_to"] for j in unreviewed] == ["orders → customers"]
-
-
-def test_joins_section_says_the_actual_predicate_was_not_read(org):
-    section = _sections(org)["joins"]
-    assert section["undetermined"] == rt.UNDETERMINED_JOINS
-    assert "not read out of the SQL" in section["undetermined"]
+    assert "o.customer_id = c.id" in [i["predicate"] for i in section["items"]]
+    assert section["undetermined"] is None
 
 
 # --- aggregates -------------------------------------------------------------
@@ -388,11 +420,11 @@ def test_no_marker_ships_an_internal_spec_id_to_a_user(org):
     `UNDETERMINED_TABLES` was the sixth name in this list and there is no constant to name any more:
     that section's marker is composed per receipt from what the statement left unestablished, so
     the live-receipt loop below is the only place it can be checked — which is exactly why that
-    loop was written to catch a marker the list above cannot reach. `UNDETERMINED_AGGREGATES` left
-    the list the same way and for the same reason.
+    loop was written to catch a marker the list above cannot reach. `UNDETERMINED_AGGREGATES` and
+    `UNDETERMINED_JOINS` left the list the same way and for the same reason.
     """
     markers = [
-        rt.UNDETERMINED_COLUMNS, rt.UNDETERMINED_JOINS,
+        rt.UNDETERMINED_COLUMNS,
         rt.UNDETERMINED_NO_PARSER, rt.UNDETERMINED_UNPARSEABLE,
         rt.UNDETERMINED_REFUSED, rt.UNDETERMINED_REFUSED_TABLES,
     ]
@@ -681,18 +713,23 @@ def test_a_cte_shadowing_a_table_does_not_credit_that_tables_relationships(org):
     no CTE name — so a statement that defines `orders` for itself and never reads the declared
     `orders` still put it "in scope", and the relationship walk then reported a declared join between
     `orders` and `customers` that this statement could not possibly have made. The subtraction is
-    made by the assembler at the point of use (`_declared_table`, and `used` here), because the map
-    itself has other callers that need the reference either way.
+    made by the assembler at the point of use (`_declared_table`, and `visible` here), because the
+    map itself has other callers that need the reference either way.
 
-    Not an admitted gap: the joins marker says the PREDICATE was not read out of the SQL, not that
-    the endpoints might not be there. `check_table_scope` and the `tables` section both subtract
-    this set already; the relationship walk now subtracts the same one.
+    The joins assertion moved from EMPTY to one `undeclarable` item, and the move is the whole
+    improvement. Empty was the right answer to the old question ("which declared relationships are
+    in scope") and the wrong answer twice over to the one the section asks now: the statement
+    plainly wrote a join, and an empty list under a null marker is a claim that it did not. The
+    property this test exists for is untouched — the receipt does not credit the real `orders` with
+    anything — and it is now stated positively, as the reason the join cannot be declared.
     """
     shadowing = ("WITH orders AS (SELECT 1 AS customer_id) "
                  "SELECT c.id FROM orders o JOIN customers c ON o.customer_id = c.id")
     sections = _sections(org, shadowing)
 
-    assert sections["joins"]["items"] == []
+    (join,) = sections["joins"]["items"]
+    assert join["status"] == rt.UNDECLARABLE
+    assert join["name"] is None and join["cardinality"] is None
     # The reference itself is still reported, and reported as undeclared — a dropped reference is
     # an unchecked one.
     assert [(t["ref"], t["declared"]) for t in sections["tables"]["items"]] == [
@@ -865,12 +902,26 @@ def test_the_full_receipt_resolves_a_case_folded_reference_to_the_models_own_spe
 def test_a_case_folded_statement_does_not_deny_a_relationship_the_model_declares(org):
     """The sibling lookup, and the reason it is worse than the table one. The relationship walk
     compared the model's own names against the UNFOLDED set of names the statement wrote, so a folded
-    statement reported both tables in scope AND no declared join between them. That pair is not an
-    admitted gap — the section's marker is about the PREDICATE, not about existence — it is the
-    receipt stating that the model declares no relationship where the model declares one."""
+    statement reported both tables in scope AND no declared join between them — the receipt stating
+    that the model declares no relationship where the model declares one.
+
+    The fold moved with the section, in both of the places the answer passes through. The endpoints
+    of a written join go through `_tkey` before they are tested for membership, so `ORDERS` is a name
+    the model could have a declaration about rather than one it could not — without that it would
+    come back `undeclarable`, which is the same false claim in the new vocabulary and worse than the
+    old one, because `undeclarable` is SETTLED and would not even be counted on the marker. Then the
+    matching normalizes both sides as `_tkey(bare_name(...))`, so the declaration is found and the
+    join reads `declared` rather than merely being left open.
+
+    The label is still the caller's own spelling: the status is the claim, and the label is the
+    address a reader finds the join by in their own SQL.
+    """
     folded = ("SELECT c.id, SUM(amount) AS total FROM ORDERS o "
               "JOIN CUSTOMERS c ON o.customer_id = c.id GROUP BY c.id")
     sections = _sections(org, folded)
 
     assert all(t["declared"] for t in sections["tables"]["items"]), "both tables are in scope"
-    assert [j["name"] for j in sections["joins"]["items"]] == ["orders_to_customers"]
+    (join,) = sections["joins"]["items"]
+    assert join["status"] == rt.DECLARED
+    assert join["name"] == "orders_to_customers"
+    assert join["from_to"] == "ORDERS → CUSTOMERS"

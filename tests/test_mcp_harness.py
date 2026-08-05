@@ -311,7 +311,8 @@ def _write_rich_model(tmp_path):
 SQL = "SELECT c.id, SUM(amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id"
 
 
-def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
+def test_mcp_receipt_surfaces_unapproved_metric_and_the_join_the_statement_wrote(
+        monkeypatch, tmp_path):
     import pytest
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, _ = _write_rich_model(tmp_path)
@@ -323,8 +324,14 @@ def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
     rev = next(i["metric"] for i in r.columns.items
                if i["metric"] and i["metric"]["name"] == "revenue")
     assert rev["review_state"] == "unreviewed"
-    # The unreviewed join is a `review_state` on the join itself rather than a pre-rendered warning
-    # sentence, so a client can group, count and link it back to the relationship it is about.
+    # The join half. `review_state` used to be borrowed from whichever declared relationship the two
+    # in-scope tables happened to have; the section is one item per join the STATEMENT wrote now, and
+    # this predicate MATCHES that declaration, so the state the server surfaces is a state about this
+    # join rather than about the pair of tables it touches. The predicate rides beside it, which is
+    # what lets a client show the join it is asking the user to sign off on.
+    assert [j["from_to"] for j in r.joins.items] == ["orders → customers"]
+    assert [j["predicate"] for j in r.joins.items] == ["o.customer_id = c.id"]
+    assert [j["status"] for j in r.joins.items] == ["declared"]
     assert [j["review_state"] for j in r.joins.items] == ["unreviewed"]
     # The ai-written column is flagged as an assumption.
     assert any(a["column"].endswith("orders.amount") for a in r.assumptions.items)

@@ -46,6 +46,7 @@ exposure. So the analysis stays, and both the authoring and the refusing go.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -879,6 +880,19 @@ class AggregateReport:
 MULTIPLIED = "multiplied"
 NOT_MULTIPLIED = "not_multiplied"
 UNDETERMINED = "undetermined"
+
+# And the values a `joins` item's status takes, named for exactly the same reason: they are set in
+# the assembler, counted by `_joins_marker`, rendered by the chart template and asserted in the
+# battery, which is more than two surfaces.
+#
+# `UNDETERMINED` above is REUSED rather than given a fourth spelling at the same value. The two
+# sections are answering different questions — one about multiplication, one about declaration —
+# but the third state is the same state in both: the analysis could not settle it. A second
+# constant holding "undetermined" would be one more thing to keep in step and would let the two
+# drift to different strings for one meaning.
+DECLARED = "declared"
+UNDECLARED = "undeclared"
+UNDECLARABLE = "undeclarable"
 
 
 # Why the checks did not run, when they did not. `None` means they DID — the analysis reached the
@@ -2000,12 +2014,11 @@ UNDETERMINED_COLUMNS = (
 # section is now composed per receipt from what THIS statement left unestablished rather than being
 # one fixed claim about every statement. See the `tables` section in `assemble_receipt`, which builds
 # it the way `assumptions` builds its own — null when there is nothing missing.
-# ACE-059 owns comparing the join predicate against the model.
-UNDETERMINED_JOINS = (
-    "The predicate the statement actually joined on is not read out of the SQL: a relationship is "
-    "listed because the model declares it and both of its tables are in scope, not because the "
-    "statement joined on it."
-)
+# `UNDETERMINED_JOINS` stood here and is gone, for the reason `UNDETERMINED_TABLES` went. It said
+# the predicate was not read out of the SQL and that a relationship was listed because the model
+# declares it, and both halves stopped being true: the section is one item per join the STATEMENT
+# wrote, each carrying the predicate as the parser read it, and what is left unestablished about a
+# particular statement is composed per receipt by `_joins_marker`.
 # `UNDETERMINED_AGGREGATES` stood here and is gone, for the reason `UNDETERMINED_TABLES` went: it
 # was one fixed sentence about every statement, so the section could never reach the state that
 # means complete, and a section permanently marked incomplete tells a reader nothing about the
@@ -2121,6 +2134,32 @@ def _aggregates_marker(tree, reports: list[AggregateReport],
     ) if clause) or None
 
 
+def _joins_marker(items: list[dict[str, Any]], dropped: int) -> Optional[str]:
+    """What the `joins` section did NOT establish about THIS statement — null when nothing.
+
+    Composed per receipt, the way `tables` and `aggregates` compose their own, and for the same
+    reason: a section with items and a NULL marker is the positive claim "established, here it is",
+    and a sentence that ships on every statement means the section can never make it.
+
+    Only `undetermined` counts. `undeclared` and `undeclarable` are SETTLED facts — the first says
+    every declaration between those two tables was read and none of them is this join, the second
+    says an endpoint is a relation the statement bound for itself and so cannot be what any
+    declaration is about. A declaration we could NOT read reaches neither: it is our gap, it reports
+    `undetermined`, and it is counted here like any other. Counting the settled two as
+    gaps would put every statement with a join in it under a non-null marker forever, which is the
+    state the fixed sentence had and the reason it went.
+
+    Both clauses are bare COUNTS of the caller's own joins and neither names anything, so the
+    marker discloses nothing the items beside it do not already.
+    """
+    unsettled = sum(1 for item in items if item["status"] == UNDETERMINED)
+    return " ".join(clause for clause in (
+        (f"{unsettled} of the listed join(s) could not be matched against the model, so whether the "
+         "model declares them is not established." if unsettled else ""),
+        (f"{dropped} further join(s) are not listed." if dropped else ""),
+    ) if clause) or None
+
+
 def assemble_receipt(
     org: Datasource,
     sql: str,
@@ -2140,17 +2179,20 @@ def assemble_receipt(
     (`tables_used`, `relationships`, `metrics`, `named_filters`, `warnings`, `sql`), because
     `assumptions` named both a flat list and a section and one dict cannot hold both. Deleting the
     flat keys removed the collision. `warnings` is the only one with a consumer to re-point: it
-    carried one sentence per unreviewed join, which is `joins.items[].review_state != "approved"`
-    read out loud, so a surface that wants a banner derives it rather than being handed a
-    pre-rendered string it cannot filter.
+    carried one sentence per unreviewed join, which a surface derives off `joins.items[]` rather
+    than being handed a pre-rendered string it cannot filter. What it derives it from moved once
+    since: the item is one join the STATEMENT wrote, so `review_state` is null until a written join
+    is matched to a declaration and a surface reading it has to tell "not signed off" from "not
+    matched yet".
 
     A section states what it did NOT establish rather than sitting empty, because an empty list and
     an unchecked list read identically to a consumer: silence reads as clean.
 
     Deterministic, no LLM: tables come from the FROM/JOIN scope; a declared filter is "applied" when
     the reference's own scope wrote that exact predicate, and the answer is per REFERENCE because a
-    filter satisfied inside a CTE body is not satisfied for the statement reading that CTE; a
-    relationship is "used" when both endpoints are in scope; a metric is "used" when its binding SQL
+    filter satisfied inside a CTE body is not satisfied for the statement reading that CTE; a join
+    is one `exp.Join` the statement wrote, carrying the predicate the parser read and the scope it
+    was written in; a metric is "used" when its binding SQL
     appears in the query; assumptions are the load-bearing columns whose description is
     AI-written/unknown. Everything is
     metadata and statement structure — never a sampled value or a row — or the receipt becomes a
@@ -2162,7 +2204,14 @@ def assemble_receipt(
         # see UNDETERMINED_NO_PARSER.
         return {"model_version": model_version,
                 **_undetermined_sections(UNDETERMINED_NO_PARSER)}
-    tree = _parse_sql(sql, _dialect_of(org)[0])
+    # The REASON the engine could not be resolved is dropped here on purpose: every section below
+    # states what IT did not establish, and "the model does not say which engine this is" is not a
+    # fact about any one of them. It is not free, though — with `dialect=None` a backtick-quoted
+    # `on:` does not parse, so a declaration a MySQL model writes perfectly well becomes one the
+    # analysis cannot read. That lands in the unread-declaration branch of the joins loop below,
+    # which is why that branch may not report `undeclared`.
+    dialect = _dialect_of(org)[0]
+    tree = _parse_sql(sql, dialect)
     if tree is None:
         return {"model_version": model_version,
                 **_undetermined_sections(UNDETERMINED_UNPARSEABLE)}
@@ -2177,36 +2226,158 @@ def assemble_receipt(
     # attributed to a table, and attributing one to a table nothing read is the same error.
     used = {bare for bare in scope.values() if _tkey(bare) not in cte_names}
     tidx = _model_table_index(org)
+    # The names the analysis can see BEHIND: a table the model declares, minus any name the
+    # statement bound to a result of its own. Computed once and handed to both callers that need
+    # it — `_model_table_index` walks the whole model and this path runs for every executed query.
+    visible = set(tidx) - cte_names
 
-    # Folded for the same reason `_model_table_index` is: `used` holds the names the STATEMENT wrote,
-    # and Postgres and friends fold unquoted identifiers, so a raw membership test made
-    # `FROM ORDERS JOIN CUSTOMERS` report both tables in scope AND no declared relationship between
-    # them. That pair is not an admitted gap, it is a false statement — the receipt says the model
-    # declares no join where it declares one — so it folds on both sides here too.
-    used_keys = {_tkey(bare) for bare in used}
+    # ONE ITEM PER JOIN THE STATEMENT WROTE, not per declared relationship whose two tables are both
+    # in scope. The old walk described the MODEL filtered by the statement: it listed a relationship
+    # the statement never traversed as though the answer had leaned on it, and a join the statement
+    # DID write that the model does not declare was invisible — which is the one thing a reader of
+    # this section most needs to see. `_join_sites` reads the joins off the parse tree; `declared`
+    # below matches each one against a declaration, and only a MATCHED relationship fills the
+    # sign-off keys, so an item never borrows a trail from a relationship nobody matched.
+    #
+    # Capped like the reference sections, with the overflow COUNTED on the marker and never listed:
+    # this is one entry per join the CALLER's statement wrote, so its length is caller-controlled
+    # and a statement inventing hundreds of joins would amplify a small request into a large
+    # section. (`metric_items` below is exempt for the opposite reason: its length is the number of
+    # metrics the DEPLOYMENT declared.) The count is the caller's own number, so stating it
+    # discloses nothing.
+    #
+    # The cap goes IN rather than being a slice of what came back. Every join past it was resolved,
+    # serialized and reduced only to be dropped here, and how many of those there are is the
+    # caller's choice — which is the whole reason the section is capped in the first place.
+    join_sites, joins_written = _join_sites(tree, visible, _RECEIPT_MAX_REFS)
+    dropped_joins = joins_written - len(join_sites)
+    # Every relationship the model declares, through `_cardinality_index` — per subject area PLUS
+    # `org.cross_subject_area_relationships`. The old walk read only the subject areas, so a
+    # genuinely declared cross-area join was missing from a section that claimed to list declared
+    # ones. Reduced to pairs ONCE, before the loop: an `on:` costs a parse, and a statement may write
+    # up to the cap of joins against a model that may declare hundreds of edges.
+    #
+    # And not at all when the statement wrote NO join, which is the other half of the same argument
+    # and the half the hoist missed. This path runs for every executed query, the single-table
+    # statement included, and there the whole reduction — a walk of every subject area plus a
+    # sqlglot parse per `on:`-form edge — is paid to match against nothing.
+    declared_pairs = ([(rel, _declared_pairs(rel, dialect)) for rel in _cardinality_index(org)]
+                      if join_sites else [])
     join_items: list[dict[str, Any]] = []
-    for sa in org.subject_areas:
-        for r in sa.relationships:
-            if _tkey(r.from_table) in used_keys and _tkey(r.to_table) in used_keys:
-                fq = (r.from_schema + ".") if (r.cross_schema and r.from_schema) else ""
-                tq = (r.to_schema + ".") if (r.cross_schema and r.to_schema) else ""
-                join_items.append({
-                    "name": f"{r.from_table}_to_{r.to_table}",
-                    "from_to": f"{fq}{r.from_table} → {tq}{r.to_table}",
-                    "cardinality": r.relationship,
-                    "confidence": r.confidence,
-                    # The sign-off state a consumer filters on to raise its own unreviewed-join
-                    # banner. It replaced a pre-rendered `warnings` sentence per unreviewed join,
-                    # which said strictly less: a string cannot be grouped, counted or linked back
-                    # to the relationship it is about.
-                    "review_state": r.review_state,
-                    "origin": "fk" if r.confidence == "confirmed" else "introspect_heuristic",
-                    "signed_off_by": r.signed_off_by,
-                    "signed_off_role": r.signed_off_role,
-                    "signed_off_at": r.signed_off_at,
-                    "cross_schema": r.cross_schema,
-                    "on": r.on,
-                })
+    for js in join_sites:
+        match: Optional[Relationship] = None
+        if not js.right_declarable:
+            # An endpoint the STATEMENT bound — a CTE name, a derived table, a `VALUES` list, a CTE
+            # shadowing a declared table — cannot be what any declaration is about, so this is
+            # settled rather than open: there is nothing here for a better analysis to establish
+            # later. The RIGHT endpoint is asked first because it is the one always established —
+            # it comes off `join.this`, the join's own right input — so a structural impossibility
+            # there outranks everything below however little the ON said.
+            status = UNDECLARABLE
+        elif not js.pinned:
+            # The ON did not reduce to a pair of endpoints. Unlike the branch above this is a fact
+            # about the ANALYSIS, so it stays open and `_joins_marker` counts it: reporting it
+            # `undeclarable` would claim the model cannot declare a join it may well declare, and
+            # would let the marker reach null with something genuinely unestablished under it.
+            status = UNDETERMINED
+        elif not js.left_declarable:
+            # And only NOW is the left endpoint worth asking about, because only now is it one the
+            # analysis established. Until the ON pins, `left` holds the FROM fallback, which is a
+            # LABEL — the address a reader needs to find the join in their own SQL — and reading a
+            # settled status off it made the FROM decide the question: the same unreadable ON came
+            # back `undetermined` over `FROM orders` and `undeclarable` over `FROM (SELECT …) d`,
+            # the second under a null marker, and the FROM relation need not be party to the join at
+            # all.
+            status = UNDECLARABLE
+        elif js.predicate is None and js.node.args.get("kind") == "CROSS":
+            # It wrote no predicate, which is a fact about the statement and not a gap in the
+            # analysis: there is nothing here for a declaration to match.
+            #
+            # `kind` is the ONLY thing separating this settled status from the open one two branches
+            # down, where the comma join lands. The battery is what pins that distinction: the
+            # sqlglot pin is an open `>=`, and a future version that normalized `FROM a, b` to a
+            # `CROSS` kind would move every comma join from `undetermined` to a settled claim that
+            # the model does not declare it — silently, since both shapes already report a null
+            # predicate. `test_the_comma_join_is_undetermined_and_reports_no_predicate` fails first.
+            status = UNDECLARED
+        elif not js.pairs:
+            # Two shapes reach here and both leave the question open. The comma join
+            # (`FROM a, b WHERE a.id = b.id`) wrote its predicate into the WHERE, and attributing a
+            # WHERE conjunct to a join is an implication check ACE-099 ruled out. The other is an ON
+            # nothing in reduced to a pair of columns — a join on an expression, or on an
+            # unqualified column this layer will not guess the table of. Neither is evidence that
+            # the model does not declare the join, which is what `undeclared` would assert.
+            status = UNDETERMINED
+        else:
+            # The written pairs against the declared ones, DECLARED-AS-A-SUBSET: extra conjuncts an
+            # author added — the as-of and soft-delete shapes — do not weaken the match, which is the
+            # stance ACE-099 shipped for declared filters, so a reader comparing `tables` and `joins`
+            # sees one rule and not two. First match in `_cardinality_index`'s own list order, so the
+            # same statement names the same relationship on every run (REQ-022).
+            #
+            # The two sides are reduced ASYMMETRICALLY and that is the whole design. The WRITTEN side
+            # is lossy on purpose — a conjunct the SQL author added beyond the declared join is not a
+            # reason to withhold the match. The DECLARED side may not be: a declaration reduced to a
+            # subset of itself would match a statement that never wrote the rest of it. So
+            # `_declared_pairs` returns None rather than a partial reduction, which is what makes
+            # `pairs is not None` here a filter and not a formality.
+            match = next((rel for rel, pairs in declared_pairs
+                          if pairs is not None and pairs <= js.pairs), None)
+            if match is not None:
+                status = DECLARED
+            elif any(pairs is None and _rel_tables(rel) == {_tkey(js.endpoints[0]),
+                                                           _tkey(js.endpoints[1])}
+                     for rel, pairs in declared_pairs):
+                # Nothing matched, and a declaration between THESE TWO TABLES is one we could not
+                # read — an `on:` that will not parse, one carrying a bind marker, one that did not
+                # reduce whole. `undeclared` would tell the reader "the model does not declare this
+                # join" on the strength of our own failure to read the model, and send a model
+                # author off to add an edge they already have. It is our gap, so it stays open and
+                # the marker counts it.
+                #
+                # Scoped to declarations touching BOTH endpoints, because an unreadable edge
+                # elsewhere in the model says nothing about this join and would otherwise make every
+                # join in every statement unanswerable.
+                status = UNDETERMINED
+            else:
+                status = UNDECLARED
+        # Everything a DECLARATION contributes, and null on every other status: an item that matched
+        # nothing must assert nothing about a relationship it did not match, which is the defect the
+        # per-relationship build had — it printed a signed-off trail beside a join written on the
+        # wrong column. Composed as one dict so both branches carry the identical key set.
+        signoff: dict[str, Any] = {key: None for key in (
+            "name", "cardinality", "confidence", "origin", "review_state", "signed_off_by",
+            "signed_off_role", "signed_off_at", "cross_schema", "on")}
+        if match is not None:
+            signoff = {
+                "name": f"{match.from_table}_to_{match.to_table}",
+                "cardinality": match.relationship,
+                "confidence": match.confidence,
+                # A confirmed relationship is one the DATABASE declares as a foreign key; anything
+                # else was proposed by introspection and is a guess until someone signs it off.
+                "origin": "fk" if match.confidence == "confirmed" else "introspect_heuristic",
+                # The sign-off state a consumer filters on to raise its own unreviewed-join banner.
+                "review_state": match.review_state,
+                "signed_off_by": match.signed_off_by,
+                "signed_off_role": match.signed_off_role,
+                "signed_off_at": match.signed_off_at,
+                "cross_schema": match.cross_schema,
+                "on": match.on,
+            }
+        left, right = js.endpoints
+        join_items.append({
+            "predicate": js.predicate,
+            "scope": js.scope,
+            "status": status,
+            # Composed from the names the STATEMENT wrote rather than the model's own spelling, so
+            # both halves take the same per-name bound every other caller-written label in the
+            # receipt takes: the receipt is tool output the calling model weights as
+            # server-authored, and a quoted identifier can hold any string at all.
+            "from_to": f"{_echo_name(left)} → {_echo_name(right)}",
+            # The keys are the ones the relationship-keyed item already carried, so a consumer
+            # reading `review_state` off a join keeps reading it off the same key.
+            **signoff,
+        })
 
     # Metrics carry their own `review_state` for the approve/change banner, for the same reason
     # joins do.
@@ -2477,7 +2648,7 @@ def assemble_receipt(
     # of the caller's own expressions either way, so stating it discloses nothing.
     # `visible` is handed in rather than rebuilt: both halves are already in hand here, and
     # `_model_table_index` walks the whole model.
-    reports = _aggregate_reports(tree, org, ctx=None, visible=set(tidx) - cte_names)
+    reports = _aggregate_reports(tree, org, ctx=None, visible=visible)
     dropped_aggregates = max(0, len(reports) - _RECEIPT_MAX_REFS)
     aggregate_items: list[dict[str, Any]] = [
         r.as_dict() for r in reports[:_RECEIPT_MAX_REFS]
@@ -2530,7 +2701,10 @@ def assemble_receipt(
                 (f"{dropped_refs} further reference(s) are not listed." if dropped_refs else ""),
             ) if clause) or None,
         },
-        "joins": {"items": join_items, "undetermined": UNDETERMINED_JOINS},
+        # One item per join the statement wrote, under a marker composed from what THIS statement
+        # left unestablished rather than one fixed claim about every statement — see `_joins_marker`
+        # for why only `undetermined` counts and what that buys.
+        "joins": {"items": join_items, "undetermined": _joins_marker(join_items, dropped_joins)},
         # The four analyses that used to REFUSE. They describe now, and this is where they land,
         # one item per aggregate. The marker is composed from what THIS statement left
         # unestablished rather than being one fixed claim about every statement — see
@@ -2826,16 +3000,36 @@ def _reference_sites(node: "exp.Expression") -> list[_RefSite]:
     sites: list[_RefSite] = []
     for tbl in node.find_all(exp.Table):
         written = ".".join(p for p in (tbl.catalog, tbl.db, tbl.name) if p)
-        sel = _enclosing_select(tbl)
-        arm = arm_suffixes.get(id(sel), "") if sel is not None else ""
-        if sel is not None and id(sel) in cte_scopes:
-            scope = "cte:" + _echo_name(cte_scopes[id(sel)]) + arm
-        elif sel is not None and (sel is node or id(sel) in output_ids):
-            scope = "main" + arm
-        else:
-            scope = "subquery"
+        scope = _scope_label(_enclosing_select(tbl), node, cte_scopes, arm_suffixes, output_ids)
         sites.append(_RefSite(TableRef(written, tbl.name, tbl.alias or None, scope), tbl))
     return sites
+
+
+def _scope_label(sel: "exp.Select | None", root: "exp.Expression",
+                 cte_scopes: dict[int, str], arm_suffixes: dict[int, str],
+                 output_ids: set[int]) -> str:
+    """Which query scope a node was written in: `cte:<name>`, `main`, or `subquery`, plus the arm
+    ordinal where there is one. The vocabulary is `TableRef.scope`'s, documented there.
+
+    One composition for every kind of node that carries a scope. A table reference and a join both
+    answer this question, and two spellings of the answer would drift — a reader could then no
+    longer join the `tables` and `joins` sections on the label, which is the whole reason the label
+    is on both.
+
+    The branch ORDER is load-bearing. A CTE body's output select is also an output select of the
+    statement when the CTE is the last thing in the WITH chain, so `cte:` has to be tested first or
+    a join inside a CTE would report `main`. And `subquery` deliberately takes NO arm suffix: a
+    label that says "we did not name this scope" must not then claim to know which of its arms you
+    are in.
+    """
+    arm = arm_suffixes.get(id(sel), "") if sel is not None else ""
+    if sel is not None and id(sel) in cte_scopes:
+        # CALLER-written text: a quoted identifier can hold any string at all, and this label lands
+        # in a receipt, which is tool output the calling model weights as server-authored.
+        return "cte:" + _echo_name(cte_scopes[id(sel)]) + arm
+    if sel is not None and (sel is root or id(sel) in output_ids):
+        return "main" + arm
+    return "subquery"
 
 
 def _table_references(node: "exp.Expression") -> list[TableRef]:
@@ -2875,6 +3069,369 @@ def _alias_map(node: "exp.Expression") -> dict[str, str]:
     arm decide the other arm's fan-trap and sensitive-projection results.
     """
     return {(r.alias or r.bare): r.bare for r in _table_references(node)}
+
+
+def _own_alias_map(sel: "exp.Select | None") -> dict[str, str]:
+    """alias (or table name) -> bare table name, for the sources THIS SELECT reads ITSELF.
+
+    `_alias_map` above is the whole-SUBTREE form and stays that way: the fan/chasm and
+    sensitive-projection callers resolve a column qualifier through it, and rescoping it would
+    change which references they resolve. It is the wrong map for a join, and not by a little.
+    Handed the outer SELECT it also returns every table referenced inside a CTE body or a nested
+    subquery, as a LAST-WINS dict — so in
+    `WITH t AS (SELECT … FROM orders o) SELECT … FROM t o JOIN customers c ON o.customer_id = c.id`
+    the CTE body's `o` overwrites the outer one and the join's left endpoint resolves to `orders`, a
+    table that join never touched. The item then reports `declared` under the sign-off of a
+    relationship declared on `orders`, which is the exact false receipt this section exists to
+    remove. It leaks the other way too, from a subquery beside the join into the scope holding it.
+
+    A source belongs to this SELECT iff its nearest enclosing SELECT is this SELECT — the same test
+    `_direct_from_tables` makes, for the same reason. A relation the statement COMPUTED (a derived
+    table, a `VALUES` list) is not an `exp.Table` and so is absent here on purpose: a qualifier
+    naming one then resolves to itself, which is the name the endpoint walk and the receipt's label
+    both want for it.
+
+    That test is made by STOPPING at the boundary rather than by walking past it and filtering.
+    "Its nearest enclosing SELECT is this one" and "reachable from this one without crossing another
+    SELECT" describe the same set of tables, so the two forms agree on every statement — but the
+    filtering form walked this SELECT's WHOLE subtree, once per enclosing SELECT, and how deeply
+    SELECTs nest is the caller's choice. On a statement of 110 nested derived tables that product
+    was the receipt's dominant cost, several times the parse it was describing. Pruning makes each
+    SELECT pay for its own region only, so the walk across all of them is linear in the tree.
+
+    `walk` yields the node it prunes at, hence the `isinstance` on the way out: the nested SELECT
+    itself comes back, and it is not a table reference.
+    """
+    if sel is None:
+        return {}
+    boundary = sel.walk(prune=lambda node: isinstance(node, exp.Select) and node is not sel)
+    return {(tbl.alias or tbl.name): tbl.name
+            for tbl in boundary if isinstance(tbl, exp.Table)}
+
+
+def _computed_relations(sel: "exp.Select | None") -> frozenset[str]:
+    """The names THIS SELECT binds to a relation it COMPUTED, folded through `_tkey`.
+
+    The complement of `_own_alias_map` over the same sources: a derived table, a `VALUES` list —
+    anything a FROM or a JOIN introduces that is not an `exp.Table`. All the statement gave it is an
+    alias, and an alias may be spelled exactly like a table the model declares:
+
+        SELECT o.id FROM orders o JOIN (SELECT 1 AS id) AS customers ON o.customer_id = customers.id
+
+    Deciding declarability on that STRING reads `customers` as the model's own, so the join reports
+    `declared` and carries the sign-off of a relationship between two tables, one of which the
+    statement never read. `visible` already subtracts the statement's CTE names, which is the same
+    hazard in the one syntax that happens to be named; this is the rest of them. Deciding it
+    STRUCTURALLY — is this endpoint's source a table REFERENCE — leaves no name for an alias to
+    collide with.
+
+    Folded through `_tkey` because `visible` is: a scope that refused `customers` while admitting
+    `Customers` would be answering one question two ways.
+    """
+    if sel is None:
+        return frozenset()
+    return frozenset(
+        _tkey(child.this.alias_or_name)
+        for child in sel.iter_expressions()
+        if isinstance(child, (exp.From, exp.Join))
+        and child.this is not None and not isinstance(child.this, exp.Table))
+
+
+class _JoinSite(NamedTuple):
+    """One join the statement WROTE, beside the `exp.Join` node it was read from.
+
+    Internal, and the node stays here rather than on the receipt item for the reason `_RefSite`
+    keeps its node off `TableRef`: the item is rendered into tool output, and a parse-tree node is
+    neither renderable nor meaningful to a reader. What needs the node is the assembler, which asks
+    it one further question (`kind`) to tell an explicit CROSS JOIN from a comma join.
+    """
+
+    node: "exp.Join"
+    # The condition the join WROTE, as the parser read it and bounded — an ON, a `USING` column
+    # list, or `NATURAL`; see `_join_condition`. `None` means it wrote no condition of its own,
+    # which is a different fact from a condition this layer failed to render and has to stay
+    # tellable apart.
+    predicate: Optional[str]
+    scope: str  # `_scope_label`'s vocabulary, the same one `TableRef.scope` carries.
+    # The two relations the join brings together, named as the enclosing scope names them: a bare
+    # table name where the reference resolves to one, and otherwise whatever the statement bound
+    # (a CTE name, a derived table's alias). Unbounded here; the assembler bounds them where it
+    # composes the label, the way every other caller-written name in the receipt is bounded.
+    endpoints: tuple[str, str]
+    # Whether each endpoint is one the MODEL could have a declaration about. False for a relation
+    # the statement bound for itself — a CTE, a derived table, a `VALUES` list, a CTE shadowing a
+    # declared table. A SETTLED structural fact: no declaration will ever be about a relation the
+    # statement invented, however the analysis improves.
+    #
+    # Kept PER ENDPOINT because the two are established differently. `right` comes from `join.this`,
+    # which is the join's own right input and is therefore always established. `left` is only
+    # established when the ON pinned it — see `pinned` — and until then it holds the FROM fallback,
+    # which is a LABEL and not a resolution. One combined flag folded those together and let a join
+    # whose ON we could not read reach a settled status off a relation we never established was
+    # party to it.
+    left_declarable: bool
+    right_declarable: bool
+    # Whether the ON reduced to a pair of endpoints. False for a compound ON reaching over three or
+    # more relations, and for one naming no column at all. That is a failure of THIS ANALYSIS rather
+    # than a fact about the statement — the model may well declare the join — and the two are kept
+    # apart because the assembler turns the first into a settled status and the second into an open
+    # one, and `_joins_marker` counts only the open ones.
+    pinned: bool
+    # The written ON reduced to the column pairs it joins on — see `_predicate_pairs` for the shape
+    # and why it is that shape. Empty when the join wrote no ON at all, and empty when nothing in
+    # the ON reduced to a pair; the assembler reads both as "not established" rather than as "the
+    # model does not declare this", because a predicate we could not read is not a predicate the
+    # model failed to declare.
+    pairs: frozenset[frozenset[tuple[str, str]]]
+
+
+def _predicate_pairs(pred: "exp.Expression",
+                     scope_map: dict[str, str]) -> frozenset[frozenset[tuple[str, str]]]:
+    """One predicate reduced to the column pairs it joins on — the shape both sides compare in.
+
+    An equality between two columns is one pair and everything else in the predicate is dropped,
+    because nothing else is a join. Each pair is a FROZENSET of its two `(table, column)` endpoints,
+    which is what makes reversed operand order match: a declared FK points from the many side to the
+    one side, the author of the SQL has no reason to write it that way round, and an ordered
+    comparison would report a blessed join as unblessed on operand order alone.
+
+    `scope_map` resolves a qualifier to the relation it names — for a written ON that is the
+    enclosing SELECT's OWN sources (`_own_alias_map`) and never the subtree-wide `_alias_map`, so
+    one arm of a UNION cannot resolve through the other arm's tables and an outer join cannot
+    resolve through a CTE body's; for declared text it is empty, because a declaration names its
+    tables directly. Both endpoints normalize through `_tkey(_bare(...))`: `_tkey` folds case
+    without stripping a schema and `_bare` strips a schema without folding case, so a relationship
+    declared on `sales.orders` and a statement writing `ORDERS` need both to meet.
+
+    A column with no qualifier contributes nothing. The pair would name a relation this layer did
+    not resolve, and a pair naming the wrong table is not a weaker fact than no pair — it is a false
+    one, and it would match a declaration the statement did not write.
+
+    `_and_conjuncts` is the flattener, and it is iterative for a reason this call site inherits: a
+    wide AND walked recursively raises `RecursionError` out of the assembler, which takes every
+    section of the receipt down with it for a statement the engine ran without complaint.
+    """
+    pairs: set[frozenset[tuple[str, str]]] = set()
+    for conj in _and_conjuncts(pred):
+        if not isinstance(conj, exp.EQ):
+            continue
+        lhs, rhs = conj.this, conj.expression
+        if not (isinstance(lhs, exp.Column) and isinstance(rhs, exp.Column)):
+            continue
+        if not (lhs.table and rhs.table):
+            continue
+        pairs.add(frozenset({
+            (_tkey(_bare(scope_map.get(lhs.table, lhs.table))), lhs.name.lower()),
+            (_tkey(_bare(scope_map.get(rhs.table, rhs.table))), rhs.name.lower()),
+        }))
+    return frozenset(pairs)
+
+
+def _declared_pairs(rel: Relationship,
+                    dialect: "str | None") -> "frozenset[frozenset[tuple[str, str]]] | None":
+    """One declared relationship in that same shape, or None when no comparison can be made from it.
+
+    The FK form yields exactly one pair, because `Relationship`'s validator admits either the column
+    pair or the `on:` escape hatch and never both — so a composite join reaches the matching only
+    through `on:`, which yields one pair per equality conjunct.
+
+    None rather than an exception, and None rather than an empty set, on the module's usual posture:
+    `Relationship.on` is model-author text that nothing validates as SQL, so an `on:` that will not
+    parse is a thing that happens, and a receipt that raises on one is a receipt the caller never
+    sees. A `:param` a model author left for an executor to fill is the case that would fail
+    SILENTLY rather than loudly: a bind marker is not a column, so the conjunct holding it drops out
+    of the pairs and what remains would match a statement that never wrote its condition. Both
+    degrade to "this relationship matches nothing".
+
+    What that degradation costs is NOT only a `declared` we cannot justify. The assembler asks this
+    of every declaration and then reports a join nothing matched as `undeclared` — a settled claim
+    that the model does not declare it, made on the strength of our own failure to read the model.
+    So the caller keeps a record of WHICH declarations came back None and routes a join whose two
+    tables one of them is about to `undetermined` instead.
+    """
+    if rel.from_column is not None and rel.to_column is not None:
+        return frozenset({frozenset({
+            (_tkey(_bare(rel.from_table)), rel.from_column.lower()),
+            (_tkey(_bare(rel.to_table)), rel.to_column.lower()),
+        })})
+    return _reduced_on(rel.on or "", dialect)
+
+
+@functools.lru_cache(maxsize=1024)
+def _reduced_on(text: str, dialect: "str | None") -> "frozenset[frozenset[tuple[str, str]]] | None":
+    """The `on:` half of `_declared_pairs`, remembered across requests.
+
+    A pure function of MODEL-author text and the engine it is read in — the two arguments are
+    everything it looks at — and model text does not change between requests, while `assemble_receipt`
+    runs on the `ok` path of every executed query and reduces every declaration the model holds.
+    Each `on:` costs a sqlglot parse, so on a model that declares its edges through this hatch rather
+    than as column pairs the reduction was the receipt: 18 ms of it against 0.6 ms for the same
+    statement over the same number of FK-form edges. The FK form above stays uncached because it
+    builds a dict and parses nothing.
+
+    Returns a FROZENSET or None, so a cached answer is not a shared object a later caller can
+    mutate out from under an earlier one. Bounded rather than unbounded because the keys are a
+    deployment's model text and a process may serve more than one deployment.
+    """
+    if _BIND_MARKER.search(text):
+        return None
+    predicate = _parse_declared_predicate(text, dialect)
+    if predicate is None:
+        return None
+    # And refused whenever the reduction lost anything, which is the general form of the bind-marker
+    # guard above rather than a second rule. `_predicate_pairs` keeps equalities between two
+    # qualified columns and drops the rest, so `orders.region_id = regions.id AND regions.name =
+    # 'EU'` reduces to the unrestricted half of itself — and that half matches a statement that
+    # wrote no restriction at all, under the whole declared predicate printed beside it. Every
+    # top-level conjunct has to survive or none of them counts. `IS NULL`, an inequality and a
+    # function call are the same case as the bind marker in three other spellings.
+    reduced = [_predicate_pairs(conj, {}) for conj in _and_conjuncts(predicate)]
+    if not reduced or not all(reduced):
+        return None
+    return frozenset().union(*reduced)
+
+
+def _join_condition(join: "exp.Join") -> "str | None":
+    """The condition THIS join wrote, serialized for a label — None when it wrote none.
+
+    Three spellings rather than one. Reading `args["on"]` alone reported `USING (id)` and
+    `NATURAL JOIN` as conditionless, and a null predicate is not a quiet field: the receipt panel
+    turns it into "this join wrote no condition of its own", which is a false statement about a join
+    that plainly wrote one. `USING` puts its columns on `args["using"]`; a natural join carries no
+    column list at all, its condition being every column the two relations share, so the label says
+    that much and no more.
+
+    Bounded through `_echo_expr`, the same bound the ON takes: a `USING` column list is
+    caller-written text and the receipt is tool output the calling model weights as server-authored.
+    """
+    on = join.args.get("on")
+    if on is not None:
+        # The ON is serialized as a FRAGMENT for a label — see `_aggregate_sites` for the whole of
+        # that argument, and `tests/test_ace093_byte_identity.py` for where it is spent.
+        return _echo_expr(on.sql())
+    using = join.args.get("using")
+    if using:
+        return _echo_expr("USING (" + ", ".join(col.sql() for col in using) + ")")
+    if join.args.get("method") == "NATURAL":
+        return "NATURAL"
+    return None
+
+
+def _rel_tables(rel: Relationship) -> frozenset[str]:
+    """The two tables a declaration is between, keyed the way a join's endpoints are.
+
+    `_bare` strips a schema without folding case and `_tkey` folds case without stripping one, which
+    is the pairing `_declared_pairs` normalizes its own endpoints through: a declaration on
+    `public.regions` and a statement writing `REGIONS` need both to meet. A FROZENSET because a
+    declared edge has a direction the author of the SQL never sees, and a set of one is the
+    self-edge.
+    """
+    return frozenset({_tkey(_bare(rel.from_table)), _tkey(_bare(rel.to_table))})
+
+
+def _relation_name(rel: "exp.Expression") -> str:
+    """The name an ON clause's qualifiers would use for one side of a join.
+
+    A table reference is known by its BARE name, because that is what `_alias_map` resolves a
+    qualifier to; anything else the statement can join to — a derived table, a lateral — is known
+    only by the alias it was given, which is the same string the qualifier carries.
+    """
+    return rel.name if isinstance(rel, exp.Table) else rel.alias_or_name
+
+
+def _join_sites(node: "exp.Expression", visible: set[str],
+                limit: int) -> "tuple[list[_JoinSite], int]":
+    """The one walk of `exp.Join`: the first `limit` joins the STATEMENT wrote, resolved to their
+    scope, beside the number of joins it wrote in total.
+
+    Over `find_all(exp.Join)` rather than each SELECT's own `joins` argument. That argument is
+    per-SELECT, so reading it off the statement root finds the outer joins and silently misses
+    every join written inside a CTE body or a subquery — which is exactly the shape a receipt has
+    to describe, because a fan inside a CTE reaches the number the caller reads.
+
+    `visible` is the names the analysis can see behind: a table the MODEL declares, minus any name
+    the statement bound to a result of its own. It is the same set `_aggregate_reports` takes and
+    for the same reason — a CTE alias, a derived table and a CTE shadowing a declared table are one
+    case, a name the statement invented, and no declaration in the model is about any of them.
+
+    The alias map is the enclosing SELECT's OWN sources — `_own_alias_map`, never `_alias_map`. One
+    arm of a UNION must not resolve a qualifier through the other arm's tables; a join in a CTE body
+    must not resolve through the outer query's; and, the case the subtree-wide map got wrong, an
+    outer join must not resolve through a CTE body's or a nested subquery's, which is where a
+    last-wins map hands one alias the wrong relation entirely. It is memoized by `id(sel)` because a
+    statement may write up to the receipt's cap of joins into one SELECT and each lookup would
+    otherwise re-walk that SELECT's whole subtree — and by `id()` rather than by the node because exp
+    nodes hash by STRUCTURE, so two identically written arms would collide.
+
+    `limit` is the receipt's own cap, applied HERE rather than by slicing the result. The caller
+    lists that many items and reports the rest as a count, so every site past the cap was built and
+    thrown away — a scope map, a serialized predicate and a reduction each, on a list whose length
+    is the CALLER's to choose. WHICH joins are listed and how many were dropped are unchanged: the
+    walk order is the same, the survivors are the same prefix of it, and the total returned beside
+    them is counted over every join whether or not a site was built for it.
+    """
+    cte_scopes = _cte_body_scopes(node)
+    arm_suffixes = _arm_suffixes(node)
+    output_ids = {id(sel) for sel in _output_selects(node)}
+    scopes: dict[int, tuple[dict[str, str], frozenset[str]]] = {}
+    sites: list[_JoinSite] = []
+    written = 0
+    for join in node.find_all(exp.Join):
+        written += 1
+        if len(sites) >= limit:
+            # Counted and nothing more. The walk still has to finish, because the number of joins
+            # the statement wrote is what the caller's "further join(s) are not listed" clause
+            # states, and a count of the ones we happened to build is not that number.
+            continue
+        sel = _enclosing_select(join)
+        if id(sel) not in scopes:
+            scopes[id(sel)] = (_own_alias_map(sel), _computed_relations(sel))
+        scope_map, computed = scopes[id(sel)]
+        on = join.args.get("on")
+        right = _relation_name(join.this)
+        # The join's LEFT input, when the ON does not say which relation it is: whatever the FROM
+        # introduced. `iter_expressions` yields this SELECT's own children, so a FROM belonging to a
+        # subquery underneath it cannot be picked up by mistake.
+        frm = next((child for child in sel.iter_expressions() if isinstance(child, exp.From)),
+                   None) if sel is not None else None
+        left = _relation_name(frm.this) if frm is not None else ""
+        pinned = True
+        if on is not None:
+            names = {scope_map.get(col.table, col.table)
+                     for col in on.find_all(exp.Column) if col.table}
+            # A join reaches between two relations, so its ON names the right-hand one and at most
+            # one other; zero others is the self-join, where both endpoints are that one relation.
+            # A compound ON reaching back over several tables, or one naming no column at all, is a
+            # shape this layer cannot reduce to a pair — it says so rather than picking one. The
+            # FROM relation still labels the item, because a reader needs to find the join in their
+            # own SQL whatever the status says about it. Sorted because it is a set and the receipt
+            # has to be the same receipt on every run (REQ-022).
+            others = sorted(names - {right})
+            pinned = right in names and len(others) <= 1
+            if pinned:
+                left = others[0] if others else right
+        # An EMPTY left is no endpoint at all rather than a name we happen to dislike: there was no
+        # enclosing SELECT to read a FROM from, or the FROM introduced an unaliased derived table,
+        # which has no name for a qualifier to use. The item renders one side of the label blank and
+        # says so; a status settled off it would be a claim about a relation the receipt cannot name.
+        pinned = pinned and bool(left)
+        sites.append(_JoinSite(
+            node=join,
+            predicate=_join_condition(join),
+            scope=_scope_label(sel, node, cte_scopes, arm_suffixes, output_ids),
+            endpoints=(left, right),
+            # STRUCTURAL on the right, where the source node is in hand: only a table REFERENCE can
+            # be what a declaration is about, so a derived table or a `VALUES` list aliased with a
+            # declared table's name cannot pass by spelling. The left endpoint is a NAME by the time
+            # it is known — resolved out of the ON through the scope map — so its structural half is
+            # `computed`, the names this SELECT bound to relations of its own.
+            left_declarable=_tkey(left) not in computed and _tkey(left) in visible,
+            right_declarable=isinstance(join.this, exp.Table) and _tkey(right) in visible,
+            pinned=pinned,
+            # Resolved through THIS join's own enclosing scope, which is the map already in hand.
+            pairs=_predicate_pairs(on, scope_map) if on is not None else frozenset(),
+        ))
+    return sites, written
 
 
 class _AggSite(NamedTuple):
