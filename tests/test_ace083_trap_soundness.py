@@ -12,10 +12,19 @@ number into `not_multiplied`, which is a positive claim on the receipt that the 
 Nothing on `main` fails when that happens. So the reverse corpus lands FIRST, in its own file,
 before a line of production code moves.
 
-The reverse corpus passes on the base implementation. That is the point: those are not the tests for
-the new behaviour, they are the tests for the behaviour that must survive it. The batteries below it
-are the per-slice tests of what each correction actually changed, and they land beside the corpus
+Almost every member of the reverse corpus passes on the base implementation, and that is the point:
+those are not the tests for the new behaviour, they are the tests for the behaviour that must
+survive it. Three members do fail on base — the unaliased `VALUES` list and the two set operations
+whose CTE is bound above the arms — and each of those was a false clean measured on base while this
+slice was being built, so they are corpus members and regression tests at once. The batteries below
+the corpus are the per-slice tests of what each correction actually changed, and they land beside it
 rather than in files of their own so that a loosening and the pins guarding it are read together.
+
+The corpus rows carry the ITEMS each statement is known to inflate rather than only the SQL, because
+the property asserted over every aggregate in a statement can only hold members every one of whose
+arms is inflated. That shut out the mixed statements — one sound number beside one unsound one —
+that most real multi-aggregate SQL is, and a rule that suppresses per STATEMENT rather than per ITEM
+is invisible until one of those is in the corpus.
 
 Slice 2 (S1) is here: an aggregate a duplication cannot move keeps the multiplication and loses the
 word trap, and the marker sentence that reported the detector's old shortcoming is deleted.
@@ -116,22 +125,190 @@ UNALIASED_VALUES_FAN = "SELECT SUM(orders.total_amount) FROM orders, (VALUES (1)
 
 # 9. Members 6 and 1, wrapped in a set operation. A WITH sits ABOVE the arms and binds its name for
 #    all of them, so an arm looking for the CTE inside itself finds nothing and the laundered fan
-#    goes unseen — the same statement, one keyword further out, reading clean. Both arms are
-#    inflated so the corpus property stays unconditional over every item the statement produces.
+#    goes unseen — the same statement, one keyword further out, reading clean.
 UNION_ARM_CTE_FAN = f"{CTE_LAUNDERED_FAN} UNION ALL {PLAIN_FAN}"
 
-# The corpus, named so the later slices can re-run it unchanged rather than restating it. Labels
-# are what a failure prints, so they name the disguise and not the SQL.
+# 10. The same set operation with ONE inflated arm and one honest one, which is what most real
+#     multi-aggregate SQL looks like. It could not be a member while the property ran over every
+#     item in the statement — that constraint is why member 9 had to be built out of two inflated
+#     arms — and it is the shape that says the laundered arm is found without the clean arm being
+#     dragged in with it.
+MIXED_SET_OPERATION = f"{CTE_LAUNDERED_FAN} UNION ALL SELECT SUM(orders.revenue) FROM orders"
+
+# 11, 12. The same fan spelled two ways nothing else here spells it. The edge comes off the model's
+#     declared relationship rather than off the JOIN keyword, so neither of these should differ from
+#     member 1 — and until now nothing said so, which is what makes a rule keyed on `exp.Join`
+#     cheap to write by accident.
+COMMA_JOIN_FAN = ("SELECT SUM(orders.total_amount) FROM orders, order_items "
+                  "WHERE order_items.order_id = orders.id")
+LEFT_JOIN_FAN = ("SELECT SUM(orders.total_amount) FROM orders "
+                 "LEFT JOIN order_items ON order_items.order_id = orders.id")
+
+# 13. Member 5 turned around: the derived table is on the ONE side and the many side is the plain
+#     declared table. `t` binds a name the `exp.Table` walk never sees, so the measure's own source
+#     is what goes unresolved here rather than the fanning one.
+DERIVED_TABLE_ON_THE_ONE_SIDE = ("SELECT SUM(t.total_amount) FROM (SELECT * FROM orders) t "
+                                 "JOIN order_items ON order_items.order_id = t.id")
+
+# 14-17. A ONE-side column off the value path. Members 3 and 4 move the MANY side around; these move
+#     the one side, and that is the only direction that can manufacture a clean answer — a value
+#     path narrowed until it holds no one-side column stops the aggregate reading the one side at
+#     all, so the fan loop never reaches it and a total the join really does inflate reports sound.
+#     Each was measured `not_multiplied` while the value path decided `sources`.
+ONE_SIDE_IN_A_CASE_PREDICATE = (
+    f"SELECT SUM(CASE WHEN orders.status = 'shipped' THEN 1 ELSE 0 END) {FAN_JOIN}"
+)
+ONE_SIDE_AS_A_SIMPLE_CASE_OPERAND = (
+    f"SELECT SUM(CASE orders.status WHEN 'shipped' THEN 1 ELSE 0 END) {FAN_JOIN}"
+)
+ONE_SIDE_IN_A_CONDITIONAL_COUNT = (
+    f"SELECT COUNT(CASE WHEN orders.status = 'shipped' THEN 1 END) {FAN_JOIN}"
+)
+BRANCHES_DISAGREEING_ABOUT_THE_GRAIN = (
+    f"SELECT SUM(CASE WHEN orders.flag THEN orders.total_amount "
+    f"ELSE order_items.quantity END) {FAN_JOIN}"
+)
+
+# 18-21. The same defect reached through a node that is not an `exp.Case`. Which sqlglot node type
+#     spells a conditional is exactly what the value-path rule is scoped by, and members 1-9 vary it
+#     not at all: `IF` is an `exp.If` that RENDERS back as a CASE, `NULLIF` and `COALESCE` are
+#     functions whose arguments are not all values, and a `GROUP_CONCAT` separator is punctuation.
+#     For a node that only combines values, contributing its columns by default is honest; for one
+#     that mixes a predicate with its values it contributes the predicate that clears the fan.
+IF_SPELLED_CONDITIONAL_FAN = (
+    f"SELECT SUM(IF(order_items.quantity > 0, orders.total_amount, 0)) {FAN_JOIN}"
+)
+NULLIF_COMPARAND_FAN = f"SELECT SUM(NULLIF(orders.total_amount, order_items.quantity)) {FAN_JOIN}"
+COALESCE_ALTERNATION_FAN = (
+    f"SELECT SUM(COALESCE(orders.total_amount, order_items.quantity)) {FAN_JOIN}"
+)
+SEPARATOR_OFF_THE_MANY_SIDE_FAN = (
+    f"SELECT STRING_AGG(orders.status, order_items.product_id) {FAN_JOIN}"
+)
+
+# Two fans off ONE dimension, the other thing members 1-9 never vary: how many many-sides a measure
+# table has. Every one of them is a single declared one-to-many, so a rule that suppresses per
+# STATEMENT and a rule that suppresses per EDGE are indistinguishable on all nine.
+TWO_FAN_JOIN = ("FROM customers JOIN orders ON orders.customer_id = customers.id "
+                "JOIN tickets ON tickets.customer_id = customers.id")
+
+# 22. The value is a product of `customers` and `tickets` columns, so the tickets join is the grain
+#     the value was defined at and multiplies nothing, while the orders join duplicates it. Exactly
+#     one of the two edges is a reason to say nothing, and suppressing the whole finding because one
+#     of them is the value's own grain reported this statement clean.
+TWO_FANS_ONE_ON_THE_VALUE_PATH = f"SELECT SUM(customers.id * tickets.id) {TWO_FAN_JOIN}"
+
+# 23. Two independent measures over one shared dimension, one of them wrapped in a CASE that puts
+#     its only column in the predicate. `agg_sources` is derived across every site in the SELECT, so
+#     a narrowing at one aggregate is not local: with two measures needed for a shared dimension to
+#     be a chasm at all, one wrapped aggregate took the finding away from the other one too.
+#     `SUM(tickets.id)` is not inside that CASE and never was.
+CHASM_WITH_ONE_WRAPPED_AGGREGATE = (
+    f"SELECT SUM(CASE WHEN orders.status = 'x' THEN 1 ELSE 0 END), SUM(tickets.id) {TWO_FAN_JOIN}"
+)
+
+# 24. Grouped FINER than the join key: one row per (order, product), joined on the order alone. The
+#     CTE is genuinely the many side of its own edge and the fan is real.
+CTE_GRAIN_BELOW_JOIN_KEY = (
+    "WITH oi AS (SELECT order_id, product_id, SUM(quantity) q FROM order_items "
+    "GROUP BY order_id, product_id) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id"
+)
+# 25. Member 6 one hop further out. Two grain-preserving CTEs in a chain are still the same rows, so
+#     the resolution has to be transitive or it answers correctly only at depth one.
+TRANSITIVE_CTE = (
+    "WITH a AS (SELECT * FROM order_items), b AS (SELECT * FROM a) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN b ON b.order_id = orders.id"
+)
+# 26. `_cte_names` and `_model_table_index` fold case; `_alias_map` preserves it. Every comparison
+#     the resolution makes therefore has to be explicit about which side it is on, and this is the
+#     shape that catches one that is not.
+CASE_FOLDED_CTE = (
+    "WITH OI AS (SELECT * FROM order_items) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN OI ON OI.order_id = orders.id"
+)
+
+# 27, 28. Two arms, each declaring its OWN `x` over a different table. Only the first arm joins, and
+#     only the first arm's `x` is the one side of that join. Written in both orders because the
+#     defect was order-dependent: read off the root, whichever arm's body the walk reached last won
+#     the folded name for both.
+SAME_NAME_PER_ARM = (
+    "(WITH x AS (SELECT * FROM orders) SELECT SUM(x.total_amount) FROM x "
+    "JOIN order_items oi ON oi.order_id = x.id) UNION ALL "
+    "(WITH x AS (SELECT * FROM order_items) SELECT SUM(x.quantity) FROM x)"
+)
+SAME_NAME_PER_ARM_SWAPPED = (
+    "(WITH x AS (SELECT * FROM order_items) SELECT SUM(x.quantity) FROM x) UNION ALL "
+    "(WITH x AS (SELECT * FROM orders) SELECT SUM(x.total_amount) FROM x "
+    "JOIN order_items oi ON oi.order_id = x.id)"
+)
+
+# 29. A `WITH` inside a `WHERE … IN (…)` subquery. It binds `order_items` for that subquery and for
+#     nothing else, and the outer statement's `order_items` is the real declared table it joins.
+NESTED_WITH_SHADOWING_A_REAL_TABLE = (
+    "SELECT SUM(orders.total_amount) FROM orders "
+    "JOIN order_items ON order_items.order_id = orders.id "
+    "WHERE orders.id IN (WITH order_items AS (SELECT id FROM customers) "
+    "SELECT id FROM order_items)"
+)
+
+# The corpus, named so the later slices can re-run it unchanged rather than restating it. Labels are
+# what a failure prints, so they name the disguise and not the SQL.
+#
+# The third field is the ITEMS the statement is known to inflate, by the label the receipt gives
+# them. The property used to run over every aggregate in the statement, which forced every member to
+# be inflated in all of its arms — member 9 is built out of two inflated arms for exactly that
+# reason — and so shut the corpus out of the mixed statements that are most of real multi-aggregate
+# SQL. Naming the items instead lets a member carry an honestly clean aggregate beside an inflated
+# one, and members 10, 23, 27 and 28 all do.
 INFLATED_SHAPES = [
-    ("plain fan", PLAIN_FAN),
-    ("measure scaled by a literal", SCALED_FAN),
-    ("many side in the CASE predicate", CONDITIONED_FAN),
-    ("many side in the ORDER BY arm", ORDERED_FAN),
-    ("many side behind a derived table", DERIVED_TABLE_FAN),
-    ("many side behind a CTE", CTE_LAUNDERED_FAN),
-    ("join inside the CTE body", JOINED_CTE_BODY),
-    ("rows from an unaliased VALUES list", UNALIASED_VALUES_FAN),
-    ("a laundered fan inside a set-operation arm", UNION_ARM_CTE_FAN),
+    ("plain fan", PLAIN_FAN, ["SUM(orders.total_amount)"]),
+    ("measure scaled by a literal", SCALED_FAN, ["SUM(orders.total_amount * 1.1)"]),
+    ("many side in the CASE predicate", CONDITIONED_FAN,
+     ["SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount END)"]),
+    ("many side in the ORDER BY arm", ORDERED_FAN,
+     ["GROUP_CONCAT(orders.status ORDER BY order_items.id, ',')"]),
+    ("many side behind a derived table", DERIVED_TABLE_FAN, ["SUM(orders.total_amount)"]),
+    ("many side behind a CTE", CTE_LAUNDERED_FAN, ["SUM(orders.total_amount)"]),
+    ("join inside the CTE body", JOINED_CTE_BODY, ["SUM(j.total_amount)"]),
+    ("rows from an unaliased VALUES list", UNALIASED_VALUES_FAN, ["SUM(orders.total_amount)"]),
+    ("a laundered fan inside a set-operation arm", UNION_ARM_CTE_FAN,
+     ["SUM(orders.total_amount)"]),
+    ("a laundered fan beside an honestly clean arm", MIXED_SET_OPERATION,
+     ["SUM(orders.total_amount)"]),
+    ("a comma-join fan", COMMA_JOIN_FAN, ["SUM(orders.total_amount)"]),
+    ("a LEFT JOIN fan", LEFT_JOIN_FAN, ["SUM(orders.total_amount)"]),
+    ("the one side behind a derived table", DERIVED_TABLE_ON_THE_ONE_SIDE,
+     ["SUM(t.total_amount)"]),
+    ("one side in a searched CASE predicate", ONE_SIDE_IN_A_CASE_PREDICATE,
+     ["SUM(CASE WHEN orders.status = 'shipped' THEN 1 ELSE 0 END)"]),
+    ("one side as a simple CASE operand", ONE_SIDE_AS_A_SIMPLE_CASE_OPERAND,
+     ["SUM(CASE orders.status WHEN 'shipped' THEN 1 ELSE 0 END)"]),
+    ("one side in a conditional COUNT", ONE_SIDE_IN_A_CONDITIONAL_COUNT,
+     ["COUNT(CASE WHEN orders.status = 'shipped' THEN 1 END)"]),
+    ("branches that disagree about the grain", BRANCHES_DISAGREEING_ABOUT_THE_GRAIN,
+     ["SUM(CASE WHEN orders.flag THEN orders.total_amount ELSE order_items.quantity END)"]),
+    ("the conditional spelled IF", IF_SPELLED_CONDITIONAL_FAN,
+     ["SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount ELSE 0 END)"]),
+    ("a NULLIF comparand off the many side", NULLIF_COMPARAND_FAN,
+     ["SUM(NULLIF(orders.total_amount, order_items.quantity))"]),
+    ("a COALESCE alternation", COALESCE_ALTERNATION_FAN,
+     ["SUM(COALESCE(orders.total_amount, order_items.quantity))"]),
+    ("a GROUP_CONCAT separator off the many side", SEPARATOR_OFF_THE_MANY_SIDE_FAN,
+     ["GROUP_CONCAT(orders.status, order_items.product_id)"]),
+    ("two fans, one of them the value's own grain", TWO_FANS_ONE_ON_THE_VALUE_PATH,
+     ["SUM(customers.id * tickets.id)"]),
+    ("a chasm pair with one wrapped aggregate", CHASM_WITH_ONE_WRAPPED_AGGREGATE,
+     ["SUM(CASE WHEN orders.status = 'x' THEN 1 ELSE 0 END)", "SUM(tickets.id)"]),
+    ("a CTE grain finer than the join key", CTE_GRAIN_BELOW_JOIN_KEY,
+     ["SUM(orders.total_amount)"]),
+    ("a chain of grain-preserving CTEs", TRANSITIVE_CTE, ["SUM(orders.total_amount)"]),
+    ("a CTE name spelled in another case", CASE_FOLDED_CTE, ["SUM(orders.total_amount)"]),
+    ("the same CTE name declared per arm", SAME_NAME_PER_ARM, ["SUM(x.total_amount)"]),
+    ("the same CTE name declared per arm, swapped", SAME_NAME_PER_ARM_SWAPPED,
+     ["SUM(x.total_amount)"]),
+    ("a WITH bound inside a WHERE subquery", NESTED_WITH_SHADOWING_A_REAL_TABLE,
+     ["SUM(orders.total_amount)"]),
 ]
 
 # A conditional count and a conditional sum over the many side. Both are honestly clean: one row
@@ -162,6 +339,19 @@ EVERY_STATUS_SQL = (
     "SELECT SUM(i.quantity * o.total_amount), SUM(o.total_amount), MIN(o.total_amount), COUNT(*) "
     "FROM orders o JOIN order_items i ON i.order_id = o.id"
 )
+# And what it actually reports, written out. Three tests consume `EVERY_STATUS_SQL` for the breadth
+# the comment above claims, and every one of them compares the analysis against itself: the
+# cross-process probe compares four children against the parent, the both-surfaces test compares
+# `assemble_receipt` against `pre_flight_check`, and the internal-consistency property asks only
+# that `joins` agrees with `status`. All three would still pass if all four aggregates degraded to
+# `undetermined` together, and the comment describing the statement would silently become false
+# while the tests resting on it went on passing. This is the one assertion that says what it is.
+EVERY_STATUS_ITEMS = [
+    ("SUM(i.quantity * o.total_amount)", rt.NOT_MULTIPLIED, []),
+    ("SUM(o.total_amount)", rt.MULTIPLIED, ["fan_trap"]),
+    ("MIN(o.total_amount)", rt.MULTIPLIED, ["fan_out_invariant"]),
+    ("COUNT(*)", rt.UNDETERMINED, []),
+]
 
 # The scope map every `_value_sources` case below is resolved through. Identity, because these
 # statements qualify their columns with the table's own name and the question under test is which
@@ -253,6 +443,14 @@ STRING_AGG_OVER_FAN = f"SELECT STRING_AGG(orders.status, ',') {FAN_JOIN}"
 # `undetermined` before any fan is considered.
 COUNT_STAR_OVER_FAN = f"SELECT COUNT(*) {FAN_JOIN}"
 
+# The same two properties over a CHASM rather than over a fan. A cross-product cannot move a minimum
+# or a distinct count either, and the split above does not reach here — see the test.
+CHASM_OVER_INVARIANT_MEASURES = (
+    "SELECT c.id, MIN(o.revenue), COUNT(DISTINCT t.id) FROM customers c "
+    "LEFT JOIN orders o ON o.customer_id = c.id "
+    "LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.id"
+)
+
 # --- the marker, after the fan-immune clause is deleted --------------------
 #
 # Four statements, one per state `_aggregates_marker` can be in that this spec could have disturbed,
@@ -290,24 +488,37 @@ def _reports(sql: str) -> list["rt.AggregateReport"]:
     return pf.aggregates
 
 
-@pytest.mark.parametrize("label,sql", INFLATED_SHAPES)
-def test_no_known_inflated_shape_is_ever_reported_clean(label, sql):
-    """A17 — for every shape a join is known to inflate, no aggregate says `not_multiplied`.
+@pytest.mark.parametrize("label,sql,inflated", INFLATED_SHAPES)
+def test_no_known_inflated_shape_is_ever_reported_clean(label, sql, inflated):
+    """A17 — for every shape a join is known to inflate, the inflated items say so.
 
-    The assertion is a PROPERTY over the whole corpus, not a per-case expected value, and that
-    choice is the test. Three of ACE-083's four corrections are loosenings; each one is correct in
-    a direction nothing had asserted, and the failure mode they share is the same one: a shape that
-    used to report `multiplied` quietly starts reporting `not_multiplied`. Pinning each member's
-    exact status would freeze answers this spec is deliberately changing (a member may legitimately
-    move between `multiplied` and `undetermined` as the scope and grain work lands) and would still
-    not say the one thing that must hold across all seven.
+    The assertion is a PROPERTY over the corpus, not a per-case expected value, and that choice is
+    the test. Three of ACE-083's four corrections are loosenings; each one is correct in a direction
+    nothing had asserted, and the failure mode they share is the same one: a shape that used to
+    report `multiplied` quietly starts reporting `not_multiplied`. Pinning each member's exact
+    status would freeze answers this spec is deliberately changing (a member may legitimately move
+    between `multiplied` and `undetermined` as the scope and grain work lands) and would still not
+    say the one thing that must hold across all of them.
 
     `multiplied` and `undetermined` are both acceptable answers here. What is not acceptable is the
     positive claim that a number a join inflated is sound: `undetermined` declines to answer, and a
     reader can act on that, while `not_multiplied` is a receipt asserting something false.
+
+    The property runs over the NAMED items rather than over every aggregate in the statement, and
+    that is what lets a member be a mixed statement. Over-everything, a member could only be added
+    if all of its arms were inflated, so the corpus held nine disguises of one topology and not one
+    statement in which a sound number sits beside an unsound one — which is most real
+    multi-aggregate SQL, and is where a rule that suppresses per STATEMENT rather than per ITEM
+    hides. Naming the items costs one thing, an expected label per row, and the first assertion is
+    what pays for it: a label this file gets wrong selects nothing, and a row that asserts a
+    property over an empty selection is a row that asserts nothing at all.
     """
-    statuses = [(a.aggregate, a.status) for a in _reports(sql)]
-    assert all(s != rt.NOT_MULTIPLIED for _, s in statuses), (label, statuses)
+    reports = _reports(sql)
+    named = [a for a in reports if a.aggregate in inflated]
+    assert sorted({a.aggregate for a in named}) == sorted(set(inflated)), (
+        label, [a.aggregate for a in reports])
+    assert all(a.status != rt.NOT_MULTIPLIED for a in named), (
+        label, [(a.aggregate, a.status) for a in named])
 
 
 @pytest.mark.parametrize("label,sql", [
@@ -638,45 +849,25 @@ def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
     assert rt._value_sources(exp.Case(), VALUE_SCOPE) == frozenset()
 
 
-# --- the direction the corpus above cannot reach ---------------------------
+# --- the direction the corpus reaches only through members 14-21 ------------
 #
-# Every member of `INFLATED_SHAPES` puts the MANY-side column somewhere unusual. Not one puts a
-# ONE-side column off the value path, and that is the only direction that can manufacture a clean:
-# a value path narrowed until it holds no one-side column stops the aggregate reading the one side
-# at all, so the fan loop never reaches it and a total the join really does inflate reports sound.
-# Each of these was measured `not_multiplied` while the value path decided `sources`, and
-# `multiplied` on the base the spec is written against.
+# The exact edge each of those members has to name. The corpus property says only that a named item
+# is not reported clean, which is what lets a member move between `multiplied` and `undetermined` as
+# the scope and grain work lands; these seven have no such freedom, because the whole reason they
+# are in the corpus is that a value path narrowed until it holds no one-side column reports them
+# sound. Each was measured `not_multiplied` while the value path decided `sources`, and `multiplied`
+# on the base the spec is written against.
 
 ONE_SIDE_OFF_THE_VALUE_PATH = [
-    ("a searched CASE testing a one-side column",
-     f"SELECT SUM(CASE WHEN orders.status = 'shipped' THEN 1 ELSE 0 END) {FAN_JOIN}"),
-    ("a simple CASE whose operand is a one-side column",
-     f"SELECT SUM(CASE orders.status WHEN 'shipped' THEN 1 ELSE 0 END) {FAN_JOIN}"),
-    ("a conditional COUNT over a one-side predicate",
-     f"SELECT COUNT(CASE WHEN orders.status = 'shipped' THEN 1 END) {FAN_JOIN}"),
-    ("branches that disagree about the grain",
-     f"SELECT SUM(CASE WHEN orders.flag THEN orders.total_amount "
-     f"ELSE order_items.quantity END) {FAN_JOIN}"),
-    ("IF, which sqlglot renders back as a CASE",
-     f"SELECT SUM(IF(order_items.quantity > 0, orders.total_amount, 0)) {FAN_JOIN}"),
-    ("NULLIF, whose second argument is a comparand",
-     f"SELECT SUM(NULLIF(orders.total_amount, order_items.quantity)) {FAN_JOIN}"),
-    ("a GROUP_CONCAT separator read off the many side",
-     f"SELECT STRING_AGG(orders.status, order_items.product_id) {FAN_JOIN}"),
+    ("a searched CASE testing a one-side column", ONE_SIDE_IN_A_CASE_PREDICATE),
+    ("a simple CASE whose operand is a one-side column", ONE_SIDE_AS_A_SIMPLE_CASE_OPERAND),
+    ("a conditional COUNT over a one-side predicate", ONE_SIDE_IN_A_CONDITIONAL_COUNT),
+    ("branches that disagree about the grain", BRANCHES_DISAGREEING_ABOUT_THE_GRAIN),
+    ("IF, which sqlglot renders back as a CASE", IF_SPELLED_CONDITIONAL_FAN),
+    ("NULLIF, whose second argument is a comparand", NULLIF_COMPARAND_FAN),
+    ("COALESCE, an alternation spelled as a function", COALESCE_ALTERNATION_FAN),
+    ("a GROUP_CONCAT separator read off the many side", SEPARATOR_OFF_THE_MANY_SIDE_FAN),
 ]
-
-# Two fans off ONE dimension. The value is a product of `customers` and `tickets` columns, so the
-# tickets join is the grain the value was defined at and multiplies nothing, while the orders join
-# duplicates it. Exactly one of the two edges is a reason to say nothing.
-TWO_FAN_JOIN = ("FROM customers JOIN orders ON orders.customer_id = customers.id "
-                "JOIN tickets ON tickets.customer_id = customers.id")
-TWO_FANS_ONE_ON_THE_VALUE_PATH = f"SELECT SUM(customers.id * tickets.id) {TWO_FAN_JOIN}"
-
-# Two independent measures over one shared dimension, one of them wrapped in a CASE that puts its
-# only column in the predicate. `SUM(tickets.id)` is untouched by that CASE.
-CHASM_WITH_ONE_WRAPPED_AGGREGATE = (
-    f"SELECT SUM(CASE WHEN orders.status = 'x' THEN 1 ELSE 0 END), SUM(tickets.id) {TWO_FAN_JOIN}"
-)
 
 
 @pytest.mark.parametrize("label,sql", ONE_SIDE_OFF_THE_VALUE_PATH)
@@ -729,15 +920,78 @@ def test_one_wrapped_aggregate_does_not_clear_the_chasm_for_the_others():
     assert all("chasm_trap" in [f.risk for f in a.findings] for a in reports), reports
 
 
-# --- A24: the same report in every process ---------------------------------
+def test_the_statement_that_carries_every_status_carries_the_ones_its_comment_claims():
+    """`EVERY_STATUS_SQL` is a premise three other tests rest on, so it is pinned as one.
 
+    It is described as "one statement carrying all three statuses and both risk labels", and three
+    tests use it for exactly that breadth. Not one of them can tell whether the breadth is still
+    there: each compares the analysis against another rendering of the same analysis, or against a
+    shape-agnostic invariant. A change that collapsed all four aggregates to `undetermined` would
+    leave every one of them green and leave the comment above the constant describing a statement
+    this file no longer produces.
+
+    The findings' risks are pinned beside the statuses because the claim is "both risk labels", and
+    `multiplied` is reachable through either. A `MIN` that started reporting `fan_trap` would keep
+    the status column identical and lose half of what this statement is here to cover.
+    """
+    assert [(a.aggregate, a.status, [f.risk for f in a.findings])
+            for a in _reports(EVERY_STATUS_SQL)] == EVERY_STATUS_ITEMS
+
+
+# --- A24: the same report in every process ---------------------------------
+#
+# The statements the probe runs, one per SET the analysis iterates. Iteration order is only
+# observable when there is more than one element to order, and `EVERY_STATUS_SQL` — which was the
+# whole of this test — has one fanning source and one many-side table, so every set it produces is
+# a singleton and its answer is the same whether the code sorts or not. Measured: with all three
+# `sorted()` calls in `_preflight_select` deleted, `EVERY_STATUS_SQL` is byte-identical across hash
+# seeds and the entire suite stays green.
+#
+# Each of the three below makes exactly one of those sets hold two elements, and each was measured
+# to produce two different receipts across the seeds below when its own `sorted()` is removed:
+#
+#   `agg_sources` in the chasm branch  -> the `srcs` list inside the reason, and `joins`
+#   `agg_sources` in the fan loop      -> the ORDER of two findings on one aggregate
+#   `many_tables` inside the fan loop  -> the order of two edges inside one finding
+#
+# Two aggregate sources over a shared dimension. `_shared_dimension` walks a set to pick the
+# dimension and the chasm reason interpolates the sources, so this is the shape that orders them.
+CHASM_OVER_TWO_MEASURES = (
+    "SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
+    "LEFT JOIN orders o ON o.customer_id = c.id "
+    "LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.id"
+)
+# One measure on the one side of TWO fans off it. `many_tables` holds `orders` and `tickets`, and
+# both are named inside a single finding, so their order is the receipt's order.
+TWO_MANY_SIDES_OFF_ONE_MEASURE = f"SELECT SUM(customers.id) {TWO_FAN_JOIN}"
+# One aggregate reading two measure tables, each the one side of a fan the value path does not
+# suppress. `customers` fans out to `tickets` and `orders` fans out to `order_items`, so this
+# aggregate carries TWO findings and the fan loop's iteration over `agg_sources` orders them.
+TWO_MEASURE_TABLES_ONE_AGGREGATE = (
+    "SELECT SUM(orders.total_amount * customers.id) FROM customers "
+    "JOIN orders ON orders.customer_id = customers.id "
+    "JOIN tickets ON tickets.customer_id = customers.id "
+    "JOIN order_items ON order_items.order_id = orders.id"
+)
+
+DETERMINISM_SHAPES = [
+    ("three statuses and both risk labels", EVERY_STATUS_SQL),
+    ("two aggregate sources over one shared dimension", CHASM_OVER_TWO_MEASURES),
+    ("one measure with two many sides", TWO_MANY_SIDES_OFF_ONE_MEASURE),
+    ("one aggregate reading two measure tables", TWO_MEASURE_TABLES_ONE_AGGREGATE),
+]
+
+# Every statement in ONE child per seed rather than one child per statement: the property is about
+# the process, and a child that analysed all four under one seed is the same evidence at a quarter
+# of the process cost.
 _PROBE = """
 import json, sys
 sys.path.insert(0, sys.argv[1])
 from semantic_model import models as m
 from semantic_model import runtime as rt
 org = m.Datasource.model_validate_json(sys.argv[3])
-print(json.dumps([a.as_dict() for a in rt.pre_flight_check(sys.argv[2], org).aggregates]))
+print(json.dumps([[a.as_dict() for a in rt.pre_flight_check(sql, org).aggregates]
+                  for sql in json.loads(sys.argv[2])]))
 """
 
 
@@ -748,35 +1002,40 @@ def test_the_aggregate_report_is_the_same_in_every_process():
     invisible under a fixed seed: `sources` is a `frozenset` and `many_tables` is a `set`, the fan
     branch iterates a sorted copy of one of them and intersects the other, and `_shared_dimension`
     picks its dimension by walking a set. Any answer derived from one of those is stable within an
-    interpreter and free to differ in the next. Four seeds, four processes, one answer.
+    interpreter and free to differ in the next. Eight seeds, eight processes, one answer.
 
     The whole serialized item list is compared rather than the statuses alone, and it is NOT sorted:
     the aggregates are reported in the order the statement wrote them, so a re-ordered list is as
     much a difference as a flipped status and sorting here would hide exactly one of the two modes
     this exists to catch.
 
-    `EVERY_STATUS_SQL` carries all three statuses and both risk labels over a single fan, so one
-    comparison covers the value-path attribution that produced `not_multiplied`, the fan that
-    produced `multiplied`, and the unresolved read that produced `undetermined`.
+    `DETERMINISM_SHAPES` and not one statement, and that is the whole of what this test is. A set
+    with one element has one iteration order, so a statement that produces only singletons cannot
+    distinguish a `sorted()` from its absence — and `EVERY_STATUS_SQL`, which stood here alone,
+    produces nothing else. Each of the other three makes one of the three sets hold two elements;
+    the comment above them says which set each reaches and what moves when it is left unordered.
 
     The model crosses the process boundary as JSON rather than as a path, because this fixture is
     built in Python and has no profile on disk; `model_validate_json` of `model_dump_json` is the
     same object by construction, so the child analyses the model the parent declared.
     """
     payload = _sales_org().model_dump_json()
+    statements = json.dumps([sql for _, sql in DETERMINISM_SHAPES])
     seen = set()
-    for seed in ("0", "1", "42", "12345"):
+    for seed in ("0", "1", "2", "3", "7", "42", "1234", "12345"):
         proc = subprocess.run(
-            [sys.executable, "-c", _PROBE, str(PKG_SRC), EVERY_STATUS_SQL, payload],
+            [sys.executable, "-c", _PROBE, str(PKG_SRC), statements, payload],
             capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": seed},
         )
         assert proc.returncode == 0, proc.stderr
         seen.add(proc.stdout.strip())
 
     assert len(seen) == 1, f"the aggregate report differed across hash seeds: {seen}"
-    # And it is the answer this process gets, so four children agreeing on something wrong would
+    # And it is the answer this process gets, so eight children agreeing on something wrong would
     # still fail rather than agree quietly.
-    assert json.loads(seen.pop()) == [a.as_dict() for a in _reports(EVERY_STATUS_SQL)]
+    assert json.loads(seen.pop()) == [
+        [a.as_dict() for a in _reports(sql)] for _, sql in DETERMINISM_SHAPES
+    ]
 
 
 # --- S3: what a SELECT can see, and what a CTE reference stands for ---------
@@ -799,26 +1058,9 @@ GRAIN_PRESERVING_CTE = (
     "WITH o AS (SELECT * FROM orders) SELECT SUM(o.total_amount) FROM o "
     "JOIN order_items ON order_items.order_id = o.id"
 )
-# The same laundering one hop further out. Two grain-preserving CTEs in a chain are still the same
-# rows, so the resolution has to be transitive or it answers correctly only at depth one.
-TRANSITIVE_CTE = (
-    "WITH a AS (SELECT * FROM order_items), b AS (SELECT * FROM a) "
-    "SELECT SUM(orders.total_amount) FROM orders JOIN b ON b.order_id = orders.id"
-)
-# Grouped FINER than the join key: one row per (order, product), joined on the order alone. The
-# CTE is genuinely the many side of its own edge and the fan is real.
-CTE_GRAIN_BELOW_JOIN_KEY = (
-    "WITH oi AS (SELECT order_id, product_id, SUM(quantity) q FROM order_items "
-    "GROUP BY order_id, product_id) "
-    "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id"
-)
-# `_cte_names` and `_model_table_index` fold case; `_alias_map` preserves it. Every comparison the
-# resolution makes therefore has to be explicit about which side it is on, and this is the shape
-# that catches one that is not.
-CASE_FOLDED_CTE = (
-    "WITH OI AS (SELECT * FROM order_items) "
-    "SELECT SUM(orders.total_amount) FROM orders JOIN OI ON OI.order_id = orders.id"
-)
+# The other three CTE shapes this section reasons about — `TRANSITIVE_CTE`,
+# `CTE_GRAIN_BELOW_JOIN_KEY` and `CASE_FOLDED_CTE` — are corpus members and are declared with the
+# corpus above, so that every statement the property runs over is defined in one place.
 
 # The derived-table shape, with its aggregate's column UNQUALIFIED. Two independent mechanisms
 # would each have to fail for this to read clean: without the derived binding the outer scope is
@@ -900,7 +1142,9 @@ UNREADABLE_CTE_BODIES = [
 # Every shape whose multiplication answer this spec decides, gathered for the one property that
 # holds across all of them. Not a new corpus: `INFLATED_SHAPES` is about the answer being wrong in
 # one direction, and this is about the answer being INTERNALLY consistent whatever it says.
-ALL_ANALYSED_SHAPES = INFLATED_SHAPES + UNREADABLE_CTE_BODIES + [
+ALL_ANALYSED_SHAPES = [
+    (label, sql) for label, sql, _inflated in INFLATED_SHAPES
+] + UNREADABLE_CTE_BODIES + [
     ("a value already at the many side's grain", VALUE_AT_MANY_GRAIN),
     ("a conditional count over the many side", CONDITIONAL_COUNT),
     ("a conditional sum over the many side", CONDITIONAL_SUM),
@@ -912,17 +1156,12 @@ ALL_ANALYSED_SHAPES = INFLATED_SHAPES + UNREADABLE_CTE_BODIES + [
     ("three statuses and both risk labels at once", EVERY_STATUS_SQL),
     ("a grain-changing CTE", GRAIN_CHANGING_CTE),
     ("a grain-preserving CTE", GRAIN_PRESERVING_CTE),
-    ("a chain of grain-preserving CTEs", TRANSITIVE_CTE),
-    ("a CTE grain finer than the join key", CTE_GRAIN_BELOW_JOIN_KEY),
-    ("a CTE name spelled in another case", CASE_FOLDED_CTE),
     ("a derived table with an unqualified measure", DERIVED_TABLE_UNQUALIFIED),
     ("a parenthesized named table", PARENTHESIZED_TABLE),
     ("a VALUES source", VALUES_SOURCE),
     ("a LATERAL source", LATERAL_SOURCE),
-    ("a chasm over two independent measures",
-     "SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
-     "LEFT JOIN orders o ON o.customer_id = c.id "
-     "LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.id"),
+    ("a chasm over two independent measures", CHASM_OVER_TWO_MEASURES),
+    ("a chasm whose measures a duplication cannot move", CHASM_OVER_INVARIANT_MEASURES),
 ]
 
 
@@ -1027,7 +1266,26 @@ def test_a_grain_preserving_cte_resolves_through_another_one():
 
     The cycle guard makes this safe rather than unbounded: `seen` is what stops `a` reading `b`
     reading `a` from recursing forever, and it is exercised by its own row in the guard table below.
+
+    The resolved SCOPE MAP is what the assertion rests on, and the status and the edge alone cannot
+    stand in for it. Base `439ecd1` produces this exact status and this exact edge on this exact
+    statement — by LEAKING `order_items` out of the CTE body into `_alias_map`, which is the defect
+    S3 exists to remove. The two implementations are byte-identical at the receipt and opposite
+    underneath it, so a test that reads only the receipt passes on the code it was written to fail
+    on. `b` resolving to `order_items` is the fact that is new: one entry per name the outer FROM/
+    JOIN clauses bind, `b` bound to the table two grain-preserving hops away, and no `a` in the map
+    at all, because `a` is a name only the CTE body ever writes.
     """
+    tree = _parse(TRANSITIVE_CTE)
+    scope, derived = rt._resolve_cte_scope(
+        tree, rt._visible_cte_bodies(tree), rt._alias_map(tree, in_scope_only=True),
+        rt._model_table_index(_sales_org()))
+    assert scope == {"orders": "orders", "b": "order_items"}, scope
+    # No DERIVED edge: `b` IS `order_items`, so the model's own declared relationship is the one the
+    # fan is read off. A derived edge here would mean the resolution fell back to treating the CTE
+    # as an entity of its own, which is the answer A14's shape gets and not this one's.
+    assert derived == [], derived
+
     reports = _reports(TRANSITIVE_CTE)
     assert [a.status for a in reports] == [rt.MULTIPLIED], reports
     assert reports[0].joins == [FAN_EDGE], reports[0].joins
@@ -1177,7 +1435,20 @@ def test_a_cte_name_is_resolved_case_insensitively_but_reported_as_written():
 
     A comparison that folded on neither side would leave this reading clean, which is the direction
     that matters: `OI` is `order_items` under another spelling and the fan is real.
+
+    The map is asserted for the same reason A13's is: this status and this edge are byte-identical
+    to what base `439ecd1` produced, where `order_items` reached the outer map by leaking out of the
+    CTE body rather than by `OI` being resolved to it. `{"OI": "order_items"}` is the whole claim —
+    the key preserved exactly as the statement wrote it, the value the folded table it stands for —
+    and it is the only place the fold's two directions are both visible at once.
     """
+    tree = _parse(CASE_FOLDED_CTE)
+    scope, derived = rt._resolve_cte_scope(
+        tree, rt._visible_cte_bodies(tree), rt._alias_map(tree, in_scope_only=True),
+        rt._model_table_index(_sales_org()))
+    assert scope == {"orders": "orders", "OI": "order_items"}, scope
+    assert derived == [], derived
+
     reports = _reports(CASE_FOLDED_CTE)
     assert [a.status for a in reports] == [rt.MULTIPLIED], reports
     assert reports[0].joins == [FAN_EDGE], reports[0].joins
@@ -1424,10 +1695,7 @@ def test_the_chasm_still_reports_both_of_the_aggregates_it_inflates():
     another file. Both aggregates are inflated by the cross-product and both must say so — a chasm
     reported on one of the two numbers it ruins is a receipt that reads as half a fact.
     """
-    sql = ("SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
-           "LEFT JOIN orders o ON o.customer_id = c.id "
-           "LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.id")
-    reports = _reports(sql)
+    reports = _reports(CHASM_OVER_TWO_MEASURES)
     assert [(a.aggregate, a.status) for a in reports] == [
         ("SUM(o.revenue)", rt.MULTIPLIED), ("COUNT(t.id)", rt.MULTIPLIED)], reports
     assert [f.risk for a in reports for f in a.findings] == ["chasm_trap", "chasm_trap"], reports
@@ -1466,15 +1734,20 @@ def test_every_item_either_names_its_joins_or_declines_to_answer():
 # --- A20: the two surfaces report the same aggregates ----------------------
 
 
-@pytest.mark.parametrize("label,sql", [
-    ("an invariant aggregate over a fan", MIN_OVER_FAN),
-    ("a value already at the many side's grain", VALUE_AT_MANY_GRAIN),
-    ("a grain-preserving CTE the analysis resolves", GRAIN_PRESERVING_CTE),
-    ("a grain-changing CTE whose edge is derived", GRAIN_CHANGING_CTE),
-    ("a derived table bound to nothing", DERIVED_TABLE_FAN),
-    ("three statuses and both risk labels at once", EVERY_STATUS_SQL),
+@pytest.mark.parametrize("label,sql,expected", [
+    ("an invariant aggregate over a fan", MIN_OVER_FAN,
+     [("MIN(orders.total_amount)", rt.MULTIPLIED, ["fan_out_invariant"])]),
+    ("a value already at the many side's grain", VALUE_AT_MANY_GRAIN,
+     [("SUM(order_items.quantity * orders.total_amount)", rt.NOT_MULTIPLIED, [])]),
+    ("a grain-preserving CTE the analysis resolves", GRAIN_PRESERVING_CTE,
+     [("SUM(o.total_amount)", rt.MULTIPLIED, ["fan_trap"])]),
+    ("a grain-changing CTE whose edge is derived", GRAIN_CHANGING_CTE,
+     [("SUM(orders.total_amount)", rt.NOT_MULTIPLIED, [])]),
+    ("a derived table bound to nothing", DERIVED_TABLE_FAN,
+     [("SUM(orders.total_amount)", rt.UNDETERMINED, [])]),
+    ("three statuses and both risk labels at once", EVERY_STATUS_SQL, EVERY_STATUS_ITEMS),
 ])
-def test_the_preflight_and_the_receipt_agree_about_the_aggregates(label, sql):
+def test_the_preflight_and_the_receipt_agree_about_the_aggregates(label, sql, expected):
     """A20. Both surfaces read one analysis, so the two renderings must be byte-equal.
 
     `pre_flight_check` parses and analyses; `assemble_receipt` analyses a tree it already holds.
@@ -1490,10 +1763,57 @@ def test_the_preflight_and_the_receipt_agree_about_the_aggregates(label, sql):
     The comparison is the serialized item list against `as_dict()`, not a status-by-status walk:
     `joins`, `findings` and the aggregate's own label are all part of what the two surfaces have to
     agree about, and a spot check of statuses would pass while a reason string differed.
+
+    And each row is ANCHORED, because equality between the two surfaces is `f(x) == f(x)` on its
+    own. Both entry points call `_aggregate_reports` on one tree and differ only in whether
+    `visible` is handed in — computed identically either way — and in the receipt's
+    `_RECEIPT_MAX_REFS` cap, which none of these six reaches. So the agreement half of this test
+    passes with the production change fully reverted, and it would pass just as well if every one of
+    these statements degraded to a single `undetermined` item. The expected list is what makes each
+    row say which mechanism it is here for. The cap, which is the one place the two surfaces really
+    do diverge, is the test below.
     """
     org = _sales_org()
     items = rt.assemble_receipt(org, sql)["aggregates"]["items"]
-    assert items == [a.as_dict() for a in rt.pre_flight_check(sql, org).aggregates], label
+    reports = rt.pre_flight_check(sql, org).aggregates
+    assert items == [a.as_dict() for a in reports], label
+    assert [(a.aggregate, a.status, [f.risk for f in a.findings]) for a in reports] == expected, (
+        label, reports)
+
+
+def test_the_receipt_bounds_the_item_list_the_preflight_returns_whole():
+    """A20's one real divergence: the receipt is capped and the pre-flight result is not.
+
+    Every other difference between the two entry points is arranged away — one analysis, one tree,
+    one `visible` set — and this one is deliberate. A receipt is tool output bounded at every
+    section, so `_RECEIPT_MAX_REFS` truncates the items and COUNTS what it dropped on the marker,
+    because a truncated list under a silent marker is a positive claim of completeness.
+    `PreFlightResult` is an in-process object with no such bound, and a caller reading it gets all
+    of them.
+
+    So the two surfaces agree UP TO the cap and not beyond it, and that is the contract this asserts
+    rather than a bug it reports. It matters because the agreement test above cannot see it: none of
+    its six shapes comes near 50 aggregates, so an equality that holds only below the cap and a
+    equality that holds everywhere are the same test there. A reader who takes A20 to mean the two
+    surfaces are interchangeable at any size is reading something no test said.
+
+    The real constant is used rather than a monkeypatched one. ACE-060's
+    `test_the_cap_counts_aggregates_and_says_so` already pins the counting behaviour at a patched
+    cap of 2; what is unpinned is what the OTHER surface does at the same statement, and patching
+    the constant would leave the shipped 50 uncovered on the only question this test is about.
+    """
+    org = _sales_org()
+    over = rt._RECEIPT_MAX_REFS + 5
+    sql = (f"SELECT {', '.join(f'SUM(orders.total_amount) AS a{i}' for i in range(over))} "
+           f"{FAN_JOIN}")
+    section = rt.assemble_receipt(org, sql)["aggregates"]
+    reports = rt.pre_flight_check(sql, org).aggregates
+
+    assert len(reports) == over, len(reports)
+    assert len(section["items"]) == rt._RECEIPT_MAX_REFS, len(section["items"])
+    assert section["items"] == [a.as_dict() for a in reports][:rt._RECEIPT_MAX_REFS]
+    # And the marker says how many it dropped, so the shorter list is not read as the whole list.
+    assert "5 further aggregate(s) are not listed." in section["undetermined"], section
 
 
 # --- the invariance boundary, pinned where it is rather than where it could be ---
@@ -1536,6 +1856,34 @@ def test_a_distinct_concatenation_with_an_ordering_arm_is_not_read_as_invariant(
     assert [f.risk for f in reports[0].findings] == ["fan_trap"], reports[0].findings
 
 
+def test_the_invariance_split_is_the_fan_branchs_alone_and_the_chasm_keeps_its_word():
+    """The other boundary: `fan_out_invariant` is a FAN label, and a chasm does not get one.
+
+    A cross-product cannot move a `MIN` or a `COUNT(DISTINCT)` any more than a fan-out can — the
+    property is about the aggregate, not about which join duplicated the rows — so on the reading
+    that produced the split, these two are as mislabelled as `MIN` over a fan was. They are not
+    relabelled, and that is deliberate rather than an oversight: the spec scopes S1 to the fan
+    branch, `_is_fan_immune` is called at one site inside the fan loop, and widening a risk
+    vocabulary is a contract change that needs its own argument.
+
+    It is asserted because nothing else would notice it move. `SKILL.md` documents both labels for a
+    reader, `chasm_trap` and `fan_out_invariant` are both in `_MULTIPLYING_RISKS` so `status` is
+    identical either way, and hoisting `_is_fan_immune` out of the fan loop into the shared path is
+    a one-line change that reads like a simplification. This is the assertion that makes it a
+    decision: the two aggregates here still say `chasm_trap`, and the word this file spent a slice
+    removing from the fan branch is not quietly added to a second one.
+
+    The statuses are pinned beside the risks. `chasm_trap` and `fan_out_invariant` are both
+    multiplying risks, so a swap between them is invisible in `status` — which is exactly why the
+    risk is what this asserts on.
+    """
+    reports = _reports(CHASM_OVER_INVARIANT_MEASURES)
+    assert [(a.aggregate, a.status) for a in reports] == [
+        ("MIN(o.revenue)", rt.MULTIPLIED), ("COUNT(DISTINCT t.id)", rt.MULTIPLIED)], reports
+    assert [f.risk for a in reports for f in a.findings] == ["chasm_trap", "chasm_trap"], reports
+    assert "fan_out_invariant" not in _every_risk(CHASM_OVER_INVARIANT_MEASURES), reports
+
+
 # --- a WITH binds its name for every arm below it --------------------------
 
 
@@ -1562,8 +1910,10 @@ def test_a_set_operation_arm_sees_the_cte_the_statement_bound_above_it():
         ("main#1", rt.MULTIPLIED), ("main#2", rt.MULTIPLIED)], reports
     assert [a.joins for a in reports] == [[FAN_EDGE], [FAN_EDGE]], reports
 
-    # And an arm that reads no CTE keeps its own answer, which is what "per-arm" has to mean.
-    mixed = _reports(f"{CTE_LAUNDERED_FAN} UNION ALL SELECT SUM(orders.total_amount) FROM orders")
+    # And an arm that reads no CTE keeps its own answer, which is what "per-arm" has to mean. The
+    # statement is `MIXED_SET_OPERATION`, a corpus member: the corpus asks that its laundered arm is
+    # never reported clean, and this asks that its honest arm still is.
+    mixed = _reports(MIXED_SET_OPERATION)
     assert [(a.scope, a.status) for a in mixed] == [
         ("main#1", rt.MULTIPLIED), ("main#2", rt.NOT_MULTIPLIED)], mixed
 
@@ -1573,30 +1923,9 @@ def test_a_set_operation_arm_sees_the_cte_the_statement_bound_above_it():
 # The other half of the same rule, and the one that was measured wrong. `sel.root().find_all(
 # exp.CTE)` collects every CTE in the statement, keyed by folded name with last-writer-wins, so a
 # CTE from a scope that does not bind for this SELECT could win the name. Both shapes below were
-# receipts calling an inflated number sound.
-
-# Two arms, each declaring its OWN `x` over a different table. Only the first arm joins, and only
-# the first arm's `x` is the one side of that join. Written in both orders because the defect was
-# order-dependent: whichever arm's body the root walk reached last won the name for both.
-SAME_NAME_PER_ARM = (
-    "(WITH x AS (SELECT * FROM orders) SELECT SUM(x.total_amount) FROM x "
-    "JOIN order_items oi ON oi.order_id = x.id) UNION ALL "
-    "(WITH x AS (SELECT * FROM order_items) SELECT SUM(x.quantity) FROM x)"
-)
-SAME_NAME_PER_ARM_SWAPPED = (
-    "(WITH x AS (SELECT * FROM order_items) SELECT SUM(x.quantity) FROM x) UNION ALL "
-    "(WITH x AS (SELECT * FROM orders) SELECT SUM(x.total_amount) FROM x "
-    "JOIN order_items oi ON oi.order_id = x.id)"
-)
-
-# A `WITH` inside a `WHERE … IN (…)` subquery. It binds `order_items` for that subquery and for
-# nothing else, and the outer statement's `order_items` is the real declared table it joins.
-NESTED_WITH_SHADOWING_A_REAL_TABLE = (
-    "SELECT SUM(orders.total_amount) FROM orders "
-    "JOIN order_items ON order_items.order_id = orders.id "
-    "WHERE orders.id IN (WITH order_items AS (SELECT id FROM customers) "
-    "SELECT id FROM order_items)"
-)
+# receipts calling an inflated number sound, so both are corpus members and both are declared with
+# the corpus: `SAME_NAME_PER_ARM`, `SAME_NAME_PER_ARM_SWAPPED` and
+# `NESTED_WITH_SHADOWING_A_REAL_TABLE`.
 
 
 def test_a_cte_declared_in_a_sibling_arm_does_not_bind_for_this_one():
