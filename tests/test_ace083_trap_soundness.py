@@ -322,6 +322,14 @@ MATCH_RECOGNIZE_SOURCE = (
     "PATTERN (a+) DEFINE a AS a.id > 0)"
 )
 
+# A grain-changing CTE that RENAMES its grain column on the way out. `_group_by_grain` reads the
+# body's input names and the join key is the body's output name, so the comparison was between two
+# spellings of one column and reported a fan on a CTE that is one row per join key. Over-reporting,
+# so it is not a corpus member; a false positive on legitimate SQL all the same.
+CTE_RENAMING_ITS_GRAIN = (
+    "WITH x AS (SELECT id AS order_id FROM customers GROUP BY id) "
+    "SELECT SUM(orders.total_amount) FROM orders JOIN x ON x.order_id = orders.id"
+)
 
 # The corpus, named so the later slices can re-run it unchanged rather than restating it. Labels are
 # what a failure prints, so they name the disguise and not the SQL.
@@ -1288,6 +1296,7 @@ ALL_ANALYSED_SHAPES = [
     ("an UNPIVOT on the table itself", UNPIVOT_SOURCE),
     ("a CONNECT BY beside the FROM clause", CONNECT_BY_SOURCE),
     ("a PIVOT on the table itself", PIVOT_SOURCE),
+    ("a CTE that renames its grain column", CTE_RENAMING_ITS_GRAIN),
 ]
 
 
@@ -2566,3 +2575,98 @@ def test_a_lateral_that_a_join_already_bound_is_not_bound_twice():
     sql = "SELECT SUM(orders.total_amount) FROM orders, LATERAL (SELECT 1) l"
     sites = rt._reference_sites(_parse(sql).find(exp.Select), bind_derived=True)
     assert [(s.ref.bare, s.ref.alias) for s in sites] == [("", "l"), ("orders", None)], sites
+
+
+def test_the_cte_chain_bound_admits_exactly_the_number_it_is_written_as():
+    """`depth > _MAX_CTE_CHAIN` admitted sixty-FIVE hops for a constant that reads sixty-four.
+
+    `depth` is 0 on the first hop, so the comparison has to be `>=` for the bound to be the number
+    beside it. Nothing depended on the extra hop; a bound nobody can read off its own constant is
+    the defect, because the next person to reason about it will reason from the constant.
+
+    Both sides of the boundary, because either alone is satisfiable by a bound that is off by one in
+    the other direction.
+    """
+    org, tidx = _sales_org(), None
+
+    def chain(links: int) -> str:
+        bodies = ["c0 AS (SELECT * FROM order_items)"]
+        bodies += [f"c{i} AS (SELECT * FROM c{i - 1})" for i in range(1, links)]
+        return ("WITH " + ", ".join(bodies) +
+                f" SELECT SUM(orders.total_amount) FROM orders JOIN c{links - 1} "
+                f"ON c{links - 1}.order_id = orders.id")
+
+    tidx = rt._model_table_index(org)
+    assert rt._MAX_CTE_CHAIN == 64
+    at_the_bound = _parse(chain(rt._MAX_CTE_CHAIN))
+    assert rt._grain_preserving_source(
+        "c63", rt._visible_cte_bodies(at_the_bound.find(exp.Select)), tidx, set()) == "order_items"
+    past_it = _parse(chain(rt._MAX_CTE_CHAIN + 1))
+    assert rt._grain_preserving_source(
+        "c64", rt._visible_cte_bodies(past_it.find(exp.Select)), tidx, set()) is None
+
+    assert [a.status for a in _reports(chain(rt._MAX_CTE_CHAIN))] == [rt.MULTIPLIED]
+    assert [a.status for a in _reports(chain(rt._MAX_CTE_CHAIN + 1))] == [rt.UNDETERMINED]
+
+
+def test_a_cte_that_renames_its_grain_column_is_not_a_fan():
+    """The two names `_cte_edge` compares came from opposite sides of the CTE.
+
+    `_group_by_grain` reads what the body groups BY, which are its INPUT columns, and the join key
+    is what the outer statement writes, which is the body's OUTPUT column. `SELECT id AS order_id …
+    GROUP BY id` makes those differ, so `order_id` was compared against a grain of `{id}`, found no
+    cover, and a CTE that really is one row per join key reported `multiplied`. Over-reporting, so
+    no receipt said anything false — and still a false positive on legitimate SQL, which is what a
+    reader learns to discount reports over.
+
+    The unresolvable direction is asserted beside it. `SELECT id + 1 AS k` gives `k` no input column
+    to stand for, so the key is compared as written and the fan is reported: what does not resolve
+    stays over-reporting rather than becoming a guess.
+    """
+    reports = _reports(CTE_RENAMING_ITS_GRAIN)
+    assert [(a.aggregate, a.status, a.joins) for a in reports] == [
+        ("SUM(orders.total_amount)", rt.NOT_MULTIPLIED, [])], reports
+
+    body = _parse(CTE_RENAMING_ITS_GRAIN).find(exp.CTE).this
+    assert rt._projection_sources(body) == {"order_id": "id"}
+
+    computed = ("WITH x AS (SELECT id + 1 AS k FROM customers GROUP BY id) "
+                "SELECT SUM(orders.total_amount) FROM orders JOIN x ON x.k = orders.id")
+    assert rt._projection_sources(_parse(computed).find(exp.CTE).this) == {}
+    assert [a.status for a in _reports(computed)] == [rt.MULTIPLIED], computed
+
+    # Two projections under one output name are two answers to a question that has to have one, so
+    # the name is dropped rather than resolved to whichever was written last. `SELECT *` names no
+    # column to resolve at all, and an output name that stands for itself is left as it is.
+    ambiguous = _parse("SELECT id AS k, customer_id AS k FROM customers GROUP BY id")
+    assert rt._projection_sources(ambiguous.find(exp.Select)) == {}
+    repeated = _parse("SELECT id AS k, id AS k FROM customers GROUP BY id")
+    assert rt._projection_sources(repeated.find(exp.Select)) == {"k": "id"}
+    star = _parse("SELECT * FROM customers GROUP BY id")
+    assert rt._projection_sources(star.find(exp.Select)) == {}
+
+
+def test_the_derived_edge_does_not_depend_on_which_source_the_statement_wrote_first():
+    """A receipt has to read the same way twice for the same SQL, which this module says of itself.
+
+    `_resolve_cte_scope` resolved the far side of a derived edge out of the map it was still
+    mutating, so whichever alias the statement wrote FIRST was resolved against a map the other one
+    had not reached yet. One statement, two spellings of its FROM clause, two answers: `multiplied`
+    naming the derived edge one way and `undetermined` the other. Both are the safe direction and
+    neither is determinism.
+
+    Two passes fix it: every grain-preserving rebinding settles first, and every edge is then
+    derived against that one settled map. Asserted on the ANSWER rather than on the pass structure,
+    because the property is that the two spellings agree and not that any particular internal order
+    was used to make them.
+    """
+    withs = ("WITH p AS (SELECT * FROM orders), "
+             "g AS (SELECT order_id, SUM(quantity) q FROM order_items "
+             "GROUP BY order_id, product_id) ")
+    preserving_first = withs + "SELECT SUM(p.total_amount) FROM p JOIN g ON g.order_id = p.id"
+    changing_first = withs + "SELECT SUM(p.total_amount) FROM g JOIN p ON g.order_id = p.id"
+
+    answers = [[(a.aggregate, a.status, a.joins) for a in _reports(sql)]
+               for sql in (preserving_first, changing_first)]
+    assert answers[0] == answers[1], answers
+    assert answers[0] == [("SUM(p.total_amount)", rt.MULTIPLIED, ["orders (1) <- g (N)"])], answers

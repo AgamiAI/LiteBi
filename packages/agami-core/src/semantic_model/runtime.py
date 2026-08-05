@@ -1903,6 +1903,10 @@ def _multiplication_status(site: "_AggSite", findings: list[Finding]) -> str:
 # reading the one before, which is not a cycle and so is not what `seen` catches. Sixty-four is far
 # past any chain a person writes and far short of the interpreter's own limit, and hitting it
 # returns None into the fail-closed branch — `undetermined`, not a lost receipt.
+#
+# Compared with `>=` and not with `>`. `depth` is 0 on the first hop, so `depth > _MAX_CTE_CHAIN`
+# admitted sixty-FIVE of them for a constant that says sixty-four, and a bound that does not admit
+# the number it is written as is a bound nobody can reason about from the constant alone.
 _MAX_CTE_CHAIN = 64
 
 
@@ -2007,7 +2011,7 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
       count stays WHOLE-SUBTREE deliberately: `SELECT order_id FROM order_items WHERE order_id IN
       (SELECT id FROM orders)` is caught only because the IN subquery's table is counted, and its
       row count is not `order_items`'s.
-    * more than `_MAX_CTE_CHAIN` hops. `seen` catches a CYCLE and a linear chain is not one: 990
+    * `_MAX_CTE_CHAIN` hops or more. `seen` catches a CYCLE and a linear chain is not one: 990
       CTEs each reading the one before fit inside `_MAX_SQL_CHARS` and raised `RecursionError`,
       which `_receipt_for` catches as a build failure — so the statement still ran and returned
       rows while the caller silently lost the receipt. Caller-chosen input that turns off the trust
@@ -2019,7 +2023,7 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
     name is one the analysis can say nothing about.
     """
     body = bodies.get(key)
-    if not isinstance(body, exp.Select) or key in seen or depth > _MAX_CTE_CHAIN:
+    if not isinstance(body, exp.Select) or key in seen or depth >= _MAX_CTE_CHAIN:
         return None
     seen.add(key)
     if any(value and arg not in _GRAIN_PRESERVING_SELECT_ARGS
@@ -2040,8 +2044,40 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
     return frm.this.name if name in tidx else None
 
 
+def _projection_sources(body: "exp.Expression") -> dict[str, str]:
+    """Folded OUTPUT name -> folded input column, over the projections that are ONE plain column.
+
+    The two names `_cte_edge` compares come from opposite sides of the CTE. `_group_by_grain` reads
+    what the body groups BY, which are the body's INPUT columns, and the join key is the name the
+    outer statement writes, which is the body's OUTPUT column. A CTE that renames its grain column
+    makes those two differ: `WITH x AS (SELECT id AS order_id FROM customers GROUP BY id)` joined on
+    `x.order_id` compared `order_id` against a grain of `{id}`, found no cover, and reported a fan on
+    a CTE that really is one row per key. Safe direction, and still a false positive on legitimate
+    SQL, so this is what closes the gap between the two spellings of one column.
+
+    Only a bare column and an alias over one resolve. `SELECT id + 1 AS k` has no input column that
+    `k` stands for, `SELECT *` names nothing, and two projections sharing an output name are
+    ambiguous. Each of those is left OUT, so the comparison falls back to the written name and the
+    fan is reported: unresolvable stays over-reporting, never under.
+    """
+    sources: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for projection in (getattr(body, "expressions", None) or []):
+        inner = projection.this if isinstance(projection, exp.Alias) else projection
+        if not isinstance(inner, exp.Column):
+            continue
+        output = _tkey(projection.alias_or_name)
+        if output in sources and sources[output] != _tkey(inner.name):
+            ambiguous.add(output)
+        sources[output] = _tkey(inner.name)
+    for name in ambiguous:
+        sources.pop(name, None)
+    return sources
+
+
 def _cte_edge(conjuncts: list["exp.Expression"], alias: str, cte_key: str, grain: list[str],
-              grains: dict[str, set[str]], scope_map: dict[str, str]) -> Optional[Relationship]:
+              grains: dict[str, set[str]], scope_map: dict[str, str],
+              outputs: dict[str, str]) -> Optional[Relationship]:
     """The join edge between a grain-CHANGING CTE and the table it is joined to, or None.
 
     A CTE that groups is a source in its own right: `WITH oi AS (SELECT order_id, SUM(quantity)
@@ -2103,12 +2139,17 @@ def _cte_edge(conjuncts: list["exp.Expression"], alias: str, cte_key: str, grain
     # folded here — the module's own convention, stated on `check_column_scope` as "matching is
     # case-insensitive", and the one this comparison was missing. The `Relationship` keeps the
     # WRITTEN spellings, because that is what the receipt echoes back to the caller.
+    #
+    # The NEAR key is additionally resolved through the body's projections, because the grain it is
+    # about to be compared against is written in the body's own input names. See
+    # `_projection_sources`; a key that does not resolve is compared as written, which over-reports.
+    near_key = outputs.get(_tkey(near.name), _tkey(near.name))
     from .build import infer_cardinality
     return Relationship(
         from_table=cte_key, to_table=other,
         from_column=near.name, to_column=far.name,
         relationship=infer_cardinality(
-            _tkey(cte_key), _tkey(other), [_tkey(near.name)], [_tkey(far.name)],
+            _tkey(cte_key), _tkey(other), [near_key], [_tkey(far.name)],
             {**grains, _tkey(cte_key): set(grain)},
         ),
     )
@@ -2174,7 +2215,15 @@ def _resolve_cte_scope(sel: "exp.Select", bodies: dict[str, "exp.Expression"],
               for key, (table, _area) in tidx.items()}
     conjuncts = [c for on in _all_join_predicates(sel) for c in _and_conjuncts(on)]
     resolved = dict(scope_map)
-    derived: list[Relationship] = []
+    # PASS ONE settles every grain-preserving rebinding, and nothing else. `_cte_edge` resolves the
+    # FAR side of an edge through this map, and one pass read it while still mutating it: whichever
+    # alias the statement wrote FIRST was resolved against a map the other alias had not reached
+    # yet. Measured on one statement with two CTEs, one grain-preserving and one grouped —
+    # `FROM p JOIN g ON g.order_id = p.id` gave `multiplied` naming the derived edge, and
+    # `FROM g JOIN p ON g.order_id = p.id` gave `undetermined`. Both are the safe direction and
+    # neither is the rule this module states about itself, which is that a receipt has to read the
+    # same way twice for the same SQL.
+    pending: list[tuple[str, str]] = []
     for alias, written in scope_map.items():
         key = _tkey(written)
         if key not in bodies:
@@ -2182,13 +2231,22 @@ def _resolve_cte_scope(sel: "exp.Select", bodies: dict[str, "exp.Expression"],
         source = _grain_preserving_source(key, bodies, tidx, set())
         if source is not None:
             resolved[alias] = source
-            continue
-        grain = _group_by_grain(bodies[key])
-        edge = _cte_edge(conjuncts, alias, written, grain, grains, resolved) if grain else None
+        else:
+            pending.append((alias, written))
+    # PASS TWO derives the edges, every one of them against the SAME settled map. A snapshot rather
+    # than `resolved` itself, so that one grain-changing CTE failing to derive an edge — which binds
+    # it to the empty string below — cannot change what a later one resolves its far side to.
+    settled = dict(resolved)
+    derived: list[Relationship] = []
+    for alias, written in pending:
+        body = bodies[_tkey(written)]
+        grain = _group_by_grain(body)
+        edge = _cte_edge(conjuncts, alias, written, grain, grains, settled,
+                         _projection_sources(body)) if grain else None
         if edge is None:
             resolved[alias] = ""
-            continue
-        derived.append(edge)
+        else:
+            derived.append(edge)
     return resolved, derived
 
 
