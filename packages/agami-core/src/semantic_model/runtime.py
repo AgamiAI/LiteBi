@@ -2930,11 +2930,16 @@ def assemble_receipt(
     # column past it would be reduced and compared against every declared metric only to be dropped.
     metric_dialect = _dialect_of(org)[0]
     candidates = _metric_candidates(org, _storage_type_of(org), metric_dialect)
+    by_binding = _by_binding(candidates)
     output_columns = _output_columns(tree)
     dropped_outputs = max(0, len(output_columns) - _RECEIPT_MAX_REFS)
     output_items: list[dict[str, Any]] = []
+    # One alias map per SELECT, not per output column: every column of an arm shares that arm's
+    # SELECT, and `_own_alias_map` walks a subtree. Lives for this call only.
+    own_alias_memo: dict[int, dict[str, str]] = {}
     for oc in output_columns[:_RECEIPT_MAX_REFS]:
-        status, match = _match_output_column(oc, candidates, visible, metric_dialect)
+        status, match = _match_output_column(oc, candidates, by_binding, visible,
+                                             metric_dialect, own_alias_memo)
         # Everything a MATCHED metric contributes, and null on every other status. An item that
         # matched nothing must assert nothing about a metric it did not match — ACE-059's review
         # found three false positives of exactly this shape in the joins section, two of them
@@ -5336,7 +5341,8 @@ def _output_columns(node: "exp.Expression") -> list[OutputColumn]:
     return out
 
 
-def _reads_only_visible(oc: OutputColumn, visible: set[str]) -> bool:
+def _reads_only_visible(oc: OutputColumn, visible: set[str],
+                        memo: dict[int, dict[str, str]]) -> bool:
     """Whether every relation this output column's expression reads is one the walk can see behind.
 
     The `visible` set is the model's declared tables minus every name the statement bound for
@@ -5355,10 +5361,19 @@ def _reads_only_visible(oc: OutputColumn, visible: set[str]) -> bool:
     last-wins walk, so a CTE body's binding overwrites the outer query's for the same alias — which
     is precisely what produced ACE-059's signed-off false match. An UNQUALIFIED column is not
     evidence of anything either way and is left to the sources the SELECT reads.
+
+    `memo` is keyed by `id(sel)` and is why this takes one, the same device `_folded_conjuncts`
+    uses: EVERY output column of one arm shares that arm's SELECT, so resolving the map per column
+    walked the same subtree once per projection. Measured at 8.96 ms against `main`'s 4.09 ms on a
+    40-column statement — and the tell was that a model with NO metrics was SLOWER than one with
+    400, because with candidates present most columns match and never reach this function at all.
+    The memo lives for one `assemble_receipt` call, which is the span the tree it keys outlives.
     """
     if oc.expr is None:                      # a star: nothing read, nothing established
         return False
-    scope_map = _own_alias_map(oc.sel)
+    scope_map = memo.get(id(oc.sel))
+    if scope_map is None:
+        scope_map = memo[id(oc.sel)] = _own_alias_map(oc.sel)
     # Every source this SELECT reads itself. A derived table or `VALUES` list is not an `exp.Table`
     # and so is absent from the map by construction, which is what makes the `.values()` check below
     # catch it: the SELECT reads something, and none of what it reads is a visible declared table.
@@ -5373,15 +5388,36 @@ def _reads_only_visible(oc: OutputColumn, visible: set[str]) -> bool:
     return True
 
 
+def _by_binding(candidates: list[MetricCandidate]) -> dict:
+    """Candidates indexed by their reduced binding, first declaration winning a tie.
+
+    First-wins in candidate order, so two metrics declaring the SAME binding always resolve to the
+    same one and the receipt is identical on every run (REQ-022). Two names for one expression is a
+    model-authoring question and not one this layer decides; picking by iteration order would make
+    the answer depend on a dict's insertion history.
+
+    Candidates whose binding could not be read carry `reduced is None` and are absent here. They are
+    still in `candidates`, because whether ANY of them is unread is what decides between `unmatched`
+    and `undetermined`.
+    """
+    out: dict = {}
+    for cand in candidates:
+        if cand.reduced is not None:
+            out.setdefault(cand.reduced, cand)
+    return out
+
+
 def _match_output_column(oc: OutputColumn, candidates: list[MetricCandidate],
-                         visible: set[str], dialect: "str | None"
+                         by_binding: dict, visible: set[str], dialect: "str | None",
+                         memo: dict[int, dict[str, str]]
                          ) -> tuple[str, Optional[MetricCandidate]]:
     """One output column against every declared metric: `(status, matched candidate or None)`.
 
     The branch ORDER is the contract, and each rung is a claim the analysis has earned:
 
-    1. **A match, if the expressions are equal.** First in candidate order, so the same statement
-       names the same metric on every run (REQ-022).
+    1. **A match, if the expressions are equal**, looked up in `by_binding` rather than scanned
+       for. Ties there are resolved first-declaration-wins, so the same statement names the same
+       metric on every run (REQ-022).
     2. **`undetermined` when the column sits behind a boundary we do not enter** — see
        `_reads_only_visible`. Asked only AFTER the match, because a column whose expression we DID
        compare successfully has been established regardless of what else is in scope.
@@ -5394,11 +5430,14 @@ def _match_output_column(oc: OutputColumn, candidates: list[MetricCandidate],
        section: it is the sentence "this number is not the organisation's agreed definition".
     """
     if oc.expr is not None:
-        reduced = _reduced_projection(oc.expr, dialect)
-        for cand in candidates:
-            if cand.reduced is not None and cand.reduced == reduced:
-                return MATCHED, cand
-    if not _reads_only_visible(oc, visible):
+        # A DICT LOOKUP, not a scan of every candidate. sqlglot's `__hash__` is consistent with its
+        # `__eq__` — both derive from the node's structure — so the equality this comparison is
+        # defined as is exactly what the lookup performs, and 50 output columns against a model
+        # declaring hundreds of metrics costs 50 hashes rather than their product.
+        cand = by_binding.get(_reduced_projection(oc.expr, dialect))
+        if cand is not None:
+            return MATCHED, cand
+    if not _reads_only_visible(oc, visible, memo):
         return UNDETERMINED, None
     if any(cand.reduced is None for cand in candidates):
         return UNDETERMINED, None

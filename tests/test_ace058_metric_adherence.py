@@ -335,7 +335,8 @@ def _statuses(org, sql: str, *, drop: tuple[str, ...] = ()) -> list[tuple[str, s
              if c.metric.name not in drop]
     out = []
     for oc in rt._output_columns(tree):
-        status, match = rt._match_output_column(oc, cands, visible, dialect)
+        status, match = rt._match_output_column(
+            oc, cands, rt._by_binding(cands), visible, dialect, {})
         out.append((oc.key, status, match.metric.name if match else None))
     return out
 
@@ -636,6 +637,55 @@ def test_a_derived_metric_whose_expansion_fails_falls_back_to_its_raw_binding(tm
 
 
 # --- cost -------------------------------------------------------------------
+
+
+def test_the_alias_map_is_resolved_once_per_select_not_once_per_output_column(org, monkeypatch):
+    """Every output column of an arm shares that arm's SELECT, and `_own_alias_map` walks a subtree.
+
+    Measured before the memo: 8.96 ms against `main`'s 4.09 ms on a 40-column statement, and the
+    tell was that a model with NO metrics ran SLOWER than one with 400 — with candidates present
+    most columns match and never reach the scope check at all. A counter rather than a clock,
+    because a timing assertion on a shared runner is a flake.
+    """
+    calls = []
+    real = rt._own_alias_map
+    monkeypatch.setattr(rt, "_own_alias_map", lambda sel: (calls.append(id(sel)), real(sel))[1])
+    sql = "SELECT " + ", ".join(f"id AS c{i}" for i in range(20)) + " FROM orders"
+    rt.assemble_receipt(org, sql)
+    # Non-empty AND one: `== 1` alone would also pass if the scope check stopped running at all,
+    # which would delete the property this is here to protect rather than satisfy it.
+    assert calls, "the scope check never ran — this test would pass vacuously"
+    assert len(calls) == 1, f"resolved the same SELECT's alias map {len(calls)} times"
+
+
+def test_matching_does_not_scan_every_declared_metric(org):
+    """The index is a dict keyed by the reduced binding, so a wide projection against a model
+    declaring hundreds of metrics costs one hash per column rather than their product. sqlglot's
+    `__hash__` derives from the same structure its `__eq__` does, which is what makes the lookup and
+    the comparison the same question."""
+    cands = rt._metric_candidates(org, rt._storage_type_of(org), rt._dialect_of(org)[0])
+    idx = rt._by_binding(cands)
+    # `broken_metric` will not parse, so it is absent from the index while staying a candidate —
+    # the list is what decides `unmatched` vs `undetermined`, the index only answers "which metric".
+    assert "broken_metric" not in {c.metric.name for c in idx.values()}
+    assert "broken_metric" in {c.metric.name for c in cands}
+    assert idx[rt._reduced_binding(PAID_REVENUE, "postgres")].metric.name == "paid_revenue"
+
+
+def test_two_metrics_declaring_one_binding_resolve_the_same_way_every_run(tmp_path):
+    """First declaration wins, so the receipt is identical on every run (REQ-022). Two names for one
+    expression is a model-authoring question, not one this layer decides — but it must not decide it
+    differently on different runs."""
+    org = _org_with_metric(tmp_path, "duplicate_binding",
+                           bindings={"PostgreSQL": PAID_REVENUE})
+    cands = rt._metric_candidates(org, rt._storage_type_of(org), rt._dialect_of(org)[0])
+    winner = rt._by_binding(cands)[rt._reduced_binding(PAID_REVENUE, "postgres")].metric.name
+    assert all(
+        rt._by_binding(rt._metric_candidates(
+            org, rt._storage_type_of(org), rt._dialect_of(org)[0]
+        ))[rt._reduced_binding(PAID_REVENUE, "postgres")].metric.name == winner
+        for _ in range(5)
+    )
 
 
 def test_a_binding_is_reduced_once_and_not_once_per_request(org):
