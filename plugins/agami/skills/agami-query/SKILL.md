@@ -374,6 +374,7 @@ It returns JSON: `{sql, findings, units}`, and it **always exits 0**. The return
 `findings` is a list, usually empty. Each entry is `{risk, reason, triggering_joins}` and each one is a **fact about the statement**, not a verdict on it:
 
 - `fan_trap` / `chasm_trap` — a join multiplies the rows an aggregate is computed from. `triggering_joins` names which join does it.
+- `fan_out_invariant` — the same multiplication, on an aggregate it cannot move (`MIN`, `MAX`, a `DISTINCT` one, `BOOL_AND` / `BOOL_OR`). The rows were duplicated; the number is the same either way. `triggering_joins` names the join, exactly as above.
 - `bad_aggregation` — a `SUM` of a rate or an identifier, or an `AVG` of one.
 - `semi_additive` — a `SUM` of a balance across a time grain, which multiplies a stock.
 

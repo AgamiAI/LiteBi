@@ -18,6 +18,47 @@ from semantic_model import runtime as rt  # noqa: E402
 
 
 def _sales_org():
+    """Four tables, three many-to-one edges, and a declared grain for every table.
+
+    `tables_defined` used to be absent, which made `_model_table_index(org)` empty. ACE-060 derives
+    its `visible` set from that index, so no aggregate on this org could ever be seen behind, and
+    `not_multiplied` — the positive claim that a number is clean — was unreachable here for every
+    statement. The tests below already assert things like "aggregating the many side is allowed",
+    a claim the fixture could not express. Declaring the tables is what lets them say it.
+
+    Two things are deliberately NOT declared. Every `Column.aggregation` stays at its default
+    `unknown` and no `metrics` are declared, which is what keeps `_check_aggregation_semantics`
+    silent: a declared `averageable` or a semi-additive metric would add `bad_aggregation` /
+    `semi_additive` findings to the exact risk lists the tests below assert, and those lists are
+    about the fan/chasm detector, not about aggregation class.
+
+    Extended in place rather than beside: a second sales org is drift, and every assertion here is
+    written against this one set of names and edges.
+    """
+    tables = [
+        m.Table(name="orders", schema="public", storage_connection="c", grain=["id"],
+                description="orders",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="customer_id", type="integer"),
+                         m.Column(name="total_amount", type="decimal"),
+                         m.Column(name="revenue", type="decimal"),
+                         m.Column(name="status", type="string"),
+                         m.Column(name="created_at", type="timestamp"),
+                         m.Column(name="flag", type="boolean")]),
+        m.Table(name="order_items", schema="public", storage_connection="c",
+                grain=["order_id", "product_id"], description="order items",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="order_id", type="integer"),
+                         m.Column(name="product_id", type="integer"),
+                         m.Column(name="quantity", type="integer")]),
+        m.Table(name="customers", schema="public", storage_connection="c", grain=["id"],
+                description="customers",
+                columns=[m.Column(name="id", type="integer")]),
+        m.Table(name="tickets", schema="public", storage_connection="c", grain=["id"],
+                description="support tickets",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="customer_id", type="integer")]),
+    ]
     rels = [
         m.Relationship(from_table="order_items", to_table="orders", from_column="order_id",
                        to_column="id", relationship="many_to_one"),
@@ -27,7 +68,8 @@ def _sales_org():
                        to_column="id", relationship="many_to_one"),
     ]
     return m.Datasource(datasource="Shop",
-                          subject_areas=[m.SubjectArea(name="sales", relationships=rels)])
+                          subject_areas=[m.SubjectArea(name="sales", tables_defined=tables,
+                                                       relationships=rels)])
 
 
 # --- pre-flight ---
@@ -83,10 +125,23 @@ def test_fan_trap_mixed_raw_and_aggregate_is_reported():
 
 
 def test_explicit_cross_product_is_not_a_trap():
+    """A cross-product with nothing aggregated over it multiplies no number, so there is nothing
+    to report — both traps are statements about the rows an aggregate is computed from.
+
+    `unchecked` is asserted beside the empty finding list for the reason
+    `test_aggregating_many_side_is_allowed` states: an empty list is also what a statement that did
+    not parse returns, so on its own it cannot tell "nothing is wrong" from "nothing was
+    established". This statement is a comma join with a `SELECT *` and no GROUP BY, which is exactly
+    the shape a parser or a scope gate is most likely to give up on quietly.
+
+    The empty aggregate roster is the other half, and it is the premise rather than a bonus: the
+    finding list is empty BECAUSE there is no aggregate, not because a fan was cleared."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT * FROM orders, tickets WHERE orders.customer_id = tickets.customer_id", org)
+    assert pf.unchecked is None, pf.unchecked
     assert pf.findings == []
+    assert pf.aggregates == []
 
 
 def test_fan_trap_in_a_set_operation_arm_is_reported():
@@ -115,20 +170,38 @@ def test_every_trapped_arm_is_reported():
 
 
 def test_clean_set_operation_passes_preflight():
-    """A set operation with no trapped arm reports nothing — arm-walking must not over-report."""
+    """A set operation with no trapped arm reports nothing — arm-walking must not over-report.
+
+    A set operation parses to `exp.SetOperation` rather than to `exp.Select`, so a walk that gave up
+    on it would report nothing too, and this test's whole subject is the walk. `unchecked` is what
+    separates the two readings: null says the analysis ran over both arms and found nothing, where
+    the empty finding list on its own says only that nothing came back.
+
+    Neither arm aggregates, so the roster is empty as well, and that is the reason the finding list
+    is: no aggregate means no fan and no chasm before either arm's tables are considered."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT id FROM orders UNION SELECT id FROM customers", org)
+    assert pf.unchecked is None, pf.unchecked
     assert pf.findings == []
+    assert pf.aggregates == []
 
 
 def test_aggregating_many_side_is_allowed():
-    # aggregating the MANY side (order_items) is legitimate, not a fan trap
+    """Aggregating the MANY side (order_items) is legitimate, not a fan trap.
+
+    The status is asserted alongside the empty finding list because an empty list is also what a
+    statement the analysis could not read returns, so on its own it cannot tell "nothing is wrong"
+    apart from "nothing was established". `not_multiplied` is the positive claim, and it is the one
+    this test's name has always made.
+    """
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT SUM(order_items.quantity) FROM orders JOIN order_items ON order_items.order_id=orders.id",
         org)
     assert pf.findings == []
+    assert [(a.aggregate, a.status) for a in pf.aggregates] == [
+        ("SUM(order_items.quantity)", rt.NOT_MULTIPLIED)]
 
 
 # --- examples-first ---
