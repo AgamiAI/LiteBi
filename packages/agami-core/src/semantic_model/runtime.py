@@ -1770,35 +1770,40 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
                 for r in fan_rels
             }
             measure = _echo_name(measure_table)
-            many = [_echo_name(mt) for mt in sorted(many_tables)]
-            # Two sentences about ONE fan, picked per aggregate. The edge is the same edge and the
-            # duplication is the same duplication; what differs is whether the number moved with it.
-            # The second states that and stops there — it names no fix, because under principle 6c
-            # this layer does not hold the question and a sentence telling the caller to act on a
-            # value that did not change would be a verdict on a statement that is fine.
-            reason_for = {
-                "fan_trap": (
+            for i, site in enumerate(sites):
+                if measure_table not in site.sources:
+                    continue
+                # PER EDGE, and that is what this loop is for. A many-side column on the value path
+                # means the value is already one row per row of THAT many side, so THAT edge's
+                # duplication is the grain the value was defined at and multiplies nothing. Every
+                # other edge in `many_tables` still does. Suppressing the whole finding because one
+                # edge is the value's grain is how `SUM(customers.id * tickets.id)` over two fans
+                # off `customers` came to report clean: the tickets join is its grain, the orders
+                # join duplicates it, and only one of those is a reason to say nothing.
+                inflating = [mt for mt in sorted(many_tables) if mt not in site.value_sources]
+                if not inflating:
+                    continue
+                many = [_echo_name(mt) for mt in inflating]
+                # Two sentences about ONE fan, picked per aggregate. The edge is the same edge and
+                # the duplication is the same duplication; what differs is whether the number moved
+                # with it. The second states that and stops there — it names no fix, because under
+                # principle 6c this layer does not hold the question and a sentence telling the
+                # caller to act on a value that did not change would be a verdict on a fine
+                # statement.
+                risk = "fan_out_invariant" if _is_fan_immune(site.node) else "fan_trap"
+                reason = (
                     f"fan trap: aggregating {measure!r} (one side) across a join to "
                     f"{many} (many side)."
-                ),
-                "fan_out_invariant": (
+                ) if risk == "fan_trap" else (
                     f"fan out: the join from {measure!r} (one side) to {many} (many side) "
                     f"multiplies the rows this aggregate reads; its value is unchanged by that "
                     f"duplication."
-                ),
-            }
-            joins = [f"{measure} (1) <- {mt} (N)" for mt in many]
-            for i, site in enumerate(sites):
-                # A many-side column ON THE VALUE PATH means the value is already one row per
-                # many-side row, so this edge's duplication IS its grain and multiplies nothing.
-                # Scoped per fan edge deliberately: `many_tables` is the many side of THIS edge, and
-                # a many-side column belonging to some other edge must not suppress this one.
-                if measure_table in site.sources and not (site.sources & many_tables):
-                    risk = "fan_out_invariant" if _is_fan_immune(site.node) else "fan_trap"
-                    attached[i].append(Finding(
-                        risk, reason=reason_for[risk],
-                        triggering_joins=list(joins), aggregate=site.aggregate,
-                    ))
+                )
+                attached[i].append(Finding(
+                    risk, reason=reason,
+                    triggering_joins=[f"{measure} (1) <- {mt} (N)" for mt in many],
+                    aggregate=site.aggregate,
+                ))
 
     # The SEMANTIC checks the fan/chasm detector is blind to: aggregation-class violations and
     # semi-additive rollups over time. These need NO join, so cardinality analysis cannot see them.
@@ -3784,9 +3789,16 @@ class _AggSite(NamedTuple):
     node: "exp.AggFunc"
     aggregate: str  # the receipt's label for it, already bounded
     scope: str  # "main", or "main#<n>" inside a set operation
-    # The model tables this aggregate reads, as far as the scope map could resolve them. This is
-    # what the fan and chasm detectors consume, in aggregate across the sites.
+    # The model tables this aggregate reads, over EVERY column inside it, as far as the scope map
+    # could resolve them. This is what the fan and chasm detectors consume, in aggregate across the
+    # sites, and what `resolved` is computed from.
     sources: frozenset[str]
+    # The tables the aggregate's VALUE is built from, per `_value_sources`. Narrower than `sources`
+    # and used in exactly one place: deciding whether a particular fan edge's duplication is the
+    # grain the value was already at. It answers a different question from `sources`, and the two
+    # were briefly one field — which is what made a one-side column sitting in a CASE predicate
+    # look like a reason to report nothing at all about a fan that really did inflate the number.
+    value_sources: frozenset[str]
     # Whether the sources above are the WHOLE story. False when a column inside the aggregate could
     # not be attributed to a table, and false when there is no column at all — see `_aggregate_sites`
     # for why the second case is the one that matters.
@@ -3837,22 +3849,28 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
     """
     sites: list[_AggSite] = []
     for agg in _select_aggregates(tree):
-        # TWO column walks over one aggregate, and the split is the point. `sources` is what the
-        # fan and chasm detectors attribute the multiplication by, so it takes only the columns the
-        # VALUE is computed from — a many-side column in a CASE predicate or an ORDER BY arm does
-        # not put the value at the many side's grain. `resolved` is a different question, "did the
-        # analysis understand everything this aggregate reads", and that one wants every column:
-        # narrowing it to the value path would turn `COUNT(CASE WHEN i.quantity > 0 THEN 1 END)`
-        # from a clean answer into `undetermined`, because a value path of one literal is
-        # indistinguishable from no columns at all to the `bool(...)` test below.
-        value_tables = [_resolve_col_table(col, scope_map) for col in _value_columns(agg)]
+        # TWO column walks over one aggregate, answering two different questions, and keeping them
+        # apart is the point. `sources` is WHICH TABLES THIS AGGREGATE READS, over every column
+        # inside it, and three consumers ask that: the fan loop's "is the measure table one this
+        # aggregate reads", the chasm rule's `agg_sources`, and `resolved`. `value_sources` is the
+        # narrower "which tables is the value BUILT from", and exactly one consumer asks it — the
+        # fan loop's per-edge suppression, where a many-side column on the value path means that
+        # edge's duplication is the grain the value was already defined at.
+        #
+        # Narrowing `sources` itself to the value path is what manufactured a clean receipt.
+        # `SUM(CASE WHEN orders.status = 'shipped' THEN 1 ELSE 0 END)` has NO column on its value
+        # path, so the aggregate stopped reading `orders` at all, the fan loop never reached it, and
+        # a total the join really does inflate reported `not_multiplied`. The chasm blast radius was
+        # wider still: `agg_sources` is the union over sites, so one wrapped aggregate emptied the
+        # set for every OTHER aggregate in the statement, including ones the CASE never touched.
         cols = list(agg.find_all(exp.Column))
         resolved = [_resolve_col_table(col, scope_map) for col in cols]
         sites.append(_AggSite(
             node=agg,
             aggregate=_echo_expr(agg.sql()),
             scope=scope,
-            sources=frozenset(t for t in value_tables if t),
+            sources=frozenset(t for t in resolved if t),
+            value_sources=_value_sources(agg, scope_map),
             resolved=bool(cols) and all(resolved) and all(scope_map.values()) and (
                 visible is None or all(_tkey(t) in visible for t in resolved)
             ),
@@ -3860,53 +3878,96 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
     return sites
 
 
-def _value_columns(node: "exp.Expression") -> list["exp.Column"]:
-    """Every column on an expression's VALUE path: the ones whose values the result is built from.
+def _value_sources(node: "exp.Expression", scope_map: dict[str, str]) -> frozenset[str]:
+    """The tables an expression's value is at the grain of on EVERY path through it.
 
-    The complement is the columns that only decide WHICH rows or in WHAT ORDER, and the difference
-    is what a fan means for the number. `SUM(order_items.quantity * orders.total_amount)` is one
-    product per order item, so the duplication the join performs is the grain the value was already
-    at and multiplies nothing; `SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount
-    END)` sums a one-side amount once per item, so the same duplication really does inflate it. A
-    walk that took every column inside the aggregate cannot tell those apart — it sees
-    `order_items` in both — which is why attribution is by POSITION and never by presence.
+    This is the one question the per-edge fan suppression asks, and both halves of it are load
+    bearing. VALUE, because a column that only decides WHICH rows or in WHAT ORDER says nothing
+    about the grain of the number: `SUM(order_items.quantity * orders.total_amount)` is one product
+    per order item, so the duplication the join performs is the grain the value was already at and
+    multiplies nothing, while `SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount
+    END)` sums a one-side amount once per item and the same duplication really does inflate it. A
+    walk that took every column inside the aggregate sees `order_items` in both and cannot tell them
+    apart, which is why attribution is by POSITION and never by presence.
 
-    Two node types put a column somewhere that is not the value, and each gets a case:
+    EVERY PATH, because an alternation is only at a table's grain if all of its alternatives are.
+    `SUM(CASE WHEN orders.flag THEN orders.total_amount ELSE order_items.quantity END)` takes a
+    one-side amount on the rows where the flag is set, and the join duplicates those rows and sums
+    the amount once per duplicate. Reading the union of the branches would put `order_items` on the
+    value path and clear a number the fan really does move, so an alternation INTERSECTS its
+    branches and everything else UNIONS its children. Those two compose correctly at depth without
+    enumerating paths: table sets under union and intersection are a distributive lattice, so
+    `(A∩B) ∪ (C∩D)` is exactly the intersection over the four paths of `CASE… * CASE…`.
+
+    Resolution to tables happens HERE rather than in the caller for the same reason. Two different
+    columns of one table are one grain, and `CASE WHEN p THEN orders.total_amount ELSE orders.revenue
+    END` is at `orders` grain on both branches; an intersection taken over COLUMNS would find nothing
+    in common and report the opposite.
+
+    The nodes that put an operand somewhere that is not the value, each measured rather than assumed:
 
     - `exp.Case`. `ifs[].this` is the branch predicate and `Case.this` is the simple-CASE operand
-      compared against them, so both are inputs to the choice rather than to the result. The value
-      is `ifs[].true` and `default`.
+      compared against them, so both are inputs to the choice and not to the result. The branches
+      are `ifs[].true` and `default`. An ABSENT `default` is not a branch: the implicit result is
+      NULL, which every aggregate skips rather than folds, so counting it would report a fan on
+      `SUM(CASE WHEN orders.flag THEN order_items.quantity END)`, whose value is at item grain on
+      every row that contributes one. An explicit `ELSE NULL` is counted, contributes no table and
+      so clears no edge — the same shape read the other way, in the fail-closed direction.
+    - `exp.If`. `IF` / `IIF` / `IFF` parse to this, NOT to `exp.Case`, on every dialect this layer
+      speaks. Without a case of its own the generic branch would take the CONDITION's columns as
+      value columns, which is the polarity that manufactures a false clean, and sqlglot RENDERS an
+      `exp.If` as `CASE WHEN … END` — so the two spellings produce a byte-identical receipt label
+      with opposite statuses.
+    - `exp.Nullif`. `args["expression"]` is the value the first argument is COMPARED against, not a
+      value the result is built from.
+    - `exp.GroupConcat`. `args["separator"]` is punctuation between the folded values.
+    - `exp.Coalesce`. `IFNULL` and `NVL` parse to it too. It is an alternation like `exp.Case`, and
+      the same reasoning applies: its value is at a table's grain only if every alternative is.
     - `exp.Order`. `STRING_AGG(x ORDER BY y)` parses to `GroupConcat(this=Order(this=x,
       expressions=[Ordered(y)]))`, so the ordering arms hang off `expressions` and are neither
       predicate nor value: reordering a concatenation changes the string but the fan is not what
       reordered it, and `y` is not a value the aggregate folds.
 
-    Everything else recurses over `node.args` unchanged, which is what keeps this honest by default:
-    a node type nobody thought about contributes its columns rather than silently dropping them, and
-    dropping is the direction that manufactures a false clean. `exp.Distinct` needs no case for
-    exactly that reason — it holds its argument under `args["expressions"]` and the generic branch
-    already reaches it. Neither does `exp.Filter`: `SUM(x) FILTER (WHERE y)` parses to
-    `Filter(this=Sum, expression=Where)`, so the predicate is structurally OUTSIDE the aggregate and
+    Everything else unions its children, and THE POLARITY OF THAT DEFAULT DEPENDS ON THE NODE. For a
+    node that only combines values it is honest: a node type nobody thought about contributes its
+    columns rather than silently dropping them. For a node that mixes a PREDICATE or a SEPARATOR
+    with its values it is inverted and dangerous — contributing the predicate's columns is what
+    manufactures a false clean, because a many-side column on the value path is what clears the fan.
+    Any node mixing predicate and value operands is that hazard class and needs a case here;
+    `exp.Case`, `exp.If`, `exp.Nullif` and `exp.GroupConcat` are the members this layer has met.
+    `exp.Distinct` is safely generic: it holds its argument under `args["expressions"]` and combines
+    nothing. So is `exp.Filter`: `SUM(x) FILTER (WHERE y)` parses to `Filter(this=Sum,
+    expression=Where)`, so the predicate is structurally OUTSIDE the aggregate and
     `find_all(exp.AggFunc)` never hands it here at all.
 
     `node.args` is iterated by hand rather than through `iter_expressions()`. Four lines that cannot
     drift, against a package that pins only `sqlglot>=20`.
     """
     if not isinstance(node, exp.Expression):
-        return []
+        return frozenset()
     if isinstance(node, exp.Column):
-        return [node]
+        table = _resolve_col_table(node, scope_map)
+        return frozenset([table]) if table else frozenset()
+    alternatives: Optional[list["exp.Expression"]] = None
     if isinstance(node, exp.Case):
-        cols = [c for branch in node.args.get("ifs") or []
-                for c in _value_columns(branch.args.get("true"))]
-        return cols + _value_columns(node.args.get("default"))
-    if isinstance(node, exp.Order):
-        return _value_columns(node.this)
-    cols = []
+        alternatives = [branch.args.get("true") for branch in node.args.get("ifs") or []]
+        alternatives.append(node.args.get("default"))
+    elif isinstance(node, exp.If):
+        alternatives = [node.args.get("true"), node.args.get("false")]
+    elif isinstance(node, exp.Coalesce):
+        alternatives = [node.this, *(node.args.get("expressions") or [])]
+    if alternatives is not None:
+        present = [alt for alt in alternatives if alt is not None]
+        if not present:
+            return frozenset()
+        return frozenset.intersection(*(_value_sources(alt, scope_map) for alt in present))
+    if isinstance(node, (exp.Order, exp.Nullif, exp.GroupConcat)):
+        return _value_sources(node.this, scope_map)
+    tables: set[str] = set()
     for arg in node.args.values():
         for child in (arg if isinstance(arg, list) else [arg]):
-            cols.extend(_value_columns(child))
-    return cols
+            tables |= _value_sources(child, scope_map)
+    return frozenset(tables)
 
 
 def _select_aggregates(sel: "exp.Select") -> list["exp.AggFunc"]:

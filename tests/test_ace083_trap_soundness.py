@@ -163,34 +163,66 @@ EVERY_STATUS_SQL = (
     "FROM orders o JOIN order_items i ON i.order_id = o.id"
 )
 
-# Every branch of `_value_columns`, exercised on the function directly. `expected` is a LIST and not
-# a set: the walk's order decides the order of nothing the receipt renders today, but `sources` is
-# built from it and a list says what was measured rather than what happened to be enough.
-VALUE_COLUMN_CASES = [
-    ("a bare column", "orders.total_amount", ["orders.total_amount"]),
+# The scope map every `_value_sources` case below is resolved through. Identity, because these
+# statements qualify their columns with the table's own name and the question under test is which
+# POSITION a column sits in, never which alias it was written under.
+VALUE_SCOPE = {"orders": "orders", "order_items": "order_items"}
+
+# Every branch of `_value_sources`, exercised on the function directly. `expected` is a set of TABLE
+# names rather than a list of columns, because the grain of a value is a fact about tables: two
+# columns of one table are one grain, and `CASE WHEN p THEN orders.total_amount ELSE orders.revenue
+# END` is at `orders` grain on both branches while sharing no column between them.
+VALUE_SOURCE_CASES = [
+    ("a bare column", "orders.total_amount", {"orders"}),
     ("arithmetic, the generic branch",
      "SUM(order_items.quantity * orders.total_amount)",
-     ["order_items.quantity", "orders.total_amount"]),
+     {"order_items", "orders"}),
     ("a searched CASE, whose WHEN is a predicate",
      "SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount END)",
-     ["orders.total_amount"]),
+     {"orders"}),
     ("a searched CASE with an ELSE, which is a value",
      "SUM(CASE WHEN order_items.quantity > 0 THEN orders.total_amount ELSE orders.revenue END)",
-     ["orders.total_amount", "orders.revenue"]),
+     {"orders"}),
     ("a simple CASE, whose operand is a predicate input",
      "SUM(CASE orders.status WHEN 'x' THEN order_items.quantity END)",
-     ["order_items.quantity"]),
+     {"order_items"}),
     ("a CASE inside a CASE branch",
      "SUM(CASE WHEN order_items.quantity > 0 "
      "THEN CASE WHEN orders.flag THEN orders.total_amount END END)",
-     ["orders.total_amount"]),
+     {"orders"}),
     ("an ordering arm, which is neither predicate nor value",
      "STRING_AGG(orders.status, ',' ORDER BY order_items.id)",
-     ["orders.status"]),
+     {"orders"}),
     ("DISTINCT, which the generic branch reaches with no case of its own",
      "SUM(DISTINCT orders.total_amount)",
-     ["orders.total_amount"]),
-    ("no column at all", "COUNT(*)", []),
+     {"orders"}),
+    ("no column at all", "COUNT(*)", set()),
+    # The branches added because the union reading of an alternation cleared a real fan.
+    ("a CASE whose branches disagree about the grain",
+     "SUM(CASE WHEN orders.flag THEN orders.total_amount ELSE order_items.quantity END)",
+     set()),
+    ("a CASE whose branches agree about the grain",
+     "SUM(CASE WHEN orders.flag THEN order_items.quantity ELSE order_items.id END)",
+     {"order_items"}),
+    ("an alternation nested inside arithmetic, which distributes",
+     "SUM(order_items.quantity * CASE WHEN orders.flag THEN orders.total_amount "
+     "ELSE orders.revenue END)",
+     {"order_items", "orders"}),
+    ("IF, which is not an exp.Case and whose condition is a predicate",
+     "SUM(IF(order_items.quantity > 0, orders.total_amount, 0))",
+     set()),
+    ("IF with no ELSE arm at all",
+     "SUM(IF(orders.flag, order_items.quantity))",
+     {"order_items"}),
+    ("NULLIF, whose second argument is a comparand",
+     "SUM(NULLIF(orders.total_amount, order_items.quantity))",
+     {"orders"}),
+    ("a GROUP_CONCAT separator, which is punctuation and not a value",
+     "STRING_AGG(orders.status, order_items.product_id)",
+     {"orders"}),
+    ("COALESCE, an alternation spelled as a function",
+     "SUM(COALESCE(orders.total_amount, order_items.quantity))",
+     set()),
 ]
 
 # --- S1: the aggregates a duplication cannot move --------------------------
@@ -543,25 +575,51 @@ def test_a_filter_clause_predicate_is_outside_the_aggregate_the_analysis_reads()
     assert reports[0].joins == [FAN_EDGE], reports[0].joins
 
 
-@pytest.mark.parametrize("label,expression,expected", VALUE_COLUMN_CASES)
-def test_the_value_path_holds_only_the_columns_the_result_is_built_from(label, expression, expected):
-    """A7. Every branch of `_value_columns`, asserted on the function rather than through a receipt.
+@pytest.mark.parametrize("label,expression,expected", VALUE_SOURCE_CASES)
+def test_the_value_path_holds_only_the_tables_the_result_is_built_from(label, expression, expected):
+    """A7. Every branch of `_value_sources`, asserted on the function rather than through a receipt.
 
     The analysis reaches most of these branches, but it reaches them in combination and reports one
-    status per statement, so a branch that dropped a column the value does use and a branch that
-    kept one it does not can cancel out in the answer. Called directly, each shape says which
-    columns it thinks the value is built from, and a wrong one is wrong visibly.
+    status per statement, so a branch that dropped a table the value does use and a branch that kept
+    one it does not can cancel out in the answer. Called directly, each shape says which tables it
+    thinks the value is built from, and a wrong one is wrong visibly.
 
-    The two guard branches are the reason this is a unit test at all. A simple `CASE`'s operand
+    The guard branches are the reason this is a unit test at all. A simple `CASE`'s operand
     (`CASE orders.status WHEN 'x' THEN …`) is an input to the branch CHOICE, not to the result, so
     it belongs with the `WHEN` predicates and not with the `THEN` values — and it lives under
     `Case.this`, which the generic branch would have taken. The nested case proves the recursion
     applies the same rule at depth rather than only at the top. `DISTINCT` is the opposite check:
     it carries a genuine value column under `args["expressions"]`, so the generic branch must reach
     it and no case may intercept it.
+
+    The alternation cases are what an earlier reading of this function got wrong. Reading a `CASE`
+    as the UNION of its branches puts a many-side column on the value path whenever ANY branch
+    carries one, so a value that is a one-side amount on the rows where the predicate holds reads as
+    though it were at many-side grain throughout — and the fan that really does duplicate those rows
+    is cleared. `IF` is the same defect with a sharper edge, because sqlglot parses `IF` / `IIF` /
+    `IFF` to `exp.If` rather than to `exp.Case` and then RENDERS it back as `CASE WHEN … END`, so
+    without a case of its own the two spellings produce a byte-identical receipt label carrying
+    opposite statuses.
     """
     node = parse_one(f"SELECT {expression} FROM orders").expressions[0]
-    assert [c.sql() for c in rt._value_columns(node)] == expected, label
+    assert rt._value_sources(node, VALUE_SCOPE) == expected, label
+
+
+@pytest.mark.parametrize("dialect", [None, "bigquery", "duckdb", "mysql", "tsql", "snowflake"])
+def test_the_conditional_function_parses_to_exp_if_on_every_dialect_this_layer_speaks(dialect):
+    """`exp.If`'s case exists because of a PARSE fact, so the parse fact is what is pinned.
+
+    `IF` is spelled `IIF` on T-SQL and `IFF` on Snowflake, and every one of them lands on `exp.If`
+    rather than on `exp.Case`. A future sqlglot that folded the conditional into `exp.Case` would
+    make the `exp.If` branch dead rather than wrong, and one that introduced a THIRD node for it
+    would silently drop back to the generic branch — which reads the condition as a value and clears
+    the fan. That is the direction this asserts against, so it asserts on the node type directly.
+    """
+    spelling = {"tsql": "IIF", "snowflake": "IFF"}.get(dialect, "IF")
+    sql = f"SELECT SUM({spelling}(order_items.quantity > 0, orders.total_amount, 0)) FROM orders"
+    node = parse_one(sql, read=dialect).expressions[0]
+    assert isinstance(node.this, exp.If), (dialect, repr(node))
+    assert rt._value_sources(node, VALUE_SCOPE) == set(), dialect
 
 
 def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
@@ -571,8 +629,99 @@ def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
     bools, and an absent optional argument is `None`. The alternative to this guard is a type check
     at every call site inside the walk, which is the same test written four times.
     """
-    assert rt._value_columns(None) == []
-    assert rt._value_columns(True) == []
+    assert rt._value_sources(None, VALUE_SCOPE) == frozenset()
+    assert rt._value_sources(True, VALUE_SCOPE) == frozenset()
+
+
+# --- the direction the corpus above cannot reach ---------------------------
+#
+# Every member of `INFLATED_SHAPES` puts the MANY-side column somewhere unusual. Not one puts a
+# ONE-side column off the value path, and that is the only direction that can manufacture a clean:
+# a value path narrowed until it holds no one-side column stops the aggregate reading the one side
+# at all, so the fan loop never reaches it and a total the join really does inflate reports sound.
+# Each of these was measured `not_multiplied` while the value path decided `sources`, and
+# `multiplied` on the base the spec is written against.
+
+ONE_SIDE_OFF_THE_VALUE_PATH = [
+    ("a searched CASE testing a one-side column",
+     f"SELECT SUM(CASE WHEN orders.status = 'shipped' THEN 1 ELSE 0 END) {FAN_JOIN}"),
+    ("a simple CASE whose operand is a one-side column",
+     f"SELECT SUM(CASE orders.status WHEN 'shipped' THEN 1 ELSE 0 END) {FAN_JOIN}"),
+    ("a conditional COUNT over a one-side predicate",
+     f"SELECT COUNT(CASE WHEN orders.status = 'shipped' THEN 1 END) {FAN_JOIN}"),
+    ("branches that disagree about the grain",
+     f"SELECT SUM(CASE WHEN orders.flag THEN orders.total_amount "
+     f"ELSE order_items.quantity END) {FAN_JOIN}"),
+    ("IF, which sqlglot renders back as a CASE",
+     f"SELECT SUM(IF(order_items.quantity > 0, orders.total_amount, 0)) {FAN_JOIN}"),
+    ("NULLIF, whose second argument is a comparand",
+     f"SELECT SUM(NULLIF(orders.total_amount, order_items.quantity)) {FAN_JOIN}"),
+    ("a GROUP_CONCAT separator read off the many side",
+     f"SELECT STRING_AGG(orders.status, order_items.product_id) {FAN_JOIN}"),
+]
+
+# Two fans off ONE dimension. The value is a product of `customers` and `tickets` columns, so the
+# tickets join is the grain the value was defined at and multiplies nothing, while the orders join
+# duplicates it. Exactly one of the two edges is a reason to say nothing.
+TWO_FAN_JOIN = ("FROM customers JOIN orders ON orders.customer_id = customers.id "
+                "JOIN tickets ON tickets.customer_id = customers.id")
+TWO_FANS_ONE_ON_THE_VALUE_PATH = f"SELECT SUM(customers.id * tickets.id) {TWO_FAN_JOIN}"
+
+# Two independent measures over one shared dimension, one of them wrapped in a CASE that puts its
+# only column in the predicate. `SUM(tickets.id)` is untouched by that CASE.
+CHASM_WITH_ONE_WRAPPED_AGGREGATE = (
+    f"SELECT SUM(CASE WHEN orders.status = 'x' THEN 1 ELSE 0 END), SUM(tickets.id) {TWO_FAN_JOIN}"
+)
+
+
+@pytest.mark.parametrize("label,sql", ONE_SIDE_OFF_THE_VALUE_PATH)
+def test_a_one_side_column_off_the_value_path_still_reports_the_multiplication(label, sql):
+    """The value path decides WHICH EDGE is suppressed, and nothing else about the aggregate.
+
+    `sources` answers three questions and only one of them is a value-path question. "Which
+    many-side table's duplication is this value's own grain" is; "which table is the measure on the
+    one side" and "which tables does this aggregate read, for the chasm rule" are not. Narrowing
+    `sources` to the value path answered all three with the narrow answer, and for a value built
+    from no column at all — `THEN 1 ELSE 0` — the narrow answer is that the aggregate reads nothing,
+    so the fan loop skipped it and the receipt asserted the total was sound.
+
+    The last three members are the same defect reached through a node the value walk had no case
+    for, where the GENERIC branch contributed the condition's columns and put the MANY side on the
+    value path instead. That is the inverted polarity: for a node that only combines values,
+    contributing by default is honest, but for one that mixes a predicate with its values it is
+    contributing the predicate that clears the fan.
+    """
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], (label, reports)
+    assert reports[0].joins == [FAN_EDGE], (label, reports[0].joins)
+
+
+def test_only_the_edge_that_is_not_the_values_own_grain_is_suppressed():
+    """A fan is suppressed PER EDGE, because `many_tables` can hold more than one.
+
+    `SUM(customers.id * tickets.id)` sits on the one side of two fans off `customers`. The tickets
+    join is the grain the product was already defined at and multiplies nothing; the orders join
+    duplicates every one of those products. Suppressing the whole finding because ONE edge is the
+    value's grain reported the statement clean, and reporting both edges names a join that did not
+    move the number. Only the `orders` edge is true, so only the `orders` edge is named.
+    """
+    reports = _reports(TWO_FANS_ONE_ON_THE_VALUE_PATH)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert reports[0].joins == ["customers (1) <- orders (N)"], reports[0].joins
+
+
+def test_one_wrapped_aggregate_does_not_clear_the_chasm_for_the_others():
+    """The chasm reads the UNION of every site's sources, so a narrowing there is not local.
+
+    `agg_sources` is derived across all the sites in one SELECT. When the value path decided
+    `sources`, a single aggregate whose value is a literal emptied its own contribution — and with
+    two measures needed for a shared dimension to be a chasm at all, one wrapped aggregate took the
+    finding away from every OTHER aggregate in the statement too. `SUM(tickets.id)` is not inside
+    that CASE and never was; its rows are still crossed against every order of the same customer.
+    """
+    reports = _reports(CHASM_WITH_ONE_WRAPPED_AGGREGATE)
+    assert [a.status for a in reports] == [rt.MULTIPLIED, rt.MULTIPLIED], reports
+    assert all("chasm_trap" in [f.risk for f in a.findings] for a in reports), reports
 
 
 # --- A24: the same report in every process ---------------------------------
