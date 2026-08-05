@@ -437,3 +437,64 @@ def test_the_switch_is_read_on_every_call_rather_than_cached_at_import(deploymen
     assert first.status == "ok", first.refusal or first.failure
     assert second.status == "refused"
     assert second.refusal.rule == guardrail.RULE_TABLE_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# The operator's half: a server that boots with the pass off says so
+# ---------------------------------------------------------------------------
+
+
+def _boot(tmp_path: Path, monkeypatch, caplog) -> list[str]:
+    """Boot a server through its real lifespan and return the WARNING lines naming the switch.
+
+    `TestClient` as a context manager is what runs the lifespan; without the `with` the startup hook
+    never fires and this would assert on an empty log while looking like it passed. That is the same
+    idiom `test_admin_seed_on_startup.py` uses for the same reason.
+    """
+    import mcp_http
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://agami.example")
+    monkeypatch.setenv("AGAMI_DB_URL", "sqlite://" + str(tmp_path / "boot.db"))
+    monkeypatch.setenv("AGAMI_SIGNING_SECRET", "x" * 32)
+    for name in ("AGAMI_ADMIN_USERNAME", "AGAMI_ADMIN_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        with TestClient(mcp_http.build_app()):
+            pass
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING" and "AGAMI_GOVERNANCE_ENFORCED" in record.getMessage()
+    ]
+
+
+def test_a_server_that_boots_with_the_pass_off_says_so_exactly_once(tmp_path, monkeypatch, caplog):
+    """The absence of a refusal is the only other signal, and nobody reads an absence.
+
+    Exactly one line per SERVER PROCESS, which is what is assertable here. It is deliberately not one
+    per deployment: `mcp_http.main` runs uvicorn with `WORKERS=N` and uvicorn re-invokes the factory in
+    each child, so an operator running four workers sees four lines and that is correct.
+    """
+    monkeypatch.delenv("AGAMI_GOVERNANCE_ENFORCED", raising=False)
+
+    lines = _boot(tmp_path, monkeypatch, caplog)
+
+    assert len(lines) == 1, lines
+    # It names what stopped AND what did not, because the second half is the part an operator reading
+    # this at 3am needs in order to size the exposure.
+    assert "OFF" in lines[0]
+    assert "Read-only, recon and the resource bounds are unaffected." in lines[0]
+
+
+def test_a_server_that_boots_with_the_pass_on_stays_quiet(tmp_path, monkeypatch, caplog):
+    """The other half, and the one that keeps the warning meaningful.
+
+    A line emitted unconditionally would train an operator to ignore it, at which point the enforcing
+    deployment and the unguarded one look identical in the log again.
+    """
+    monkeypatch.setenv("AGAMI_GOVERNANCE_ENFORCED", "true")
+
+    assert _boot(tmp_path, monkeypatch, caplog) == []

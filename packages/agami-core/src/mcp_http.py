@@ -565,6 +565,23 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        # Say the posture out loud before serving anything (ACE-101). `AGAMI_GOVERNANCE_ENFORCED`
+        # defaults OFF, so a server can be brought up with table scope, column scope, the star ban and
+        # the engine-mismatch check all inert — which is a supported deployment and a surprising one.
+        # The only other place it is visible is the absence of a refusal, and nobody reads an absence.
+        #
+        # Here rather than in `create_app`'s body because this runs when the process SERVES, while the
+        # body also runs for every embedding harness and every test that builds an app. Once per
+        # worker process, not once per deployment: `main()` runs uvicorn with `WORKERS=N` and uvicorn
+        # re-invokes the factory in each child, so N workers legitimately log N lines.
+        from execute_sql import _governance_enforced
+
+        if not _governance_enforced():
+            _log.warning(
+                "AGAMI_GOVERNANCE_ENFORCED is not set: the semantic-model pass is OFF, so table and "
+                "column scope, the SELECT * ban and the engine-mismatch check will not run. "
+                "Read-only, recon and the resource bounds are unaffected."
+            )
         # Heal the schema before serving: apply any pending migrations so freshly-deployed code never hits
         # an old DB shape (a column a migration adds, selected before it's applied, 500s the admin). This
         # is fail-closed — a failing migration propagates and aborts startup; a half-migrated DB never
