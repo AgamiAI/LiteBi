@@ -592,6 +592,49 @@ def test_a_binding_for_another_engine_is_not_matched_through_the_caller_path(sho
     assert env.refusal is None
 
 
+# --- binding text a comparison cannot be made from --------------------------
+
+
+def _org_with_metric(tmp_path, name: str, **overrides):
+    """The fixture model with one extra metric written into it."""
+    yaml = __import__("yaml")
+    root = tmp_path / name
+    root.mkdir(parents=True)
+    _write_model(root)
+    doc = {"name": name, "calculation": "whatever", "source_tables": ["orders"],
+           "description": name, "confidence": "proposed", "review_state": "unreviewed"}
+    doc.update(overrides)
+    (root / "subject_areas" / "s" / "metrics" / f"{name}.yaml").write_text(yaml.safe_dump(doc))
+    return L.load_datasource(root)
+
+
+def test_a_statement_shaped_binding_is_not_a_comparable_expression(tmp_path):
+    """A binding that parses to a whole SELECT is not an expression, and comparing one to a
+    projection would be a category error rather than a mismatch. It is treated as unread, which is
+    the conservative direction: it holds a column open instead of settling it wrongly."""
+    org = _org_with_metric(tmp_path, "statement_metric",
+                           bindings={"PostgreSQL": "SELECT SUM(total_amount) FROM orders"})
+    cand = {c.metric.name: c
+            for c in rt._metric_candidates(org, rt._storage_type_of(org),
+                                           rt._dialect_of(org)[0])}["statement_metric"]
+    assert cand.reduced is None
+
+
+def test_a_derived_metric_whose_expansion_fails_falls_back_to_its_raw_binding(tmp_path):
+    """`{placeholder}` makes this derived, and the base it names does not exist, so
+    `expanded_bindings` raises. Falling back to the raw binding rather than dropping the metric
+    keeps it a candidate — it then reduces to nothing and lands in the unread-binding branch, where
+    a declaration we could not compose belongs. Dropping it would let `unmatched` be reached off a
+    metric we never managed to read."""
+    org = _org_with_metric(tmp_path, "derived_metric",
+                           bindings={"PostgreSQL": "SUM({no_such_base})"})
+    cands = {c.metric.name: c
+             for c in rt._metric_candidates(org, rt._storage_type_of(org),
+                                            rt._dialect_of(org)[0])}
+    assert "derived_metric" in cands, "a metric whose expansion failed must stay a candidate"
+    assert cands["derived_metric"].binding == "SUM({no_such_base})"
+
+
 # --- cost -------------------------------------------------------------------
 
 
