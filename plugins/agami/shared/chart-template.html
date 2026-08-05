@@ -652,15 +652,23 @@
       const u = s ? s.undetermined : null;
       return (typeof u === 'string' && u.trim()) ? u.trim() : null;
     }
-    // The metrics this answer used. They live in `columns.items`: a metric match is a
-    // statement-level fact today rather than a per-column one, so it rides as an entry with no
-    // owning column.
+    // `columns.items` holds TWO kinds of entry and says which on `kind`: one per value the
+    // statement RETURNED, and one per column it READ. Both carry a `column`, so these two
+    // selectors key off `kind` — filtering on truthiness of `column`, which is what this did
+    // while a metric match was a statement-level entry with no owning column, now folds the two
+    // together and lists output aliases among the resolved `schema.table.column` labels.
+    function outputColumns() {
+      return itemsOf('columns').filter(i => i && i.kind === 'output');
+    }
+    // The metrics this answer used, each now attached to the value it computes. An item is only a
+    // metric claim when it MATCHED: every metric key is null on `unmatched` and `undetermined`, so
+    // reading them off an unmatched item would invent a definition the model never declared.
     function receiptMetrics() {
-      return itemsOf('columns').map(i => i && i.metric).filter(Boolean);
+      return outputColumns().filter(i => i.status === 'matched');
     }
     // The plain column references, i.e. the other half of the same section.
     function receiptColumns() {
-      return itemsOf('columns').filter(i => i && i.column).map(i => i.column);
+      return itemsOf('columns').filter(i => i && i.kind === 'reference').map(i => i.column);
     }
     // The joins the answer leaned on that nobody has signed off. This is DERIVED rather than read
     // from a pre-rendered list of warning sentences: a review state can be counted, grouped and
@@ -1602,10 +1610,12 @@
         rb.appendChild(ul);
       });
 
-      // Columns and metrics are ONE section of the receipt, and they share one marker: the gap the
-      // marker names is precisely that a matched metric cannot yet be tied to the column it
-      // computes. So they are drawn under one heading, metrics first because they are the
-      // load-bearing half, and the marker lands once, under both.
+      // Columns and metrics are ONE section of the receipt and share one marker, so they are drawn
+      // under one heading, metrics first because they are the load-bearing half.
+      //
+      // The reason given here used to be that a matched metric could not be tied to the column it
+      // computes, and that is no longer true: each match now names its own output column, drawn
+      // beside it below. They stay one heading because they are one section with one marker.
       renderSection('columns', 'Columns and metric definitions used', null, () => {
         const metrics = receiptMetrics();
         const columns = receiptColumns();
@@ -1619,6 +1629,13 @@
             li.appendChild(el('code', { text: m.name || '<unnamed>' }));
             li.appendChild(document.createTextNode(' '));
             li.appendChild(badge(m.review_state));   // metrics get the trust badge too, not just relationships
+            // WHICH value this metric is, which the section could not say until ACE-058: a
+            // statement returning five numbers and matching one metric never said which of the
+            // five it was about.
+            if (m.column) {
+              li.appendChild(document.createTextNode(' → '));
+              li.appendChild(el('code', { text: m.column }));
+            }
             if (m.definition_prose) {
               li.appendChild(document.createTextNode(' — ' + m.definition_prose));
             }
