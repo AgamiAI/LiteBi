@@ -5174,14 +5174,40 @@ def _strip_qualifiers(node: "exp.Expression") -> "exp.Expression":
     """
     stripped = node.copy()
     for col in stripped.find_all(exp.Column):
-        if col.args.get("table"):
-            col.set("table", None)
+        # ALL THREE namespace parts, not just `table`. A column can be written
+        # `catalog.db.table.column`, and sqlglot keeps each part in its own arg — so clearing
+        # `table` alone left `public.total_amount` behind for a statement writing
+        # `SUM(public.orders.total_amount)`, which then failed to match a binding's
+        # `SUM(total_amount)`. That is the same false non-match the qualifier strip exists to
+        # prevent, one namespace level up, and schema-qualified projections are what an introspected
+        # model's own SQL tends to look like.
+        for part in ("table", "db", "catalog"):
+            if col.args.get(part):
+                col.set(part, None)
     return stripped
 
 
-@functools.lru_cache(maxsize=1024)
 def _reduced_binding(text: str, dialect: "str | None") -> "exp.Expression | None":
     """A metric binding parsed and normalized for comparison — None when it will not parse.
+
+    THE PARSER CHECK IS OUTSIDE THE CACHE, and that placement is the whole reason this is two
+    functions. `_HAVE_SQLGLOT` decides the answer but is not part of the key, so a `None` produced
+    while the parser was unavailable would be memoized against `(text, dialect)` and returned
+    forever after — every binding it touched permanently unreadable, and every column that binding
+    could have matched permanently `undetermined`, in a process where the parser is present.
+
+    A cache whose value depends on state its key does not capture is wrong whether or not anything
+    reaches the bad state today. What made it observable was a test that settles a FROM-less
+    statement running after one of the six that patch `_HAVE_SQLGLOT` off.
+    """
+    if not _HAVE_SQLGLOT:
+        return None
+    return _reduced_binding_cached(text, dialect)
+
+
+@functools.lru_cache(maxsize=1024)
+def _reduced_binding_cached(text: str, dialect: "str | None") -> "exp.Expression | None":
+    """The memoized half of `_reduced_binding`, reached only when the parser is present.
 
     Cached for the reason `_reduced_on` is: a pure function of MODEL-author text and the engine it
     is read in, and model text does not change between requests, while this runs on the `ok` path of
@@ -5377,11 +5403,24 @@ def _reads_only_visible(oc: OutputColumn, visible: set[str],
     scope_map = memo.get(id(oc.sel))
     if scope_map is None:
         scope_map = memo[id(oc.sel)] = _own_alias_map(oc.sel)
-    # Every source this SELECT reads itself. A derived table or `VALUES` list is not an `exp.Table`
-    # and so is absent from the map by construction, which is what makes the `.values()` check below
-    # catch it: the SELECT reads something, and none of what it reads is a visible declared table.
-    sources = set(scope_map.values())
-    if not sources or any(_tkey(src) not in visible for src in sources):
+    # A relation this SELECT COMPUTED — a derived table, a `VALUES` list — is a scope we do not
+    # enter, so nothing computed off it is established. Asked through ACE-059's helper rather than
+    # inferred from an empty alias map, and that distinction is the whole of this branch: an empty
+    # map has TWO causes and only one of them is a gap.
+    #
+    #   `SELECT MAX(x.t) FROM (SELECT …) x`  — reads something it cannot see behind  -> undetermined
+    #   `SELECT 1 AS one`                    — reads NOTHING AT ALL                  -> settles
+    #
+    # Treating both as gaps (which reading the map alone does) reports "could not be matched" for a
+    # statement with nothing left to establish, and puts a non-null marker on a trivially complete
+    # receipt. That is the mirror of the false settled claim above: a false UNSETTLED one, and it
+    # costs the section the null marker that means "established, here it is".
+    if _computed_relations(oc.sel):
+        return False
+    # And the base tables it does read, which must all be ones the model declares and the statement
+    # did not bind itself. A CTE name IS an `exp.Table` to the parser, so it arrives here and is
+    # caught by `visible` having had the statement's CTE names subtracted out of it.
+    if any(_tkey(src) not in visible for src in set(scope_map.values())):
         return False
     for col in oc.expr.find_all(exp.Column):
         if col.table:

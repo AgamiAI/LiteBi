@@ -194,6 +194,19 @@ def test_a_table_qualifier_does_not_defeat_a_match():
     assert _matches("SUM(o.total_amount) FILTER (WHERE o.status = 'paid')", PAID_REVENUE)
 
 
+def test_a_schema_qualified_column_does_not_defeat_a_match():
+    """All three namespace parts are stripped, not just `table`.
+
+    A column can be written `catalog.db.table.column` and sqlglot keeps each part in its own arg, so
+    clearing `table` alone left `public.total_amount` behind and the match failed. Schema-qualified
+    projections are what an introspected model's own SQL tends to look like, so this is not an
+    exotic shape. Found by Copilot on PR #205.
+    """
+    assert _matches("SUM(public.orders.total_amount) FILTER (WHERE public.orders.status = 'paid')",
+                    PAID_REVENUE)
+    assert _matches("SUM(orders.total_amount) FILTER (WHERE orders.status = 'paid')", PAID_REVENUE)
+
+
 def test_an_unquoted_identifiers_case_is_folded():
     """Unquoted identifiers fold case in Postgres and friends, so these are the same column."""
     assert _matches("SUM(O.TOTAL_AMOUNT) FILTER (WHERE O.STATUS = 'paid')", PAID_REVENUE)
@@ -445,6 +458,44 @@ def test_a_value_from_a_derived_table_is_undetermined_not_unmatched(org):
     got = _statuses(org, "SELECT MAX(x.t) AS m FROM (SELECT total_amount AS t FROM orders) x",
                     drop=("broken_metric",))
     assert got == [("m", rt.UNDETERMINED, None)]
+
+
+def test_a_statement_that_reads_no_relation_at_all_still_settles(org):
+    """`SELECT 1` reads nothing, so there is nothing it failed to read.
+
+    An empty alias map has TWO causes and only one of them is a gap: a SELECT whose only source is
+    a derived table (we cannot see behind it) and a SELECT with no source at all (there is nothing
+    to see). Reading the map alone conflated them, so a FROM-less statement reported "could not be
+    matched against the model's declared metrics" and carried a non-null marker on a receipt with
+    nothing left to establish — the mirror of a false settled claim, and it costs the section the
+    null marker that means "established, here it is". Found by Copilot on PR #205.
+    """
+    assert _statuses(org, "SELECT 1 AS one", drop=("broken_metric",)) == [
+        ("one", rt.UNMATCHED, None)]
+    section = rt.assemble_receipt(org, "SELECT 1 AS one")["columns"]
+    # `broken_metric` is still in the model here, so the column is held open by the UNREAD
+    # declaration rather than by the FROM-less shape — which is the correct reason and a different
+    # one. What must not happen is the shape deciding it.
+    (out,) = [i for i in section["items"] if i["kind"] == "output"]
+    assert out["status"] == rt.UNDETERMINED
+
+
+def test_a_derived_table_source_is_still_a_scope_we_do_not_enter(org):
+    """The half of the empty-map case that IS a gap, kept passing by the same change."""
+    assert _statuses(org, "SELECT MAX(x.t) AS m FROM (SELECT total_amount AS t FROM orders) x",
+                     drop=("broken_metric",)) == [("m", rt.UNDETERMINED, None)]
+    assert _statuses(org, "SELECT c AS v FROM (VALUES (1)) AS v(c)",
+                     drop=("broken_metric",)) == [("v", rt.UNDETERMINED, None)]
+
+
+def test_a_join_to_a_derived_table_does_not_settle_off_the_visible_half(org):
+    """A SELECT reading `orders` AND a derived table has visible base tables, so a check that only
+    looked at the alias map's values would settle it. `_computed_relations` asks whether this SELECT
+    binds anything it computed, which is the question that matters."""
+    assert _statuses(
+        org, "SELECT SUM(total_amount) AS revenue FROM orders o "
+             "JOIN (SELECT 1 AS k) d ON o.id = d.k", drop=("broken_metric",)) == [
+        ("revenue", rt.UNDETERMINED, None)]
 
 
 def test_a_star_is_undetermined(org):
@@ -746,15 +797,35 @@ def test_two_metrics_declaring_one_binding_resolve_the_same_way_every_run(tmp_pa
     )
 
 
+def test_a_missing_parser_does_not_poison_the_binding_cache(monkeypatch):
+    """The cache keys `(text, dialect)`; `_HAVE_SQLGLOT` decides the answer and is NOT in the key.
+
+    So a `None` produced while the parser was unavailable would be memoized and returned forever
+    after — that binding permanently unreadable, and every column it could have matched permanently
+    `undetermined`, in a process where the parser is present. The parser check therefore sits
+    OUTSIDE the memoized half.
+
+    Not hypothetical: six test files patch `_HAVE_SQLGLOT` off, and this surfaced as two ACE-058
+    tests passing alone and failing in the full suite. A cache whose value depends on state its key
+    does not capture is wrong whether or not anything reaches the bad state in production.
+    """
+    rt._reduced_binding_cached.cache_clear()
+    monkeypatch.setattr(rt, "_HAVE_SQLGLOT", False)
+    assert rt._reduced_binding("COUNT(*)", "postgres") is None
+    monkeypatch.undo()
+    assert rt._reduced_binding("COUNT(*)", "postgres") is not None, \
+        "the parser is back and this binding is readable — a cached None outlived its cause"
+
+
 def test_a_binding_is_reduced_once_and_not_once_per_request(org):
     """The cache is the cost guard, not a nicety. This runs on the `ok` path of every executed query
     against every metric the deployment declares, and each reduction is a sqlglot parse of text that
     has not changed since the process started. ACE-059 was measured at 10.6x `main` before its own
     reduction was cached."""
-    rt._reduced_binding.cache_clear()
+    rt._reduced_binding_cached.cache_clear()
     for _ in range(5):
         rt._metric_candidates(org, rt._storage_type_of(org), rt._dialect_of(org)[0])
-    info = rt._reduced_binding.cache_info()
+    info = rt._reduced_binding_cached.cache_info()
     # Four metrics declare a binding for this engine; each is parsed once and read from the cache
     # every time after.
     assert info.misses == 4
