@@ -252,8 +252,18 @@ def test_the_record_carries_the_receipt_for_an_executed_call_and_a_refused_one(e
     The marker is the half worth pinning. A section nobody checked has to keep saying so in the
     record too, or the audit trail turns "nobody looked" back into "nothing wrong" one layer down
     from where ACE-088 fixed it.
+
+    The `ok` statement reads its value out of a CTE ON PURPOSE, and that is a change ACE-058 forced.
+    A plain `SELECT id, status FROM orders` used to be guaranteed a marker because `columns` carried
+    a FIXED sentence on every receipt ever assembled — so this assertion held without ever
+    exercising the thing it describes. With all five sections composing their markers per receipt, a
+    clean statement now correctly reaches five nulls, and pinning "a marker survives into the
+    record" needs a statement that genuinely leaves something unestablished. A value computed inside
+    a CTE is exactly that: the walk does not enter that scope, so which definition it computes is
+    not established, and the record has to keep saying so.
     """
-    _record_one("SELECT id, status FROM orders")  # ok
+    _record_one("WITH recent AS (SELECT id, status FROM orders) "
+                "SELECT id, status FROM recent")  # ok, and genuinely not fully established
     _record_one("DELETE FROM orders")  # refused
 
     for row in _rows(env.app_db):

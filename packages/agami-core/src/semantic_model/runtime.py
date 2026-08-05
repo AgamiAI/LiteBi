@@ -2478,10 +2478,14 @@ def _tkey(name: str) -> str:
     return (name or "").lower()
 
 
-def _norm_sql(s: Optional[str]) -> str:
-    return " ".join((s or "").split()).lower()
-
-
+# `_norm_sql` stood here and is gone with the containment test that was its only caller. It
+# lowercased a whole statement, string literals included, and asked whether a declared binding was a
+# SUBSTRING of it — so a declared `'Test'` matched a written `'test'`, a binding differing from the
+# written expression only in a literal's case was reported as used, and `SUM(amount)` matched
+# `SUM(amount) FILTER (…)` because one is a substring of the other. Comparison of parsed expressions
+# is the standard now, in `_reduced_binding` / `_reduced_projection`, and
+# `_fold_unquoted_identifiers` is the normalizer that folds what SQL folds and nothing more.
+#
 # The reason each declared section carries an `undetermined` marker. A section whose analysis has not
 # shipped states what it did not establish instead of sitting empty, because an empty list and an
 # unchecked list read identically to a caller: silence reads as clean. Written as user-facing
@@ -2491,12 +2495,12 @@ def _norm_sql(s: Optional[str]) -> str:
 # a PUBLIC repo, and an "ACE-NNN" resolves only in a private portfolio repo — so to a reader it is an
 # unresolvable reference, and to a competitor it is a roadmap of work that has not shipped. The
 # behavioural half is the half a user can act on, and it is the half that stays.
-# ACE-058 owns per-column metric attribution.
-UNDETERMINED_COLUMNS = (
-    "Metrics are matched against the whole statement, not against an output column: a metric is "
-    "listed here when its binding SQL appears anywhere in the text, so nothing says which column "
-    "it computes, and a column that matches no metric is not reported as unmatched."
-)
+#
+# `UNDETERMINED_COLUMNS` stood here and is gone, for the reason `UNDETERMINED_TABLES` went. It said
+# metrics are matched against the whole statement rather than against an output column, and both
+# halves of that stopped being true: the section is one item per value the statement RETURNS, each
+# carrying the metric it computes or the explicit statement that none matched, and what is left
+# unestablished about a particular statement is composed per receipt by `_columns_marker`.
 # `UNDETERMINED_TABLES` stood here and is gone. It said the accounting was not done, and the
 # accounting is done: every reference carries its own `filters` list, so the sentence describing the
 # section is now composed per receipt from what THIS statement left unestablished rather than being
@@ -2630,6 +2634,34 @@ def _aggregates_marker(tree, reports: list[AggregateReport],
         # sentence about a shortcoming the detector no longer has is a false statement about this
         # statement, and the section's null state is the claim it would cost.
         (f"{dropped} further aggregate(s) are not listed." if dropped else ""),
+    ) if clause) or None
+
+
+def _columns_marker(output_items: list[dict[str, Any]], dropped_refs: int,
+                    dropped_outputs: int) -> Optional[str]:
+    """What the `columns` section did NOT establish about THIS statement — null when nothing.
+
+    Composed per receipt, the way `tables`, `joins` and `aggregates` compose theirs. The fixed
+    sentence that stood here said metrics are matched against the whole statement rather than
+    against a column, which stopped being true the moment the items became per-output-column — and a
+    section shipping a report underneath a marker denying the report exists is the one way it could
+    contradict itself.
+
+    Only `undetermined` counts. `unmatched` is a SETTLED fact — every candidate binding was read and
+    none of them is this column — and it is the most load-bearing thing this section says, so
+    counting it as a gap would put every honest hand-rolled statement under a non-null marker and
+    make the marker mean nothing. That was the state the fixed sentence had.
+
+    All three clauses are bare COUNTS of the caller's own output columns and references, and none
+    names anything, so the marker discloses nothing the items beside it do not already.
+    """
+    unsettled = sum(1 for item in output_items if item["status"] == UNDETERMINED)
+    return " ".join(clause for clause in (
+        (f"{unsettled} of the listed output column(s) could not be matched against the model's "
+         "declared metrics, so which definition they compute is not established."
+         if unsettled else ""),
+        (f"{dropped_outputs} further output column(s) are not listed." if dropped_outputs else ""),
+        (f"{dropped_refs} further column reference(s) are not listed." if dropped_refs else ""),
     ) if clause) or None
 
 
@@ -2878,25 +2910,72 @@ def assemble_receipt(
             **signoff,
         })
 
-    # Metrics carry their own `review_state` for the approve/change banner, for the same reason
-    # joins do.
-    metric_items: list[dict[str, Any]] = []
-    nsql = _norm_sql(sql)
-    for sa in org.subject_areas:
-        for met in sa.metrics:
-            binding = next((b for b in (met.bindings or {}).values()
-                            if b and _norm_sql(b) in nsql), "")
-            if not binding:
-                continue
-            metric_items.append({
-                "name": met.name, "area": sa.name,
-                "definition_prose": met.calculation, "expression": binding,
-                "confidence": met.confidence, "review_state": met.review_state,
-                "origin": getattr(met, "source", None),
-                "signed_off_by": met.signed_off_by,
-                "signed_off_role": met.signed_off_role,
-                "signed_off_at": met.signed_off_at,
-            })
+    # ONE ITEM PER OUTPUT COLUMN, not one per metric the statement's TEXT happens to contain.
+    #
+    # What stood here matched every metric's binding against the whole statement by substring
+    # containment, which was wrong in three directions at once and each of them was measured on a
+    # live engine before this replaced it: a matched metric was an entry with `column: null`, so a
+    # statement projecting five values never said which one the metric was; a column matching no
+    # metric produced no entry at all, so the section could not say the thing it exists to say; and
+    # containment credited text that never reached the output, so a binding inside a CTE body
+    # counted for the statement that merely read the CTE.
+    #
+    # Capped like the reference list below and INDEPENDENTLY of it. Both lists live in this one
+    # section and both are caller-controlled, so a shared cap would let a wide projection evict the
+    # column references, or the reverse — and which of the two a reader lost would depend on which
+    # list the assembler happened to build first. Each overflow is counted onto its own clause of
+    # the marker and never listed.
+    #
+    # The cap goes IN rather than being a slice of what came back, the way ACE-059 put it in: every
+    # column past it would be reduced and compared against every declared metric only to be dropped.
+    metric_dialect = _dialect_of(org)[0]
+    candidates = _metric_candidates(org, _storage_type_of(org), metric_dialect)
+    output_columns = _output_columns(tree)
+    dropped_outputs = max(0, len(output_columns) - _RECEIPT_MAX_REFS)
+    output_items: list[dict[str, Any]] = []
+    for oc in output_columns[:_RECEIPT_MAX_REFS]:
+        status, match = _match_output_column(oc, candidates, visible, metric_dialect)
+        # Everything a MATCHED metric contributes, and null on every other status. An item that
+        # matched nothing must assert nothing about a metric it did not match — ACE-059's review
+        # found three false positives of exactly this shape in the joins section, two of them
+        # printing an approved sign-off trail beside a value the declaration was not about.
+        # Composed as one dict so every branch carries the identical key set.
+        trust: dict[str, Any] = {key: None for key in (
+            "name", "area", "definition_prose", "expression", "confidence", "origin",
+            "review_state", "signed_off_by", "signed_off_role", "signed_off_at")}
+        if match is not None:
+            trust = {
+                "name": match.metric.name, "area": match.area,
+                "definition_prose": match.metric.calculation,
+                # The binding as the MODEL AUTHOR wrote it, not the normalized form the comparison
+                # was made on: the reader is being told which declaration this is, and a
+                # qualifier-stripped, case-folded rendering is not text they would recognise.
+                "expression": match.binding,
+                "confidence": match.metric.confidence,
+                "origin": getattr(match.metric, "source", None),
+                # The sign-off state a consumer filters on to raise its own approve/change banner.
+                # Reported, never used as a filter on which metrics were considered: the approved
+                # body checked signed-off metrics only, so a hand-roll of a `proposed` metric was
+                # silent, which is the opposite of what the section is for.
+                "review_state": match.metric.review_state,
+                "signed_off_by": match.metric.signed_off_by,
+                "signed_off_role": match.metric.signed_off_role,
+                "signed_off_at": match.metric.signed_off_at,
+            }
+        output_items.append({
+            # Which of the two kinds of item in this section this is. Stated on the item rather than
+            # inferred from which keys are present: the section holds one entry per value the
+            # statement RETURNS and one per column it READ, those answer different questions, and a
+            # consumer left to tell them apart by key-presence is one refactor away from reading a
+            # sensitive-column flag as a metric verdict.
+            "kind": "output",
+            "column": oc.key,
+            # The same scope label `tables` and `joins` carry, from the same composer, so a reader
+            # can join the three sections on it for a column that appears in more than one.
+            "scope": oc.scope,
+            "status": status,
+            **trust,
+        })
 
     def _declared_table(bare: str) -> Optional[tuple]:
         """The model row a table name resolves to, or None when the model declares no such table.
@@ -3013,7 +3092,11 @@ def assemble_receipt(
         # than in `aggregates` beside the four aggregate findings. The flag is only ever True — the
         # key is absent otherwise — because a receipt that marked every ordinary column
         # `sensitive: false` would bury the handful that are.
-        item: dict[str, Any] = {"column": label, "metric": None}
+        # `metric: None` stood here on every one of these and was ALWAYS null — the reference items
+        # never carried a metric, and the key existed only so that both kinds of item in this
+        # section had the same shape. It is gone, so a null `metric` now has exactly one meaning in
+        # the section: a metric was looked for and none matched. `kind` is what tells the two apart.
+        item: dict[str, Any] = {"kind": "reference", "column": label}
         # `_projected_sensitive` keys a resolved reference as "table.column" and an ambiguous one
         # by bare name, so both forms are checked. It means PROJECTED, not merely referenced: a
         # sensitive column used only in a WHERE is not flagged, because the value did not come
@@ -3021,13 +3104,10 @@ def assemble_receipt(
         if f"{bare}.{cname}" in projected_sensitive or cname in projected_sensitive:
             item["sensitive"] = True
         column_items.append(item)
-    # A matched metric is a statement-level fact today, so it gets its own entry with no owning
-    # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
-    # Deliberately NOT subject to the cap above: there is one entry per metric the MODEL declares
-    # and whose binding the statement used, so the count is the deployment's own, not the caller's,
-    # and dropping a metric the answer leaned on to make room for a column name would trade the
-    # load-bearing fact for the incidental one.
-    column_items.extend({"column": None, "metric": met} for met in metric_items)
+    # The output columns lead. They are what the caller READ, so a surface rendering the first few
+    # items of this section shows the values the answer returned rather than the incidental
+    # references behind them, and the order is the same on every run for the same statement.
+    column_items = output_items + column_items
 
     table_items: list[dict[str, Any]] = []
     # ONE walk of `exp.Table` for both halves of this section. `_reference_sites` carries each
@@ -3160,11 +3240,7 @@ def assemble_receipt(
         "model_version": model_version,
         "columns": {
             "items": column_items,
-            # Counted, not listed — the same device `tables` uses below and for the same reason.
-            "undetermined": UNDETERMINED_COLUMNS + (
-                f" {dropped_cols} further column reference(s) are not listed."
-                if dropped_cols else ""
-            ),
+            "undetermined": _columns_marker(output_items, dropped_cols, dropped_outputs),
         },
         "tables": {
             "items": table_items,
@@ -4810,11 +4886,16 @@ def _fold_unquoted_identifiers(node: "exp.Expression") -> "exp.Expression":
     `status != 'test'` select different rows, and a normalizer that flattened both would report the
     wrong one as the declared filter applied.
 
-    That is the reason this is a named helper and not `_norm_sql`, which is the module's other
-    normalizer and wrong for this job twice over: it lowercases the WHOLE string, literals
-    included, and it is used for substring containment, so a declared `amount > 0` would "match" a
-    written `amount > 0.5`. Copied rather than mutated in place because the nodes belong to the
-    caller's parse tree, which other analyses in the same receipt still read.
+    That is the reason this is a named helper rather than a whole-string normalizer. The module used
+    to carry one (`_norm_sql`, deleted with the containment test that was its only caller), and it
+    was wrong for this job twice over: it lowercased the WHOLE string, literals included, and it was
+    used for substring containment, so a declared `amount > 0` would "match" a written
+    `amount > 0.5`. Copied rather than mutated in place because the nodes belong to the caller's
+    parse tree, which other analyses in the same receipt still read.
+
+    Now shared by both structural comparisons in this module — the declared-filter one below and the
+    metric one in `_reduced_binding` / `_reduced_projection` — which is what keeps `columns` and
+    `tables` folding a name the same way rather than drifting to two rules for one question.
     """
     folded = node.copy()
     for ident in folded.find_all(exp.Identifier):

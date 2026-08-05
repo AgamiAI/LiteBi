@@ -429,6 +429,96 @@ def test_two_union_arms_are_told_apart_by_status(org):
                    ("revenue", rt.UNMATCHED, None)]
 
 
+# --- the section as assembled -----------------------------------------------
+
+
+def _columns(org, sql: str) -> dict:
+    return rt.assemble_receipt(org, sql)["columns"]
+
+
+def _outs(section) -> list[dict]:
+    return [i for i in section["items"] if i["kind"] == "output"]
+
+
+def test_the_section_holds_both_kinds_and_says_which_is_which(org):
+    """One entry per value the statement RETURNS, beside one per column it READ. Both carry a
+    `column`, so `kind` is what separates them — not which keys happen to be present."""
+    section = _columns(org, "SELECT SUM(total_amount) AS revenue FROM orders")
+    assert {i["kind"] for i in section["items"]} == {"output", "reference"}
+    assert [i["column"] for i in _outs(section)] == ["revenue"]
+
+
+def test_a_reference_item_no_longer_carries_the_always_null_metric_key(org):
+    """It was null on every reference item that ever shipped, and existed only so both kinds had one
+    shape. Gone, so a null metric in this section has exactly one meaning: none matched."""
+    section = _columns(org, "SELECT id FROM orders")
+    assert all("metric" not in i for i in section["items"])
+
+
+def test_every_model_derived_key_is_null_on_every_status_but_matched(org):
+    """The defect this shape exists to prevent. ACE-059's review found three false positives in the
+    joins section, two of which printed an approved sign-off trail beside a value the matched
+    declaration was not about."""
+    section = _columns(org, "SELECT id AS i FROM orders")
+    (item,) = _outs(section)
+    assert item["status"] != rt.MATCHED
+    for key in ("name", "area", "definition_prose", "expression", "confidence", "origin",
+                "review_state", "signed_off_by", "signed_off_role", "signed_off_at"):
+        assert item[key] is None, key
+
+
+def test_a_matched_item_carries_the_binding_the_model_author_wrote(org):
+    """Not the normalized form the comparison was made on: the reader is being told WHICH
+    declaration this is, and a qualifier-stripped, case-folded rendering is not text they wrote."""
+    section = _columns(org, "SELECT SUM(o.total_amount) FILTER (WHERE o.status = 'paid') AS r "
+                            "FROM orders o")
+    (item,) = _outs(section)
+    assert item["status"] == rt.MATCHED
+    assert item["expression"] == PAID_REVENUE
+    assert item["signed_off_by"] == "you@example.com"
+
+
+def test_the_marker_counts_only_what_is_unsettled(org):
+    """`unmatched` is the most load-bearing thing this section says and is NOT a gap. Counting it
+    would put every honest hand-rolled statement under a non-null marker, which is the state the
+    fixed sentence had and the reason it went."""
+    # `broken_metric` is in the model, so this column cannot settle.
+    section = _columns(org, "SELECT id AS i FROM orders")
+    assert "1 of the listed output column(s)" in section["undetermined"]
+
+
+def test_the_marker_is_null_when_everything_settled(tmp_path):
+    """Null is the positive claim "established, here it is", and the section could never reach it
+    before: the fixed sentence shipped on every receipt."""
+    root = tmp_path / "clean"
+    root.mkdir(parents=True)
+    _write_model(root)
+    # Drop the unparseable binding, which is the only thing holding this statement open.
+    (root / "subject_areas" / "s" / "metrics" / "broken_metric.yaml").unlink()
+    org = L.load_datasource(root)
+    section = rt.assemble_receipt(org, "SELECT SUM(total_amount) AS revenue FROM orders")["columns"]
+    assert section["undetermined"] is None
+    assert [i["status"] for i in _outs(section)] == [rt.UNMATCHED]
+
+
+
+def test_the_deleted_containment_test_is_grep_clean():
+    """SC-9. `_norm_sql` and `UNDETERMINED_COLUMNS` are gone, not merely unused: a substring
+    matcher left in the module is one import away from being the comparison again."""
+    src = (PKG_SRC / "semantic_model" / "runtime.py").read_text()
+    assert "def _norm_sql" not in src
+    assert "UNDETERMINED_COLUMNS = " not in src
+
+
+def test_a_hand_rolled_metric_executes_and_is_never_refused(org):
+    """SC-10 / F11 §3. A metric mismatch is none of principle 4's three refusal reasons, and this
+    section reports a fact on an answer that RAN."""
+    receipt = rt.assemble_receipt(org, "SELECT SUM(total_amount) AS revenue FROM orders")
+    assert set(receipt) == {"model_version", "columns", "tables", "joins", "aggregates",
+                            "assumptions"}
+    assert any(i["kind"] == "output" for i in receipt["columns"]["items"])
+
+
 # --- cost -------------------------------------------------------------------
 
 

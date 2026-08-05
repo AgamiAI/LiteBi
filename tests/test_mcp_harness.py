@@ -319,11 +319,14 @@ def test_mcp_receipt_surfaces_unapproved_metric_and_the_join_the_statement_wrote
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
     r = _resolve_receipt(profile, SQL)
     # The unapproved metric is surfaced WITH its review_state, which is what drives a client's
-    # approve/change banner. It rides the columns section as its own entry: metric attribution is
-    # statement-level today, so it is not claimed against a column we cannot identify.
-    rev = next(i["metric"] for i in r.columns.items
-               if i["metric"] and i["metric"]["name"] == "revenue")
+    # approve/change banner. It rides the columns section on the item for the OUTPUT COLUMN that
+    # computes it — ACE-058 — so the banner can name the value it is about rather than asserting a
+    # metric against the statement as a whole.
+    rev = next(i for i in r.columns.items
+               if i["kind"] == "output" and i["name"] == "revenue")
     assert rev["review_state"] == "unreviewed"
+    assert rev["status"] == "matched"
+    assert rev["column"] == "total"
     # The join half. `review_state` used to be borrowed from whichever declared relationship the two
     # in-scope tables happened to have; the section is one item per join the STATEMENT wrote now, and
     # this predicate MATCHES that declaration, so the state the server surfaces is a state about this
