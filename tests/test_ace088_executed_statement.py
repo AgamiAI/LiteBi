@@ -242,9 +242,14 @@ def diverged(monkeypatch) -> None:
 
 
 def _column_names(items) -> list[str]:
-    """The qualified column names a receipt's `columns` section carries, dropping the entries that
-    are a statement-level metric match rather than a column (those have no owning column today)."""
-    return [item["column"] for item in items if item["column"]]
+    """The qualified names of the columns the statement READ, from a receipt's `columns` section.
+
+    Selected on `kind`. ACE-058 put a second kind of item in this section — one per value the
+    statement RETURNS, keyed by its output alias — and both kinds carry a `column`, so the
+    truthiness filter this used would fold the two together and compare an alias against a resolved
+    `schema.table.column` label.
+    """
+    return [item["column"] for item in items if item["kind"] == "reference"]
 
 
 def _tool_out(sql: str) -> dict:

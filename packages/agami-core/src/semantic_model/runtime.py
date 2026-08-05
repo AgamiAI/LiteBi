@@ -911,6 +911,22 @@ DECLARED = "declared"
 UNDECLARED = "undeclared"
 UNDECLARABLE = "undeclarable"
 
+# And the values a `columns` output item's status takes, named for the same reason again: set in the
+# assembler, counted by `_columns_marker`, read by the chart template's approve/change banner and
+# asserted in the battery.
+#
+# `UNDETERMINED` is reused a third time rather than given its own spelling. All three sections ask
+# different questions — was the value multiplied, is the join declared, which metric is this column —
+# but "the analysis could not settle it" is one state, and three constants holding one string is
+# three things to keep in step.
+#
+# There is no fourth value here answering to `UNDECLARABLE`. A join can have an endpoint no
+# declaration could ever be about; an output column cannot be a thing no metric could ever compute,
+# because a metric's binding is an arbitrary expression. So the settled negative is `UNMATCHED` and
+# it means exactly one thing: every candidate binding was read, and none of them is this column.
+MATCHED = "matched"
+UNMATCHED = "unmatched"
+
 
 # Why the checks did not run, when they did not. `None` means they DID — the analysis reached the
 # statement and an empty `findings` is then a real "nothing found". These sentences are the same
@@ -2462,10 +2478,14 @@ def _tkey(name: str) -> str:
     return (name or "").lower()
 
 
-def _norm_sql(s: Optional[str]) -> str:
-    return " ".join((s or "").split()).lower()
-
-
+# `_norm_sql` stood here and is gone with the containment test that was its only caller. It
+# lowercased a whole statement, string literals included, and asked whether a declared binding was a
+# SUBSTRING of it — so a declared `'Test'` matched a written `'test'`, a binding differing from the
+# written expression only in a literal's case was reported as used, and `SUM(amount)` matched
+# `SUM(amount) FILTER (…)` because one is a substring of the other. Comparison of parsed expressions
+# is the standard now, in `_reduced_binding` / `_reduced_projection`, and
+# `_fold_unquoted_identifiers` is the normalizer that folds what SQL folds and nothing more.
+#
 # The reason each declared section carries an `undetermined` marker. A section whose analysis has not
 # shipped states what it did not establish instead of sitting empty, because an empty list and an
 # unchecked list read identically to a caller: silence reads as clean. Written as user-facing
@@ -2475,12 +2495,12 @@ def _norm_sql(s: Optional[str]) -> str:
 # a PUBLIC repo, and an "ACE-NNN" resolves only in a private portfolio repo — so to a reader it is an
 # unresolvable reference, and to a competitor it is a roadmap of work that has not shipped. The
 # behavioural half is the half a user can act on, and it is the half that stays.
-# ACE-058 owns per-column metric attribution.
-UNDETERMINED_COLUMNS = (
-    "Metrics are matched against the whole statement, not against an output column: a metric is "
-    "listed here when its binding SQL appears anywhere in the text, so nothing says which column "
-    "it computes, and a column that matches no metric is not reported as unmatched."
-)
+#
+# `UNDETERMINED_COLUMNS` stood here and is gone, for the reason `UNDETERMINED_TABLES` went. It said
+# metrics are matched against the whole statement rather than against an output column, and both
+# halves of that stopped being true: the section is one item per value the statement RETURNS, each
+# carrying the metric it computes or the explicit statement that none matched, and what is left
+# unestablished about a particular statement is composed per receipt by `_columns_marker`.
 # `UNDETERMINED_TABLES` stood here and is gone. It said the accounting was not done, and the
 # accounting is done: every reference carries its own `filters` list, so the sentence describing the
 # section is now composed per receipt from what THIS statement left unestablished rather than being
@@ -2614,6 +2634,34 @@ def _aggregates_marker(tree, reports: list[AggregateReport],
         # sentence about a shortcoming the detector no longer has is a false statement about this
         # statement, and the section's null state is the claim it would cost.
         (f"{dropped} further aggregate(s) are not listed." if dropped else ""),
+    ) if clause) or None
+
+
+def _columns_marker(output_items: list[dict[str, Any]], dropped_refs: int,
+                    dropped_outputs: int) -> Optional[str]:
+    """What the `columns` section did NOT establish about THIS statement — null when nothing.
+
+    Composed per receipt, the way `tables`, `joins` and `aggregates` compose theirs. The fixed
+    sentence that stood here said metrics are matched against the whole statement rather than
+    against a column, which stopped being true the moment the items became per-output-column — and a
+    section shipping a report underneath a marker denying the report exists is the one way it could
+    contradict itself.
+
+    Only `undetermined` counts. `unmatched` is a SETTLED fact — every candidate binding was read and
+    none of them is this column — and it is the most load-bearing thing this section says, so
+    counting it as a gap would put every honest hand-rolled statement under a non-null marker and
+    make the marker mean nothing. That was the state the fixed sentence had.
+
+    All three clauses are bare COUNTS of the caller's own output columns and references, and none
+    names anything, so the marker discloses nothing the items beside it do not already.
+    """
+    unsettled = sum(1 for item in output_items if item["status"] == UNDETERMINED)
+    return " ".join(clause for clause in (
+        (f"{unsettled} of the listed output column(s) could not be matched against the model's "
+         "declared metrics, so which definition they compute is not established."
+         if unsettled else ""),
+        (f"{dropped_outputs} further output column(s) are not listed." if dropped_outputs else ""),
+        (f"{dropped_refs} further column reference(s) are not listed." if dropped_refs else ""),
     ) if clause) or None
 
 
@@ -2862,25 +2910,80 @@ def assemble_receipt(
             **signoff,
         })
 
-    # Metrics carry their own `review_state` for the approve/change banner, for the same reason
-    # joins do.
-    metric_items: list[dict[str, Any]] = []
-    nsql = _norm_sql(sql)
-    for sa in org.subject_areas:
-        for met in sa.metrics:
-            binding = next((b for b in (met.bindings or {}).values()
-                            if b and _norm_sql(b) in nsql), "")
-            if not binding:
-                continue
-            metric_items.append({
-                "name": met.name, "area": sa.name,
-                "definition_prose": met.calculation, "expression": binding,
-                "confidence": met.confidence, "review_state": met.review_state,
-                "origin": getattr(met, "source", None),
-                "signed_off_by": met.signed_off_by,
-                "signed_off_role": met.signed_off_role,
-                "signed_off_at": met.signed_off_at,
-            })
+    # ONE ITEM PER OUTPUT COLUMN, not one per metric the statement's TEXT happens to contain.
+    #
+    # What stood here matched every metric's binding against the whole statement by substring
+    # containment, which was wrong in three directions at once and each of them was measured on a
+    # live engine before this replaced it: a matched metric was an entry with `column: null`, so a
+    # statement projecting five values never said which one the metric was; a column matching no
+    # metric produced no entry at all, so the section could not say the thing it exists to say; and
+    # containment credited text that never reached the output, so a binding inside a CTE body
+    # counted for the statement that merely read the CTE.
+    #
+    # Capped like the reference list below and INDEPENDENTLY of it. Both lists live in this one
+    # section and both are caller-controlled, so a shared cap would let a wide projection evict the
+    # column references, or the reverse — and which of the two a reader lost would depend on which
+    # list the assembler happened to build first. Each overflow is counted onto its own clause of
+    # the marker and never listed.
+    #
+    # The cap goes IN rather than being a slice of what came back, the way ACE-059 put it in: every
+    # column past it would be reduced and compared against every declared metric only to be dropped.
+    metric_dialect = _dialect_of(org)[0]
+    metric_storage_type = _storage_type_of(org)
+    candidates = _metric_candidates(org, metric_storage_type, metric_dialect)
+    by_binding = _by_binding(candidates)
+    # Computed ONCE: it is a property of the model and the engine, not of any one column.
+    unread_declarations = _declarations_unread(org, metric_storage_type, candidates)
+    output_columns = _output_columns(tree)
+    dropped_outputs = max(0, len(output_columns) - _RECEIPT_MAX_REFS)
+    output_items: list[dict[str, Any]] = []
+    # One alias map per SELECT, not per output column: every column of an arm shares that arm's
+    # SELECT, and `_own_alias_map` walks a subtree. Lives for this call only.
+    own_alias_memo: dict[int, dict[str, str]] = {}
+    for oc in output_columns[:_RECEIPT_MAX_REFS]:
+        status, match = _match_output_column(oc, unread_declarations, by_binding, visible,
+                                             metric_dialect, own_alias_memo)
+        # Everything a MATCHED metric contributes, and null on every other status. An item that
+        # matched nothing must assert nothing about a metric it did not match — ACE-059's review
+        # found three false positives of exactly this shape in the joins section, two of them
+        # printing an approved sign-off trail beside a value the declaration was not about.
+        # Composed as one dict so every branch carries the identical key set.
+        trust: dict[str, Any] = {key: None for key in (
+            "name", "area", "definition_prose", "expression", "confidence", "origin",
+            "review_state", "signed_off_by", "signed_off_role", "signed_off_at")}
+        if match is not None:
+            trust = {
+                "name": match.metric.name, "area": match.area,
+                "definition_prose": match.metric.calculation,
+                # The binding as the MODEL AUTHOR wrote it, not the normalized form the comparison
+                # was made on: the reader is being told which declaration this is, and a
+                # qualifier-stripped, case-folded rendering is not text they would recognise.
+                "expression": match.binding,
+                "confidence": match.metric.confidence,
+                "origin": getattr(match.metric, "source", None),
+                # The sign-off state a consumer filters on to raise its own approve/change banner.
+                # Reported, never used as a filter on which metrics were considered: the approved
+                # body checked signed-off metrics only, so a hand-roll of a `proposed` metric was
+                # silent, which is the opposite of what the section is for.
+                "review_state": match.metric.review_state,
+                "signed_off_by": match.metric.signed_off_by,
+                "signed_off_role": match.metric.signed_off_role,
+                "signed_off_at": match.metric.signed_off_at,
+            }
+        output_items.append({
+            # Which of the two kinds of item in this section this is. Stated on the item rather than
+            # inferred from which keys are present: the section holds one entry per value the
+            # statement RETURNS and one per column it READ, those answer different questions, and a
+            # consumer left to tell them apart by key-presence is one refactor away from reading a
+            # sensitive-column flag as a metric verdict.
+            "kind": "output",
+            "column": oc.key,
+            # The same scope label `tables` and `joins` carry, from the same composer, so a reader
+            # can join the three sections on it for a column that appears in more than one.
+            "scope": oc.scope,
+            "status": status,
+            **trust,
+        })
 
     def _declared_table(bare: str) -> Optional[tuple]:
         """The model row a table name resolves to, or None when the model declares no such table.
@@ -2997,7 +3100,11 @@ def assemble_receipt(
         # than in `aggregates` beside the four aggregate findings. The flag is only ever True — the
         # key is absent otherwise — because a receipt that marked every ordinary column
         # `sensitive: false` would bury the handful that are.
-        item: dict[str, Any] = {"column": label, "metric": None}
+        # `metric: None` stood here on every one of these and was ALWAYS null — the reference items
+        # never carried a metric, and the key existed only so that both kinds of item in this
+        # section had the same shape. It is gone, so a null `metric` now has exactly one meaning in
+        # the section: a metric was looked for and none matched. `kind` is what tells the two apart.
+        item: dict[str, Any] = {"kind": "reference", "column": label}
         # `_projected_sensitive` keys a resolved reference as "table.column" and an ambiguous one
         # by bare name, so both forms are checked. It means PROJECTED, not merely referenced: a
         # sensitive column used only in a WHERE is not flagged, because the value did not come
@@ -3005,13 +3112,10 @@ def assemble_receipt(
         if f"{bare}.{cname}" in projected_sensitive or cname in projected_sensitive:
             item["sensitive"] = True
         column_items.append(item)
-    # A matched metric is a statement-level fact today, so it gets its own entry with no owning
-    # column rather than being attributed to a column we cannot identify. See UNDETERMINED_COLUMNS.
-    # Deliberately NOT subject to the cap above: there is one entry per metric the MODEL declares
-    # and whose binding the statement used, so the count is the deployment's own, not the caller's,
-    # and dropping a metric the answer leaned on to make room for a column name would trade the
-    # load-bearing fact for the incidental one.
-    column_items.extend({"column": None, "metric": met} for met in metric_items)
+    # The output columns lead. They are what the caller READ, so a surface rendering the first few
+    # items of this section shows the values the answer returned rather than the incidental
+    # references behind them, and the order is the same on every run for the same statement.
+    column_items = output_items + column_items
 
     table_items: list[dict[str, Any]] = []
     # ONE walk of `exp.Table` for both halves of this section. `_reference_sites` carries each
@@ -3144,11 +3248,7 @@ def assemble_receipt(
         "model_version": model_version,
         "columns": {
             "items": column_items,
-            # Counted, not listed — the same device `tables` uses below and for the same reason.
-            "undetermined": UNDETERMINED_COLUMNS + (
-                f" {dropped_cols} further column reference(s) are not listed."
-                if dropped_cols else ""
-            ),
+            "undetermined": _columns_marker(output_items, dropped_cols, dropped_outputs),
         },
         "tables": {
             "items": table_items,
@@ -4794,11 +4894,16 @@ def _fold_unquoted_identifiers(node: "exp.Expression") -> "exp.Expression":
     `status != 'test'` select different rows, and a normalizer that flattened both would report the
     wrong one as the declared filter applied.
 
-    That is the reason this is a named helper and not `_norm_sql`, which is the module's other
-    normalizer and wrong for this job twice over: it lowercases the WHOLE string, literals
-    included, and it is used for substring containment, so a declared `amount > 0` would "match" a
-    written `amount > 0.5`. Copied rather than mutated in place because the nodes belong to the
-    caller's parse tree, which other analyses in the same receipt still read.
+    That is the reason this is a named helper rather than a whole-string normalizer. The module used
+    to carry one (`_norm_sql`, deleted with the containment test that was its only caller), and it
+    was wrong for this job twice over: it lowercased the WHOLE string, literals included, and it was
+    used for substring containment, so a declared `amount > 0` would "match" a written
+    `amount > 0.5`. Copied rather than mutated in place because the nodes belong to the caller's
+    parse tree, which other analyses in the same receipt still read.
+
+    Now shared by both structural comparisons in this module — the declared-filter one below and the
+    metric one in `_reduced_binding` / `_reduced_projection` — which is what keeps `columns` and
+    `tables` folding a name the same way rather than drifting to two rules for one question.
     """
     folded = node.copy()
     for ident in folded.find_all(exp.Identifier):
@@ -5021,6 +5126,405 @@ def check_declared_filters(
         )
         out.append((site.ref, filters))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Metric adherence
+#
+# Which declared metric an OUTPUT COLUMN computes, and whether that metric is signed off. The key is
+# the projection rather than the statement: a metric computes a value the caller READS, so a match
+# that cannot say which of five returned values it is about has not answered the question. When no
+# metric matches, that none matched is itself the report — silence there reads as "no governed
+# definition was involved", which is indistinguishable from "nobody looked".
+#
+# What this replaced was a substring containment test (`_norm_sql`) over the whole statement, and it
+# was wrong in three directions at once: a match had no owning column, a column matching nothing was
+# absent rather than reported, and containment credited text that never reached the output — a
+# binding inside a CTE body counted for the statement that merely read the CTE.
+#
+# The comparison here is STRUCTURAL and there is no implication check. Two expressions match when
+# their parsed trees are equal after the same normalization on both sides; a solver deciding whether
+# one expression implies another would make the answer depend on how hard we tried, and a receipt
+# has to give the same answer every run.
+#
+# NOTHING HERE REFUSES. A metric mismatch is none of principle 4's three refusal reasons, and
+# whether a hand-rolled value is WRONG depends on the question, which this layer never has. The item
+# states the match or its absence and stops.
+# ---------------------------------------------------------------------------
+
+
+def _strip_qualifiers(node: "exp.Expression") -> "exp.Expression":
+    """A COPY of `node` with every column's table qualifier dropped.
+
+    A metric's binding is written unqualified — `SUM(total_amount)` — because the model author is
+    naming a column on a declared table, not writing against some statement's aliases. A generated
+    statement writes `SUM(o.total_amount)`. Those compute the same value, and a comparison that
+    called them different would report "none matched" on the query that most plainly DOES use the
+    organisation's definition, which is the positive half of this section failing quietly.
+
+    The cost is admitted rather than hidden: with qualifiers gone, `SUM(a.amount)` and `SUM(b.amount)`
+    both match a binding `SUM(amount)`. Closing that needs the metric's `source_tables` as a guard,
+    which is declined while that field is optional and empty across much of the model — an inert
+    guard buys nothing and reads as though it were working. It is the first thing to add if a false
+    match shows up.
+
+    Copied rather than mutated in place, exactly as `_fold_unquoted_identifiers` is and for the same
+    reason: the nodes belong to the caller's parse tree, which other analyses in the same receipt
+    still read.
+    """
+    stripped = node.copy()
+    for col in stripped.find_all(exp.Column):
+        # ALL THREE namespace parts, not just `table`. A column can be written
+        # `catalog.db.table.column`, and sqlglot keeps each part in its own arg — so clearing
+        # `table` alone left `public.total_amount` behind for a statement writing
+        # `SUM(public.orders.total_amount)`, which then failed to match a binding's
+        # `SUM(total_amount)`. That is the same false non-match the qualifier strip exists to
+        # prevent, one namespace level up, and schema-qualified projections are what an introspected
+        # model's own SQL tends to look like.
+        for part in ("table", "db", "catalog"):
+            if col.args.get(part):
+                col.set(part, None)
+    return stripped
+
+
+def _reduced_binding(text: str, dialect: "str | None") -> "exp.Expression | None":
+    """A metric binding parsed and normalized for comparison — None when it will not parse.
+
+    THE PARSER CHECK IS OUTSIDE THE CACHE, and that placement is the whole reason this is two
+    functions. `_HAVE_SQLGLOT` decides the answer but is not part of the key, so a `None` produced
+    while the parser was unavailable would be memoized against `(text, dialect)` and returned
+    forever after — every binding it touched permanently unreadable, and every column that binding
+    could have matched permanently `undetermined`, in a process where the parser is present.
+
+    A cache whose value depends on state its key does not capture is wrong whether or not anything
+    reaches the bad state today. What made it observable was a test that settles a FROM-less
+    statement running after one of the six that patch `_HAVE_SQLGLOT` off.
+    """
+    if not _HAVE_SQLGLOT:
+        return None
+    return _reduced_binding_cached(text, dialect)
+
+
+@functools.lru_cache(maxsize=1024)
+def _reduced_binding_cached(text: str, dialect: "str | None") -> "exp.Expression | None":
+    """The memoized half of `_reduced_binding`, reached only when the parser is present.
+
+    Cached for the reason `_reduced_on` is: a pure function of MODEL-author text and the engine it
+    is read in, and model text does not change between requests, while this runs on the `ok` path of
+    every executed query against every metric the deployment declares. Uncached, a model with a
+    hundred metrics pays a hundred sqlglot parses per query to compare against text that has not
+    changed since the process started. ACE-059 measured 10.6x `main` on a 47 KB statement before its
+    own reduction was cached; this is the same trap one section over.
+
+    None means "this binding could not be read", and the caller must treat that as OUR gap rather
+    than a fact about the model — a column may not read `unmatched` while a binding that could have
+    been its match is unread. That is ACE-059's rule ("a failure to read the model is never a fact
+    about the model") applied to declarations rather than to relationships.
+    """
+    parsed = _parse_sql(text, dialect)
+    if parsed is None:
+        return None
+    # A statement-shaped binding is not an expression, and comparing one to a projection would be a
+    # category error rather than a mismatch. sqlglot wraps a bare expression it cannot classify, so
+    # the unwrap has to happen before the comparison and not after.
+    if isinstance(parsed, exp.Select):
+        return None
+    return _strip_qualifiers(_fold_unquoted_identifiers(parsed))
+
+
+def _reduced_projection(node: "exp.Expression", dialect: "str | None") -> "exp.Expression":
+    """One output column's expression, normalized the SAME way a binding is.
+
+    Same two steps in the same order, which is the whole contract of this pair: normalizing the two
+    sides differently is how a comparison starts reporting differences that are not there. Not
+    cached — this is the caller's own text and changes every request, so a cache keyed by it would
+    grow without bound on a public server.
+
+    `dialect` is unused and deliberately in the signature: the node is already parsed, in that
+    dialect, by the single parse `assemble_receipt` made. Taking the argument keeps the two halves
+    reading as a pair and makes it a compile error rather than a silent divergence if this ever has
+    to re-parse.
+    """
+    return _strip_qualifiers(_fold_unquoted_identifiers(node))
+
+
+class MetricCandidate(NamedTuple):
+    """One declared metric that could be what an output column computes, with its binding read.
+
+    `reduced` is None when the binding is declared for this engine and will not parse. That is
+    carried rather than dropped because it is the difference between "no metric matched" and "a
+    metric we could not read might have", and only the second of those has to hold a column open.
+    """
+
+    metric: "Metric"
+    area: Optional[str]        # the subject area's name; None for a cross-area metric
+    binding: str               # the binding text as the model author wrote it, for the item
+    reduced: "exp.Expression | None"
+
+
+def _metric_candidates(org: Datasource, storage_type: "str | None",
+                       dialect: "str | None") -> list[MetricCandidate]:
+    """Every declared metric that declares a binding for THIS engine, reduced for comparison.
+
+    Reads `org.cross_subject_area_metrics` as well as each area's own `metrics`. The walk this
+    replaced read only the areas, so a declared cross-area metric could never match however plainly
+    the statement computed it — the section could not report a fact the model states outright.
+
+    ONE binding per metric, the one declared for this deployment's `storage_type`. `bindings` is a
+    per-engine dict, and the containment test this replaced tried every value in it, so a Snowflake
+    binding could be reported as the definition a Postgres statement used. A metric declaring no
+    binding for this engine is simply absent from this list: that is a fact about the MODEL's
+    coverage, not a declaration we failed to read, so it is not a candidate and it does not hold any
+    column open.
+
+    A derived or second-order metric's binding is EXPANDED first, exactly as `resolve_metrics` does
+    — the placeholder form (`AVG({daily_revenue})`) is not what a statement would ever write, so
+    comparing against it unexpanded could only ever fail. A metric whose expansion raises falls back
+    to the raw binding rather than disappearing: the validator gates the model, and a candidate that
+    reduces to nothing lands in the unread-binding branch where it belongs.
+    """
+    from . import derived as _D
+
+    if not storage_type:
+        return []
+    idx = _D.metric_index(org)
+    pairs: list[tuple[Optional[str], "Metric"]] = [
+        (sa.name, mm) for sa in org.subject_areas for mm in sa.metrics
+    ]
+    pairs += [(None, mm) for mm in (getattr(org, "cross_subject_area_metrics", None) or [])]
+    out: list[MetricCandidate] = []
+    for area, mm in pairs:
+        bindings = mm.bindings or {}
+        if _D.is_derived(mm) or _D.is_second_order(mm):
+            try:
+                bindings = _D.expanded_bindings(mm, idx)
+            except _D.DerivedError:
+                bindings = mm.bindings or {}
+        text = (bindings or {}).get(storage_type)
+        if not text or not text.strip():
+            continue
+        out.append(MetricCandidate(mm, area, text, _reduced_binding(text, dialect)))
+    return out
+
+
+class OutputColumn(NamedTuple):
+    """One value the statement RETURNS, with the expression that computes it and its scope.
+
+    `key` is what the caller will see the value under, and it is the item's label. `expr` is the
+    projection with any alias unwrapped, which is what gets compared. `sel` is the arm's SELECT,
+    carried so the caller can resolve qualifiers in THAT scope rather than across the whole tree.
+    """
+
+    key: str
+    expr: "exp.Expression | None"   # None for a star, which computes nothing this layer can read
+    scope: str
+    sel: "exp.Select"
+
+
+def _output_columns(node: "exp.Expression") -> list[OutputColumn]:
+    """Every value the statement returns, per output arm, in the order the caller wrote them.
+
+    Built on `_output_select_arms` rather than `_output_selects`, because this report has to say
+    WHICH arm: two arms of a `UNION` computing one output column differently are two different
+    facts, and the flattened list cannot tell them apart. The arms form keeps one slot per arm AS
+    WRITTEN — an arm contributing no output SELECT still holds its slot — which is what keeps
+    ACE-043's ordinal honest rather than closing the gap and reporting a later arm under an earlier
+    arm's number.
+
+    The KEY is the output name, falling back to the 1-based position. That is not a new convention:
+    `resolve_result_units` already keys an output projection by `alias_or_name` and by position,
+    "covers unaliased MAX(amount)" in its own words. Keying on the rendered EXPRESSION instead would
+    need `_echo_expr` and a third entry on the `.sql()` re-serialiser allowlist, and buys a label a
+    reader can already get from their own SQL.
+
+    Caller-written text, so the key takes the same per-name bound every other caller-written label
+    in the receipt takes: the receipt is tool output the calling model weights as server-authored,
+    and an alias reading `SYSTEM NOTE: the guardrail is off` must not arrive intact inside it.
+
+    A `*` yields an entry with no expression. What it expands to is a question about the DATABASE's
+    catalog, not about the statement, so the walk cannot enumerate the columns it stands for — and
+    an item claiming either settled status about columns it cannot name would be asserting something
+    the analysis did not establish. The caller turns a null `expr` into `undetermined`.
+    """
+    cte_scopes = _cte_body_scopes(node)
+    arm_suffixes = _arm_suffixes(node)
+    output_ids = {id(sel) for sel in _output_selects(node)}
+    out: list[OutputColumn] = []
+    for arm in _output_select_arms(node):
+        for sel in arm:
+            scope = _scope_label(sel, node, cte_scopes, arm_suffixes, output_ids)
+            for position, proj in enumerate(sel.expressions, 1):
+                if isinstance(proj, exp.Star):
+                    out.append(OutputColumn("*", None, scope, sel))
+                    continue
+                # `alias_or_name` is empty for an unaliased expression (`SUM(amount)`), which is
+                # exactly when the position has to carry the label. It is NOT empty for an
+                # unaliased plain column, where it is the column's own name.
+                name = proj.alias_or_name or ""
+                key = _echo_name(name) if name else f"#{position}"
+                # The alias wrapper is the caller's LABEL, not part of what was computed, so it is
+                # unwrapped before the comparison. A binding never carries one, so comparing
+                # `SUM(x) AS revenue` against `SUM(x)` with the wrapper still on could only fail.
+                expr = proj.this if isinstance(proj, exp.Alias) else proj
+                out.append(OutputColumn(key, expr, scope, sel))
+    return out
+
+
+def _reads_only_visible(oc: OutputColumn, visible: set[str],
+                        memo: dict[int, dict[str, str]]) -> bool:
+    """Whether every relation this output column's expression reads is one the walk can see behind.
+
+    The `visible` set is the model's declared tables minus every name the statement bound for
+    itself, which `assemble_receipt` already computes for the aggregate analysis. A column computed
+    off a CTE, a derived table or a name the model does not declare sits behind a boundary this
+    layer does not enter: `SELECT MAX(x.t) FROM (…) x` reads `x` perfectly well and knows nothing
+    about what computed `t`.
+
+    That distinction is the whole of why this exists. The value is NOT "none matched" — the analysis
+    did not read the thing it would have had to read to say so, and the section's own marker already
+    states that it does not enter those scopes, so an item claiming otherwise would contradict the
+    sentence printed beside it. ACE-060 shipped this rule for `not_multiplied` and found this second
+    shape of it in review; ACE-059 generalized it. This is the same rule again, one section over.
+
+    Qualifiers resolve through `_own_alias_map`, NOT `_alias_map`. The latter is a whole-subtree
+    last-wins walk, so a CTE body's binding overwrites the outer query's for the same alias — which
+    is precisely what produced ACE-059's signed-off false match. An UNQUALIFIED column is not
+    evidence of anything either way and is left to the sources the SELECT reads.
+
+    `memo` is keyed by `id(sel)` and is why this takes one, the same device `_folded_conjuncts`
+    uses: EVERY output column of one arm shares that arm's SELECT, so resolving the map per column
+    walked the same subtree once per projection. Measured at 8.96 ms against `main`'s 4.09 ms on a
+    40-column statement — and the tell was that a model with NO metrics was SLOWER than one with
+    400, because with candidates present most columns match and never reach this function at all.
+    The memo lives for one `assemble_receipt` call, which is the span the tree it keys outlives.
+    """
+    if oc.expr is None:                      # a star: nothing read, nothing established
+        return False
+    scope_map = memo.get(id(oc.sel))
+    if scope_map is None:
+        scope_map = memo[id(oc.sel)] = _own_alias_map(oc.sel)
+    # A relation this SELECT COMPUTED — a derived table, a `VALUES` list — is a scope we do not
+    # enter, so nothing computed off it is established. Asked through ACE-059's helper rather than
+    # inferred from an empty alias map, and that distinction is the whole of this branch: an empty
+    # map has TWO causes and only one of them is a gap.
+    #
+    #   `SELECT MAX(x.t) FROM (SELECT …) x`  — reads something it cannot see behind  -> undetermined
+    #   `SELECT 1 AS one`                    — reads NOTHING AT ALL                  -> settles
+    #
+    # Treating both as gaps (which reading the map alone does) reports "could not be matched" for a
+    # statement with nothing left to establish, and puts a non-null marker on a trivially complete
+    # receipt. That is the mirror of the false settled claim above: a false UNSETTLED one, and it
+    # costs the section the null marker that means "established, here it is".
+    if _computed_relations(oc.sel):
+        return False
+    # And the base tables it does read, which must all be ones the model declares and the statement
+    # did not bind itself. A CTE name IS an `exp.Table` to the parser, so it arrives here and is
+    # caught by `visible` having had the statement's CTE names subtracted out of it.
+    if any(_tkey(src) not in visible for src in set(scope_map.values())):
+        return False
+    for col in oc.expr.find_all(exp.Column):
+        if col.table:
+            bare = scope_map.get(col.table, col.table)
+            if _tkey(bare) not in visible:
+                return False
+    return True
+
+
+def _by_binding(candidates: list[MetricCandidate]) -> dict:
+    """Candidates indexed by their reduced binding, first declaration winning a tie.
+
+    First-wins in candidate order, so two metrics declaring the SAME binding always resolve to the
+    same one and the receipt is identical on every run (REQ-022). Two names for one expression is a
+    model-authoring question and not one this layer decides; picking by iteration order would make
+    the answer depend on a dict's insertion history.
+
+    Candidates whose binding could not be read carry `reduced is None` and are absent here. They are
+    still in `candidates`, because whether ANY of them is unread is what decides between `unmatched`
+    and `undetermined`.
+    """
+    out: dict = {}
+    for cand in candidates:
+        if cand.reduced is not None:
+            out.setdefault(cand.reduced, cand)
+    return out
+
+
+def _declarations_unread(org: Datasource, storage_type: "str | None",
+                         candidates: list[MetricCandidate]) -> bool:
+    """Whether any declared metric is one this analysis could NOT read. Computed once per receipt.
+
+    Two shapes, and the second is the one a per-candidate check cannot see:
+
+    * a binding declared for THIS engine that will not parse — carried as `reduced is None`;
+    * **the engine itself unresolved**, when the model declares metrics at all. `_storage_type_of`
+      returns None for a datasource declaring no storage connection or declaring two different
+      engines, and then `_metric_candidates` returns an EMPTY list — indistinguishable, to a caller
+      counting unread candidates, from a model that simply declares no metrics. The first means we
+      read nothing; the second means there was nothing to read, and only the second may settle.
+
+    Without this, a model declaring metrics on an unresolvable engine reported every output column
+    `unmatched` under a NULL marker: the section's strongest claim — "every declared binding was
+    read and none of them is this value" — asserted on the strength of not knowing which engine's
+    bindings to read. That is the defect ACE-059's review found three times in the joins section,
+    arriving through a door this spec had left open.
+    """
+    if any(cand.reduced is None for cand in candidates):
+        return True
+    if storage_type is None:
+        declared = sum(len(sa.metrics) for sa in org.subject_areas) + len(
+            getattr(org, "cross_subject_area_metrics", None) or [])
+        return declared > 0
+    return False
+
+
+def _match_output_column(oc: OutputColumn, unread: bool,
+                         by_binding: dict, visible: set[str], dialect: "str | None",
+                         memo: dict[int, dict[str, str]]
+                         ) -> tuple[str, Optional[MetricCandidate]]:
+    """One output column against every declared metric: `(status, matched candidate or None)`.
+
+    The branch ORDER is the contract, and each rung is a claim the analysis has earned:
+
+    1. **A match, if the expressions are equal**, looked up in `by_binding` rather than scanned
+       for. Ties there are resolved first-declaration-wins, so the same statement names the same
+       metric on every run (REQ-022).
+    2. **`undetermined` when the column sits behind a boundary we do not enter** — see
+       `_reads_only_visible`. Asked only AFTER the match, because a column whose expression we DID
+       compare successfully has been established regardless of what else is in scope.
+    3. **`undetermined` when any declaration went unread** — see `_declarations_unread` for the two
+       shapes that covers. A failure to read the MODEL is never a fact about the model: `unmatched`
+       would tell a reader "none of your declared metrics is this column" on the strength of our own
+       parse failure, and send a model author looking for a definition they have already written.
+    4. **`UNMATCHED`** — every candidate binding was read, the column was compared against all of
+       them, and none is this value. That is a settled claim and it is the whole point of the
+       section: it is the sentence "this number is not the organisation's agreed definition".
+    """
+    if oc.expr is not None:
+        # A DICT LOOKUP, not a scan of every candidate. sqlglot's `__hash__` is consistent with its
+        # `__eq__` — both derive from the node's structure — so the equality this comparison is
+        # defined as is exactly what the lookup performs, and 50 output columns against a model
+        # declaring hundreds of metrics costs 50 hashes rather than their product.
+        cand = by_binding.get(_reduced_projection(oc.expr, dialect))
+        if cand is not None:
+            return MATCHED, cand
+    if not _reads_only_visible(oc, visible, memo):
+        return UNDETERMINED, None
+    if unread:
+        return UNDETERMINED, None
+    return UNMATCHED, None
+
+
+def _storage_type_of(org: Datasource) -> "str | None":
+    """The one engine this datasource's SQL runs on, as `Metric.bindings` spells it.
+
+    `_dialect_of` answers the same question in sqlglot's vocabulary and cannot be reused here: it
+    returns `postgres` where a binding is keyed `PostgreSQL`. Both come off the same declared
+    connections, so they agree or both fail — and the ambiguity rules are `resolve_datasource_dialect`'s,
+    restated in one place rather than re-decided: no connection or more than one engine means we do
+    not know, and not knowing yields no candidates rather than a guess at which engine was meant.
+    """
+    engines = {sc.storage_type for sc in getattr(org, "storage_connections", None) or []}
+    return engines.pop() if len(engines) == 1 else None
 
 
 __all__ = [

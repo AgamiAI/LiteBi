@@ -363,6 +363,13 @@ def test_a_statement_full_of_column_references_does_not_become_a_report(declared
     The references are deliberately ones the model does NOT declare: reaching the section requires no
     model row (a qualified reference keeps the text the statement wrote), which is what makes the
     count caller-controlled rather than bounded by the model's own width.
+
+    ACE-058 put a SECOND caller-controlled list in this section — one entry per value the statement
+    returns — and it takes the same cap from the same constant, applied INDEPENDENTLY. Two lists
+    under one shared cap would let a wide projection evict the references or the reverse, and which
+    of the two a reader lost would depend on which list the assembler happened to build first. So
+    the section is bounded by 2 × the constant, which is still a constant, and each overflow is
+    counted onto its own clause of the marker.
     """
     from semantic_model import loader as L
     from semantic_model import runtime as RT
@@ -371,8 +378,14 @@ def test_a_statement_full_of_column_references_does_not_become_a_report(declared
     invented = ", ".join(f"o.c{i}" for i in range(400))
     section = RT.assemble_receipt(org, f"SELECT {invented} FROM orders o")["columns"]
 
-    assert len(section["items"]) == RT._RECEIPT_MAX_REFS
+    by_kind = {kind: [i for i in section["items"] if i["kind"] == kind]
+               for kind in ("output", "reference")}
+    assert len(by_kind["reference"]) == RT._RECEIPT_MAX_REFS
+    assert len(by_kind["output"]) == RT._RECEIPT_MAX_REFS
+    assert len(section["items"]) == 2 * RT._RECEIPT_MAX_REFS
+    # Both counts are the caller's own numbers, so stating either discloses nothing.
     assert "350 further column reference(s) are not listed." in section["undetermined"]
+    assert "350 further output column(s) are not listed." in section["undetermined"]
 
 
 # ---------------------------------------------------------------------------
