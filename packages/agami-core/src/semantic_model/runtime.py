@@ -4197,6 +4197,12 @@ if _HAVE_SQLGLOT:
         "Case", "If", "Nvl2", "Coalesce", "Greatest", "Least", "DecodeCase")
     # The two that hold their arms under `true` and `false` rather than under `expressions`.
     _TERNARY_NODES = _exp_nodes("If", "Nvl2")
+    # `DECODE`'s own shape, resolved by name for the same reason the tuple above is. A bare
+    # `exp.DecodeCase` in the dispatch below would defeat `_exp_nodes` entirely: the attribute is
+    # read when the line RUNS, so on a sqlglot that predates the class every `COALESCE`, `IF`,
+    # `GREATEST` and `LEAST` in the dispatch raises `AttributeError` instead of being attributed,
+    # and the receipt fails to build for a statement that version parses perfectly well.
+    _DECODE_NODES = _exp_nodes("DecodeCase")
     # STRUCTURAL: the value is `this` and the rest of the node is neither predicate nor value.
     # `exp.Order` holds `STRING_AGG(x ORDER BY y)`'s ordering arms on `expressions`; reordering a
     # concatenation changes the string, but the fan is not what reordered it. `exp.Nullif`'s
@@ -4222,6 +4228,7 @@ if _HAVE_SQLGLOT:
     )
 else:  # pragma: no cover - nothing in this section runs without a parser
     _ALTERNATION_NODES = _TERNARY_NODES = _STRUCTURAL_NODES = _COMBINING_NODES = ()
+    _DECODE_NODES = ()
 
 
 # What `_value_operands` says about a node, and what `_value_sources` does with the operands beside
@@ -4278,7 +4285,7 @@ def _value_operands(node: "exp.Expression") -> tuple[str, list["exp.Expression"]
         arms.append(node.args.get("default"))
         return _VALUE_INTERSECT, _present(arms)
     if isinstance(node, _ALTERNATION_NODES):
-        if isinstance(node, exp.DecodeCase):
+        if isinstance(node, _DECODE_NODES):
             return _VALUE_INTERSECT, _decode_arms(node)
         if isinstance(node, _TERNARY_NODES):
             return _VALUE_INTERSECT, _present([node.args.get("true"), node.args.get("false")])

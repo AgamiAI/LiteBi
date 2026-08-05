@@ -955,6 +955,36 @@ def test_the_conditional_function_parses_to_exp_if_on_every_dialect_this_layer_s
     assert rt._value_sources(node, VALUE_SCOPE) == set(), dialect
 
 
+@pytest.mark.parametrize("label, sql", [
+    ("COALESCE", "SELECT SUM(COALESCE(orders.total_amount, 0)) FROM orders"),
+    ("IF", "SELECT SUM(IF(orders.flag, orders.total_amount, 0)) FROM orders"),
+    ("GREATEST", "SELECT SUM(GREATEST(orders.total_amount, orders.revenue)) FROM orders"),
+    ("LEAST", "SELECT SUM(LEAST(orders.total_amount, orders.revenue)) FROM orders"),
+])
+def test_an_alternation_is_attributed_on_a_sqlglot_that_never_heard_of_decode(label, sql, monkeypatch):
+    """The dispatch may not read a late-added class by attribute, only through `_exp_nodes`.
+
+    `_exp_nodes` exists because the package pins `sqlglot>=20` and `exp.Nvl2` / `exp.DecodeCase`
+    are later additions, and it is what keeps the module importable against a sqlglot that reads
+    every statement here perfectly well. A bare `exp.DecodeCase` inside `_value_operands` defeats
+    it completely, because the attribute is read when the LINE runs rather than at import: the
+    `DECODE` arm sits above the ternary and the leading-argument arms, so on such a version every
+    `COALESCE`, `IF`, `GREATEST` and `LEAST` raises `AttributeError` on the way past it.
+
+    That is not a crash the caller sees. `execute_sql._receipt_for` catches it and returns
+    `RECEIPT_BUILD_FAILED`, so the statement executes and answers while the trust layer silently
+    disappears — the same shape `_MAX_CTE_CHAIN` and the iterative `_value_sources` walk exist for.
+    `COALESCE` over an aggregate is ordinary SQL, so this was not an exotic configuration.
+
+    Deleting the attribute is the honest simulation: the module-level tuples resolved at import on
+    the real sqlglot, and what is under test is whether the dispatch reaches for the name again.
+    """
+    monkeypatch.delattr(exp, "DecodeCase", raising=False)
+    reports = _reports(sql)
+    assert [(r.aggregate, r.status) for r in reports] == [
+        (reports[0].aggregate, rt.NOT_MULTIPLIED)], label
+
+
 def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
     """The guard that lets the generic branch iterate `node.args` without inspecting what it holds.
 
