@@ -486,7 +486,64 @@ def test_a_server_that_boots_with_the_pass_off_says_so_exactly_once(tmp_path, mo
     # It names what stopped AND what did not, because the second half is the part an operator reading
     # this at 3am needs in order to size the exposure.
     assert "OFF" in lines[0]
-    assert "Read-only, recon and the resource bounds are unaffected." in lines[0]
+    assert "Read-only, dangerous-function and resource-bound protection are unaffected." in lines[0]
+    # And it says the uncomfortable half out loud. An earlier draft of this line claimed recon was
+    # unaffected, which is false: `check_no_recon` denies catalog FUNCTIONS, while catalog RELATIONS
+    # were only ever refused by table scope, which is inside the pass this switch turns off. An
+    # operator sizing the exposure has to be told that schema enumeration is reachable.
+    assert "enumerate the schema" in lines[0]
+    assert "columns excluded from the model" in lines[0]
+
+
+def test_the_boot_warning_reports_the_value_that_was_actually_rejected(tmp_path, monkeypatch, caplog):
+    """A value the parser did not recognize is not the same as no value, and saying so matters.
+
+    The parse is fail-open for anything unrecognized, so `ture` leaves a server unguarded that its
+    operator believes is enforcing. Telling that operator the variable "is not set" sends them to
+    check their env plumbing, which is fine, while their actual typo sits in front of them. Echoing
+    the rejected value is the difference between a warning that ends the incident and one that starts
+    a search. Same standard the receipt reasons are held to: never state a cause that is not the one.
+    """
+    monkeypatch.setenv("AGAMI_GOVERNANCE_ENFORCED", "ture")
+
+    lines = _boot(tmp_path, monkeypatch, caplog)
+
+    assert len(lines) == 1, lines
+    assert "'ture'" in lines[0]
+    assert "is not enabled" in lines[0]
+
+
+def test_a_server_with_no_database_stays_quiet_because_the_switch_is_not_consulted(
+    tmp_path, monkeypatch, caplog
+):
+    """File mode is a supported shape of this same app, and there the pass is fully ON.
+
+    `_hosted()` is false with no database configured, so `_model_pass_disabled()` is false and every
+    gate runs. A warning here would announce that the gates are off on a server where they are on.
+    Wrong in the safe direction is still wrong: an operator who sees this line on a server that is
+    enforcing learns to discount it, and the line is then worth nothing on the server where it is
+    true. The predicate is shared with the enforcement sites precisely so the two cannot drift.
+    """
+    monkeypatch.delenv("AGAMI_GOVERNANCE_ENFORCED", raising=False)
+
+    import mcp_http
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://agami.example")
+    monkeypatch.delenv("AGAMI_DB_URL", raising=False)
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
+    monkeypatch.setenv("AGAMI_SIGNING_SECRET", "x" * 32)
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        with TestClient(mcp_http.build_app()):
+            pass
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if "AGAMI_GOVERNANCE_ENFORCED" in record.getMessage()
+    ] == []
 
 
 def test_a_server_that_boots_with_the_pass_on_stays_quiet(tmp_path, monkeypatch, caplog):

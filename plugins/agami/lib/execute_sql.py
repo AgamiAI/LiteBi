@@ -1347,6 +1347,48 @@ _guard_model: ContextVar[Any | None] = ContextVar("_guard_model", default=None)
 # that third text is not a defensive branch — it is the answer for every deployment without a model.
 _guard_shape: ContextVar[str | None] = ContextVar("_guard_shape", default=None)
 
+# The ACE-101 posture, resolved ONCE per call and then fixed for the rest of it.
+#
+# `_governance_enforced()` is deliberately read per call so an operator can flip the switch on a
+# running deployment. That is the feature, and it is also the hazard: within ONE request the posture
+# is consulted in four places, and on the fork path two of them are in different PROCESSES. The child
+# decides whether the gates run; the parent, after the child has exited, decides what the receipt
+# says. Flip the variable ON in that window, which is exactly the operation the per-call read exists
+# to enable, performed by an operator who has just finished validating the gates, and the child
+# executed unguarded while the parent resolves the model itself and assembles a full, populated
+# receipt claiming the gates ran. That is the one defect this whole spec must not ship.
+#
+# So the posture is pinned at the top of a call and every later reader takes the pinned value.
+# Unpinned (`None`) it falls back to reading the environment, which is what a direct in-process caller
+# of a single helper gets and what the tests exercise.
+_pass_posture: ContextVar[bool | None] = ContextVar("_pass_posture", default=None)
+
+
+def _model_pass_disabled() -> bool:
+    """Whether the semantic-model pass is off for THIS call.
+
+    The single spelling of the condition. It was written out four times before, once per site, and
+    the fifth site (the hosted server's boot warning) got it wrong by dropping the `_hosted()` half,
+    which is the argument for naming it rather than repeating it.
+    """
+    pinned = _pass_posture.get()
+    if pinned is not None:
+        return pinned
+    return _hosted() and not _governance_enforced()
+
+
+def _pin_model_pass_posture() -> bool:
+    """Resolve the posture once and fix it for the remainder of this call. Returns what was pinned.
+
+    Called at the two entry points a request can arrive through: `execute_guarded` (in-process, and
+    the child's own entry across the fork) and `tools._tool_execute_sql` (the parent side of the
+    fork, which must reach the same answer its child did). Everything downstream reads
+    `_model_pass_disabled()` and therefore cannot observe a change made mid-call.
+    """
+    value = _hosted() and not _governance_enforced()
+    _pass_posture.set(value)
+    return value
+
 
 def _resolve_row_cap() -> int:
     """Effective result-row cap. `AGAMI_SQL_MAX_ROWS` is the operator-configurable DEPLOYMENT cap
@@ -1688,15 +1730,28 @@ def _governance_enforced() -> bool:
     The one place a deployment can turn off the 4b/4c half of the guard: table scope, column scope,
     the star ban, the readability and scopability gates, the three `model_unavailable` branches, and
     the engine-mismatch check. It exists because those refuse on facts about OUR parser and OUR model
-    resolution rather than about the caller's statement — a dialect drift or a model that will not
+    resolution rather than about the caller's statement: a dialect drift or a model that will not
     resolve refuses EVERY query on the server until an operator intervenes, and until this switch
     there was no way to bring a server up without them.
 
-    **It cannot reach 4a**, and that is structural rather than a rule to remember: `check_read_only`
-    and `check_no_recon` are composed in `execute_guarded` ABOVE the semantic-model pass, and the
-    resource bounds are applied around the executor below it. Nothing this function gates is on the
-    write / RCE / probe / exhaust path, and the least-privilege read-only DB role — the primary
-    control that F9 names, with this layer as defense-in-depth — is untouched either way.
+    **It cannot reach the gates that stop a statement writing, calling a dangerous function, or
+    outrunning its bounds**, and that much is structural rather than a rule to remember:
+    `check_read_only` and `check_no_recon` are composed in `execute_guarded` ABOVE the semantic-model
+    pass, the resource bounds are applied around the executor below it, and `sql_guard` imports only
+    `re` and `typing` so neither gate degrades when the pass is skipped. The least-privilege
+    read-only DB role, the primary control F9 names with this layer as defense-in-depth, is untouched
+    either way.
+
+    **What it DOES reach, stated plainly because the honest version is short and the flattering one
+    is wrong:** with the pass off, a statement may name any table and any column the connecting role
+    can read, including columns deliberately excluded from the model, which is the only mechanism
+    REQ-021 offers for "this must not be readable". `SELECT *` is permitted, so one star returns every
+    physical column. And **schema enumeration through catalog RELATIONS is reachable**:
+    `check_no_recon` denies catalog FUNCTIONS, while `information_schema.tables`, `pg_catalog.pg_class`
+    and `sqlite_master` in a FROM clause were only ever refused by `check_table_scope`, which is
+    inside this pass. The read-only grant this project recommends does not revoke catalog access, so
+    with the pass off nothing backstops it. See ACE-102, which moves catalog relations into
+    `check_no_recon` so that half becomes structural too.
 
     Default OFF deliberately inverts the fail-closed default every other gate takes, and the
     inversion is written into REQ-014 rather than left as drift between the register and this file.
@@ -1921,12 +1976,12 @@ def _model_safety(sql: str, profile: str, area: str | None) -> tuple[str, Refusa
     pre-flight and the sensitive-column check were the two exceptions, writing their own diagnostic
     and returning a bare int. Both became receipt facts, so neither is here at all now.
     """
-    if _hosted() and not _governance_enforced():
+    if _model_pass_disabled():
         # The deployment switch (ACE-101). ABOVE the import on purpose: an off deployment pays
         # neither the `semantic_model.runtime` import nor the parse it would drive, so turning the
         # pass off costs nothing rather than costing slightly less.
         #
-        # Returning `(sql, None)` and not a Refusal is the whole point — the caller's statement is
+        # Returning `(sql, None)` and not a Refusal is the whole point: the caller's statement is
         # handed on untouched, exactly as on the no-model-declared branch below. What this must NOT
         # do is let the receipt claim the gates ran: `_receipt_for` answers
         # `RECEIPT_GOVERNANCE_DISABLED` under this same condition, as its FIRST statement, because
@@ -2233,10 +2288,10 @@ def _receipt_for(sql: str, profile: str, *, bounded: bool) -> Receipt:
     install legitimately has no model yet; and an assembler that raises must cost the caller its
     receipt, never its answer.
     """
-    if _hosted() and not _governance_enforced():
+    if _model_pass_disabled():
         # ACE-101, and it is the FIRST statement for a reason that is easy to get wrong and silent
         # when wrong. `_model_safety` returns before it can `_guard_model.set(org)`, so the var below
-        # is still the `None` `execute_guarded` cleared on entry — and the `org is None` branch answers
+        # is still the `None` `execute_guarded` cleared on entry, and the `org is None` branch answers
         # `RECEIPT_NO_MODEL`, "no semantic model could be resolved", on a deployment whose model
         # resolves perfectly. Placing this after the import instead trades that for `RECEIPT_NO_RUNTIME`
         # on a vendored deployment. Both are false causes stated with confidence, which is worse than
@@ -2521,6 +2576,11 @@ def execute_guarded(
     # And the same again for the shape. A stale value here is worse than none: it would word this
     # call's refusal for a statement somebody else sent, and the two wordings give opposite advice.
     _guard_shape.set(None)
+    # And the ACE-101 posture, resolved once here rather than cleared. Same reason as the four above,
+    # one step stronger: those must not carry a STALE value into this call, and this one must not
+    # CHANGE during it. The gate below and the receipt built after it have to be two statements about
+    # one decision, so the decision is made once, at the top, before anything can act on it.
+    _pin_model_pass_posture()
     # The statement the CALLER sent. Every NON-OK receipt is built from this one, and the rule is
     # about the REBINDING rather than about any particular mechanism: whatever a safety pass rewrites
     # a statement INTO is the guard's own text, so a rebound string can name a table the caller never
@@ -2580,7 +2640,7 @@ def execute_guarded(
                 return _envelope("refused", refusal=verdict,
                                  receipt=_refusal_receipt(verdict, received_sql, profile))
         creds = _load_credentials(profile, org_id or "local")
-        if not no_safety and not (_hosted() and not _governance_enforced()):
+        if not no_safety and not _model_pass_disabled():
             # The guard picked its grammar from the model's declared engine; the executor picks its
             # driver from these credentials. Two independent pieces of operator configuration with
             # nothing reconciling them, so a mis-declared model has the guard vet a statement in a
@@ -2591,7 +2651,7 @@ def execute_guarded(
             # It carries the ACE-101 switch too, and needs its own copy of the condition rather than
             # riding `_model_safety`'s: this is a SECOND `if not no_safety:` block, so scoping the
             # switch to that function alone would leave this gate enforcing on a deployment that had
-            # turned the pass off. It belongs with the pass because it is the same class of finding —
+            # turned the pass off. It belongs with the pass because it is the same class of finding:
             # `engine_mismatch` reports OUR configuration drift, a model declaring an engine its own
             # credentials do not speak, and it refuses every statement on that datasource until an
             # operator fixes it. That is 4c, not 4a: nothing here is about what the statement can do.
