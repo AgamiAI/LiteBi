@@ -79,6 +79,20 @@ from .models import (
 )
 from .sql_dialect import DialectUnresolved, engines_disagree, resolve_datasource_dialect
 
+
+def _exp_nodes(*names: str) -> tuple[type, ...]:
+    """The `sqlglot.expressions` classes among `names` that THIS sqlglot declares.
+
+    Resolved by name rather than by attribute because the package pins only `sqlglot>=20` and not
+    every node type below exists across that whole range: `exp.Nvl2` and `exp.DecodeCase` are
+    later additions. A class this version does not declare is a shape this version cannot parse, so
+    leaving it out of the tuple changes no answer; a bare `exp.Nvl2` in a module-level tuple would
+    instead make the whole module unimportable against a sqlglot that reads every statement here
+    perfectly well.
+    """
+    return tuple(t for t in (getattr(exp, name, None) for name in names) if isinstance(t, type))
+
+
 # A prober resolves a literal/value against the DB. Returns True if the value
 # exists in <table>.<column>. Injected so runtime stays DB-agnostic.
 Prober = Callable[[str, str, str], bool]
@@ -1892,6 +1906,33 @@ def _multiplication_status(site: "_AggSite", findings: list[Finding]) -> str:
 _MAX_CTE_CHAIN = 64
 
 
+# The `exp.Select` arguments a body may populate and still hand back its source's rows one for one.
+# **An ALLOWLIST, which is the correction**: the guard read `group`, `distinct` and `joins` and
+# accepted everything else, so an unanticipated argument landed on the clean side. `exp.Select`
+# also carries `laterals`, `connect`, `match` and `pivots`, and each of the four changes the row
+# count. Measured, all three parseable ones reported `not_multiplied` against a base that said
+# `undetermined`: `SELECT * FROM orders LATERAL VIEW EXPLODE(orders.status) t AS s`,
+# `SELECT * FROM orders UNPIVOT (v FOR k IN (total_amount, revenue))` and
+# `SELECT * FROM orders CONNECT BY PRIOR id = customer_id`, each as the body of a CTE the outer
+# statement then aggregates over. `limit`, `qualify`, `sample` and `with_` are the same hazard
+# class and are out for the same reason.
+#
+# Five members, and each earns its place. `expressions` is the projection, which renames and drops
+# columns and never rows. `from_` is required, and `from` is the pre-sqlglot-30 spelling of it —
+# read under one spelling only, every CTE silently answers None. `where` REMOVES rows, which is not
+# a grain change: a filtered many side is still the many side, and the model's declared edge still
+# describes the join exactly. `order` changes the sequence and not the count, and `limit` and
+# `offset` — the two arguments that turn an ordering into a truncation — are their own keys and are
+# both out.
+#
+# `order` earns it on a measurement rather than on the argument alone. Excluded, the analysis
+# answers `undetermined` for `WITH oi AS (SELECT * FROM order_items ORDER BY id)` joined into a fan,
+# which is not the fail-closed direction but a LOST FINDING: the fan is real, the resolver can see
+# it, and the receipt would decline to say so. Over-reporting is the safe way to be wrong; going
+# quiet about a trap this layer can prove is not.
+_GRAIN_PRESERVING_SELECT_ARGS = ("expressions", "from_", "from", "where", "order")
+
+
 def _visible_cte_bodies(sel: "exp.Expression") -> dict[str, "exp.Expression"]:
     """Folded CTE name -> body, for every WITH that BINDS for `sel`. Innermost binding wins.
 
@@ -1941,10 +1982,12 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
 
     * not an `exp.Select` — a UNION-bodied CTE, whose row count is the sum of its arms;
     * already `seen` — the cycle guard, for a CTE that reads itself directly or through another;
-    * `GROUP BY`, `DISTINCT` — both collapse rows by definition;
-    * a `JOIN` — the join is the multiplication, one scope further in than the caller can see;
-    * an aggregate anywhere — `SELECT SUM(quantity) FROM order_items` is one row from many, and it
-      needs no `GROUP BY` to be so;
+    * **any populated argument outside `_GRAIN_PRESERVING_SELECT_ARGS`.** This is the allowlist,
+      and it subsumes the `GROUP BY` / `DISTINCT` / `JOIN` tests it replaced — all three collapse or
+      multiply rows by definition, and so do the four the denylist never named. See the constant for
+      the three shapes measured reporting `not_multiplied` through the hole;
+    * an aggregate anywhere — `SELECT SUM(quantity) FROM order_items` is one row from many, it needs
+      no `GROUP BY` to be so, and no argument of `exp.Select` says it is happening;
     * the body's own `FROM` not naming a table directly. Read off `args`, under BOTH spellings —
       sqlglot 30 keys the argument `"from_"`, so a resolver built on `args.get("from")` alone
       silently answers None for every CTE, passing the corpus and failing only the assertions that
@@ -1955,6 +1998,11 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
       is the second half: `SELECT * FROM (SELECT DISTINCT order_id FROM order_items) g` hands back
       one row per DISTINCT order, not one row per order item, and reading through the wrapper named
       a join the statement does not take;
+    * that `exp.Table` carrying `pivots`. A PIVOT and an UNPIVOT both hang off the TABLE rather than
+      off the SELECT — `Table(this=Identifier, pivots=[Pivot])` — so an argument allowlist on the
+      body cannot see them and the `isinstance(frm.this, exp.Table)` test passes straight through
+      one. An UNPIVOT turns one row into one row per unpivoted column; a PIVOT escaped only by
+      accident, because it happens to contain an `exp.AggFunc` the guard below catches;
     * more than one table, or none — a nested source, or a body that reads nothing nameable. This
       count stays WHOLE-SUBTREE deliberately: `SELECT order_id FROM order_items WHERE order_id IN
       (SELECT id FROM orders)` is caught only because the IN subquery's table is counted, and its
@@ -1974,12 +2022,15 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
     if not isinstance(body, exp.Select) or key in seen or depth > _MAX_CTE_CHAIN:
         return None
     seen.add(key)
-    if body.args.get("group") or body.args.get("distinct") or body.args.get("joins"):
+    if any(value and arg not in _GRAIN_PRESERVING_SELECT_ARGS
+           for arg, value in body.args.items()):
         return None
     if body.find(exp.AggFunc) is not None:
         return None
     frm = body.args.get("from_") or body.args.get("from")
     if not isinstance(frm, exp.From) or not isinstance(frm.this, exp.Table):
+        return None
+    if frm.this.args.get("pivots"):
         return None
     if len(list(body.find_all(exp.Table))) != 1:
         return None
@@ -3347,6 +3398,19 @@ class _RefSite(NamedTuple):
     node: "exp.Expression"
 
 
+# The row-multiplying sources that are NOT a FROM's or a JOIN's `this`, and so are reached by no
+# walk of those two clauses. `exp.Lateral` (from `Select.args["laterals"]`, the `LATERAL VIEW`
+# spelling), `exp.Connect` (`CONNECT BY`), `exp.MatchRecognize` (`MATCH_RECOGNIZE`) and `exp.Pivot`
+# (`PIVOT` / `UNPIVOT`, which rides the `exp.Table` rather than the `exp.Select`). Each binds the
+# empty string, which is the honest answer and the one `_aggregate_sites` reads as "this scope holds
+# something the analysis could not resolve".
+#
+# Resolved by name for the reason `_exp_nodes` gives, and empty when there is no parser at all.
+_ROW_MULTIPLYING_SOURCES: tuple[type, ...] = (
+    _exp_nodes("Lateral", "Connect", "MatchRecognize", "Pivot") if _HAVE_SQLGLOT else ()
+)
+
+
 def _reference_sites(node: "exp.Expression", *,
                      bind_derived: bool = False) -> list[_RefSite]:
     """The one walk: every table REFERENCE, resolved to its scope, with the node it was read from.
@@ -3397,6 +3461,17 @@ def _reference_sites(node: "exp.Expression", *,
     surface for a statement whose rows an unnest can multiply. A source kind nobody anticipated has
     to default to `undetermined`, and only binding by exclusion gives that.
 
+    **`_ROW_MULTIPLYING_SOURCES` is what makes that claim true rather than only stated.** Four
+    constructs multiply a SELECT's rows without ever being a FROM's or a JOIN's `this`, so walking
+    From/Join alone reached none of them: `laterals`, `connect` and `match` are SIBLINGS of `from_`
+    on `exp.Select`, and `pivots` rides the `exp.Table` itself under its real name. Each was
+    measured reporting a clean `not_multiplied` on the ungated `cmd_preflight` / `cmd_prepare`
+    surface — `FROM orders LATERAL VIEW EXPLODE(orders.status) t AS tag`,
+    `FROM orders o UNPIVOT (v FOR k IN (total_amount, revenue))` and
+    `FROM orders CONNECT BY PRIOR id = customer_id`. They are walked by their own node types here,
+    and a node already bound as a FROM/JOIN source is not bound twice: `LATERAL (SELECT 1) l` is an
+    `exp.Lateral` the Join arm reaches first, and one source reported twice is one source too many.
+
     Two guards, both measured rather than defensive:
 
     - Taking each clause's own bound source is `check_column_scope`'s FROM/JOIN parent test read
@@ -3425,11 +3500,17 @@ def _reference_sites(node: "exp.Expression", *,
     cte_scopes = _cte_body_scopes(node)
     arm_suffixes = _arm_suffixes(node)
     output_ids = {id(sel) for sel in _output_selects(node)}
-    walk = (exp.Table, exp.From, exp.Join) if bind_derived else (exp.Table,)
+    walk = ((exp.Table, exp.From, exp.Join, *_ROW_MULTIPLYING_SOURCES)
+            if bind_derived else (exp.Table,))
+    # Node identity, so a source reachable two ways is bound once. An `exp.Lateral` in a JOIN is
+    # both that JOIN's `this` and a member of the walk above.
+    bound: set[int] = set()
     sites: list[_RefSite] = []
     for found in node.find_all(*walk):
         if isinstance(found, exp.Table):
             ref_node: "exp.Expression" = found
+        elif isinstance(found, _ROW_MULTIPLYING_SOURCES):
+            ref_node = found
         else:
             # What this FROM/JOIN clause binds. An `exp.Table` source was already bound by the arm
             # above under its real name, and so was the table inside a parenthesized `FROM (orders)`;
@@ -3450,7 +3531,15 @@ def _reference_sites(node: "exp.Expression", *,
             sites.append(
                 _RefSite(TableRef(written, ref_node.name, ref_node.alias or None, scope), ref_node)
             )
+            # A PIVOT or an UNPIVOT on this table is NOT bound here. It rides the `exp.Table` under
+            # the table's own name, and both facts have to reach the map: the rows really do come
+            # from `orders`, so the model's declared edges apply, and there really are more of them
+            # than `orders` has. The table binds the first; the `exp.Pivot` in the walk binds the
+            # second, under its own alias when it wrote one and under the empty key when it did not.
             continue
+        if id(ref_node) in bound:
+            continue
+        bound.add(id(ref_node))
         sites.append(_RefSite(
             TableRef(ref_node.alias, "", ref_node.alias or None, scope), ref_node))
     return sites
@@ -4020,6 +4109,166 @@ def _aggregate_sites(tree: "exp.Select", scope_map: dict[str, str], scope: str,
     return sites
 
 
+# The node types `_value_operands` understands, in the three readings it has, plus a fail-closed
+# default for everything else. **They are an ALLOWLIST, and inverting that polarity is the whole of
+# this correction.** They were a denylist: four node types were named as putting an operand
+# somewhere that is not the value, and every other node unioned all of its children. An
+# unanticipated shape therefore landed on the UNSAFE side, because contributing a choice's INPUTS
+# as though they were its result is exactly what clears a fan the number really does move. Four
+# shapes of ordinary analytics SQL were measured doing that against `orders JOIN order_items`, each
+# reporting `not_multiplied` where the pre-spec implementation reported `multiplied`:
+# `SUM(GREATEST(orders.total_amount, order_items.quantity))`, the same with `LEAST`,
+# `SUM(NVL2(order_items.quantity, orders.total_amount, 0))` and
+# `SUM(DECODE(order_items.product_id, 1, orders.total_amount, 0))` — Snowflake, Redshift and Oracle
+# spellings, not contrived ones. `ROUND`, `SUBSTRING`, `LEFT`, `LPAD`, `SPLIT_PART`, `REPEAT` and
+# `TRUNCATE` were measured on the same polarity and are contrived; the fix is the same for both.
+#
+# Enumerated this way round, a node nobody anticipated contributes NOTHING, an empty contribution
+# suppresses no edge, and the fan is reported. Over-reporting is a receipt that says more than it
+# had to; the other polarity is a receipt that says something false.
+if _HAVE_SQLGLOT:
+    # ALTERNATION: the result is ONE of the operands, so the value is at a table's grain only when
+    # every alternative is. `exp.Nvl2.arg_types` is `{this, true, false}`, byte-identical to
+    # `exp.If`'s, and `NVL2(a, b, c)` returns `b` or `c` exactly as `IF` does. `exp.Greatest` and
+    # `exp.Least` carry `exp.Coalesce`'s `this` + `expressions` layout and, like it, return one of
+    # their arguments rather than a function of all of them. `DECODE` parses to
+    # `exp.DecodeCase(expressions=[operand, search, result, …, default])`, which is a simple CASE
+    # with the commas moved. Every one of these was read off `arg_types` and off a parse, not
+    # assumed.
+    _ALTERNATION_NODES = _exp_nodes(
+        "Case", "If", "Nvl2", "Coalesce", "Greatest", "Least", "DecodeCase")
+    # The two that hold their arms under `true` and `false` rather than under `expressions`.
+    _TERNARY_NODES = _exp_nodes("If", "Nvl2")
+    # STRUCTURAL: the value is `this` and the rest of the node is neither predicate nor value.
+    # `exp.Order` holds `STRING_AGG(x ORDER BY y)`'s ordering arms on `expressions`; reordering a
+    # concatenation changes the string, but the fan is not what reordered it. `exp.Nullif`'s
+    # `expression` is the value `this` is COMPARED against, and the result is `this` or NULL, which
+    # every aggregate skips rather than folds. `exp.GroupConcat`'s `separator` is punctuation.
+    _STRUCTURAL_NODES = _exp_nodes("Order", "Nullif", "GroupConcat")
+    # COMBINING: every operand is on the value path, so the sets UNION. This set is load-bearing
+    # for the spec's own criterion rather than a convenience: A7 pins
+    # `SUM(order_items.quantity * orders.total_amount)` to `not_multiplied`, which happens only if
+    # `exp.Mul` unions so that `order_items` reaches `value_sources` and suppresses that edge.
+    # `exp.Binary` is the arithmetic and the comparisons (`a > b` is a value built from both `a`
+    # and `b`, which is what `BOOL_OR(orders.total_amount > 0)` folds); `exp.Unary` is `exp.Paren`
+    # and `exp.Neg`. The aggregate classes are here because `_value_sources` is called ON the
+    # aggregate node, so a `SUM` that combined nothing would empty every value path in the
+    # statement. They are enumerated one by one rather than as `exp.AggFunc`, because an aggregate
+    # CAN mix a selector with its value — `ARG_MAX(a, b)` returns `a` at the row maximizing `b` —
+    # and the base class would put that selector on the value path. The membership is derived from
+    # what the suite actually exercises, measured by tracing every node type that reached the old
+    # generic branch across the whole test run.
+    _COMBINING_NODES = _exp_nodes(
+        "Binary", "Unary", "Cast", "Distinct",
+        "Sum", "Count", "Avg", "Min", "Max", "LogicalOr", "LogicalAnd",
+    )
+else:  # pragma: no cover - nothing in this section runs without a parser
+    _ALTERNATION_NODES = _TERNARY_NODES = _STRUCTURAL_NODES = _COMBINING_NODES = ()
+
+
+# What `_value_operands` says about a node, and what `_value_sources` does with the operands beside
+# it. `_VALUE_UNKNOWN` is the fail-closed default and carries no operands at all.
+_VALUE_COLUMN = "column"
+_VALUE_INTERSECT = "intersect"
+_VALUE_UNION = "union"
+_VALUE_UNKNOWN = "unknown"
+
+
+def _value_operands(node: "exp.Expression") -> tuple[str, list["exp.Expression"]]:
+    """How to read one node's value, and which of its operands that reading is over.
+
+    Split out of `_value_sources` so that the classification and the traversal are two things: the
+    traversal is a stack and says nothing about SQL, and this says everything about SQL and walks
+    nothing. Every operand it returns is a node the tree already holds, never a new one, which is
+    what lets the caller key its results by `id()`.
+
+    The alternation arms are the operands that can BE the result, and never the ones that decide
+    WHICH:
+
+    - `exp.Case`. `ifs[].this` is the branch predicate and `Case.this` is the simple-CASE operand
+      compared against them, so both are inputs to the choice. The arms are `ifs[].true` and
+      `default`. An ABSENT `default` is not an arm: the implicit result is NULL, which every
+      aggregate skips rather than folds, so counting it would report a fan on
+      `SUM(CASE WHEN orders.flag THEN order_items.quantity END)`, whose value is at item grain on
+      every row that contributes one. An explicit `ELSE NULL` IS counted, contributes no table and
+      so clears no edge: the same shape read the other way, in the fail-closed direction.
+    - `exp.If` and `exp.Nvl2`. `IF` / `IIF` / `IFF` parse to `exp.If`, NOT to `exp.Case`, on every
+      dialect this layer speaks, and `NVL2` to a node with the identical three arguments. Without a
+      case of their own the combining branch would take the CONDITION's columns as value columns,
+      which is the polarity that manufactures a false clean, and sqlglot RENDERS both as
+      `CASE WHEN … END` — so two spellings would produce a byte-identical receipt label carrying
+      opposite statuses.
+    - `exp.Coalesce` (`IFNULL` and `NVL` parse to it too), `exp.Greatest` and `exp.Least`. Each
+      returns one of its arguments, so each is at a table's grain only if every argument is.
+    - `exp.DecodeCase`. `expressions` is `[operand, search, result, …]` with an optional trailing
+      default, so the arms are the RESULT slots plus that default. The operand and the searches are
+      the comparison, which is the choice and not the result. Fewer than three expressions is not a
+      DECODE this can read, and falls to the fail-closed default rather than guessing which slot is
+      which.
+
+    `exp.Filter` needs no reading of its own and never will: `SUM(x) FILTER (WHERE y)` parses to
+    `Filter(this=Sum, expression=Where)`, so the predicate is structurally OUTSIDE the aggregate and
+    `find_all(exp.AggFunc)` hands the bare `Sum` to `_value_sources` rather than the wrapper.
+
+    `node.args` is iterated by hand rather than through `iter_expressions()`: two lines that cannot
+    drift, against a package that pins only `sqlglot>=20`.
+    """
+    if isinstance(node, exp.Column):
+        return _VALUE_COLUMN, []
+    if isinstance(node, exp.Case):
+        arms = [branch.args.get("true") for branch in node.args.get("ifs") or []]
+        arms.append(node.args.get("default"))
+        return _VALUE_INTERSECT, _present(arms)
+    if isinstance(node, _ALTERNATION_NODES):
+        if isinstance(node, exp.DecodeCase):
+            return _VALUE_INTERSECT, _decode_arms(node)
+        if isinstance(node, _TERNARY_NODES):
+            return _VALUE_INTERSECT, _present([node.args.get("true"), node.args.get("false")])
+        # `exp.Coalesce`, `exp.Greatest`, `exp.Least`: one leading argument plus the rest.
+        return _VALUE_INTERSECT, _present([node.this, *(node.args.get("expressions") or [])])
+    if isinstance(node, _STRUCTURAL_NODES):
+        return _VALUE_UNION, _present([node.this])
+    if isinstance(node, _COMBINING_NODES):
+        return _VALUE_UNION, _present(
+            [child for arg in node.args.values()
+             for child in (arg if isinstance(arg, list) else [arg])]
+        )
+    return _VALUE_UNKNOWN, []
+
+
+def _present(operands: list) -> list["exp.Expression"]:
+    """The operands that are actually expression nodes, in the order given.
+
+    An absent argument is `None` in `args` and a `sqlglot` argument can also hold a bare string or
+    a bool (`Greatest.ignore_nulls`, `Cast.safe`). Neither is a value path, and neither is
+    something the traversal can key by `id()` and expect to still be alive.
+    """
+    return [operand for operand in operands if isinstance(operand, exp.Expression)]
+
+
+def _decode_arms(node: "exp.Expression") -> list["exp.Expression"]:
+    """The result slots of a `DECODE`, plus its trailing default when it wrote one.
+
+    `DECODE(e, s1, r1, s2, r2, d)` parses to `expressions=[e, s1, r1, s2, r2, d]`: one operand,
+    then `(search, result)` pairs, then an optional default in the odd position left over. Walked
+    rather than sliced, because the two arities read differently and a slice that is right for one
+    is silently wrong for the other.
+    """
+    args = _present(list(node.args.get("expressions") or []))
+    if len(args) < 3:
+        return []
+    arms: list["exp.Expression"] = []
+    index = 1
+    while index < len(args):
+        if index + 1 < len(args):
+            arms.append(args[index + 1])  # the RESULT of this (search, result) pair
+            index += 2
+        else:
+            arms.append(args[index])  # the trailing default
+            index += 1
+    return arms
+
+
 def _value_sources(node: "exp.Expression", scope_map: dict[str, str]) -> frozenset[str]:
     """The tables an expression's value is at the grain of on EVERY path through it.
 
@@ -4037,7 +4286,7 @@ def _value_sources(node: "exp.Expression", scope_map: dict[str, str]) -> frozens
     one-side amount on the rows where the flag is set, and the join duplicates those rows and sums
     the amount once per duplicate. Reading the union of the branches would put `order_items` on the
     value path and clear a number the fan really does move, so an alternation INTERSECTS its
-    branches and everything else UNIONS its children. Those two compose correctly at depth without
+    branches and a combining node UNIONS its operands. Those two compose correctly at depth without
     enumerating paths: table sets under union and intersection are a distributive lattice, so
     `(A∩B) ∪ (C∩D)` is exactly the intersection over the four paths of `CASE… * CASE…`.
 
@@ -4046,70 +4295,54 @@ def _value_sources(node: "exp.Expression", scope_map: dict[str, str]) -> frozens
     END` is at `orders` grain on both branches; an intersection taken over COLUMNS would find nothing
     in common and report the opposite.
 
-    The nodes that put an operand somewhere that is not the value, each measured rather than assumed:
+    **A node `_value_operands` does not recognize contributes NOTHING**, and that direction is the
+    correction rather than an omission. An empty contribution suppresses no edge, so the fan is
+    reported; the union-everything default it replaced contributed a choice's own inputs and cleared
+    real edges. See `_COMBINING_NODES` for the four ordinary-SQL shapes that were measured doing it.
 
-    - `exp.Case`. `ifs[].this` is the branch predicate and `Case.this` is the simple-CASE operand
-      compared against them, so both are inputs to the choice and not to the result. The branches
-      are `ifs[].true` and `default`. An ABSENT `default` is not a branch: the implicit result is
-      NULL, which every aggregate skips rather than folds, so counting it would report a fan on
-      `SUM(CASE WHEN orders.flag THEN order_items.quantity END)`, whose value is at item grain on
-      every row that contributes one. An explicit `ELSE NULL` is counted, contributes no table and
-      so clears no edge — the same shape read the other way, in the fail-closed direction.
-    - `exp.If`. `IF` / `IIF` / `IFF` parse to this, NOT to `exp.Case`, on every dialect this layer
-      speaks. Without a case of its own the generic branch would take the CONDITION's columns as
-      value columns, which is the polarity that manufactures a false clean, and sqlglot RENDERS an
-      `exp.If` as `CASE WHEN … END` — so the two spellings produce a byte-identical receipt label
-      with opposite statuses.
-    - `exp.Nullif`. `args["expression"]` is the value the first argument is COMPARED against, not a
-      value the result is built from.
-    - `exp.GroupConcat`. `args["separator"]` is punctuation between the folded values.
-    - `exp.Coalesce`. `IFNULL` and `NVL` parse to it too. It is an alternation like `exp.Case`, and
-      the same reasoning applies: its value is at a table's grain only if every alternative is.
-    - `exp.Order`. `STRING_AGG(x ORDER BY y)` parses to `GroupConcat(this=Order(this=x,
-      expressions=[Ordered(y)]))`, so the ordering arms hang off `expressions` and are neither
-      predicate nor value: reordering a concatenation changes the string but the fan is not what
-      reordered it, and `y` is not a value the aggregate folds.
+    **ITERATIVE, over an explicit stack**, for the reason `_and_conjuncts` is: sqlglot builds
+    `a + 1 + 1 + …` LEFT-DEEP, so the tree is as deep as the expression is wide and one Python frame
+    per term is a ceiling a caller can reach. Measured: `SELECT SUM(orders.total_amount + 1 + …)`
+    with 989 terms is 4,052 characters against `sql_guard._MAX_SQL_CHARS` of 50,000 and raised
+    `RecursionError` out of the recursive version. `execute_sql._receipt_for` catches bare
+    `Exception` and returns `RECEIPT_BUILD_FAILED`, so the statement still ran and returned rows
+    while the caller silently lost the receipt; on the ungated `cmd_preflight` / `cmd_prepare`
+    surface it propagated as a traceback. That is caller-chosen input turning off the trust layer
+    without turning off the answer, which is the one shape this module already legislated against
+    twice — `_and_conjuncts` is iterative for it and `_MAX_CTE_CHAIN` exists for it. A stack has no
+    such ceiling, so there is no bound here to exhaust and no "value path unknown" to plumb.
 
-    Everything else unions its children, and THE POLARITY OF THAT DEFAULT DEPENDS ON THE NODE. For a
-    node that only combines values it is honest: a node type nobody thought about contributes its
-    columns rather than silently dropping them. For a node that mixes a PREDICATE or a SEPARATOR
-    with its values it is inverted and dangerous — contributing the predicate's columns is what
-    manufactures a false clean, because a many-side column on the value path is what clears the fan.
-    Any node mixing predicate and value operands is that hazard class and needs a case here;
-    `exp.Case`, `exp.If`, `exp.Nullif` and `exp.GroupConcat` are the members this layer has met.
-    `exp.Distinct` is safely generic: it holds its argument under `args["expressions"]` and combines
-    nothing. So is `exp.Filter`: `SUM(x) FILTER (WHERE y)` parses to `Filter(this=Sum,
-    expression=Where)`, so the predicate is structurally OUTSIDE the aggregate and
-    `find_all(exp.AggFunc)` never hands it here at all.
-
-    `node.args` is iterated by hand rather than through `iter_expressions()`. Four lines that cannot
-    drift, against a package that pins only `sqlglot>=20`.
+    Post-order over that stack: a node is pushed once to expand and once to fold, and the fold reads
+    its operands' answers out of `computed`. Keying by `id()` is safe because every operand
+    `_value_operands` returns is a node the caller's tree already holds, so none of them can be
+    collected and have its id reused while this runs.
     """
     if not isinstance(node, exp.Expression):
         return frozenset()
-    if isinstance(node, exp.Column):
-        table = _resolve_col_table(node, scope_map)
-        return frozenset([table]) if table else frozenset()
-    alternatives: Optional[list["exp.Expression"]] = None
-    if isinstance(node, exp.Case):
-        alternatives = [branch.args.get("true") for branch in node.args.get("ifs") or []]
-        alternatives.append(node.args.get("default"))
-    elif isinstance(node, exp.If):
-        alternatives = [node.args.get("true"), node.args.get("false")]
-    elif isinstance(node, exp.Coalesce):
-        alternatives = [node.this, *(node.args.get("expressions") or [])]
-    if alternatives is not None:
-        present = [alt for alt in alternatives if alt is not None]
-        if not present:
-            return frozenset()
-        return frozenset.intersection(*(_value_sources(alt, scope_map) for alt in present))
-    if isinstance(node, (exp.Order, exp.Nullif, exp.GroupConcat)):
-        return _value_sources(node.this, scope_map)
-    tables: set[str] = set()
-    for arg in node.args.values():
-        for child in (arg if isinstance(arg, list) else [arg]):
-            tables |= _value_sources(child, scope_map)
-    return frozenset(tables)
+    computed: dict[int, frozenset[str]] = {}
+    stack: list[tuple["exp.Expression", bool]] = [(node, False)]
+    while stack:
+        current, folding = stack.pop()
+        reading, operands = _value_operands(current)
+        if reading == _VALUE_COLUMN:
+            table = _resolve_col_table(current, scope_map)
+            computed[id(current)] = frozenset([table]) if table else frozenset()
+            continue
+        if reading == _VALUE_UNKNOWN or not operands:
+            # No operands is the empty alternation (`CASE` with no arm this counts) and the empty
+            # combination alike, and both are the same answer: nothing on the value path.
+            computed[id(current)] = frozenset()
+            continue
+        if not folding:
+            stack.append((current, True))
+            stack.extend((operand, False) for operand in operands)
+            continue
+        parts = [computed.get(id(operand), frozenset()) for operand in operands]
+        computed[id(current)] = (
+            frozenset.intersection(*parts) if reading == _VALUE_INTERSECT
+            else frozenset().union(*parts)
+        )
+    return computed.get(id(node), frozenset())
 
 
 def _select_aggregates(sel: "exp.Select") -> list["exp.AggFunc"]:

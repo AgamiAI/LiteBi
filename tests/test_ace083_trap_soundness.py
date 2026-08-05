@@ -39,6 +39,15 @@ is correct and is half of S3 — but `CTE_LAUNDERED_FAN` reported `multiplied` a
 of that leak, and with the leak gone and no resolution for what `oi` stands for, a genuinely
 inflated statement read `not_multiplied`. The intermediate state fails the corpus's own criterion,
 so it is not a legal place to stop.
+
+The last battery in this file is the one two independent re-reviews arrived at from opposite ends,
+and it is one root cause rather than several. `_value_sources` and `_grain_preserving_source` were
+both DENYLISTS with an unsafe default: one enumerated the alternation node types and let every other
+node union its children, the other rejected three `exp.Select` arguments and accepted the rest, and
+in both an unanticipated shape landed on the side that CLEARS a finding. Seven statements were
+measured `not_multiplied` through those two holes — four of them ordinary Snowflake / Redshift /
+Oracle analytics SQL — and they are corpus members above rather than a corpus of their own, because
+the property they violate is the one this file already asserts.
 """
 
 from __future__ import annotations
@@ -252,6 +261,68 @@ NESTED_WITH_SHADOWING_A_REAL_TABLE = (
     "SELECT id FROM order_items)"
 )
 
+# 30-33. The alternation spelled as a FUNCTION rather than as a keyword, which is where the same
+#     defect class was found one node type over. `GREATEST` and `LEAST` carry `COALESCE`'s
+#     `this` + `expressions` layout; `NVL2`'s three arguments are byte-identical to `IF`'s; `DECODE`
+#     parses to a node of its own, `exp.DecodeCase`. Every one of them returns ONE of its arguments,
+#     so a rule that unioned their operands put a many-side column on the value path and cleared the
+#     fan. All four are ordinary Snowflake / Redshift / Oracle analytics SQL rather than contrived
+#     shapes, and all four were measured `not_multiplied` against a base that said `multiplied`.
+GREATEST_ALTERNATION_FAN = (
+    f"SELECT SUM(GREATEST(orders.total_amount, order_items.quantity)) {FAN_JOIN}"
+)
+LEAST_ALTERNATION_FAN = f"SELECT SUM(LEAST(orders.total_amount, order_items.quantity)) {FAN_JOIN}"
+NVL2_ALTERNATION_FAN = f"SELECT SUM(NVL2(order_items.quantity, orders.total_amount, 0)) {FAN_JOIN}"
+DECODE_ALTERNATION_FAN = (
+    f"SELECT SUM(DECODE(order_items.product_id, 1, orders.total_amount, 0)) {FAN_JOIN}"
+)
+
+# 34-36. A CTE body that multiplies its OWN rows with no JOIN, no GROUP BY and no DISTINCT in it.
+#     `laterals`, `connect` and `match` are arguments of `exp.Select` that the grain-preserving
+#     guard's three-name denylist never read, so each body resolved as though it handed back
+#     `orders` row for row and the outer aggregate reported `not_multiplied` — against a base that
+#     said `undetermined`, which is a false clean created by this branch. A LATERAL VIEW emits one
+#     row per exploded element, an UNPIVOT one row per unpivoted column, and a CONNECT BY one row
+#     per path through the hierarchy.
+LATERAL_VIEW_CTE = (
+    "WITH o AS (SELECT * FROM orders LATERAL VIEW EXPLODE(orders.status) t AS s) "
+    "SELECT SUM(o.total_amount) FROM o"
+)
+UNPIVOT_CTE = (
+    "WITH o AS (SELECT * FROM orders UNPIVOT (v FOR k IN (total_amount, revenue))) "
+    "SELECT SUM(o.total_amount) FROM o"
+)
+CONNECT_BY_CTE = (
+    "WITH o AS (SELECT * FROM orders CONNECT BY PRIOR id = customer_id) "
+    "SELECT SUM(o.total_amount) FROM o"
+)
+
+# The same three constructs written STRAIGHT INTO the statement rather than into a CTE body, plus
+# the PIVOT that escaped only by accident. `laterals`, `connect` and `match` are siblings of `from_`
+# on `exp.Select` and `pivots` rides the `exp.Table`, so a binding walk over `exp.From` and
+# `exp.Join` reached none of them and the alias map looked like a single table. These are corpus
+# members of the ungated `cmd_preflight` / `cmd_prepare` surface — see the test that runs them —
+# and the false clean on them is PRE-EXISTING rather than created here.
+LATERAL_VIEW_SOURCE = (
+    "SELECT SUM(orders.total_amount) FROM orders LATERAL VIEW EXPLODE(orders.status) t AS tag"
+)
+UNPIVOT_SOURCE = (
+    "SELECT SUM(o.total_amount) FROM orders o UNPIVOT (v FOR k IN (total_amount, revenue))"
+)
+CONNECT_BY_SOURCE = "SELECT SUM(orders.total_amount) FROM orders CONNECT BY PRIOR id = customer_id"
+PIVOT_SOURCE = (
+    "SELECT SUM(p.total_amount) FROM orders PIVOT (SUM(total_amount) FOR status IN ('a')) p"
+)
+# `MATCH_RECOGNIZE` does not parse on sqlglot's default grammar, so it cannot be driven through
+# `pre_flight_check` against `_sales_org`, which declares no dialect. It is asserted on the binding
+# walk directly, off a tree parsed with a dialect that does speak it.
+MATCH_RECOGNIZE_SOURCE = (
+    "SELECT SUM(orders.total_amount) FROM orders MATCH_RECOGNIZE ("
+    "PARTITION BY customer_id ORDER BY id MEASURES id AS m ONE ROW PER MATCH "
+    "PATTERN (a+) DEFINE a AS a.id > 0)"
+)
+
+
 # The corpus, named so the later slices can re-run it unchanged rather than restating it. Labels are
 # what a failure prints, so they name the disguise and not the SQL.
 #
@@ -309,6 +380,17 @@ INFLATED_SHAPES = [
      ["SUM(x.total_amount)"]),
     ("a WITH bound inside a WHERE subquery", NESTED_WITH_SHADOWING_A_REAL_TABLE,
      ["SUM(orders.total_amount)"]),
+    ("an alternation spelled GREATEST", GREATEST_ALTERNATION_FAN,
+     ["SUM(GREATEST(orders.total_amount, order_items.quantity))"]),
+    ("an alternation spelled LEAST", LEAST_ALTERNATION_FAN,
+     ["SUM(LEAST(orders.total_amount, order_items.quantity))"]),
+    ("an alternation spelled NVL2", NVL2_ALTERNATION_FAN,
+     ["SUM(NVL2(order_items.quantity, orders.total_amount, 0))"]),
+    ("an alternation spelled DECODE", DECODE_ALTERNATION_FAN,
+     ["SUM(DECODE(order_items.product_id, 1, orders.total_amount, 0))"]),
+    ("a CTE body that explodes a column", LATERAL_VIEW_CTE, ["SUM(o.total_amount)"]),
+    ("a CTE body that unpivots", UNPIVOT_CTE, ["SUM(o.total_amount)"]),
+    ("a CTE body that walks a hierarchy", CONNECT_BY_CTE, ["SUM(o.total_amount)"]),
 ]
 
 # A conditional count and a conditional sum over the many side. Both are honestly clean: one row
@@ -412,6 +494,38 @@ VALUE_SOURCE_CASES = [
      {"orders"}),
     ("COALESCE, an alternation spelled as a function",
      "SUM(COALESCE(orders.total_amount, order_items.quantity))",
+     set()),
+    # The branches added because the union default cleared four more real fans. Each of these
+    # returns ONE of its arguments and so intersects them, exactly as COALESCE above does.
+    ("GREATEST, which carries COALESCE's layout",
+     "SUM(GREATEST(orders.total_amount, order_items.quantity))",
+     set()),
+    ("LEAST, the same node shape the other way up",
+     "SUM(LEAST(orders.total_amount, order_items.quantity))",
+     set()),
+    ("NVL2, whose three arguments are IF's",
+     "SUM(NVL2(order_items.quantity, orders.total_amount, 0))",
+     set()),
+    ("DECODE, a simple CASE with the commas moved",
+     "SUM(DECODE(order_items.product_id, 1, orders.total_amount, 0))",
+     set()),
+    ("DECODE with no default arm, whose implicit result is NULL",
+     "SUM(DECODE(order_items.product_id, 1, orders.total_amount))",
+     {"orders"}),
+    ("DECODE with two search arms and no default",
+     "SUM(DECODE(order_items.product_id, 1, orders.total_amount, 2, orders.revenue))",
+     {"orders"}),
+    ("an alternation whose arms are two columns of one table",
+     "SUM(GREATEST(orders.total_amount, orders.revenue))",
+     {"orders"}),
+    # The fail-closed default, which is the polarity this round inverted. Neither of these is a node
+    # `_value_operands` enumerates, and neither contributes anything: an empty value path suppresses
+    # no edge, so the fan is reported.
+    ("a scalar function nobody enumerated",
+     "SUM(ROUND(orders.total_amount, order_items.quantity))",
+     set()),
+    ("a function sqlglot does not know at all",
+     "SUM(SOME_UDF(orders.total_amount))",
      set()),
 ]
 
@@ -847,6 +961,14 @@ def test_the_value_path_of_something_that_is_not_an_expression_is_empty():
     assert rt._value_sources(None, VALUE_SCOPE) == frozenset()
     assert rt._value_sources(True, VALUE_SCOPE) == frozenset()
     assert rt._value_sources(exp.Case(), VALUE_SCOPE) == frozenset()
+    # `DECODE` needs at least an operand, a search value and a result before any slot means
+    # anything, and sqlglot parses the two-argument spelling to `exp.Decode` — a charset decode,
+    # an entirely different function — so this arity is reachable only by construction. Answered
+    # anyway rather than guessed at, because the alternative is reading a SEARCH value as a result.
+    short_decode = exp.DecodeCase(
+        expressions=[exp.column("product_id", "order_items"), exp.column("total_amount", "orders")])
+    assert rt._decode_arms(short_decode) == []
+    assert rt._value_sources(short_decode, VALUE_SCOPE) == frozenset()
 
 
 # --- the direction the corpus reaches only through members 14-21 ------------
@@ -1162,6 +1284,10 @@ ALL_ANALYSED_SHAPES = [
     ("a LATERAL source", LATERAL_SOURCE),
     ("a chasm over two independent measures", CHASM_OVER_TWO_MEASURES),
     ("a chasm whose measures a duplication cannot move", CHASM_OVER_INVARIANT_MEASURES),
+    ("a LATERAL VIEW beside the FROM clause", LATERAL_VIEW_SOURCE),
+    ("an UNPIVOT on the table itself", UNPIVOT_SOURCE),
+    ("a CONNECT BY beside the FROM clause", CONNECT_BY_SOURCE),
+    ("a PIVOT on the table itself", PIVOT_SOURCE),
 ]
 
 
@@ -2205,3 +2331,238 @@ def test_the_root_cte_set_and_the_model_index_are_built_once_per_statement(monke
     assert len(reports) == 10, reports
     assert calls["cte_names"] == 1, calls
     assert calls["model_index"] == 1, calls
+
+
+# --- the same defect class, one node type over -----------------------------
+#
+# Two independent re-reviews found the same root cause in two functions: `_value_sources` and
+# `_grain_preserving_source` were both written as DENYLISTS with an unsafe default. One enumerated
+# the alternation node types and let everything else union its children; the other rejected three
+# `exp.Select` arguments and accepted the rest. In both, an unanticipated shape landed on the side
+# that CLEARS a finding, and in both the docstring named the hazard without the code enforcing it.
+# Both are now allowlists: what is understood is enumerated, and everything else fails closed.
+#
+# The batteries below are the per-finding regressions. The corpus above carries the seven shapes
+# they were found on, so the property that no known-inflated statement reads clean covers them too.
+
+
+@pytest.mark.parametrize("label,sql,aggregate", [
+    ("GREATEST", GREATEST_ALTERNATION_FAN,
+     "SUM(GREATEST(orders.total_amount, order_items.quantity))"),
+    ("LEAST", LEAST_ALTERNATION_FAN, "SUM(LEAST(orders.total_amount, order_items.quantity))"),
+    ("NVL2", NVL2_ALTERNATION_FAN, "SUM(NVL2(order_items.quantity, orders.total_amount, 0))"),
+    ("DECODE", DECODE_ALTERNATION_FAN,
+     "SUM(DECODE(order_items.product_id, 1, orders.total_amount, 0))"),
+])
+def test_an_alternation_spelled_as_a_function_still_names_the_edge_it_multiplies(
+    label, sql, aggregate,
+):
+    """A7, A8. Four ordinary-SQL shapes that reported `not_multiplied` over a real fan.
+
+    Each of these returns ONE of its arguments, so the value is at a table's grain only if every
+    argument is — the rule `exp.Case` and `exp.Coalesce` were already read by. Without a case of
+    their own they reached the generic branch, which unioned every operand, put `order_items` on the
+    value path, and suppressed the only edge there was. Measured against base `439ecd1`, all four
+    said `multiplied` there and `not_multiplied` here.
+
+    The corpus above asserts only that these are not reported clean, which `undetermined` satisfies
+    too. This asserts the answer, because `multiplied` naming the fan edge is what base gave and
+    what the statement deserves: a one-side amount summed once per order item is inflated, whichever
+    keyword the alternation was written with.
+    """
+    reports = _reports(sql)
+    assert [(a.aggregate, a.status) for a in reports] == [(aggregate, rt.MULTIPLIED)], (
+        label, reports)
+    assert reports[0].joins == [FAN_EDGE], (label, reports[0].joins)
+
+
+@pytest.mark.parametrize("label,expression", [
+    ("a scalar function with a many-side argument", "ROUND(orders.total_amount, 2)"),
+    ("a function sqlglot has no node for", "SOME_UDF(orders.total_amount)"),
+])
+def test_a_node_type_the_value_path_does_not_enumerate_contributes_nothing(label, expression):
+    """The inverted polarity, asserted on the classifier rather than only through an answer.
+
+    This is the correction the four shapes above are symptoms of. A node `_value_operands` does not
+    recognize used to UNION its children, so an unanticipated shape contributed its operands to the
+    value path — and a many-side operand on the value path is exactly what clears a fan. Enumerated
+    the other way round, it contributes nothing, an empty contribution suppresses no edge, and the
+    fan is reported.
+
+    Asserted through `_value_operands` because the two ways of contributing nothing are different
+    facts. `COUNT(*)` contributes nothing because there is no column in it; these contribute nothing
+    because this layer has never established what their operands mean. A test that only read the
+    empty set could not tell a fail-closed default from a lucky parse.
+    """
+    node = parse_one(f"SELECT {expression} FROM orders").expressions[0]
+    reading, operands = rt._value_operands(node)
+    assert (reading, operands) == (rt._VALUE_UNKNOWN, []), (label, reading, operands)
+    assert rt._value_sources(node, VALUE_SCOPE) == frozenset(), label
+
+
+def test_a_wide_expression_inside_the_character_cap_does_not_cost_the_receipt():
+    """The availability bound, and it is the same shape `_and_conjuncts` was made iterative for.
+
+    sqlglot builds `a + 1 + 1 + …` LEFT-DEEP, so the tree is as deep as the expression is wide and a
+    recursive value walk costs one Python frame per term. Measured: 989 terms is 4,052 characters
+    against `sql_guard._MAX_SQL_CHARS` of 50,000 and raised `RecursionError`, which
+    `execute_sql._receipt_for` catches under bare `Exception` and turns into `RECEIPT_BUILD_FAILED`
+    — the statement runs, returns rows, and the caller silently loses the trust layer. On
+    `cmd_preflight` and `cmd_prepare`, which have no such catch, it propagated as a traceback.
+
+    So the widest expression the CHARACTER cap admits is what this asserts, rather than some number
+    chosen to be comfortably inside it. 12,476 terms is 50,000 characters exactly; anything wider is
+    refused by `sql_guard` before this layer is asked, so there is no shape left for a depth bound
+    to have an opinion about. The status is asserted too: an analysis that survived by answering
+    `undetermined` would pass a test that only asked for no exception.
+    """
+    terms = 12_476
+    sql = f"SELECT SUM(orders.total_amount{' + 1' * terms}) {FAN_JOIN}"
+    assert len(sql) == 50_000, len(sql)
+
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.MULTIPLIED], [a.status for a in reports]
+    assert reports[0].joins == [FAN_EDGE], reports[0].joins
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("a LATERAL VIEW", LATERAL_VIEW_CTE),
+    ("an UNPIVOT", UNPIVOT_CTE),
+    ("a CONNECT BY", CONNECT_BY_CTE),
+])
+def test_a_cte_body_that_multiplies_its_own_rows_is_not_the_table_it_reads(label, sql):
+    """The grain-preserving guard read three `exp.Select` arguments and accepted every other one.
+
+    None of these bodies has a JOIN, a GROUP BY or a DISTINCT in it, so all three passed the whole
+    denylist and resolved as though they handed `orders` back row for row. They do not: a LATERAL
+    VIEW emits one row per exploded element, an UNPIVOT one row per unpivoted column, and a CONNECT
+    BY one row per path through the hierarchy. Each was measured `not_multiplied` here against an
+    `undetermined` on base `439ecd1`, which makes all three false cleans this branch created.
+
+    The resolver is asserted as well as the status, because they are separable: a body that resolved
+    to `orders` and then failed to find a fan would report `not_multiplied` for a second reason, and
+    the fix has to be that the body is unreadable rather than that the fan is absent.
+    """
+    tree = _parse(sql)
+    bodies = rt._visible_cte_bodies(tree.find(exp.Select))
+    assert set(bodies) == {"o"}, (label, bodies)
+    assert rt._grain_preserving_source(
+        "o", bodies, rt._model_table_index(_sales_org()), set()) is None, label
+
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.UNDETERMINED], (label, reports)
+
+
+def test_the_grain_preserving_allowlist_is_the_arguments_that_keep_the_rows():
+    """The allowlist itself, so that widening it is a deliberate act and not a side effect.
+
+    `exp.Select` carries thirty-odd arguments and only five of them leave the source's row count
+    alone: the projection, the FROM under both of sqlglot's spellings for it, the WHERE, which
+    removes rows without changing what a row IS, and the ORDER BY, which changes their sequence.
+    Every other one either collapses rows (`group`, `distinct`), multiplies them (`joins`,
+    `laterals`, `connect`, `match`, `pivots`), or truncates them (`limit`, `offset`), and a guard
+    that named three of those and accepted the rest is how the three shapes above got through.
+
+    `order` is in and `limit` is out, which is the pair that says why the allowlist is arguments and
+    not intuitions: ORDER BY alone is a sequence, ORDER BY with LIMIT is a truncation, and the two
+    live under separate keys. Both are asserted through the analysis below, because leaving `order`
+    out costs a LOST FINDING rather than an over-report — the fan is real and the resolver can see
+    it, and a receipt going quiet about a trap it can prove is the failure this spec is against.
+
+    Asserted as a set rather than as a sequence: the order it is written in decides nothing, and a
+    tuple comparison would fail on a reordering that changes no answer.
+    """
+    assert set(rt._GRAIN_PRESERVING_SELECT_ARGS) == {
+        "expressions", "from_", "from", "where", "order"}
+    for hazard in ("group", "distinct", "joins", "laterals", "connect", "match", "pivots",
+                   "limit", "offset", "qualify", "with_"):
+        assert hazard not in rt._GRAIN_PRESERVING_SELECT_ARGS, hazard
+
+    ordered = ("WITH oi AS (SELECT * FROM order_items ORDER BY id) "
+               "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id")
+    assert [(a.status, a.joins) for a in _reports(ordered)] == [(rt.MULTIPLIED, [FAN_EDGE])]
+    truncated = ("WITH oi AS (SELECT * FROM order_items ORDER BY id LIMIT 10) "
+                 "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id")
+    assert [(a.status, a.joins) for a in _reports(truncated)] == [(rt.UNDETERMINED, [])]
+
+
+@pytest.mark.parametrize("label,sql,expected_map", [
+    ("a LATERAL VIEW", LATERAL_VIEW_SOURCE, {"orders": "orders", "t": ""}),
+    ("an UNPIVOT", UNPIVOT_SOURCE, {"o": "orders", "": ""}),
+    ("a CONNECT BY", CONNECT_BY_SOURCE, {"orders": "orders", "": ""}),
+    ("a PIVOT", PIVOT_SOURCE, {"orders": "orders", "p": ""}),
+])
+def test_a_row_multiplying_source_beside_the_from_clause_binds_nothing(label, sql, expected_map):
+    """`_reference_sites`' own docstring claims a denylist; these are what made the claim false.
+
+    It says every FROM/JOIN source that is not an `exp.Table` binds, and that a source kind nobody
+    anticipated has to default to `undetermined`. Four constructs are neither: `laterals`, `connect`
+    and `match` are SIBLINGS of `from_` on `exp.Select` rather than children of it, and `pivots`
+    rides the `exp.Table`, which the table arm has already bound under its real name. A walk over
+    `exp.From` and `exp.Join` reaches none of the four, so the scope map looked like a single clean
+    table and every aggregate in the statement read `not_multiplied`.
+
+    The false clean is PRE-EXISTING — base `439ecd1` answers `not_multiplied` on the first three as
+    well — and it lives on the ungated surface: `cmd_preflight` and `cmd_prepare` in
+    `semantic_model/cli.py` call `pre_flight_check` with no gate battery in front of it. `PIVOT`
+    escaped only by accident, because it happens to contain an `exp.AggFunc`, which is not a
+    property of PIVOT so much as of the example anyone writes.
+
+    Both halves are asserted. The map says the alias is in scope and resolves to no model table,
+    which is the honest answer; the status says what the analysis does with that. A binding that
+    dropped `orders` instead of adding the empty one would also give `undetermined`, and would have
+    lost the join the model declares.
+    """
+    assert rt._alias_map(_parse(sql).find(exp.Select), in_scope_only=True) == expected_map, label
+
+    reports = _reports(sql)
+    assert [a.status for a in reports] == [rt.UNDETERMINED], (label, reports)
+
+
+def test_a_match_recognize_binds_nothing_on_the_dialect_that_speaks_it():
+    """The fourth `exp.Select` argument, asserted off a tree rather than through a receipt.
+
+    `MATCH_RECOGNIZE` does not parse on sqlglot's default grammar and `_sales_org` declares no
+    dialect, so `pre_flight_check` against it answers "could not be parsed" and reaches none of this
+    layer. That is not a reason to leave the argument unbound: Snowflake, Oracle and Trino all speak
+    it, a model declaring any of them resolves that grammar, and one match per partition out of many
+    rows is a row count nothing else in the statement states.
+
+    The parse is asserted first so the test cannot silently start measuring a statement that no
+    longer contains a MATCH_RECOGNIZE at all.
+    """
+    tree = parse_one(MATCH_RECOGNIZE_SOURCE, read="snowflake")
+    select = tree.find(exp.Select)
+    assert select.args.get("match") is not None, select.args
+    assert rt._alias_map(select, in_scope_only=True) == {"orders": "orders", "": ""}
+
+
+def test_the_receipts_own_reference_roster_is_unchanged_by_the_row_multiplying_binding():
+    """ACE-099's contract: the DEFAULT walk is what the receipt and the refusal path read.
+
+    `bind_derived` is opt-in precisely because `_projected_sensitive` refuses on what it finds and
+    `assemble_receipt`'s roster discloses it. A row-multiplying source is not a table reference and
+    must not appear as one, whatever the scope map needs to know about it — a receipt listing an
+    empty-named table would be a disclosure of a source that has no name to disclose.
+    """
+    for label, sql in [("a LATERAL VIEW", LATERAL_VIEW_SOURCE), ("an UNPIVOT", UNPIVOT_SOURCE),
+                       ("a CONNECT BY", CONNECT_BY_SOURCE), ("a PIVOT", PIVOT_SOURCE)]:
+        refs = rt._table_references(_parse(sql))
+        assert [(r.bare, r.scope) for r in refs] == [("orders", "main")], (label, refs)
+
+
+def test_a_lateral_that_a_join_already_bound_is_not_bound_twice():
+    """One source, one binding, whichever of the two walks reaches it first.
+
+    `LATERAL (SELECT 1) l` is an `exp.Lateral` that is also a JOIN's `this`, so it is now reachable
+    both as the clause's bound source and as a member of the row-multiplying walk. Binding it twice
+    would put one source in the reference list twice, and a list is what the receipt's roster and
+    the arm-counting assertions in `test_ace043_set_operation_arms.py` read.
+
+    The ORDER is sqlglot's own traversal order and is asserted as written rather than sorted, for
+    the reason `_table_references` states: `_RECEIPT_MAX_REFS` truncates from the front of exactly
+    this order, so a reordering is a change in which references a capped receipt lists.
+    """
+    sql = "SELECT SUM(orders.total_amount) FROM orders, LATERAL (SELECT 1) l"
+    sites = rt._reference_sites(_parse(sql).find(exp.Select), bind_derived=True)
+    assert [(s.ref.bare, s.ref.alias) for s in sites] == [("", "l"), ("orders", None)], sites
