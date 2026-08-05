@@ -2929,8 +2929,11 @@ def assemble_receipt(
     # The cap goes IN rather than being a slice of what came back, the way ACE-059 put it in: every
     # column past it would be reduced and compared against every declared metric only to be dropped.
     metric_dialect = _dialect_of(org)[0]
-    candidates = _metric_candidates(org, _storage_type_of(org), metric_dialect)
+    metric_storage_type = _storage_type_of(org)
+    candidates = _metric_candidates(org, metric_storage_type, metric_dialect)
     by_binding = _by_binding(candidates)
+    # Computed ONCE: it is a property of the model and the engine, not of any one column.
+    unread_declarations = _declarations_unread(org, metric_storage_type, candidates)
     output_columns = _output_columns(tree)
     dropped_outputs = max(0, len(output_columns) - _RECEIPT_MAX_REFS)
     output_items: list[dict[str, Any]] = []
@@ -2938,7 +2941,7 @@ def assemble_receipt(
     # SELECT, and `_own_alias_map` walks a subtree. Lives for this call only.
     own_alias_memo: dict[int, dict[str, str]] = {}
     for oc in output_columns[:_RECEIPT_MAX_REFS]:
-        status, match = _match_output_column(oc, candidates, by_binding, visible,
+        status, match = _match_output_column(oc, unread_declarations, by_binding, visible,
                                              metric_dialect, own_alias_memo)
         # Everything a MATCHED metric contributes, and null on every other status. An item that
         # matched nothing must assert nothing about a metric it did not match — ACE-059's review
@@ -5407,7 +5410,35 @@ def _by_binding(candidates: list[MetricCandidate]) -> dict:
     return out
 
 
-def _match_output_column(oc: OutputColumn, candidates: list[MetricCandidate],
+def _declarations_unread(org: Datasource, storage_type: "str | None",
+                         candidates: list[MetricCandidate]) -> bool:
+    """Whether any declared metric is one this analysis could NOT read. Computed once per receipt.
+
+    Two shapes, and the second is the one a per-candidate check cannot see:
+
+    * a binding declared for THIS engine that will not parse — carried as `reduced is None`;
+    * **the engine itself unresolved**, when the model declares metrics at all. `_storage_type_of`
+      returns None for a datasource declaring no storage connection or declaring two different
+      engines, and then `_metric_candidates` returns an EMPTY list — indistinguishable, to a caller
+      counting unread candidates, from a model that simply declares no metrics. The first means we
+      read nothing; the second means there was nothing to read, and only the second may settle.
+
+    Without this, a model declaring metrics on an unresolvable engine reported every output column
+    `unmatched` under a NULL marker: the section's strongest claim — "every declared binding was
+    read and none of them is this value" — asserted on the strength of not knowing which engine's
+    bindings to read. That is the defect ACE-059's review found three times in the joins section,
+    arriving through a door this spec had left open.
+    """
+    if any(cand.reduced is None for cand in candidates):
+        return True
+    if storage_type is None:
+        declared = sum(len(sa.metrics) for sa in org.subject_areas) + len(
+            getattr(org, "cross_subject_area_metrics", None) or [])
+        return declared > 0
+    return False
+
+
+def _match_output_column(oc: OutputColumn, unread: bool,
                          by_binding: dict, visible: set[str], dialect: "str | None",
                          memo: dict[int, dict[str, str]]
                          ) -> tuple[str, Optional[MetricCandidate]]:
@@ -5421,10 +5452,10 @@ def _match_output_column(oc: OutputColumn, candidates: list[MetricCandidate],
     2. **`undetermined` when the column sits behind a boundary we do not enter** — see
        `_reads_only_visible`. Asked only AFTER the match, because a column whose expression we DID
        compare successfully has been established regardless of what else is in scope.
-    3. **`undetermined` when any candidate binding for this engine could not be read.** A failure to
-       read the MODEL is never a fact about the model: `unmatched` would tell a reader "none of your
-       declared metrics is this column" on the strength of our own parse failure, and send a model
-       author looking for a definition they have already written.
+    3. **`undetermined` when any declaration went unread** — see `_declarations_unread` for the two
+       shapes that covers. A failure to read the MODEL is never a fact about the model: `unmatched`
+       would tell a reader "none of your declared metrics is this column" on the strength of our own
+       parse failure, and send a model author looking for a definition they have already written.
     4. **`UNMATCHED`** — every candidate binding was read, the column was compared against all of
        them, and none is this value. That is a settled claim and it is the whole point of the
        section: it is the sentence "this number is not the organisation's agreed definition".
@@ -5439,7 +5470,7 @@ def _match_output_column(oc: OutputColumn, candidates: list[MetricCandidate],
             return MATCHED, cand
     if not _reads_only_visible(oc, visible, memo):
         return UNDETERMINED, None
-    if any(cand.reduced is None for cand in candidates):
+    if unread:
         return UNDETERMINED, None
     return UNMATCHED, None
 

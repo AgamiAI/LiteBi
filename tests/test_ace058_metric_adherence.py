@@ -234,19 +234,76 @@ def test_a_binding_that_will_not_parse_is_carried_as_unread(org):
     assert cands["paid_revenue"].reduced is not None
 
 
-def test_an_unresolvable_engine_yields_no_candidates(tmp_path):
-    """No declared connection means we do not know which engine's binding to read, and a guess is
-    not available to a receipt. `resolve_datasource_dialect` refuses the same two shapes."""
+def _org_without_resolvable_engine(tmp_path, name: str, connections: list):
     yaml = __import__("yaml")
-    root = tmp_path / "noengine"
+    root = tmp_path / name
     root.mkdir(parents=True)
     _write_model(root)
     doc = yaml.safe_load((root / "datasource.yaml").read_text())
-    doc["storage_connections"] = []
+    doc["storage_connections"] = connections
+    (root / "datasource.yaml").write_text(yaml.safe_dump(doc))
+    return L.load_datasource(root)
+
+
+@pytest.mark.parametrize("connections,label", [
+    ([], "no declared connection"),
+    ([{"name": "a", "storage_type": "PostgreSQL"}, {"name": "b", "storage_type": "Snowflake"}],
+     "two different engines"),
+])
+def test_an_unresolvable_engine_yields_no_candidates(tmp_path, connections, label):
+    """We do not know which engine's binding to read, and a guess is not available to a receipt.
+    `resolve_datasource_dialect` refuses the same two shapes."""
+    org = _org_without_resolvable_engine(tmp_path, "noengine", connections)
+    assert rt._storage_type_of(org) is None, label
+    assert rt._metric_candidates(org, rt._storage_type_of(org), None) == []
+
+
+@pytest.mark.parametrize("connections,label", [
+    ([], "no declared connection"),
+    ([{"name": "a", "storage_type": "PostgreSQL"}, {"name": "b", "storage_type": "Snowflake"}],
+     "two different engines"),
+])
+def test_an_unresolvable_engine_may_not_settle_a_column(tmp_path, connections, label):
+    """The regression this function exists to prevent, and it shipped before review caught it.
+
+    An unresolvable engine makes `_metric_candidates` return an EMPTY list, which is
+    indistinguishable — to anything counting unread candidates — from a model that declares no
+    metrics. So every output column read `unmatched` under a NULL marker: the section's strongest
+    claim ("every declared binding was read and none of them is this value") asserted on the
+    strength of not knowing which engine's bindings to read.
+
+    The model here declares four metrics. Not knowing the engine means we read none of them.
+    """
+    org = _org_without_resolvable_engine(tmp_path, "unsettled", connections)
+    section = rt.assemble_receipt(org, "SELECT SUM(total_amount) AS revenue FROM orders")["columns"]
+    outs = [i for i in section["items"] if i["kind"] == "output"]
+    assert [i["status"] for i in outs] == [rt.UNDETERMINED], label
+    assert section["undetermined"], "a section that established nothing may not claim completeness"
+
+
+def test_a_model_with_no_metrics_at_all_still_settles(tmp_path):
+    """The other side of the same rule, and why it is not simply "unknown engine means unknown".
+
+    Nothing to read is not the same as reading nothing. A deployment that declares no metrics has
+    no definition this value could have used, so `unmatched` is the honest answer and the marker
+    stays null. Reporting `undetermined` here would make the section permanently unsettled for
+    every deployment that has not written a metric yet — which is most of them on day one.
+    """
+    yaml = __import__("yaml")
+    root = tmp_path / "nometrics"
+    root.mkdir(parents=True)
+    _write_model(root)
+    for f in (root / "subject_areas" / "s" / "metrics").iterdir():
+        f.unlink()
+    doc = yaml.safe_load((root / "datasource.yaml").read_text())
+    doc["cross_subject_area_metrics"] = []
+    doc["storage_connections"] = []          # engine unresolvable AND nothing declared to read
     (root / "datasource.yaml").write_text(yaml.safe_dump(doc))
     org = L.load_datasource(root)
-    assert rt._storage_type_of(org) is None
-    assert rt._metric_candidates(org, rt._storage_type_of(org), None) == []
+    section = rt.assemble_receipt(org, "SELECT SUM(total_amount) AS revenue FROM orders")["columns"]
+    outs = [i for i in section["items"] if i["kind"] == "output"]
+    assert [i["status"] for i in outs] == [rt.UNMATCHED]
+    assert section["undetermined"] is None
 
 
 # --- SC-1 / SC-8: one entry per value the statement RETURNS -----------------
@@ -336,7 +393,8 @@ def _statuses(org, sql: str, *, drop: tuple[str, ...] = ()) -> list[tuple[str, s
     out = []
     for oc in rt._output_columns(tree):
         status, match = rt._match_output_column(
-            oc, cands, rt._by_binding(cands), visible, dialect, {})
+            oc, rt._declarations_unread(org, rt._storage_type_of(org), cands),
+            rt._by_binding(cands), visible, dialect, {})
         out.append((oc.key, status, match.metric.name if match else None))
     return out
 
