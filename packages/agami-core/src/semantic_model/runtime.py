@@ -5255,6 +5255,75 @@ def _output_columns(node: "exp.Expression") -> list[OutputColumn]:
     return out
 
 
+def _reads_only_visible(oc: OutputColumn, visible: set[str]) -> bool:
+    """Whether every relation this output column's expression reads is one the walk can see behind.
+
+    The `visible` set is the model's declared tables minus every name the statement bound for
+    itself, which `assemble_receipt` already computes for the aggregate analysis. A column computed
+    off a CTE, a derived table or a name the model does not declare sits behind a boundary this
+    layer does not enter: `SELECT MAX(x.t) FROM (…) x` reads `x` perfectly well and knows nothing
+    about what computed `t`.
+
+    That distinction is the whole of why this exists. The value is NOT "none matched" — the analysis
+    did not read the thing it would have had to read to say so, and the section's own marker already
+    states that it does not enter those scopes, so an item claiming otherwise would contradict the
+    sentence printed beside it. ACE-060 shipped this rule for `not_multiplied` and found this second
+    shape of it in review; ACE-059 generalized it. This is the same rule again, one section over.
+
+    Qualifiers resolve through `_own_alias_map`, NOT `_alias_map`. The latter is a whole-subtree
+    last-wins walk, so a CTE body's binding overwrites the outer query's for the same alias — which
+    is precisely what produced ACE-059's signed-off false match. An UNQUALIFIED column is not
+    evidence of anything either way and is left to the sources the SELECT reads.
+    """
+    if oc.expr is None:                      # a star: nothing read, nothing established
+        return False
+    scope_map = _own_alias_map(oc.sel)
+    # Every source this SELECT reads itself. A derived table or `VALUES` list is not an `exp.Table`
+    # and so is absent from the map by construction, which is what makes the `.values()` check below
+    # catch it: the SELECT reads something, and none of what it reads is a visible declared table.
+    sources = set(scope_map.values())
+    if not sources or any(_tkey(src) not in visible for src in sources):
+        return False
+    for col in oc.expr.find_all(exp.Column):
+        if col.table:
+            bare = scope_map.get(col.table, col.table)
+            if _tkey(bare) not in visible:
+                return False
+    return True
+
+
+def _match_output_column(oc: OutputColumn, candidates: list[MetricCandidate],
+                         visible: set[str], dialect: "str | None"
+                         ) -> tuple[str, Optional[MetricCandidate]]:
+    """One output column against every declared metric: `(status, matched candidate or None)`.
+
+    The branch ORDER is the contract, and each rung is a claim the analysis has earned:
+
+    1. **A match, if the expressions are equal.** First in candidate order, so the same statement
+       names the same metric on every run (REQ-022).
+    2. **`undetermined` when the column sits behind a boundary we do not enter** — see
+       `_reads_only_visible`. Asked only AFTER the match, because a column whose expression we DID
+       compare successfully has been established regardless of what else is in scope.
+    3. **`undetermined` when any candidate binding for this engine could not be read.** A failure to
+       read the MODEL is never a fact about the model: `unmatched` would tell a reader "none of your
+       declared metrics is this column" on the strength of our own parse failure, and send a model
+       author looking for a definition they have already written.
+    4. **`UNMATCHED`** — every candidate binding was read, the column was compared against all of
+       them, and none is this value. That is a settled claim and it is the whole point of the
+       section: it is the sentence "this number is not the organisation's agreed definition".
+    """
+    if oc.expr is not None:
+        reduced = _reduced_projection(oc.expr, dialect)
+        for cand in candidates:
+            if cand.reduced is not None and cand.reduced == reduced:
+                return MATCHED, cand
+    if not _reads_only_visible(oc, visible):
+        return UNDETERMINED, None
+    if any(cand.reduced is None for cand in candidates):
+        return UNDETERMINED, None
+    return UNMATCHED, None
+
+
 def _storage_type_of(org: Datasource) -> "str | None":
     """The one engine this datasource's SQL runs on, as `Metric.bindings` spells it.
 

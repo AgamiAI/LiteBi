@@ -302,6 +302,133 @@ def test_an_output_key_is_bounded_like_every_other_caller_written_label():
     assert "\n" not in oc.key
 
 
+# --- SC-5 / SC-6: what may and may not reach a settled status ---------------
+
+
+def _statuses(org, sql: str, *, drop: tuple[str, ...] = ()) -> list[tuple[str, str, str | None]]:
+    """(key, status, matched metric name) per output column, straight off the matcher.
+
+    `drop` removes named metrics from the candidate list. It exists for one reason: the fixture
+    deliberately declares `broken_metric`, whose binding for this engine will not parse, so
+    `unmatched` is out of reach by DEFAULT and any test asserting it has to say so. Filtering the
+    list here rather than patching `_metric_candidates` keeps the real function on the path under
+    test — a patch would have made these assertions about the stub.
+    """
+    dialect = rt._dialect_of(org)[0]
+    tree = rt._parse_sql(sql, dialect)
+    tidx = rt._model_table_index(org)
+    visible = set(tidx) - rt._cte_names(tree)
+    cands = [c for c in rt._metric_candidates(org, rt._storage_type_of(org), dialect)
+             if c.metric.name not in drop]
+    out = []
+    for oc in rt._output_columns(tree):
+        status, match = rt._match_output_column(oc, cands, visible, dialect)
+        out.append((oc.key, status, match.metric.name if match else None))
+    return out
+
+
+def test_the_declared_binding_reads_matched_and_names_the_metric(org):
+    assert _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders") == [
+        ("revenue", rt.MATCHED, "paid_revenue")]
+
+
+def test_a_qualified_statement_reads_matched(org):
+    """SC-4 end to end through the matcher, not just the comparison."""
+    assert _statuses(
+        org, "SELECT SUM(o.total_amount) FILTER (WHERE o.status = 'paid') AS revenue "
+             "FROM orders o") == [("revenue", rt.MATCHED, "paid_revenue")]
+
+
+def test_an_unreviewed_metric_matches_too(org):
+    """SC-7. Sign-off is a FIELD on the item, not a filter on which metrics are considered. The
+    approved body checked signed-off metrics only, so a hand-roll of a proposed metric was silent."""
+    assert _statuses(org, "SELECT COUNT(*) AS n FROM orders") == [
+        ("n", rt.MATCHED, "order_count")]
+
+
+def test_a_cross_area_metric_matches(org):
+    """SC-7's other half: the walk this replaced could not see these at all."""
+    assert _statuses(org, "SELECT COUNT(DISTINCT customer_id) AS c FROM orders") == [
+        ("c", rt.MATCHED, "active_customers")]
+
+
+def test_a_binding_only_inside_a_cte_matches_no_output_column(org):
+    """SC-6. Containment credited this: the binding appears in the text, so the whole statement was
+    reported as using the metric even though the value never reaches the caller. Measured on the
+    live testbed as a false match before this change.
+
+    `broken_metric` is removed for this case so the settled `unmatched` is reachable — the unread
+    binding is its own test below, and leaving both in would confound the two.
+    """
+    got = _statuses(org, f"WITH x AS (SELECT {PAID_REVENUE} AS r FROM orders) "
+                         "SELECT r AS revenue FROM x", drop=("broken_metric",))
+    # One output column, and it is NOT a match: the CTE is a scope this layer does not enter, so the
+    # honest answer is that nothing was established about it.
+    assert got == [("revenue", rt.UNDETERMINED, None)]
+
+
+def test_a_value_from_a_derived_table_is_undetermined_not_unmatched(org):
+    """`SELECT MAX(x.t) FROM (…) x` reads `x` fine and knows nothing about what computed `t`.
+    ACE-060 shipped this rule for `not_multiplied` and found this second shape of it in review."""
+    got = _statuses(org, "SELECT MAX(x.t) AS m FROM (SELECT total_amount AS t FROM orders) x",
+                    drop=("broken_metric",))
+    assert got == [("m", rt.UNDETERMINED, None)]
+
+
+def test_a_star_is_undetermined(org):
+    got = _statuses(org, "SELECT * FROM orders")
+    assert got == [("*", rt.UNDETERMINED, None)]
+
+
+def test_an_unread_binding_keeps_unmatched_out_of_reach(org):
+    """SC-5. `broken_metric` declares a binding for THIS engine that will not parse. Until it is
+    read, "none of your declared metrics is this column" is a claim reached off our own failure —
+    which is the defect ACE-059's review found three times, twice with a signed-off trail attached.
+
+    The fixture leaves it in, so this is the DEFAULT state of the fixture and every `unmatched`
+    assertion elsewhere has to remove it deliberately. That is the safe direction for a default.
+    """
+    assert _statuses(org, "SELECT id AS i FROM orders") == [("i", rt.UNDETERMINED, None)]
+
+
+def test_with_every_binding_read_a_hand_roll_reads_unmatched(org):
+    """The settled negative, which is the sentence this whole section exists to be able to say."""
+    assert _statuses(org, "SELECT SUM(total_amount) AS revenue FROM orders",
+                     drop=("broken_metric",)) == [("revenue", rt.UNMATCHED, None)]
+
+
+def test_an_unread_binding_does_not_suppress_a_match_that_was_made(org):
+    """The rung order. A column we DID compare successfully is established regardless of what else
+    in the model we could not read — otherwise one malformed binding would blank the whole section
+    on every statement, which is the opposite failure and just as wrong."""
+    assert _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders") == [
+        ("revenue", rt.MATCHED, "paid_revenue")]
+
+
+def test_a_metric_missing_for_this_engine_does_not_hold_a_column_open(org):
+    """`elsewhere_only` declares a Snowflake binding and none for this engine. That is the MODEL's
+    coverage, not our gap, so it is not a candidate and `unmatched` stays reachable.
+
+    The statement below is `elsewhere_only`'s Snowflake binding **written out verbatim**, which is
+    what gives this test teeth: if the engine filter were dropped and every value in `bindings`
+    tried — what the containment test being replaced did — this would read `matched` and name a
+    metric defined for an engine this deployment does not run.
+    """
+    got = _statuses(org, "SELECT SUM(total_amount) AS revenue FROM orders",
+                    drop=("broken_metric",))
+    assert got == [("revenue", rt.UNMATCHED, None)]
+
+
+def test_two_union_arms_are_told_apart_by_status(org):
+    """SC-8's payload. One arm uses the declared metric, the other hand-rolls it, and the section
+    now says which is which — measured on the live testbed as ONE indistinguishable entry before."""
+    got = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders "
+                         "UNION ALL SELECT SUM(total_amount) AS revenue FROM orders",
+                    drop=("broken_metric",))
+    assert got == [("revenue", rt.MATCHED, "paid_revenue"),
+                   ("revenue", rt.UNMATCHED, None)]
+
+
 # --- cost -------------------------------------------------------------------
 
 
