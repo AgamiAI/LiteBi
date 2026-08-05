@@ -121,6 +121,15 @@ are two different facts, and keeping them apart is the whole point:
 | empty | set | **not checked**, and here is why |
 | set | set | partly established, and here is what is missing |
 
+On a **server** there is a fifth reason a section can be undetermined, and it is a deployment
+posture rather than a degradation: an operator has turned the semantic-model pass off
+(`AGAMI_GOVERNANCE_ENFORCED`, off by default). Then all five sections read *"the semantic-model
+checks are turned off in this deployment, so nothing in the statement was checked against the
+model"*, with no findings attached, and the audit row carries the same. That is the row-three case
+above and it is the point of the design: a server can be brought up before the model-aware checks
+have been validated against your data, and no answer it gives is ever presented as governed while
+that is true. See the [self-hosting reference](self-hosting.md).
+
 Before this, an unchecked section and a clean one were both the empty list, so
 silence read as clean. Today what a section could not establish says so where you
 read the answer, and it says it in the caller's own numbers rather than naming
