@@ -574,13 +574,20 @@ def create_app(
         # body also runs for every embedding harness and every test that builds an app. Once per
         # worker process, not once per deployment: `main()` runs uvicorn with `WORKERS=N` and uvicorn
         # re-invokes the factory in each child, so N workers legitimately log N lines.
-        from execute_sql import _model_pass_disabled
+        from execute_sql import _model_pass_disabled_by_env
 
-        if _model_pass_disabled():
+        if _model_pass_disabled_by_env():
             # The SAME predicate every enforcement site reads, not a second spelling of it. An earlier
             # draft dropped the `_hosted()` half and so announced "the gates are off" on a file-mode
             # server where they were fully on. A warning that is wrong in the safe direction is still
             # a warning an operator learns to discount, which is the one thing this line cannot afford.
+            #
+            # The `_by_env` reader rather than the pinned one, and that distinction is the point of
+            # its existing: this runs ONCE at startup, before any request, so there is no call for it
+            # to be scoped to. Reading the pinned value would make a startup statement depend on
+            # request-scoped state, which is None in a served process but need not be in an embedding
+            # harness that ran a query before building an app. Found by driving the boot path after a
+            # query in one process, where the stale pin made this line fire on all four postures.
             #
             # `is not enabled` rather than `is not set`: the variable is also not enabled when it IS
             # set to `false`, `0`, or a typo like `ture`, and telling an operator who typed something

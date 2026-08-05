@@ -513,6 +513,24 @@ def test_the_boot_warning_reports_the_value_that_was_actually_rejected(tmp_path,
     assert "is not enabled" in lines[0]
 
 
+def test_the_boot_warning_ignores_a_posture_pinned_by_an_earlier_call(tmp_path, monkeypatch, caplog):
+    """Startup answers for the deployment, never for whatever request happened to run before it.
+
+    `_pass_posture` is pinned per call so the gates and the receipt cannot disagree within one
+    statement. That makes it request-scoped state, and a startup line has no request to be scoped to.
+    In a served process the distinction is invisible (the lifespan runs before any request, so the pin
+    is None), which is exactly why it needs a test: an embedding harness that runs a query and then
+    builds an app in the same context would otherwise get a warning describing the query's posture
+    rather than the server's. Found by driving the boot path after a query in one process, where a
+    stale pin made the line fire on all four postures including the enforcing one.
+    """
+    monkeypatch.setenv("AGAMI_GOVERNANCE_ENFORCED", "true")
+    # A previous call in this context concluded the pass was OFF. The environment now says otherwise.
+    execute_sql._pass_posture.set(True)
+
+    assert _boot(tmp_path, monkeypatch, caplog) == []
+
+
 def test_a_server_with_no_database_stays_quiet_because_the_switch_is_not_consulted(
     tmp_path, monkeypatch, caplog
 ):

@@ -1364,17 +1364,30 @@ _guard_shape: ContextVar[str | None] = ContextVar("_guard_shape", default=None)
 _pass_posture: ContextVar[bool | None] = ContextVar("_pass_posture", default=None)
 
 
-def _model_pass_disabled() -> bool:
-    """Whether the semantic-model pass is off for THIS call.
+def _model_pass_disabled_by_env() -> bool:
+    """Whether the environment, right now, says the pass is off.
 
     The single spelling of the condition. It was written out four times before, once per site, and
     the fifth site (the hosted server's boot warning) got it wrong by dropping the `_hosted()` half,
     which is the argument for naming it rather than repeating it.
+
+    Callers that are answering for a STATEMENT want `_model_pass_disabled` below instead. This one is
+    for the two that legitimately have no call to be scoped to: pinning at the top of a request, and
+    the server's boot warning, which runs once before any request exists.
+    """
+    return _hosted() and not _governance_enforced()
+
+
+def _model_pass_disabled() -> bool:
+    """Whether the semantic-model pass is off for THIS call.
+
+    The pinned answer when there is one, so every reader within a call agrees; otherwise the
+    environment. See `_pass_posture` for why a call is pinned at all.
     """
     pinned = _pass_posture.get()
     if pinned is not None:
         return pinned
-    return _hosted() and not _governance_enforced()
+    return _model_pass_disabled_by_env()
 
 
 def _pin_model_pass_posture() -> bool:
@@ -1385,7 +1398,7 @@ def _pin_model_pass_posture() -> bool:
     fork, which must reach the same answer its child did). Everything downstream reads
     `_model_pass_disabled()` and therefore cannot observe a change made mid-call.
     """
-    value = _hosted() and not _governance_enforced()
+    value = _model_pass_disabled_by_env()
     _pass_posture.set(value)
     return value
 
