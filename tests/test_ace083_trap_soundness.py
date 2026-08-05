@@ -114,6 +114,12 @@ JOINED_CTE_BODY = (
 #    parenthesized table, and dropping this one with it would have been a false clean.
 UNALIASED_VALUES_FAN = "SELECT SUM(orders.total_amount) FROM orders, (VALUES (1), (2))"
 
+# 9. Members 6 and 1, wrapped in a set operation. A WITH sits ABOVE the arms and binds its name for
+#    all of them, so an arm looking for the CTE inside itself finds nothing and the laundered fan
+#    goes unseen — the same statement, one keyword further out, reading clean. Both arms are
+#    inflated so the corpus property stays unconditional over every item the statement produces.
+UNION_ARM_CTE_FAN = f"{CTE_LAUNDERED_FAN} UNION ALL {PLAIN_FAN}"
+
 # The corpus, named so the later slices can re-run it unchanged rather than restating it. Labels
 # are what a failure prints, so they name the disguise and not the SQL.
 INFLATED_SHAPES = [
@@ -125,6 +131,7 @@ INFLATED_SHAPES = [
     ("many side behind a CTE", CTE_LAUNDERED_FAN),
     ("join inside the CTE body", JOINED_CTE_BODY),
     ("rows from an unaliased VALUES list", UNALIASED_VALUES_FAN),
+    ("a laundered fan inside a set-operation arm", UNION_ARM_CTE_FAN),
 ]
 
 # A conditional count and a conditional sum over the many side. Both are honestly clean: one row
@@ -725,6 +732,39 @@ UNREADABLE_CTE_BODIES = [
     ("the grain is an expression with no column name to compare",
      "WITH oi AS (SELECT SUM(quantity) q FROM order_items GROUP BY order_id + 1) "
      "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.q = orders.id"),
+    ("the unreadable body is joined from inside a set-operation arm",
+     "WITH oi AS (SELECT i.order_id AS order_id FROM order_items i "
+     "JOIN orders o ON o.id = i.order_id) "
+     "SELECT SUM(orders.total_amount) FROM orders JOIN oi ON oi.order_id = orders.id "
+     "UNION ALL SELECT SUM(orders.revenue) FROM orders JOIN oi ON oi.order_id = orders.id"),
+]
+
+# Every shape whose multiplication answer this spec decides, gathered for the one property that
+# holds across all of them. Not a new corpus: `INFLATED_SHAPES` is about the answer being wrong in
+# one direction, and this is about the answer being INTERNALLY consistent whatever it says.
+ALL_ANALYSED_SHAPES = INFLATED_SHAPES + UNREADABLE_CTE_BODIES + [
+    ("a value already at the many side's grain", VALUE_AT_MANY_GRAIN),
+    ("a conditional count over the many side", CONDITIONAL_COUNT),
+    ("a conditional sum over the many side", CONDITIONAL_SUM),
+    ("an aggregate a duplication cannot move", MIN_OVER_FAN),
+    ("a DISTINCT count over a fan", DISTINCT_COUNT_OVER_FAN),
+    ("a boolean fold over a fan", BOOL_OR_OVER_FAN),
+    ("COUNT(*) over a fan", COUNT_STAR_OVER_FAN),
+    ("a FILTER clause predicate", FILTERED_FAN),
+    ("three statuses and both risk labels at once", EVERY_STATUS_SQL),
+    ("a grain-changing CTE", GRAIN_CHANGING_CTE),
+    ("a grain-preserving CTE", GRAIN_PRESERVING_CTE),
+    ("a chain of grain-preserving CTEs", TRANSITIVE_CTE),
+    ("a CTE grain finer than the join key", CTE_GRAIN_BELOW_JOIN_KEY),
+    ("a CTE name spelled in another case", CASE_FOLDED_CTE),
+    ("a derived table with an unqualified measure", DERIVED_TABLE_UNQUALIFIED),
+    ("a parenthesized named table", PARENTHESIZED_TABLE),
+    ("a VALUES source", VALUES_SOURCE),
+    ("a LATERAL source", LATERAL_SOURCE),
+    ("a chasm over two independent measures",
+     "SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
+     "LEFT JOIN orders o ON o.customer_id = c.id "
+     "LEFT JOIN tickets t ON t.customer_id = c.id GROUP BY c.id"),
 ]
 
 
@@ -930,9 +970,14 @@ def test_a_cte_body_the_analysis_cannot_read_is_undetermined(label, sql):
     was multiplied, or that it was not, or that it could not tell — and every one of these is the
     third. What none of them may be is absent or clean: `not_multiplied` on any row here would be
     the receipt asserting a statement is sound on the strength of a body it could not read.
+
+    Asserted over the status SET rather than an exact list because the last row is a set operation
+    and produces one item per arm. Every item still has to be `undetermined` and every item still
+    has to name no join, so nothing is loosened for the single-select rows: one item whose status
+    must be `undetermined` is the same assertion either way.
     """
     reports = _reports(sql)
-    assert [a.status for a in reports] == [rt.UNDETERMINED], (label, reports)
+    assert {a.status for a in reports} == {rt.UNDETERMINED}, (label, reports)
     assert [j for a in reports for j in a.joins] == [], (label, reports)
 
 
@@ -1145,27 +1190,61 @@ def test_a_source_the_guarded_path_refuses_is_still_answered_honestly_on_the_pre
 @pytest.mark.parametrize("label,sql", [
     ("qualified", "SELECT SUM(facts.unit_price) FROM facts"),
     ("unqualified, one table in scope", "SELECT SUM(unit_price) FROM facts"),
+    ("unqualified, through a CTE",
+     "WITH c AS (SELECT unit_price FROM facts) SELECT SUM(unit_price) FROM c"),
+    ("qualified by a CTE alias — GAINED by the grain resolution",
+     "WITH c AS (SELECT unit_price FROM facts) SELECT SUM(c.unit_price) FROM c"),
+    ("qualified by a SELECT * CTE alias — GAINED by the grain resolution",
+     "WITH c AS (SELECT * FROM facts) SELECT SUM(c.unit_price) FROM c"),
 ])
 def test_an_aggregation_class_violation_still_fires_on_the_statement_that_makes_it(label, sql):
-    """`_check_aggregation_semantics` reads the same narrowed map, so its floor is pinned here.
+    """`_check_aggregation_semantics` reads the same map, so its floor is pinned here.
 
     It resolves the summed column's table through the scope map `_preflight_select` hands it, and
-    that map now holds only what this SELECT's own FROM/JOIN clauses bind. Two `bad_aggregation`
-    findings were measured to stop firing as a result, and both fired only by reading a table out of
-    a scope the outer statement cannot see: `SUM(unit_price) FROM (SELECT unit_price FROM facts) f`
-    and its CTE equivalent. That is ACE-099's rule applied consistently — a column in a CTE body is
-    not a reference of the outer statement — and it is recorded as a contract change rather than
-    hidden, since one of the two traded a lost finding for a killed false clean.
+    that map changed twice over: narrowed to what this SELECT's own FROM/JOIN clauses bind, then
+    widened again where a grain-preserving CTE resolves back to the table it hands through. The net
+    was measured against base `439ecd1` over eight spellings, and it is NOT the loss of two that an
+    earlier mid-build measurement recorded — that reading was taken before the grain resolution
+    landed and is superseded by this one.
 
-    What may not narrow is the case the check exists for: a statement that sums an `averageable`
-    column off a table it plainly reads. Both spellings are pinned, because they take different
-    paths through the resolver — the qualified one through the map, the unqualified one through the
-    single-in-scope-table fallback — and the fallback reads the map's VALUES, which is the half the
-    filter changed.
+    ONE finding is lost: `SUM(unit_price) FROM (SELECT unit_price FROM facts) f`, which fired only
+    by reading `facts` out of a derived body the outer statement cannot see. Its status moved from
+    `not_multiplied` to `undetermined` in the same change, so it trades a finding for a killed false
+    clean rather than simply going quiet.
+
+    TWO are gained, and both are the resolution working: `SUM(c.unit_price)` over a CTE resolves `c`
+    back to `facts`, where before it resolved to the undeclared name `c` and the check had nothing
+    to look up. Those are the last three rows here — pinned as gains rather than mentioned, because
+    a narrowing that quietly took them away again would otherwise look like the loss it is not.
+
+    Both plain spellings stay, and they take different paths through the resolver: the qualified one
+    through the map, the unqualified one through the single-in-scope-table fallback, which reads the
+    map's VALUES — the half the filter changed.
     """
     pf = rt.pre_flight_check(sql, _averageable_org())
     assert [f.risk for f in pf.findings] == ["bad_aggregation"], (label, pf.findings)
     assert "unit_price" in pf.findings[0].reason, (label, pf.findings[0].reason)
+
+
+def test_the_one_aggregation_class_finding_this_spec_gives_up_is_the_one_that_read_a_hidden_scope():
+    """The other side of the differential above, so the narrowing is bounded rather than open-ended.
+
+    This is the single `bad_aggregation` that base `439ecd1` reported and this spec does not. It
+    fired because `facts` leaked out of the derived table's body into the outer scope map, which is
+    precisely the leak S3 removes: a column inside a derived body is not a reference of the outer
+    statement, and the outer statement here reads one source, `f`, whose columns the analysis cannot
+    attribute to any declared table.
+
+    Asserted together with the status, because the two halves are one trade. Base called this
+    statement `not_multiplied` — a positive claim that a number computed over an unreadable derived
+    source is sound — and it now declines to answer. Losing a true finding is a real cost; losing it
+    alongside a false clean is the exchange this spec makes, and stating only one half of it would
+    misrepresent the change in either direction.
+    """
+    sql = "SELECT SUM(unit_price) FROM (SELECT unit_price FROM facts) f"
+    pf = rt.pre_flight_check(sql, _averageable_org())
+    assert [f.risk for f in pf.findings] == [], pf.findings
+    assert [a.status for a in pf.aggregates] == [rt.UNDETERMINED], pf.aggregates
 
 
 def test_the_chasm_still_reports_both_of_the_aggregates_it_inflates():
@@ -1184,3 +1263,138 @@ def test_the_chasm_still_reports_both_of_the_aggregates_it_inflates():
     assert [(a.aggregate, a.status) for a in reports] == [
         ("SUM(o.revenue)", rt.MULTIPLIED), ("COUNT(t.id)", rt.MULTIPLIED)], reports
     assert [f.risk for a in reports for f in a.findings] == ["chasm_trap", "chasm_trap"], reports
+
+
+# --- A25: an item that answers, names its evidence -------------------------
+
+
+def test_every_item_either_names_its_joins_or_declines_to_answer():
+    """A25. Whatever an item says, it says it consistently — over every shape this spec decides.
+
+    Two directions, and each is a way a receipt can be internally contradictory rather than merely
+    wrong. A `multiplied` item with an empty `joins` tells a reader their number was inflated and
+    gives them nothing to look at, which is a fact they cannot check and cannot act on. A
+    `not_multiplied` or `undetermined` item that names a join asserts the opposite of what its own
+    status says, and a reader has no way to know which half to believe.
+
+    An internal loop rather than a parametrize, deliberately: the property is about the whole set,
+    the set is assembled from constants defined for other tests, and a failure has to print the SQL
+    it came from or the label alone would not locate it. Collecting every offender before asserting
+    means one run reports all of them instead of stopping at the first.
+
+    `status` is checked against the three constants as well. The vocabulary is closed, and an item
+    carrying anything else is a fourth thing this layer is not allowed to say.
+    """
+    offenders: list[tuple[str, str, str, list[str]]] = []
+    for label, sql in ALL_ANALYSED_SHAPES:
+        for item in _reports(sql):
+            assert item.status in (rt.MULTIPLIED, rt.NOT_MULTIPLIED, rt.UNDETERMINED), (label, item)
+            names_joins = bool(item.joins)
+            if names_joins != (item.status == rt.MULTIPLIED):
+                offenders.append((label, item.aggregate, item.status, item.joins))
+    assert offenders == [], offenders
+
+
+# --- A20: the two surfaces report the same aggregates ----------------------
+
+
+@pytest.mark.parametrize("label,sql", [
+    ("an invariant aggregate over a fan", MIN_OVER_FAN),
+    ("a value already at the many side's grain", VALUE_AT_MANY_GRAIN),
+    ("a grain-preserving CTE the analysis resolves", GRAIN_PRESERVING_CTE),
+    ("a grain-changing CTE whose edge is derived", GRAIN_CHANGING_CTE),
+    ("a derived table bound to nothing", DERIVED_TABLE_FAN),
+    ("three statuses and both risk labels at once", EVERY_STATUS_SQL),
+])
+def test_the_preflight_and_the_receipt_agree_about_the_aggregates(label, sql):
+    """A20. Both surfaces read one analysis, so the two renderings must be byte-equal.
+
+    `pre_flight_check` parses and analyses; `assemble_receipt` analyses a tree it already holds.
+    They are meant to be two doors onto one answer, and the way that stops being true is silent — a
+    caller reading a receipt and a caller reading a pre-flight result would simply disagree about
+    the same statement, with nothing failing anywhere.
+
+    ACE-060 already asserts this, and its file stays unedited — but its shapes all predate this
+    spec, so none of them exercises an invariance label, a value-path attribution, a resolved CTE or
+    an alias bound to nothing. These six do, one per mechanism this spec added, on `_sales_org` so
+    that no fixture ACE-060 depends on has to move.
+
+    The comparison is the serialized item list against `as_dict()`, not a status-by-status walk:
+    `joins`, `findings` and the aggregate's own label are all part of what the two surfaces have to
+    agree about, and a spot check of statuses would pass while a reason string differed.
+    """
+    org = _sales_org()
+    items = rt.assemble_receipt(org, sql)["aggregates"]["items"]
+    assert items == [a.as_dict() for a in rt.pre_flight_check(sql, org).aggregates], label
+
+
+# --- the invariance boundary, pinned where it is rather than where it could be ---
+
+
+def test_a_distinct_concatenation_with_an_ordering_arm_is_not_read_as_invariant():
+    """The boundary of `_is_fan_immune`, pinned in the direction it currently errs.
+
+    `STRING_AGG(DISTINCT x ORDER BY y)` parses to `GroupConcat(this=Order(this=Distinct(...)))`, so
+    `agg.this` is an `exp.Order` and not the `exp.Distinct` the predicate tests for, and
+    `args["distinct"]` is `None` as well. The same expression WITHOUT the ordering arm puts
+    `exp.Distinct` directly under the aggregate and reads as invariant, so one keyword moves the
+    answer.
+
+    A duplication genuinely cannot move a DISTINCT concatenation, so the honest label here is
+    `fan_out_invariant` and what it gets is `fan_trap`. That is the SAFE direction — it names a
+    defect where there is none, rather than telling a reader a number is unaffected when it is —
+    and it is not worth widening the predicate for, because the widening is where this split gets
+    dangerous. It is pinned so the boundary cannot move without someone deciding to move it: a
+    change that made this read invariant is a change that needs its own argument.
+
+    The two parses are asserted alongside the report, since the whole behaviour rests on a fact
+    about sqlglot's tree rather than about this module.
+    """
+    ordered = parse_one(
+        f"SELECT STRING_AGG(DISTINCT orders.status, ',' ORDER BY orders.status) {FAN_JOIN}"
+    ).find(exp.AggFunc)
+    assert isinstance(ordered.this, exp.Order), ordered.this
+    assert ordered.args.get("distinct") is None, ordered.args
+    assert rt._is_fan_immune(ordered) is False, ordered
+
+    plain = parse_one(f"SELECT STRING_AGG(DISTINCT orders.status, ',') {FAN_JOIN}").find(exp.AggFunc)
+    assert isinstance(plain.this, exp.Distinct), plain.this
+    assert rt._is_fan_immune(plain) is True, plain
+
+    reports = _reports(
+        f"SELECT STRING_AGG(DISTINCT orders.status, ',' ORDER BY orders.status) {FAN_JOIN}"
+    )
+    assert [a.status for a in reports] == [rt.MULTIPLIED], reports
+    assert [f.risk for f in reports[0].findings] == ["fan_trap"], reports[0].findings
+
+
+# --- a WITH binds its name for every arm below it --------------------------
+
+
+def test_a_set_operation_arm_sees_the_cte_the_statement_bound_above_it():
+    """A WITH sits above the arms, so an arm that looks for it inside itself finds nothing.
+
+    Measured on this statement before the fix: `main#1` reported `not_multiplied` over a laundered
+    fan, because `_cte_names` was read off the ARM, the guard never fired, and `oi` stayed bound to
+    the undeclared name `oi`. The unreadable-body shape failed the same way and is a row in the
+    guard table above.
+
+    The fix is narrow on purpose and both halves are asserted here. CTE NAMES and BODIES come off
+    the root, because a WITH binds its name for every arm below it — the same reason
+    `_aggregate_reports` computes `visible` on the root. Which TABLES an arm reads does NOT: the
+    alias map stays strictly per-arm, so the second arm below, which reads only `orders`, is
+    honestly clean and is not dragged into the first arm's fan.
+
+    The scope labels are asserted too. They are what tells a reader which arm an item belongs to,
+    and reading CTE names off the root is exactly the kind of change that could have flattened two
+    arms into one scope without any status moving.
+    """
+    reports = _reports(UNION_ARM_CTE_FAN)
+    assert [(a.scope, a.status) for a in reports] == [
+        ("main#1", rt.MULTIPLIED), ("main#2", rt.MULTIPLIED)], reports
+    assert [a.joins for a in reports] == [[FAN_EDGE], [FAN_EDGE]], reports
+
+    # And an arm that reads no CTE keeps its own answer, which is what "per-arm" has to mean.
+    mixed = _reports(f"{CTE_LAUNDERED_FAN} UNION ALL SELECT SUM(orders.total_amount) FROM orders")
+    assert [(a.scope, a.status) for a in mixed] == [
+        ("main#1", rt.MULTIPLIED), ("main#2", rt.NOT_MULTIPLIED)], mixed

@@ -1706,7 +1706,13 @@ def _preflight_select(tree: "exp.Select", org: Datasource,
     # tell the difference: `FROM oi` reads `oi` whether `oi` is a table or a WITH. Resolving it is
     # what lets the fan detector see the join the statement actually takes, and the guard is the
     # cheap half of the question, so a statement with no CTE in its FROM pays nothing for this.
-    if _cte_names(tree) & {_tkey(v) for v in tables_in_scope.values()}:
+    #
+    # The CTE names come off the ROOT and the alias map does NOT, and the asymmetry is the point.
+    # A WITH binds its name for every arm below it, so an arm reading `oi` reads a name declared
+    # above it — `_aggregate_reports` computes `visible` on the root for exactly this reason. Which
+    # TABLES an arm reads is the opposite kind of question and stays strictly per-arm, because one
+    # arm's tables deciding another arm's fan is the defect ACE-099 and ACE-043 exist to prevent.
+    if _cte_names(tree.root()) & {_tkey(v) for v in tables_in_scope.values()}:
         tidx = ctx.model_table_index if ctx is not None else _model_table_index(org)
         tables_in_scope, cte_rels = _resolve_cte_scope(tree, tables_in_scope, tidx)
         # A NEW list. `ctx.cardinality_index` is the model's own edges, shared across every guard
@@ -1908,7 +1914,7 @@ def _grain_preserving_source(key: str, bodies: dict[str, "exp.Expression"],
     return tables[0].name if name in tidx else None
 
 
-def _cte_edge(sel: "exp.Select", alias: str, cte_key: str, grain: list[str],
+def _cte_edge(conjuncts: list["exp.Expression"], alias: str, cte_key: str, grain: list[str],
               grains: dict[str, set[str]], scope_map: dict[str, str]) -> Optional[Relationship]:
     """The join edge between a grain-CHANGING CTE and the table it is joined to, or None.
 
@@ -1922,6 +1928,10 @@ def _cte_edge(sel: "exp.Select", alias: str, cte_key: str, grain: list[str],
     finer than the join key — `GROUP BY order_id, product_id` joined on `order_id` alone — it is
     many rows per joined row and the fan is real. That difference is the whole reason this returns
     an edge instead of abstaining, and it is `infer_cardinality` that reads it off the grains.
+
+    `conjuncts` is every join predicate of the enclosing SELECT, already flattened over AND by the
+    caller. It is passed in rather than derived because it is the same list for every alias in one
+    SELECT, and deriving it here would re-walk the joins once per grain-changing CTE.
 
     Three ways to decline, each an honest `undetermined` rather than a guess:
 
@@ -1939,17 +1949,16 @@ def _cte_edge(sel: "exp.Select", alias: str, cte_key: str, grain: list[str],
     module-load import closure — pinned by `tests/test_plugin_lib_resolution.py` — is untouched.
     """
     pairs: list[tuple["exp.Column", "exp.Column"]] = []
-    for on in _all_join_predicates(sel):
-        for conjunct in _and_conjuncts(on):
-            if not isinstance(conjunct, exp.EQ):
-                continue
-            left, right = conjunct.this, conjunct.expression
-            if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
-                continue
-            if left.table == alias:
-                pairs.append((left, right))
-            elif right.table == alias:
-                pairs.append((right, left))
+    for conjunct in conjuncts:
+        if not isinstance(conjunct, exp.EQ):
+            continue
+        left, right = conjunct.this, conjunct.expression
+        if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+            continue
+        if left.table == alias:
+            pairs.append((left, right))
+        elif right.table == alias:
+            pairs.append((right, left))
     if len(pairs) != 1:
         return None
     near, far = pairs[0]
@@ -1976,6 +1985,14 @@ def _resolve_cte_scope(sel: "exp.Select", scope_map: dict[str, str],
     CTE BODIES are collected here because nothing else needs them: `_cte_body_scopes` answers which
     CTE a reference sits IN, which is the opposite question.
 
+    They come off `sel.root()`, and the JOIN PREDICATES do not. A WITH sits above a set operation
+    and binds its name for every arm, so an arm that reads `oi` is reading a name declared outside
+    itself and looking for it inside the arm finds nothing — measured: a UNION arm joining a
+    grain-preserving CTE reported `not_multiplied` over a fan, on both the resolvable and the
+    unreadable shape. `_aggregate_reports` reads `_cte_names` off the root for exactly this reason.
+    The join predicates stay the arm's own, because which rows an arm joins is a fact about that
+    arm, and folding two arms' joins together is the defect ACE-099 and ACE-043 exist to prevent.
+
     Three outcomes per reference, and they are the three a caller can act on:
 
     * a grain-preserving CTE rebinds to the table it hands back, and the model's declared edges then
@@ -1998,8 +2015,9 @@ def _resolve_cte_scope(sel: "exp.Select", scope_map: dict[str, str],
     that decides its cardinality folds on the way in.
     """
     bodies = {_tkey(cte.alias_or_name): cte.this
-              for cte in sel.find_all(exp.CTE) if cte.this is not None}
+              for cte in sel.root().find_all(exp.CTE) if cte.this is not None}
     grains = {key: set(table.grain or []) for key, (table, _area) in tidx.items()}
+    conjuncts = [c for on in _all_join_predicates(sel) for c in _and_conjuncts(on)]
     resolved = dict(scope_map)
     derived: list[Relationship] = []
     for alias, written in scope_map.items():
@@ -2013,7 +2031,7 @@ def _resolve_cte_scope(sel: "exp.Select", scope_map: dict[str, str],
         group = bodies[key].args.get("group")
         keys = list(group.expressions) if group is not None else []
         grain = [k.name for k in keys] if keys and all(isinstance(k, exp.Column) for k in keys) else []
-        edge = _cte_edge(sel, alias, written, grain, grains, resolved) if grain else None
+        edge = _cte_edge(conjuncts, alias, written, grain, grains, resolved) if grain else None
         if edge is None:
             resolved[alias] = ""
             continue
