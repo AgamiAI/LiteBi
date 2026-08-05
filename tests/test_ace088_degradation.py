@@ -227,7 +227,7 @@ def test_the_two_builders_report_a_missing_model_with_one_sentence(monkeypatch, 
     assert forked == in_process
 
 
-def test_the_four_reasons_are_four_different_sentences():
+def test_the_five_reasons_are_five_different_sentences():
     """Collapsing any two of these would reintroduce the defect one layer down: a caller reading
     "could not be established" cannot act, while "the runtime is not installed in this deployment"
     tells them exactly what to change.
@@ -235,14 +235,22 @@ def test_the_four_reasons_are_four_different_sentences():
     `RECEIPT_BEFORE_MODEL` is the fourth and it is not a degradation at all — a model may resolve
     perfectly for a statement a pre-model gate refused — so borrowing "no model could be resolved"
     for it would report a deployment problem that is not happening.
+
+    `RECEIPT_GOVERNANCE_DISABLED` is the fifth, and it may not borrow any of the four for that same
+    argument: each of them names a cause, and on its path none of those causes is happening. The
+    runtime imports, a model resolves, the assembler works and the statement was not refused. What
+    happened is that a deployment turned the semantic-model pass off, so the gates never ran. This
+    assertion going from four to five is a deliberate contract change rather than a weakening: a
+    fifth cause exists now, and every property the four were held to still applies to it.
     """
     reasons = {
         guardrail.RECEIPT_NO_RUNTIME,
         guardrail.RECEIPT_NO_MODEL,
         guardrail.RECEIPT_BUILD_FAILED,
         guardrail.RECEIPT_BEFORE_MODEL,
+        guardrail.RECEIPT_GOVERNANCE_DISABLED,
     }
-    assert len(reasons) == 4
+    assert len(reasons) == 5
     assert all(r.strip().endswith(".") for r in reasons), "they surface next to an answer"
     assert all("ACE-" not in r for r in reasons), "no internal spec id ships to a user"
 

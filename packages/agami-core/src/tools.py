@@ -621,13 +621,17 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
     from execute_sql import _governance_enforced, _hosted  # sibling module; no import cycle
 
     if _hosted() and not _governance_enforced():
-        # ACE-101, first statement here too — and this side is the more dangerous of the two. The
+        # ACE-101, first statement here too, and this side is the more dangerous of the two. The
         # in-process twin reaches a `_guard_model is None` branch and reports a FALSE cause; this one
-        # does not read `_guard_model` at all. It resolves the model itself, one line down, and on a
-        # deployment with the pass off that resolve SUCCEEDS — so left alone it would assemble a full,
-        # clean receipt describing checks that never ran. A receipt that reads as clean is exactly what
-        # the fifth reason exists to prevent, and it would also make the fork path and the in-process
-        # path describe one call two different ways, which REQ-002 forbids.
+        # does not read `_guard_model` at all. It resolves the model itself, one line down, and when
+        # that model is deployed to the STORE — the normal hosted shape, since `_load_org` reads the DB
+        # and raises rather than falling back to disk once `AGAMI_DB_URL` is set — the resolve succeeds
+        # with the pass off. Left alone it would then assemble a full, CLEAN receipt describing checks
+        # that never ran, which is exactly what the fifth reason exists to prevent, and it would make
+        # the fork path and the in-process path describe one call two different ways (REQ-002).
+        #
+        # On a hosted deployment whose model is only on disk the resolve raises instead and the arm
+        # below answers `RECEIPT_NO_MODEL` — still a false cause, just a quieter one.
         return undetermined_receipt(RECEIPT_GOVERNANCE_DISABLED)
     try:
         org = get_cached_org(profile)
