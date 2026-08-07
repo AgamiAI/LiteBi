@@ -1,0 +1,53 @@
+-- Make the audit row enough to reproduce the judgement without the database (ACE-098, principle 7).
+-- 014 gave the row a verdict — which of `ok` / `refused` / `failed`, and for a refusal which rule
+-- under which reason. That says WHAT was decided. It does not say what the decision was made
+-- against, nor what the caller was told, so nobody could take a row and re-derive it. Three columns
+-- close that:
+--
+--   detail         The refusal's own sentence. Principle 9 carves the two RUNTIME bounds out of the
+--                  re-derivation bar and says their record "states that a bound fired, which one,
+--                  and what it was set to". The row could not say which one or what it was set to:
+--                  the statement timeout and the result bound share ONE rule id
+--                  (`resource_limit`, deliberately — ACE-087 keeps one rule with one emit site) and
+--                  `reason` + `rule` were the whole of the row. `Refusal.detail` already holds the
+--                  distinction and the configured number, and was simply never written down.
+--   receipt        Everything principle 6 reported, verbatim, as the `Receipt` JSON — all five
+--                  sections including their `undetermined` markers. 7c requires it, and the marker
+--                  is the half that matters: a section that was never checked has to keep saying so
+--                  in the record, or the audit trail turns "nobody looked" into "nothing wrong" all
+--                  over again.
+--   model_version  The version the judgement was made against.
+--
+-- MODEL_VERSION IS DELIBERATELY STORED TWICE. It is inside the receipt JSON as well, and that is
+-- not redundancy to be cleaned up: a replay has to be able to SELECT on the version — find every
+-- row judged against a model, or detect that a re-derivation ran against a different one — and a
+-- value buried in a JSON blob cannot be filtered or joined on portably across SQLite and Postgres.
+-- The column is the queryable copy; the receipt stays the verbatim record of what the caller saw,
+-- and decomposing it into columns would make it something other than that.
+--
+-- COLUMNS, NOT A SECOND TABLE — 014's argument, unchanged. All three are 1:1 with the execution and
+-- `Envelope.audit_id` IS `query_executions.id`, so a side table would be a join that can only ever
+-- match one row, keyed on an id that already lives here.
+--
+-- NULLABLE, all three, and NULL is a claim rather than a gap. `detail` is NULL on every non-refusal
+-- row because only a refusal has one. `receipt` and `model_version` are NULL on rows written before
+-- this migration ran, which is the same claim 014 made about `status`: written before the contract
+-- existed. A back-fill would be inventing history. `model_version` is additionally NULL where the
+-- receipt itself could not pin one — a deployment with no resolvable model — and that is a fact
+-- about the call worth keeping rather than a hole to fill.
+--
+-- BOUNDED BY THE WRITER, like `sql` (015) and `error_detail` (016) before it. `detail` is authored
+-- by us and value-free by the `Refusal` contract, but it echoes identifiers the caller sent, so the
+-- same argument applies: a statement must not become a way to grow the store
+-- (`tools.AUDIT_DETAIL_MAX_CHARS`). `receipt` is bounded upstream instead — `runtime._RECEIPT_MAX_REFS`
+-- caps the per-section reference count before the receipt is ever built, so the JSON has a ceiling
+-- by construction rather than by truncation, which matters because a truncated JSON blob does not
+-- parse and would be worse than no receipt at all.
+--
+-- Forward-only and portable (runs on SQLite + Postgres unchanged) — same shape as 016. No
+-- `IF NOT EXISTS`: SQLite's ALTER TABLE does not accept it, and re-run safety comes from the
+-- runner's `schema_migrations` ledger, which skips an applied file.
+
+ALTER TABLE query_executions ADD COLUMN detail TEXT;
+ALTER TABLE query_executions ADD COLUMN receipt TEXT;
+ALTER TABLE query_executions ADD COLUMN model_version TEXT;

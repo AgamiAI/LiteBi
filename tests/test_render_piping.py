@@ -115,9 +115,11 @@ def test_receipt_from_sql(tmp_path, capsys):
     I.introspect("shop", "postgres", runner=runner, artifacts_dir=tmp_path)
 
     args = types.SimpleNamespace(
-        root=str(tmp_path / "shop"), sql_file=None, applied_filters=None, freshness=None,
+        root=str(tmp_path / "shop"), sql_file=None, freshness=None,
         sql="SELECT c.id, COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id")
     cli.cmd_receipt(args)
     receipt = json.loads(capsys.readouterr().out)
-    assert {t["qname"] for t in receipt["tables_used"]} == {"public.customers", "public.orders"}
-    assert any("customers" in r["from_to"] for r in receipt["relationships"])
+    # The five sections are top-level keys beside the version pin — the same shape the MCP server
+    # emits, so `sm receipt` and the server describe one statement one way.
+    assert {t["qname"] for t in receipt["tables"]["items"]} == {"public.customers", "public.orders"}
+    assert any("customers" in r["from_to"] for r in receipt["joins"]["items"])

@@ -8,6 +8,7 @@ tool dispatch and lands in the log — the one piece of new wiring (a contextvar
 from __future__ import annotations
 
 import itertools
+import json
 import sys
 from pathlib import Path
 
@@ -72,6 +73,65 @@ def test_record_marks_error_body_and_exception(db):
     err_body, raised = _rows(db)
     assert err_body["success"] == 0 and err_body["error_kind"] == "syntax"
     assert raised["success"] == 0 and raised["error_kind"] == "exception"
+
+
+def test_record_marks_a_guardrail_failure_body_unsuccessful(db):
+    """`execute_sql` speaks the guardrail Envelope now, so a failed query arrives as
+    `{"status": "failed", "failure": {kind, message}}` rather than `{"error": {kind, remediation}}`.
+
+    The sink must read BOTH shapes: reading only the old one would log every failed query as a
+    success, which is a silent hole in the audit rather than a formatting change. (The other tools
+    still return the `{"error": …}` shape, pinned above.)"""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT nope FROM t"},
+        result_text='{"status": "failed", "failure": {"kind": "syntax", "message": "no column"}}',
+        execution_ms=3, actor="a",
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 0 and r["error_kind"] == "syntax"
+
+
+def test_record_marks_a_refusal_unsuccessful_and_names_the_rule(db):
+    """A refusal is `success=0`, carrying the rule that fired — restoring the pre-Envelope
+    operational semantics, and sharpening them.
+
+    Before the Envelope, a refusal came back as `{"error": {"kind": "permission", …}}`, which this
+    sink read through its `error` branch: `success=0`, `error_kind='permission'`. The Envelope moved
+    the verdict from `error` into `refusal`, and for a while nothing here read that key — so every
+    blocked query logged as a success and any dashboard counting blocked queries off
+    `tool_calls.success` would have gone to zero on deploy, with no error anywhere to notice it by.
+
+    (An earlier version of this test asserted `success=1` and said in its docstring that this
+    matched the old behaviour. It did not: `446cc20` derived `success=0, error_kind='permission'`
+    for exactly this body. The claim was wrong, so the test is rewritten rather than kept.)
+
+    `error_kind` is the rule rather than a fixed `'permission'`, which is strictly more information
+    than the old shape could carry — `table_scope` and `column_scope` were indistinguishable then.
+    `success` here means the caller's request was carried out, not that the server behaved
+    correctly; a refusal is the server behaving correctly AND the request not being carried out.
+    """
+    for rule in ("read_only", "table_scope"):
+        tools.record_tool_call(
+            name="execute_sql", arguments={"sql": "DELETE FROM t"},
+            result_text=json.dumps({"status": "refused", "refusal": {
+                "reason": "unsafe", "rule": rule, "detail": "d", "remediation": "r"}}),
+            execution_ms=1, actor="a",
+        )
+    rows = _rows(db)
+    assert [(r["success"], r["error_kind"]) for r in rows] == [(0, "read_only"), (0, "table_scope")]
+
+
+def test_record_falls_back_to_a_marker_when_a_refusal_names_no_rule(db):
+    """`Refusal.rule` is mandatory at construction, so a body without one did not come from the
+    contract. It is still unsuccessful — the fallback keeps the boolean right when the detail is
+    missing, rather than letting a malformed body read as a success."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "DELETE FROM t"},
+        result_text='{"status": "refused", "refusal": {"detail": "d"}}',
+        execution_ms=1, actor="a",
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 0 and r["error_kind"] == "refused"
 
 
 def test_record_logs_every_tool_with_null_self_report(db):
