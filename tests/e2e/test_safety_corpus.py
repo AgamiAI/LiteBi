@@ -1,0 +1,229 @@
+"""Every vector of the safety corpus, driven through the real `execute_sql` tool over HTTP.
+
+This is the file that makes the corpus a regression gate rather than a list. Each vector goes in as
+a `tools/call` on the authenticated `/mcp` endpoint and the serialized tool-edge body comes back,
+so what is asserted is what a caller actually receives — not what a gate returns to its own caller
+one frame in.
+
+**A refused vector asserts its RULE and its REASON, never merely that it was refused.**
+`status == "refused"` reads green while the gate that owns the rule never fires: the bracket-quoted
+star is the standing example, where column scope can answer for the star ban and the statement is
+still refused, by the wrong gate, for the wrong reason. So every refusal names the
+`guardrail.RULE_*` symbol it expects and takes its `reason` from `guardrail.REASON_FOR_RULE`, which
+keeps the contract's enum the only source of the pairing.
+
+The governed vectors are the other half and they are not decoration: they are what stops a
+tightening from buying safety by refusing valid SQL. Each asserts `ok`, the ABSENCE of a refusal,
+and a receipt carrying every declared section — iterated off `guardrail.Receipt.SECTIONS` so a
+section added to the contract is covered here the day it lands.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+TESTS_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = TESTS_ROOT.parent
+for _path in (
+    TESTS_ROOT,
+    Path(__file__).resolve().parent,
+    REPO_ROOT / "packages" / "agami-core" / "src",
+):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+import itdeps  # noqa: E402
+
+# The model stack every vector reads. `importorfail`, not `importorskip`, and the difference is the
+# whole point of the sentinel: with `sqlglot` unimportable, `pytest tests/e2e` came back
+# `4 passed, 6 skipped` and exit 0 — the job that runs on every PR passing having collected
+# almost none of the corpus it exists to run. Under `AGAMI_E2E_REQUIRED` that is now a failure.
+# Without it, still a skip, so a developer without the extras keeps a usable suite.
+itdeps.importorfail("pydantic", "sqlglot", "yaml", sentinel=itdeps.E2E_REQUIRED)
+
+import guardrail  # noqa: E402
+import harness  # noqa: E402
+
+from safety.corpus import CASES  # noqa: E402
+
+
+@pytest.fixture()
+def file_path(tmp_path, monkeypatch):
+    """The file-served model path: disk YAML + a SQLite warehouse, both built from `SCHEMA`."""
+    yield harness.build_file_path(tmp_path, monkeypatch)
+    harness.reset_injected_executor()
+
+
+def _params():
+    """One parameter per vector, carrying the `http_path` MARKER and its own strict-xfail marker
+    where this branch is red.
+
+    `http_path` is what puts this file inside the collection and session sentinels in `conftest.py`,
+    and it was the one half of the corpus outside them. The DB-path count made a thinned
+    parametrization visible and said nothing at all about a run that kept the DB half and dropped
+    this file: `--deselect tests/e2e/test_safety_corpus.py` removed every vector of the every-PR
+    half and the session still exited 0. Counted off `safety.corpus.EXPECTED_HTTP_VECTORS`, which is
+    derived from `CASES`, so it cannot be edited into agreement with a thinned corpus.
+
+    The xfail marker is applied here off `Case.red_on_main` for the same reason, so the red set is a
+    property of the corpus rather than a decoration a later edit can add to a vector that already
+    passes. `strict` cuts both ways on purpose: when the owning gate lands, the vector flips green
+    and this file fails until the marker is removed, so nobody has to re-read a spec to notice.
+    """
+    return [
+        pytest.param(
+            case,
+            marks=[
+                pytest.mark.http_path,
+                pytest.mark.xfail(
+                    strict=True, reason="the gate that closes this has not landed"
+                ),
+            ],
+            id=case.id,
+        )
+        if case.red_on_main
+        else pytest.param(case, marks=pytest.mark.http_path, id=case.id)
+        for case in CASES
+        if case.runs_on(harness.ENGINE)
+    ]
+
+
+@pytest.mark.parametrize("case", _params())
+def test_the_chokepoint_gives_each_vector_its_own_rule_over_http(file_path, case, monkeypatch):
+    """The whole corpus, one vector at a time, on the transport the hosted deployment serves."""
+    if case.rule == guardrail.RULE_RESOURCE_LIMIT:
+        # The deployment ceiling, lowered on the harness's server process for the two vectors that
+        # exist to reach it. There is no per-call cap to lower any more, and lowering it for the
+        # whole session would turn the governed vectors into availability refusals — they return
+        # more rows than this ceiling by design.
+        monkeypatch.setenv("AGAMI_SQL_MAX_ROWS", str(harness.LOW_ROW_CAP))
+
+    body = harness.route_http(case.sql)
+
+    _assert_verdict(body, case)
+
+
+def _assert_verdict(body: dict, case) -> None:
+    """The two halves of the contract, asserted the same way for every vector."""
+    if case.rule is None:
+        assert body["status"] == "ok", body
+        # Not "the refusal is empty" — the key is absent. A caller distinguishing the two would be
+        # reading a shape the tool edge does not emit.
+        assert "refusal" not in body, body
+        # And it returned DATA. Without this the no-false-refusal half is provable against an empty
+        # result set: a gate that let the statement through to a warehouse that answered with
+        # nothing would satisfy every assertion above.
+        assert body["row_count"] > 0, body
+        receipt = body["receipt"]
+        for section in guardrail.Receipt.SECTIONS:
+            assert section in receipt, (section, receipt)
+            assert set(receipt[section]) == {"items", "undetermined"}, (section, receipt)
+        return
+
+    assert body["status"] == "refused", body
+    refusal = body["refusal"]
+    assert refusal["rule"] == case.rule, body
+    assert refusal["reason"] == guardrail.REASON_FOR_RULE[case.rule], body
+    # And it handed back NOTHING. This is the highest-consequence failure the corpus could catch —
+    # "refused, and the rows came back anyway" — so it is asserted on every refusal rather than on
+    # the one class that happened to have a test for it. The rule and reason above are the
+    # precondition: without them "the body has no rows" would pass on any refusal at all.
+    for key in harness.RESULT_KEYS:
+        assert key not in body, (key, body)
+
+
+def test_every_receipt_section_says_something_on_some_governed_vector(file_path):
+    """The section assertion above is about SHAPE, and shape is not content.
+
+    `_assert_verdict` compares each section's KEYS to `{"items", "undetermined"}`, which an
+    assembler returning `{"items": [], "undetermined": None}` for all five sections satisfies on
+    every governed vector. That was measured: the fabricated all-empty receipt passed unchanged.
+    `harness.write_model` spends eighty lines building a deliberately rich model — a declared
+    relationship, an unreviewed metric, an AI-written column description, a default filter and a row
+    estimate — for exactly this reason, and nothing enforced that any of the richness arrived.
+
+    So: every section the contract declares carries a non-empty `items` on at least ONE governed
+    vector. Not on every vector, which would be false and should be — a projection has no joins and
+    no aggregates, and a receipt that invented some would be worse than one that reported none. The
+    failure message names the sections that came back empty everywhere AND which vectors populated
+    each of the others, so an assembler that stopped reporting joins says so in one line.
+    """
+    populated: dict[str, list[str]] = {section: [] for section in guardrail.Receipt.SECTIONS}
+    for case in (c for c in CASES if c.rule is None and c.runs_on(harness.ENGINE)):
+        receipt = harness.route_http(case.sql)["receipt"]
+        for section in guardrail.Receipt.SECTIONS:
+            if receipt[section]["items"]:
+                populated[section].append(case.note)
+
+    silent = sorted(section for section, notes in populated.items() if not notes)
+    assert not silent, (silent, populated)
+
+
+# ---------------------------------------------------------------------------
+# Keeping the corpus honest
+# ---------------------------------------------------------------------------
+
+
+# The rules NO vector in this corpus can produce, each named individually with the reason it is
+# exempt. Deliberately a list of three rather than "whatever the corpus does not happen to cover":
+# the assertion below is an equality against `REASON_FOR_RULE` minus this set, so a rule that stops
+# being exercised has to be added here, in the open, with a reason.
+#
+#   * `model_unavailable` needs a deployment with no resolvable model, which is a configuration
+#     rather than a statement. Covered per path by
+#     `test_safety_corpus_db_path.py::test_the_served_path_refuses_when_its_model_is_gone` and its
+#     local counterpart.
+#   * `audit_unavailable` needs a deployment whose audit store will not open, likewise a
+#     configuration. Covered by `test_safety_envelope.py` on the package surface and by
+#     `test_vendored_surface_parity.py` on the plugin's.
+#   * `engine_mismatch` is covered by NOTHING yet. It is named here rather than quietly folded into
+#     the corpus because an exemption with a reason is a known gap and an unnamed one is an
+#     accident: it fires when the model's declared `storage_type` disagrees with the engine the
+#     credentials connect to, which every harness build is careful to keep in step — so provoking it
+#     means building a deliberately mismatched model, which no test does.
+_RULES_NO_VECTOR_CAN_PRODUCE = frozenset(
+    {
+        guardrail.RULE_MODEL_UNAVAILABLE,
+        guardrail.RULE_AUDIT_UNAVAILABLE,
+        guardrail.RULE_ENGINE_MISMATCH,
+    }
+)
+
+
+def test_the_corpus_is_the_shape_the_coverage_claim_rests_on():
+    """The parametrization above is only as good as the list it reads.
+
+    Four facts a thinned corpus would quietly lose: the vector count, the governed vectors that
+    carry the no-false-refusal half, that ids are unique, and — the one that was not being checked —
+    that the rules the corpus exercises are EXACTLY the pinned vocabulary minus a named exemption
+    list.
+
+    That last assertion used to be `expected_rules <= set(REASON_FOR_RULE)`, a subset check, which
+    is satisfied by a corpus covering one rule. It was measured passing while four pinned rules had
+    no vector at all, `unparseable` among them — a rule with two live producers and the canonical
+    bypass class for this architecture, since a statement the guard and the engine read differently
+    is exactly how a gate gets walked around. An equality is what turns "this rule has no vector"
+    from an invisible state into a red build.
+    """
+    assert len(CASES) == 84
+    assert len([c for c in CASES if c.rule is None]) == 16
+    expected_rules = {c.rule for c in CASES if c.rule is not None}
+    assert expected_rules == set(guardrail.REASON_FOR_RULE) - _RULES_NO_VECTOR_CAN_PRODUCE
+    assert len({c.id for c in CASES}) == len(CASES), "a duplicate id would silently drop a vector"
+
+
+def test_no_vector_is_red_and_the_red_set_is_empty_on_purpose():
+    """A strict xfail that PASSES fails the build, so the red set is a claim about this branch and
+    has to be exactly right. Right now it is empty: every vector's owning gate has landed.
+
+    It was not empty an hour ago. The table function and the comma-joined VALUES were both red,
+    and both flipped green when the scopable gate merged mid-build — the strict markers failed the
+    suite on the rebase, which is the whole reason they are strict. Keep this assertion exact
+    rather than loosening it to a subset check: an empty expected set is what makes a NEW red
+    vector, silently added later, fail here instead of blending in.
+    """
+    assert {c.note for c in CASES if c.red_on_main} == set()
+    assert not any(c.red_on_main for c in CASES if c.cls == "quoting")

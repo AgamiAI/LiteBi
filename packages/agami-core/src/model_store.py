@@ -395,11 +395,17 @@ class DbActivitySink:
         self._store = store
 
     def record_query_execution(self, record: Any) -> None:
+        # The row's key is the caller's `record.id`, NOT a uuid minted here. It is the `audit_id` the
+        # guardrail Envelope already handed back with the answer, so the caller can look up the row
+        # recording its own query. Minting one here (as this did) discarded it inside the INSERT,
+        # which made the id unreferenceable the moment it existed.
         self._store.execute(
             "INSERT INTO query_executions (id, ts, org_id, datasource, question, sql, row_count, "
-            "source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "source, status, reason, rule, sql_truncated, error_detail, detail, receipt, "
+            "model_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                uuid4().hex,
+                record.id,
                 record.ts,
                 _record_org(record),
                 record.profile,
@@ -407,6 +413,21 @@ class DbActivitySink:
                 record.sql,
                 record.row_count,
                 record.source,
+                record.status,
+                record.reason,
+                record.rule,
+                # A portable 0/1 rather than a boolean literal — the same reason `record_tool_call`
+                # below writes `success` that way (SQLite has no boolean type).
+                1 if getattr(record, "sql_truncated", False) else 0,
+                # The raw driver error, operator-only. NULL on the forked surface, where the
+                # chokepoint holding it and this recorder are different processes (ACE-039).
+                getattr(record, "error_detail", None),
+                # The three that make the row re-derivable (ACE-098). `getattr` with a default like
+                # the two above, so a caller still on the older record shape writes NULLs rather
+                # than raising — the same tolerance `error_detail` and `sql_truncated` already have.
+                getattr(record, "detail", None),
+                getattr(record, "receipt", None),
+                getattr(record, "model_version", None),
             ),
         )
         self._store.commit()
@@ -446,7 +467,7 @@ class DbActivitySink:
 
 _TOOL_CALL_COLS = (
     "id, ts, actor, tool_name, datasource, sql, row_count, execution_ms, success, error_kind, "
-    "user_question, agent_query, thread_id, correlation_id"
+    "user_question, agent_query, thread_id, correlation_id, source"
 )
 
 
@@ -478,9 +499,30 @@ def _group_turns(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "question": question,
                 "started": tc[0]["ts"],
                 "calls": tc,
+                "question_self_reported": _question_is_self_reported(tc),
             }
         )
     return turns
+
+
+def _question_is_self_reported(calls: list[dict[str, Any]]) -> bool:
+    """Whether a turn's `question` is the model's own claim rather than something the caller observed.
+
+    On the transport path the question is copied out of the tool arguments the model wrote, so it is a
+    self-report; a caller that dispatches handlers itself can state it authoritatively instead, and says
+    so by recording a different `source`. **Fails toward self-reported:** an unset source (rows written
+    before the column existed) and a turn whose calls disagree both count as self-reported, because the
+    marker signals *lower* trust and the honest thing under uncertainty is to keep showing it.
+
+    "Disagree" means the calls do not all carry the SAME source — not merely that one of them is the
+    default. A turn mixing two different non-default sources is just as ambiguous about who captured
+    the question, and dropping the marker there would overstate the trust rather than understate it.
+    An empty turn has no evidence at all, so it keeps the marker too."""
+    from tools import DEFAULT_CALL_SOURCE  # lazy: keeps the stdlib-lean base install importable
+
+    sources = {(c.get("source") or DEFAULT_CALL_SOURCE) for c in calls}
+    # Only one case drops the marker: every call agreeing on a single, non-default source.
+    return len(sources) != 1 or DEFAULT_CALL_SOURCE in sources
 
 
 def list_sessions(

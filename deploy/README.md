@@ -21,7 +21,7 @@ exposed ports.
 ## Deploy (the secure VM bundle — the default)
 ```bash
 git clone <this repo> && cd <repo>/deploy
-cp agami.env.example agami.env            # then edit: PUBLIC_BASE_URL (your hostname), admin email + password, DATASOURCE_URL (use a read-only DB user — see Security notes)
+cp agami.env.example agami.env            # then edit: PUBLIC_BASE_URL (your hostname), admin email + password, DATASOURCE_URL (point at a read-only DB role — required; see Security notes)
 ln -s /path/to/your/agami-artifacts ./artifacts   # or set AGAMI_ARTIFACTS_DIR in agami.env
 ./deploy.sh                     # validates agami.env, generates the signing secret, builds + starts
 ```
@@ -51,9 +51,14 @@ re-ingests the model on boot. **No rebuild, no new VM, no database access** — 
   gated by per-user OAuth. Both need the HTTPS that Caddy provides.
 - `agami.env` holds the signing secret and DB creds — it stays on your host and is never committed. **No data ever
   leaves your environment.**
-- **Use a read-only warehouse user** in `DATASOURCE_URL` — agami only runs read-only SELECTs and never needs
-  write access, so a read-only user is the safest thing to connect. Copy-paste `GRANT SELECT` SQL per database
-  is in [../plugins/agami/shared/readonly-grants.md](../plugins/agami/shared/readonly-grants.md).
+- **Point `DATASOURCE_URL` at a read-only database role — this is the required posture for a deploy, not
+  just a nicety.** agami only ever runs read-only SELECTs against your datasource, and the read-only role is
+  the primary, non-bypassable control: a login that can only `SELECT` can't write, run DDL, `COPY`, reach
+  files/network, or touch another database even if the app-layer guard were bypassed. Copy-paste
+  `CREATE ROLE` / `GRANT SELECT` SQL per engine — and the app-role vs operator-role split — is in
+  [../plugins/agami/shared/readonly-grants.md](../plugins/agami/shared/readonly-grants.md). This is your
+  **datasource** role; agami's own store (`APP_DATABASE_URL`) is a *separate* database and keeps its normal
+  **read-write** user.
 - **Always deploy via `./deploy.sh`** (it runs the preflight). If you `docker compose up` directly without
   having run the preflight, `AGAMI_PUBLIC_HOST` is unset and Caddy fails to start (loudly, never insecurely) —
   run `python -m deploy_preflight agami.env` first.

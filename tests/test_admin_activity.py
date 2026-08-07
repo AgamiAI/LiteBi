@@ -39,6 +39,17 @@ def _call(s, **kw):
     DbActivitySink(s).record_tool_call(ToolCallRecord(**rec))
 
 
+def _observed(s, **kw):
+    """A call an embedder dispatched itself, so the grouping fields were observed rather than
+    self-reported. Any non-default `source` means that; the value is the embedder's to choose."""
+    _call(s, source="embedded", **kw)
+
+
+def _just_after(html: str, needle: str, n: int = 200) -> str:
+    """The rendered text immediately following `needle` — where a per-question marker would sit."""
+    return html[html.index(needle) : html.index(needle) + n]
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     url = "sqlite://" + str(tmp_path / "activity.db")
@@ -397,3 +408,89 @@ def test_server_instructions_say_pass_ids_on_every_call():
     import tools
 
     assert "EVERY tool call" in tools.SERVER_INSTRUCTIONS
+
+
+# --- provenance on the turn question -----------------------------------------
+
+
+def test_the_question_marker_tracks_who_reported_it(client, env):
+    """One test, both paths, deliberately: the marker is a trust signal, and a change to either path
+    that silently flipped the other would be exactly the regression worth catching.
+
+    On the transport path the question is copied out of the model's own tool arguments, so it is a
+    self-report and says so. A caller that dispatched the tool itself observed the question directly;
+    there the marker would understate the trust, so it is dropped."""
+    s = Store.connect(env)
+    _call(s, ts="2026-06-28T10:00:00Z", actor="jordan@example.com", sql="Q1", success=True,
+          thread_id="t-mcp", correlation_id="c-mcp", user_question="reported by the model",
+          agent_query="the model's framing")
+    _observed(s, ts="2026-06-28T10:05:00Z", actor="jordan@example.com", sql="Q2", success=True,
+              thread_id="t-obs", correlation_id="c-obs", user_question="observed by the caller",
+              agent_query="still the model's framing")
+    s.close()
+    _login(client)
+    html = client.get("/admin?tab=activity").text
+    assert "reported by the model" in html and "observed by the caller" in html
+    # exactly one turn still carries the marker...
+    assert html.count("· self-reported") == 1
+    # ...and it is the transport one. Checked on the text just after each question rather than by
+    # position: sessions render newest-first, so the two turns' order is not the insertion order.
+    assert "· self-reported" in _just_after(html, "reported by the model")
+    assert "· self-reported" not in _just_after(html, "observed by the caller")
+    # `· agent-reported` is about the agent's framing, not the question — it stays on BOTH paths
+    assert html.count("· agent-reported") == 2
+
+
+def test_a_turn_whose_calls_disagree_keeps_the_marker(env):
+    """The marker signals *lower* trust, so an ambiguous turn keeps it rather than losing it."""
+    s = Store.connect(env)
+    _call(s, ts="2026-06-28T11:00:00Z", actor="a", sql="Q1", success=True,
+          thread_id="t", correlation_id="c", user_question="mixed turn")
+    _observed(s, ts="2026-06-28T11:00:01Z", actor="a", sql="Q2", success=True,
+              thread_id="t", correlation_id="c")
+    (session,) = model_store.list_sessions(s)
+    s.close()
+    (turn,) = session["turns"]
+    assert turn["question_self_reported"] is True
+
+
+def test_a_row_written_before_the_source_column_counts_as_self_reported(env):
+    """Old rows have no source at all. Absent evidence, keep the marker."""
+    s = Store.connect(env)
+    s.execute(
+        "INSERT INTO tool_calls (id, ts, org_id, tool_name, success, thread_id, correlation_id, "
+        "user_question) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("legacy-1", "2026-06-28T12:00:00Z", "local", "execute_sql", 1, "t", "c", "from before"),
+    )
+    s.commit()
+    (session,) = model_store.list_sessions(s)
+    s.close()
+    assert session["turns"][0]["question_self_reported"] is True
+
+
+def test_a_turn_mixing_two_non_default_sources_still_counts_as_self_reported(env):
+    """"Disagree" means the calls do not all carry the SAME source — not merely that one of them is
+    the transport's. A turn mixing two different non-default sources is just as ambiguous about who
+    captured the question, and dropping the marker there would OVERSTATE the trust, which is the one
+    direction this must never fail in."""
+    s = Store.connect(env)
+    _observed(s, ts="2026-06-28T13:00:00Z", actor="a", sql="Q1", success=True,
+              thread_id="t", correlation_id="c", user_question="mixed non-default sources")
+    _call(s, ts="2026-06-28T13:00:01Z", actor="a", sql="Q2", success=True, source="another-embedder",
+          thread_id="t", correlation_id="c")
+    (session,) = model_store.list_sessions(s)
+    s.close()
+    (turn,) = session["turns"]
+    assert turn["question_self_reported"] is True
+
+
+def test_a_turn_with_one_agreed_non_default_source_drops_the_marker(env):
+    """The only case that drops it: every call agreeing on a single non-default source."""
+    s = Store.connect(env)
+    _observed(s, ts="2026-06-28T14:00:00Z", actor="a", sql="Q1", success=True,
+              thread_id="t2", correlation_id="c2", user_question="all observed")
+    _observed(s, ts="2026-06-28T14:00:01Z", actor="a", sql="Q2", success=True,
+              thread_id="t2", correlation_id="c2")
+    (session,) = model_store.list_sessions(s)
+    s.close()
+    assert session["turns"][0]["question_self_reported"] is False

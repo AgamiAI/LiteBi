@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agami-core"
-version = "0.5.0"
+version = "0.5.3"
 description = "agami-core — governed semantic model, the shared MCP TOOLS harness, and the unified local query executor."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,7 +51,7 @@ server = [
 package-dir = { "" = "src" }
 # Flat top-level modules (not under a parent package) — listed explicitly so the import
 # names stay flat regardless of disk layout.
-py-modules = ["agami_paths", "async_offload", "execute_sql", "sql_guard", "mcp_harness", "mcp_http", "tools", "ports", "contracts", "oss_adapters", "store", "model_store", "model_deploy", "deploy_preflight", "oauth_server", "oidc", "passwords", "user_store", "admin", "ui", "onboarding"]
+py-modules = ["agami_paths", "async_offload", "execute_sql", "guardrail", "sql_guard", "mcp_harness", "mcp_http", "tools", "ports", "contracts", "oss_adapters", "store", "model_store", "model_deploy", "deploy_preflight", "oauth_server", "oidc", "passwords", "user_store", "admin", "ui", "onboarding"]
 # `static` (brand assets served at /static) and `migrations` (the core schema) are DATA, not import
 # targets — but both must land NEXT TO the flat modules in site-packages, because mcp_http and store
 # resolve them as `Path(__file__).parent / …`. Shipping them as packages with their files as

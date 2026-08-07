@@ -1,10 +1,25 @@
 # Read-only database user — copy-paste grants
 
-agami only ever runs **read-only SELECT** queries (query generation refuses `INSERT` / `UPDATE` / `DELETE` / DDL, and the local MCP server double-checks every statement). So the safest thing to connect it to is a **read-only user** that can read your data and nothing else. It's optional — read-write credentials work too — but recommended, especially against a production database.
+agami only ever runs **read-only SELECT** queries against your datasource: query generation refuses `INSERT` / `UPDATE` / `DELETE` / DDL, and the server's app-layer guard double-checks every statement. But that guard is defense-in-depth on top of the real boundary — **the database login agami connects as.** A role that can only `SELECT` is *physically* unable to write, run DDL, `COPY` to/from files, call server-side network functions, or reach another database, so a bug in the app guard cannot grant what the role does not have. That makes the read-only role the **primary, non-bypassable** safety control.
 
-Create the user with one of the blocks below, then put **its** credentials in your profile: the `user` / `password` (or `url = …`) in `<artifacts_dir>/local/credentials` for the single-player flow, or the `DATASOURCE_URL` in `agami.env` for a self-host deploy.
+## Which posture applies to you
 
-Replace the `<…>` placeholders — `<password>`, `<db>`, `<schema>`, `<warehouse>`, `<catalog>`, `<project>`, `<dataset>`, and the `agami_ro` user/role name — with your values (each block uses only some of them). For **multiple schemas**, repeat the `USAGE` + `SELECT` grants once per schema.
+- **Single-player (local `credentials`).** A read-only user is **strongly recommended** — especially against a production database — but read-write credentials also work; agami never uses the write.
+- **Hosted / self-host deploy (`DATASOURCE_URL`).** A read-only role is a **requirement**, not a suggestion. The deployed server points `DATASOURCE_URL` at a **SELECT-only role**, and **any writes stay on a separate, privileged identity.** agami never migrates or loads your datasource — your own owner / ETL / migration role does that, and it must not be the login you hand agami. **Never point `DATASOURCE_URL` at owner or admin credentials.**
+
+> **agami's own store is a *different* database.** The read-only obligation here is about your **datasource** (`DATASOURCE_URL` — the data agami queries). agami's metadata store (`APP_DATABASE_URL` / `AGAMI_DB_URL`), which the server migrates on boot, is a **separate** database and needs its normal **read-write** user — do **not** make that one read-only.
+
+## What the role does and does not guarantee
+
+The read-only role is the **primary, non-bypassable** guarantee of **integrity and confinement**: SELECT-only means **no write / DDL / `COPY` / file access / server-side network call / cross-database reach** — and that holds even if the app-layer guard were bypassed. It does **not** bound a **runaway** query (a recursive CTE or cartesian join), and it does **not** stop schema/metadata **recon**. Those are the **app layer's** job, not the role's. The executor now bounds **how long** a statement runs (`AGAMI_SQL_TIMEOUT_S`, default 30 seconds — the statement is cancelled on the server and the caller gets a structured refusal, not a partial result) as well as **how many rows** one result may carry (`AGAMI_SQL_MAX_ROWS`, default 1000 — a result larger than that is likewise refused rather than trimmed, because an unordered prefix of a bigger result is an arbitrary sample, not a smaller answer), with a supervisor behind both for an executor that stops responding altogether. **Error-text and recon hardening are still not in place.** Two residuals are worth knowing about the time bound: on **BigQuery** it is the server-side job timeout alone, because a BigQuery query is a job with no connection to cancel; and a *per-statement* bound is not a *concurrency* bound, so enough simultaneous queries can still load a database. An operator who wants a bound that does not depend on agami at all can still set `statement_timeout` (or the engine's equivalent) on the role itself.
+
+**One consequence worth reading twice, because it lands exactly on the sentence above.** "The role does not stop schema/metadata recon, that is the app layer's job" assumes the app layer is doing it. On a **server** the part of the app layer that refuses catalog *relations* (`information_schema.tables`, `pg_catalog.pg_class`, `sqlite_master`) is the semantic-model pass, and that pass is **off by default** (`AGAMI_GOVERNANCE_ENFORCED`, see [self-hosting](../../../docs/self-hosting.md)). Catalog *functions* are refused in both postures. So on a default server neither layer stops schema enumeration: the grants below do not revoke catalog access, and none of these recipes adds a revoke, because catalog visibility is uneven across engines and revoking it breaks legitimate tooling. If schema enumeration matters in your environment, either turn the pass on or revoke catalog access on the role yourself.
+
+## Creating the role
+
+Create the user/role with one of the blocks below, then put **its** credentials where your setup reads them: the `user` / `password` (or `url = …`) in `<artifacts_dir>/local/credentials` for the single-player flow, or `DATASOURCE_URL` in `agami.env` for a deploy.
+
+Replace the `<…>` placeholders — `<password>`, `<db>`, `<schema>`, `<owner>`, `<warehouse>`, `<catalog>`, `<project>`, `<dataset>`, and the `agami_ro` user/role name — with your values (each block uses only some of them). For **multiple schemas**, repeat the `USAGE` + `SELECT` grants once per schema.
 
 ## PostgreSQL / Redshift
 
@@ -13,11 +28,23 @@ CREATE USER agami_ro WITH PASSWORD '<password>';
 GRANT CONNECT ON DATABASE <db> TO agami_ro;
 GRANT USAGE ON SCHEMA <schema> TO agami_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO agami_ro;
--- keep future tables readable too (run once per schema):
-ALTER DEFAULT PRIVILEGES IN SCHEMA <schema> GRANT SELECT ON TABLES TO agami_ro;
+-- keep future tables readable too (run once per schema). `FOR ROLE` names whoever CREATES the
+-- tables — your owner / ETL / migration role; without it the default only covers tables created
+-- by the role running this statement, so tables your ETL adds later stay invisible to agami_ro:
+ALTER DEFAULT PRIVILEGES FOR ROLE <owner> IN SCHEMA <schema> GRANT SELECT ON TABLES TO agami_ro;
 ```
 
 (Redshift uses the same statements. `<schema>` defaults to `public` if you didn't set one.)
+
+> **Optional hardening (PostgreSQL ≤ 14 / Redshift).** A fresh role inherits `CREATE` on schema `public`
+> and `TEMP` on the database from the built-in `PUBLIC` role — so, strictly, it could create *new* objects
+> (it still can't read or modify your existing data). To make it pure SELECT-only, once per database:
+> ```sql
+> REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+> REVOKE TEMP ON DATABASE <db> FROM PUBLIC;
+> ```
+> Note these affect **every** non-owner role on that database, not just `agami_ro`. PostgreSQL 15+ already
+> drops the public-schema `CREATE` default. Optional, not required (per the SELECT-only baseline).
 
 ## MySQL / MariaDB
 
@@ -109,6 +136,8 @@ bq add-iam-policy-binding --member="serviceAccount:agami-ro@<project>.iam.gservi
   --role="roles/bigquery.dataViewer" <project>:<dataset>
 ```
 
+Here the two IAM roles above **are** the whole guarantee — BigQuery has no SQL-level role to scope further and no role-level statement timeout. Confinement comes from `dataViewer` (read-only); runaway bounding is app-side, and BigQuery is the one engine where that bound is **server-side only** — a query here is a job that outlives the client, so agami sets the job's own timeout rather than cancelling a connection it does not have. A custom quota / maximum-bytes-billed is worthwhile extra defense on this engine in particular.
+
 ## SQLite / DuckDB
 
-File-based — there's no user or role. Safety comes from agami's **read-only SQL guard** (it refuses anything that isn't a `SELECT`) plus **filesystem permissions**. DuckDB files are additionally opened in read-only mode; SQLite is not, so for a hard guarantee point agami at a **read-only copy** of the file, or mark the file read-only for the account agami runs as.
+File-based — there's no user or role, so the **read-only file / read-only open is the whole guarantee** at this layer. Safety comes from agami's **read-only SQL guard** (it refuses anything that isn't a `SELECT`) plus **filesystem permissions**. DuckDB files are additionally opened in read-only mode; SQLite is not, so for a hard guarantee point agami at a **read-only copy** of the file, or mark the file read-only for the account agami runs as. (Runaway-query bounding is app-side, as above — the file mode only stops writes. On these two the cancel is genuine and in-process, so the time bound is as strong here as anywhere.)

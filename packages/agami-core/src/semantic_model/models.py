@@ -312,7 +312,20 @@ class Table(_Base):
     # provenance of `description` — drives "earn trust through use" (advisory, not a gate)
     description_source: Optional[DescriptionSource] = None
 
-    default_filters: list[str] = Field(default_factory=list)
+    # DESCRIPTIVE, NOT ENFORCED (ACE-042). Declaring a filter here states what the org means by
+    # this table (`{alias}.is_deleted = false`); it is business logic, not a disclosure control.
+    # It is not AND-ed into a statement before execution, so write the filter into the query
+    # yourself. ACE-099 made the outcome visible rather than the injection: the receipt reports,
+    # per table REFERENCE, which of these a statement applied, omitted, or left undetermined —
+    # scoped, so a filter satisfied inside a CTE body is not credited to the read outside it.
+    default_filters: list[str] = Field(
+        default_factory=list,
+        # Spec ids stay in the comment above rather than in `description`, which serializes into
+        # the published JSON schema and ships to clients where an id resolves to nothing.
+        description="Declared row filters for this table. Descriptive only: not applied to your "
+                    "SQL. The receipt reports, per table reference, which ones the statement "
+                    "applied and which it omitted.",
+    )
     caveats: list[str] = Field(default_factory=list)
 
     parent_table: Optional[str] = None

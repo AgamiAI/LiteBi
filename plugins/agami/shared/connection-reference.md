@@ -350,7 +350,7 @@ The `bq://` scheme also works. Query parameters `credentials_path` and `service_
 
 #### Cost note
 
-BigQuery bills per byte scanned (~$5 / TB). `INFORMATION_SCHEMA` queries are free, so introspection is cheap. Sample-row queries (for description generation, choice-field detection) ARE billed — the SKILL applies `LIMIT 100` aggressively and uses `TABLESAMPLE SYSTEM (1 PERCENT)` on tables > 1B rows. Runtime queries from `agami-query` are billed at whatever they scan; the receipt's `tables_used` row counts give the user visibility.
+BigQuery bills per byte scanned (~$5 / TB). `INFORMATION_SCHEMA` queries are free, so introspection is cheap. Sample-row queries (for description generation, choice-field detection) ARE billed — the SKILL applies `LIMIT 100` aggressively and uses `TABLESAMPLE SYSTEM (1 PERCENT)` on tables > 1B rows. Runtime queries from `agami-query` are billed at whatever they scan; the row estimates on the receipt's `tables.items[]` give the user visibility.
 
 #### Required IAM roles
 

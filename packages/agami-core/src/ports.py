@@ -1,4 +1,4 @@
-"""The five port Protocols — the seams adapters plug into.
+"""The four port Protocols — the seams adapters plug into.
 
 agami-core keeps one MCP implementation across deployments; deployment-specific behavior is
 swapped at the composition root through these ports, never by forking a tool:
@@ -6,7 +6,6 @@ swapped at the composition root through these ports, never by forking a tool:
   - ``ActivitySink``     — where query-execution records go (file by default)
   - ``OrgResolver``      — single vs multi tenancy as a config flag, not a schema fork
   - ``AuthProvider``     — bearer token → principal (presence by default)
-  - ``GovernancePolicy`` — warn-only by default; enforcement is a paid concern
   - ``Executor``         — the connect-and-run step, *behind* the shared guard (built-in by default;
                            a consumer injects a pooled/RBAC/tunnel executor without forking the guard)
 
@@ -14,7 +13,7 @@ These are **interfaces only** — `typing.Protocol`, so an adapter satisfies a p
 no import coupling back to core. The OSS default adapters live in ``oss_adapters`` (so the local
 product runs out of the box); a downstream consumer supplies its own.
 
-The seam value types (``Org`` / ``Principal`` / ``GovernanceVerdict``) are stdlib dataclasses, not
+The seam value types (``Org`` / ``Principal``) are stdlib dataclasses, not
 pydantic models, so this module imports with **zero dependencies** — a consumer can depend on the
 seams without pulling the model deps. The wire shapes that need validation (the 4-tool I/O) live
 in ``contracts`` (pydantic). Each type is kept minimal — only what a default adapter or a
@@ -23,7 +22,8 @@ consumer needs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -56,22 +56,22 @@ class Org:
 @dataclass(frozen=True)
 class Principal:
     """An authenticated caller. By default this is just token presence (one user); real
-    providers populate identity/claims."""
+    providers populate identity/claims.
+
+    `session_id` distinguishes CONCURRENT CLIENTS of the same subject — two windows under one login are
+    otherwise indistinguishable here, so anything the server remembers per-caller (an active selection, a
+    per-conversation binding) would be shared between them, last write wins. Optional because most auth
+    paths have no such notion: presence auth, a hand-minted bearer, and a username/password check all
+    leave it None, and a consumer must read it as "no session", never as an error. It is an identity, not
+    a liveness signal — see `oauth_server._session_id`.
+    """
 
     subject: str
-
-
-@dataclass(frozen=True)
-class GovernanceVerdict:
-    """The outcome of a governance check. The default is **warn-only** — ``allowed`` is always
-    True and ``warnings`` is advisory; only a paid enforcement tier may set allowed=False."""
-
-    allowed: bool = True
-    warnings: list[str] = field(default_factory=list)
+    session_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# The five ports
+# The four ports
 # ---------------------------------------------------------------------------
 
 
@@ -106,15 +106,6 @@ class AuthProvider(Protocol):
 
 
 @runtime_checkable
-class GovernancePolicy(Protocol):
-    """Evaluate a request and return a ``GovernanceVerdict`` (warnings; never blocks by default).
-
-    OSS default = warn-only ("basic governance warning"); enforcement is a paid tier."""
-
-    def evaluate(self, ctx: object | None = None) -> GovernanceVerdict: ...
-
-
-@runtime_checkable
 class Executor(Protocol):
     """Connect to a datasource and run **already-vetted** SQL — the only swappable part of the
     execution path. It runs *inside* the guarded envelope (guard → executor → shape/log), so it
@@ -124,7 +115,22 @@ class Executor(Protocol):
 
     ``profile`` is the datasource identity a pooling executor keys its reused connection on. The
     built-in OSS default (subprocess/direct connect-per-query) implements this same shape, so a
-    plain deploy is unchanged."""
+    plain deploy is unchanged.
+
+    Returns:
+        An ``ExecResult``. Returning ``None`` (or anything else) is a contract violation and is
+        reported to the caller as ``failed`` / ``other`` — never as a successful empty result.
+
+    Raises:
+        ``execute_sql.ExecutorError`` for a connect / credential / driver / run failure. That is the
+        classified channel: its ``code`` picks the ``Failure.kind`` the caller sees and its ``msg``
+        is relayed, so an adapter that wants a specific kind and a useful message raises this.
+
+        Any **other** exception is caught by ``execute_guarded`` and becomes ``failed`` / ``other``
+        with a generic, value-free message; the raw text and stack go to the server log only. So a
+        pooled executor's own ``PoolError`` is safe to raise — it will not escape the chokepoint and
+        it will not skip the audit row — but it will not reach the caller either. Prefer
+        ``ExecutorError``."""
 
     def execute(self, vetted_sql: str, creds: dict[str, str], *, profile: str) -> ExecResult: ...
 
@@ -139,11 +145,10 @@ class Adapters:
     """The port adapters, bundled so ``mcp_http.create_app`` takes them as one argument.
 
     A consumer builds this with its own implementations of the ports (its own ``OrgResolver``,
-    ``AuthProvider``, ``ActivitySink``, ``GovernancePolicy``, and optionally an ``Executor``);
+    ``AuthProvider``, ``ActivitySink``, and optionally an ``Executor``);
     passing ``adapters=None`` to ``create_app`` uses the OSS defaults (``mcp_http.default_adapters``).
     Today ``create_app`` wires ``auth_provider`` + ``org_resolver`` into the request path;
-    ``activity_sink`` + ``governance`` are carried here for consumers and not yet referenced by a
-    core call site.
+    ``activity_sink`` is carried here for consumers and not yet referenced by a core call site.
 
     ``executor`` is optional and defaults to ``None`` — meaning "use the built-in executor" (the
     subprocess/direct connect-per-query path, byte-identical to today). A consumer sets it to run
@@ -152,5 +157,12 @@ class Adapters:
     activity_sink: ActivitySink
     org_resolver: OrgResolver
     auth_provider: AuthProvider
-    governance: GovernancePolicy
     executor: Executor | None = None
+    # `tool_visibility(tool_name) -> bool` narrows the ADVERTISED tool surface per request. None (the
+    # default) is exactly today's behaviour — the whole registry, listed and callable. A registry
+    # assembled once at composition time cannot answer "may THIS caller see this tool", and for a
+    # consumer running a server-side agent that gap is the difference between a control and a
+    # suggestion: the model chooses what to call, so withholding the tool is the control. Subtractive
+    # only — it filters the one shared registry and never adds or reshapes a tool. See
+    # `mcp_http.build_server` for where it is applied (both list AND call, deliberately).
+    tool_visibility: Callable[[str], bool] | None = None

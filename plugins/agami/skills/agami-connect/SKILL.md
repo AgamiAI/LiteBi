@@ -539,12 +539,18 @@ Stash everything gathered (doc text + repo definitions) as `$DATA_MODEL_DOC_TEXT
 
 ```bash
 ts=$(date -u +%Y%m%d-%H%M%S)
-bash "$AGAMI_PLUGIN_ROOT/scripts/sm" discover \
+AGAMI_SQL_MAX_ROWS=200000 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" discover \
   --profile <profile> --db-type <db_type> \
   --artifacts "<artifacts_dir>" \
   --out "<artifacts_dir>/local/prune/<profile>/$ts.html" \
   [--schemas <selected_schemas…>]   # the 1.3 pick, if you narrowed schemas
 ```
+
+> **<a id="raised-cap"></a>Why the `AGAMI_SQL_MAX_ROWS` prefix — and why it must stay a prefix.** The executor **refuses** (never truncates) any result over the row cap, default 1000. That bound is sized for a *user query*, where a runaway is the thing it exists to stop. A **catalog read** blows past it on schema size alone — `information_schema.columns` for a 500-table catalog is tens of thousands of rows — and the engine **swallows that refusal silently**, degrading to one round-trip per table, or reporting "catalog enumeration denied" when the catalog was in fact readable. So the three commands that read catalog or dictionary tables — `discover` (1.6), `introspect` (1.7), `enrich-metadata` (2a.0) — run with a raised cap.
+>
+> - **Inline on the command, never `export`.** An exported value is still set when Phase 6 runs the demo *user* query, quietly raising the bound for exactly the caller it exists to hold. The inline form dies with the process.
+> - **Never on `seed-examples` (Phase 5).** That command validates SQL which later runs as a real user query; validating under a raised cap green-lights examples that get refused in production.
+> - **Tell the user you did it**, once, with the real numbers the commands print — and say their query-time cap is unchanged. See 2a.0 for the wording.
 
 It writes the inventory to `<artifacts_dir>/<profile>/.introspect/inventory.json`, renders a standalone **prune page**, and prints JSON with `table_count` + `prune_html`. (This page is a deliberately minimal, separate artifact — *not* the model explorer — so there's no description/metric/review machinery, just tables + columns + checkboxes.)
 
@@ -568,12 +574,14 @@ This is the deterministic core — it replaces hand-authoring tables/columns/FK 
 ```bash
 # write the kept allowlist to a file first (zsh-safe — no word-splitting to get wrong)
 printf '%s\n' incident problem change_request sys_user ... > /tmp/agami-keep.txt
-bash "$AGAMI_PLUGIN_ROOT/scripts/sm" introspect \
+AGAMI_SQL_MAX_ROWS=200000 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" introspect \
   --profile <profile> --db-type <db_type> \
   --artifacts "<artifacts_dir>" \
   [--tables-file /tmp/agami-keep.txt] \
   [--exclude-columns <schema.table.column list from 1.6>]
 ```
+
+(The raised cap is the same one 1.6 explains — [why](#raised-cap). Without it a large schema's `sql_tables` / foreign-key reads are refused, the engine swallows it, and you get a model with no join graph and no error to show for it.)
 
 `--tables-file` is the prune step's **kept set** (it also covers the no-catalog/probe-only case from 1.2). `--exclude-columns` marks the dropped columns excluded during the build — one validated write, no follow-up curate call. Omit both only when the user kept everything or skipped pruning. (If a table name is bogus / can't be described, the engine now drops it with a note and — if *nothing* describes — errors clearly instead of writing a partial model.)
 
@@ -583,7 +591,8 @@ bash "$AGAMI_PLUGIN_ROOT/scripts/sm" introspect \
    ```bash
    split -l 12 /tmp/agami-keep.txt /tmp/agami-batch-      # batch files
    for b in /tmp/agami-batch-*; do
-     bash "$AGAMI_PLUGIN_ROOT/scripts/sm" introspect --profile <p> --db-type <t> \
+     AGAMI_SQL_MAX_ROWS=200000 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" introspect \
+       --profile <p> --db-type <t> \
        --artifacts "<artifacts_dir>" --tables-file "$b" --append
    done
    ```
@@ -613,10 +622,19 @@ The engine gives structure; you add meaning. Load the model with `cli bundle <ro
 **Many databases describe themselves.** Metadata-driven platforms ship their own data dictionary + value-label tables (ServiceNow `sys_dictionary` + `sys_choice`, SAP `DD03L`, Salesforce metadata…), and plenty of ordinary schemas have code→label lookup/dimension tables. When that metadata is present it is **authoritative** — strictly better than LLM guessing or fetching JS-walled vendor docs. Always try it first:
 
 ```bash
-bash "$AGAMI_PLUGIN_ROOT/scripts/sm" enrich-metadata "$ROOT" --profile <profile> --db-type <db_type>
+AGAMI_SQL_MAX_ROWS=200000 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" enrich-metadata "$ROOT" \
+  --profile <profile> --db-type <db_type>
 ```
 
 It auto-detects a preset (e.g. `servicenow`) or takes `--preset`, reads the dictionary/lookup tables, and applies — in validated curate batches — **column descriptions** (stamped `description_source: metadata`, authoritative), **`choice_field` labels**, and **reference/FK relationships** (the `caller_id → sys_user` edges that `<x>_id` name-matching can't find). On ServiceNow this alone closes most of the column-coverage, enum-decode, and join-graph gaps deterministically. It prints what it enriched. **Then** hand-enrich only what it didn't cover (2a–2c below). `--skip-references` if you want descriptions/choices only.
+
+**The raised cap is not optional here — [why](#raised-cap).** A real `sys_dictionary` is tens of thousands of rows, so without the prefix this command doesn't degrade, it **dies**: the read is refused and the runner re-raises the refusal as `RuntimeError: {"refusal": … "rule": "resource_limit" …}`. Nothing is half-applied when that happens (the fetch is above the first `curate` write), so re-running with the prefix is clean. Two things when you run it: **never pipe it through `tail`** — that masks the exit code and a hard failure reads as success; and if the command still refuses even at 200,000, read the `fetched` counts, raise the prefix to clear the largest source table, and say so.
+
+**Then tell the user, once, using the numbers it printed** (`fetched` is a per-role row count, on both the success and the nothing-applicable paths):
+
+> *Read `<dictionary_rows>` dictionary rows and `<choice_rows>` choice rows. Catalog and dictionary reads run with a temporarily raised row cap (200,000) — a data dictionary is far larger than the 1,000-row default. **Your query-time cap is unchanged:** a normal question that would return more than 1,000 rows is still refused rather than quietly truncated.*
+
+The second sentence is the load-bearing one. Without it a user reasonably concludes their safety bound was weakened.
 
 ### 2a — Descriptions (describe coded columns; leave only self-evident ones empty)
 
@@ -733,7 +751,7 @@ Don't propose metrics depending on choice-field literals you didn't detect, or c
 From samples + the domain doc, add provider-portable cleaning where evidence supports it:
 - **Caveats** (`caveats[]` on table/column/entity): data-quality notes, anti-patterns (e.g. "filter on the event date, not the load date"), dedup warnings.
 - **value_transform** on columns whose raw value needs cleaning (`regexp_replace(...)` for bracketed text, `TO_TIMESTAMP(...)` for epoch). Must parse as SQL (validator checks).
-- **default_filters** (`default_filters[]` on a table): soft-delete / tenancy filters AND-ed in at query time (use the `{alias}` placeholder, e.g. `{alias}.deleted_at IS NULL`).
+- **default_filters** (`default_filters[]` on a table): soft-delete / tenancy filters that state what the org means by the table (use the `{alias}` placeholder, e.g. `{alias}.deleted_at IS NULL`). **Declarative only** — they are not AND-ed into a query for you; the query path reads them and writes in the ones a question needs. Declaring one is still worth it: the trust receipt reports, per table reference, which of them the statement that produced an answer applied and which it omitted, so an author sees whether their definition was honored.
 - **Currency (one ask per profile):** **find the money columns with `sm suggest-units "$ROOT"` — don't hand-roll a name regex** (a bare `count` pattern matches inside `discount` and silently drops `discount_amount`; the command's matcher is word-boundary-correct and tested). It returns `{money_columns: [{area, table, column, type}]}` (numeric columns named like money — amount/price/revenue/discount/… — minus rate/count/id/score, and skipping any that already have a `unit`). Glance at the list; if a `_usd`/`_inr`-suffixed column makes the currency obvious, set it directly. Otherwise ask once: "What currency are these in?" (`USD`/`EUR`/`GBP`/`JPY`/`INR`/`Other`/`Mixed`). On the answer, apply it with **one tested command — never pipe `suggest-units` through a hand-rolled script** (that glue breaks, e.g. on empty stdin):
 
 ```bash
@@ -800,7 +818,7 @@ bash "$AGAMI_PLUGIN_ROOT/scripts/sm" curate "$ROOT" --ops-file /tmp/agami-area-d
 
 ## Phase 4: Curate before examples — exclude + sign off what seeds depend on
 
-Seeds reference **columns, tables, metrics, and entities** — so settle those *before* generating examples (a seed that uses a column you'd later exclude breaks at query time, and a seed built on an unreviewed metric bakes in a guessed definition). **Relationships are NOT gated here** — they stay lazy: FK joins are already auto-approved by the engine (the DB declared them), and inferred joins self-approve as you query / surface as receipt warnings. So you're not asked to rubber-stamp database-declared foreign keys.
+Seeds reference **columns, tables, metrics, and entities** — so settle those *before* generating examples (a seed that uses a column you'd later exclude breaks at query time, and a seed built on an unreviewed metric bakes in a guessed definition). **Relationships are NOT gated here** — they stay lazy: FK joins are already auto-approved by the engine (the DB declared them), and inferred joins self-approve as you query, and an unreviewed one raises the trust banner on the answer's report. So you're not asked to rubber-stamp database-declared foreign keys.
 
 **4a — The curate gate: open the explorer whenever there's anything to curate.** One call returns the decision (turn-boundary-safe — same answer on a fresh run or a resume):
 
@@ -857,7 +875,7 @@ Output `{added, written, committed, rejected:[{question, error}]}`. For each `re
 
 ## Phase 6: Validate every seed example (the trust onboarding)
 
-**Run every seed with ONE packaged call — `sm seed-validate` — never a hand-rolled "run all the seeds" script.** It executes each written seed against the live DB **through `execute_sql`** (the same path agami-query uses), so the **fan-trap / chasm-trap pre-flight + `default_filters` always apply** — a raw-connection driver could skip that safety and let a fan-out scan the whole table. It emits the examples-validation items (`{n, question, sql, row_headers, row_preview, row_count, state}`); a seed the pre-flight refuses or that errors comes back with its `error`, not a faked result:
+**Run every seed with ONE packaged call — `sm seed-validate` — never a hand-rolled "run all the seeds" script.** It executes each written seed against the live DB **through `execute_sql`** (the same path agami-query uses), so the **fan-trap / chasm-trap pre-flight and the scope/PII gates always apply** — a raw-connection driver could skip that safety and let a fan-out scan the whole table. It emits the examples-validation items (`{n, question, sql, row_headers, row_preview, row_count, state}`); a seed the pre-flight refuses or that errors comes back with its `error`, not a faked result:
 
 ```bash
 bash "$AGAMI_PLUGIN_ROOT/scripts/sm" seed-validate "$ROOT" --area <area> --profile <profile> > /tmp/agami-examples-items.json
@@ -949,7 +967,7 @@ Then **AskUserQuestion**: `Open the review queue` (→ `/agami-model review` —
 
 (No telemetry — agami has none; don't surface anything about it.)
 
-**8a — gate on Rule 1 status:** count metrics/named-filters with `review_state != approved`. If > 0, use the **in-progress** framing (8b); else the **fully-set-up** framing (8c). Unsigned Rule 1 metrics don't *block* queries — agami still answers — but an answer that uses one carries a "not signed off yet" **warning** on its receipt until you approve it, so reviewing them is still worth doing.
+**8a — gate on Rule 1 status:** count metrics/named-filters with `review_state != approved`. If > 0, use the **in-progress** framing (8b); else the **fully-set-up** framing (8c). Unsigned Rule 1 metrics don't *block* queries — agami still answers — but an answer that uses one carries the metric on its receipt with `review_state: unreviewed`, which raises the report's approve/change banner until you sign it off, so reviewing them is still worth doing.
 
 **8b — in-progress:**
 ```
