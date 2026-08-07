@@ -236,9 +236,19 @@ def _load_credentials(profile: str, org_id: str = "local") -> dict[str, str]:
     cfg = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
     cfg.read(CREDENTIALS_PATH)
     if profile not in cfg:
+        # **Name the other profiles only on the single-user path.** This message is returned by the
+        # tool, so it reaches the model and from there whoever asked the question. On a deployment
+        # serving several tenants the credentials file spans all of them, and listing its sections
+        # tells one tenant's users the connection names of every other tenant — information crossing
+        # a boundary through an error path, which is the shape `SECURITY.md` rules out for database
+        # error text.
+        #
+        # `org_id == "local"` is the distinction the module already draws (see `_env_datasource_dsn`):
+        # one operator, their own machine, their own file — where listing what IS configured is the
+        # most useful thing the message can say and discloses nothing they do not own.
+        known = f" Sections present: {cfg.sections()}" if org_id == "local" else ""
         raise ExecutorError(
-            f"Profile [{profile}] not found in <artifacts_dir>/local/credentials. "
-            f"Sections present: {cfg.sections()}",
+            f"Profile [{profile}] not found in <artifacts_dir>/local/credentials.{known}",
             code=2,
         )
 

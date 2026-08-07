@@ -19,7 +19,14 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
+# **The package source, the way the sibling suites do it** (`test_postgres_named_cursor_integration`).
+# The conftest's `plugins/agami/scripts` entry no longer holds these modules — they moved into the
+# package — so without this the file imports whatever `execute_sql` happens to be INSTALLED, and on a
+# machine with a published copy on the path it silently tests the release instead of the working tree.
+# CI installs the package editable and is unaffected; a developer is not.
+PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
+if str(PKG_SRC) not in sys.path:
+    sys.path.insert(0, str(PKG_SRC))
 
 import execute_sql  # noqa: E402
 from execute_sql import _env_datasource_dsn, _load_credentials  # noqa: E402
@@ -163,3 +170,54 @@ def test_missing_both_sources_names_env_and_file(monkeypatch, tmp_path):
         _load_credentials("default")
     assert "DATASOURCE_URL" in ei.value.msg
     assert "credentials" in ei.value.msg
+
+
+# --- a missing profile must not enumerate the other tenants' -------------------------------
+
+
+def _shared_credentials(tmp_path: Path) -> Path:
+    """A credentials file holding several tenants' profiles, as a multi-tenant deployment's does."""
+    creds = tmp_path / "credentials"
+    creds.write_text(
+        "[acme_sales]\nurl = postgresql://u:p@acme:5432/sales\n\n"
+        "[globex_ops]\nurl = postgresql://u:p@globex:5432/ops\n"
+    )
+    creds.chmod(0o600)
+    return creds
+
+
+def test_a_named_tenant_is_not_told_which_other_profiles_exist(monkeypatch, tmp_path):
+    """**The disclosure this closes.**
+
+    The message is returned by the tool, so it reaches the model and from there whoever asked the
+    question. On a deployment serving several tenants the file spans all of them, so listing its
+    sections tells one tenant's users the connection names of every other tenant — information
+    crossing a boundary through an error path, which is the shape `SECURITY.md` rules out for
+    database error text.
+    """
+    monkeypatch.setattr(execute_sql, "CREDENTIALS_PATH", _shared_credentials(tmp_path))
+
+    with pytest.raises(execute_sql.ExecutorError) as raised:
+        _load_credentials("acme_missing", "acme")
+
+    message = raised.value.msg
+    assert "acme_missing" in message, "the caller's own profile is theirs to be told about"
+    for someone_else in ("globex_ops", "acme_sales", "Sections present"):
+        assert someone_else not in message, f"the refusal named {someone_else}"
+
+
+def test_the_single_user_operator_is_still_told_what_they_have(monkeypatch, tmp_path):
+    """The other half, and the reason this is not a blanket removal.
+
+    On the local path there is one operator, their own machine and their own file: listing what IS
+    configured is the most useful thing the message can say and discloses nothing they do not own.
+    `org_id == "local"` is the distinction the module already draws for the env-var forms.
+    """
+    monkeypatch.setattr(execute_sql, "CREDENTIALS_PATH", _shared_credentials(tmp_path))
+
+    with pytest.raises(execute_sql.ExecutorError) as raised:
+        _load_credentials("typo_here")  # org_id defaults to "local"
+
+    message = raised.value.msg
+    assert "typo_here" in message
+    assert "acme_sales" in message and "globex_ops" in message
