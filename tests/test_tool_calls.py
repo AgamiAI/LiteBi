@@ -134,6 +134,80 @@ def test_record_falls_back_to_a_marker_when_a_refusal_names_no_rule(db):
     assert r["success"] == 0 and r["error_kind"] == "refused"
 
 
+def test_a_refusal_records_the_gate_s_own_sentences(db):
+    """The specific fact and the action, beside the rule — the whole point of 018.
+
+    `error_kind` tells an administrator WHICH rule fired; alone it separates "your server is unwell"
+    from "your user overstepped" and lets them act on neither. These two carry what it fired on and
+    what to do instead, so a conversation in the console is actionable without shell access to the
+    server log — which was the only other copy.
+
+    Safe to record and to show BY CONTRACT: `guardrail.Refusal` requires both to be value-free, which
+    is what separates them from the driver's own text (operator-only, and deliberately never stored
+    on this row).
+    """
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT id FROM orders_archive"},
+        result_text=json.dumps({"status": "refused", "refusal": {
+            "reason": "out_of_scope", "rule": "table_scope",
+            "detail": "orders_archive is not declared in the semantic model",
+            "remediation": "Declare the table in the model, or ask a question that stays in scope.",
+        }}),
+        execution_ms=1, actor="a",
+    )
+    (r,) = _rows(db)
+    assert r["error_kind"] == "table_scope"
+    assert r["refusal_detail"] == "orders_archive is not declared in the semantic model"
+    assert r["refusal_remediation"] == (
+        "Declare the table in the model, or ask a question that stays in scope."
+    )
+
+
+def test_a_call_that_was_not_refused_records_no_sentences(db):
+    """NULL is the ordinary case, and the reason the columns are nullable. A successful call has no
+    gate verdict to explain, and a row carrying refusal prose beside `success=1` would be read as a
+    refusal that ran anyway."""
+    tools.record_tool_call(name="execute_sql", arguments={"sql": "SELECT 1"},
+                           result_text='{"row_count": 1}', execution_ms=1, actor="a")
+    (r,) = _rows(db)
+    assert r["success"] == 1
+    assert r["refusal_detail"] is None and r["refusal_remediation"] is None
+
+
+def test_an_overridden_outcome_drops_sentences_parsed_from_the_body(db):
+    """The sentences are replaced WITH the classification, not left behind it.
+
+    An embedder that states the outcome is not offering these, and prose describing a rule the
+    caller just overrode would explain a decision this row no longer claims — the same contradiction
+    the existing coherence rule (`success`/`row_count`/`error_kind` replaced as a group) prevents.
+    """
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "DELETE FROM t"},
+        result_text=json.dumps({"status": "refused", "refusal": {
+            "reason": "unsafe", "rule": "read_only", "detail": "d", "remediation": "r"}}),
+        execution_ms=1, actor="a", error_kind="stated_by_the_caller",
+    )
+    (r,) = _rows(db)
+    assert r["error_kind"] == "stated_by_the_caller"
+    assert r["refusal_detail"] is None and r["refusal_remediation"] is None
+
+
+def test_a_long_refusal_detail_is_bounded_before_it_is_stored(db):
+    """A detail ECHOES identifiers the caller sent, so its LENGTH is caller-controlled even though
+    its content is ours. Same argument as the statement bound: a refused call must not be a way to
+    grow the store."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text=json.dumps({"status": "refused", "refusal": {
+            "reason": "out_of_scope", "rule": "column_scope",
+            "detail": "x" * 5_000, "remediation": "y" * 5_000}}),
+        execution_ms=1, actor="a",
+    )
+    (r,) = _rows(db)
+    assert len(r["refusal_detail"]) == tools.AUDIT_DETAIL_MAX_CHARS
+    assert len(r["refusal_remediation"]) == tools.AUDIT_DETAIL_MAX_CHARS
+
+
 def test_record_logs_every_tool_with_null_self_report(db):
     tools.record_tool_call(name="list_datasources", arguments={}, result_text="[]",
                            execution_ms=2, actor="a")

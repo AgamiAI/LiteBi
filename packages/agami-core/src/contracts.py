@@ -239,6 +239,13 @@ class ToolCallRecord(_Contract):
     execution_ms: int | None = None
     success: bool = True
     error_kind: str | None = None
+    # The gate's own sentences when this call was refused (018), bounded by the writer
+    # (`tools.AUDIT_DETAIL_MAX_CHARS`). `error_kind` names the rule; these say what it fired on and
+    # what to do instead. Value-free by `guardrail.Refusal`'s contract, which is what makes them
+    # showable to a customer's administrator — unlike `QueryExecutionRecord.error_detail`, which is
+    # the driver's own text and operator-only. NULL on every non-refusal.
+    refusal_detail: str | None = None
+    refusal_remediation: str | None = None
     user_question: str | None = None
     agent_query: str | None = None
     thread_id: str | None = None
