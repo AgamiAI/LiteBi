@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -50,6 +51,7 @@ except ImportError:  # pragma: no cover - sqlglot is in requirements
     _HAVE_SQLGLOT = False
 
 from .models import (
+    CrossDatasourceRelationship,
     CrossSubjectAreaRelationship,
     Datasource,
     Entity,
@@ -226,6 +228,142 @@ def validate(org: Datasource, *, cache: "ValidationCache | None" = None) -> Vali
     _check_metric_binding_columns(org, res)
 
     return res
+
+
+# ---------------------------------------------------------------------------
+# Deployment-level pass (F16 / ACE-072): cross-datasource bridges
+# ---------------------------------------------------------------------------
+
+
+def validate_deployment(artifacts_dir: str | Path) -> ValidationResult:
+    """Validate the deployment-level cross-datasource bridges on the ``OrgRecord``.
+
+    A bridge links a key in one datasource to the same entity in another, so it can only be checked
+    with EVERY datasource's model in view — more than the per-profile ``validate(org)`` sees. This
+    loads the record (with its merged bridges) plus each attached datasource model and, for each
+    bridge, rejects ``same_engine`` (structurally impossible across two engines) and any endpoint
+    whose datasource / dataset (``schema.table``) / column doesn't resolve in that datasource's model.
+
+    Returns an empty (``ok``) result when there is no record or no bridges — a pre-F16 deployment is a
+    no-op, never an error."""
+    from . import loader as _loader
+    from . import org_record as _org_record
+
+    res = ValidationResult()
+    record = _org_record.load_org_record(artifacts_dir)
+    if record is None or not record.cross_datasource_relationships:
+        return res
+
+    art = Path(artifacts_dir)
+    models: dict[str, Datasource] = {}
+    # Datasources LISTED on the record but that failed to load — distinct from a name never attached
+    # at all, so the endpoint message can tell "attached but broken" from "not attached" (fix #2).
+    failed_to_load: set[str] = set()
+    for name in record.datasources:
+        try:
+            models[name] = _loader.load_datasource(art / name)
+        except Exception:
+            # A profile listed on the record but unreadable on disk is the per-profile validate's
+            # problem, not this pass's — skip it so an endpoint pointing at it just reports unresolved.
+            failed_to_load.add(name)
+            continue
+
+    for bridge in record.cross_datasource_relationships:
+        _check_bridge(bridge, models, failed_to_load, res)
+    return res
+
+
+def _bridge_label(bridge: CrossDatasourceRelationship) -> str:
+    """Readable identity for a bridge in a finding message (bridges are usually anonymous —
+    identified by their endpoints, not a name)."""
+    return (f"{bridge.from_datasource}.{bridge.from_dataset} -> "
+            f"{bridge.to_datasource}.{bridge.to_dataset}")
+
+
+def _check_bridge(
+    bridge: CrossDatasourceRelationship,
+    models: dict[str, Datasource],
+    failed_to_load: set[str],
+    res: ValidationResult,
+) -> None:
+    # same_engine is impossible across two datasources (two engines). The model validator already
+    # refuses to construct one; re-assert here for a bridge that reached the deployment some other way.
+    if bridge.executable == "same_engine":
+        res.error(
+            "cross_datasource_executable_mismatch",
+            f"cross-datasource bridge {_bridge_label(bridge)}: executable='same_engine' is invalid "
+            "across two datasources; use 'split' or 'informational'",
+        )
+        return
+    _check_bridge_endpoint(
+        res, bridge, models, failed_to_load,
+        bridge.from_datasource, bridge.from_dataset, bridge.from_columns)
+    _check_bridge_endpoint(
+        res, bridge, models, failed_to_load,
+        bridge.to_datasource, bridge.to_dataset, bridge.to_columns)
+
+
+def _check_bridge_endpoint(
+    res: ValidationResult,
+    bridge: CrossDatasourceRelationship,
+    models: dict[str, Datasource],
+    failed_to_load: set[str],
+    datasource: str,
+    dataset: str,
+    columns: list[str],
+) -> None:
+    """Resolve one endpoint (datasource -> dataset -> column(s)) against the loaded models, emitting
+    a ``cross_datasource_endpoint_unresolved`` error at the first level that doesn't resolve."""
+    label = _bridge_label(bridge)
+    model = models.get(datasource)
+    if model is None:
+        # Fail-closed either way, but distinguish the two causes: a datasource the record lists but
+        # couldn't load is a broken-model problem to fix (not a bad bridge), whereas an unlisted name
+        # is a genuinely wrong endpoint.
+        if datasource in failed_to_load:
+            reason = (f"datasource {datasource!r} is attached but its model failed to load")
+        else:
+            reason = (f"datasource {datasource!r} is not an attached datasource of this deployment")
+        res.error(
+            "cross_datasource_endpoint_unresolved",
+            f"cross-datasource bridge {label}: {reason}",
+        )
+        return
+    table = _resolve_dataset(model, dataset)
+    if table is None:
+        res.error(
+            "cross_datasource_endpoint_unresolved",
+            f"cross-datasource bridge {label}: dataset {dataset!r} not found in datasource "
+            f"{datasource!r}",
+        )
+        return
+    present = {c.name for c in table.columns}
+    missing = [c for c in columns if c not in present]
+    if missing:
+        res.error(
+            "cross_datasource_endpoint_unresolved",
+            f"cross-datasource bridge {label}: column(s) {missing} not found in dataset "
+            f"{dataset!r} of datasource {datasource!r}",
+        )
+
+
+def _resolve_dataset(model: Datasource, dataset: str) -> Optional[Table]:
+    """Find the ``Table`` a ``schema.table`` dataset names in a datasource's model. The schema half
+    is matched leniently — a schema-less model (SQLite) or a bare ``table`` dataset resolves on the
+    table name alone — so the bridge author isn't forced to schema-qualify when it's unambiguous."""
+    target_schema, target_table = dataset.rsplit(".", 1) if "." in dataset else (None, dataset)
+    lenient: Optional[Table] = None
+    for sa in model.subject_areas:
+        for t in sa.tables_defined:
+            if t.name != target_table:
+                continue
+            if target_schema is not None and t.schema_name == target_schema:
+                return t  # exact schema match wins outright
+            if target_schema is None or t.schema_name is None:
+                # schema-less model (SQLite) or bare-table dataset: remember it, but keep scanning in
+                # case an exact-schema table exists further on (fix #3 — prefer the exact match).
+                lenient = lenient or t
+    return lenient
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +987,7 @@ __all__ = [
     "Finding",
     "ValidationResult",
     "validate",
+    "validate_deployment",
     "recommended_confidence_cap",
     "format_result",
     "SIZING_WARN",

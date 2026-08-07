@@ -72,7 +72,15 @@ def cmd_validate(args) -> int:
     org = L.load_datasource(args.root, include_rejected=True)
     res = V.validate(org)
     print(V.format_result(res))
-    return 0 if res.ok else 1
+    ok = res.ok
+    # Deployment-level pass (F16 / ACE-072): when the profile sits under a deployment with an
+    # OrgRecord, ALSO validate the cross-datasource bridges — they resolve endpoints ACROSS profiles,
+    # so a single-profile validate can't see them. A no-op (empty, ok) on a pre-F16 layout with no
+    # record, so this stays a superset of the old behaviour. The artifacts dir is the profile's parent.
+    dres = V.validate_deployment(Path(args.root).parent)
+    if dres.findings:
+        print(V.format_result(dres))
+    return 0 if (ok and dres.ok) else 1
 
 
 def cmd_snapshot(args) -> int:
