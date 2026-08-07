@@ -81,7 +81,7 @@ Datasource (datasource.yaml)
 └─ cross_subject_area_relationships[]   (org-level edges spanning areas)
 ```
 
-The Pydantic models in [`packages/agami-core/src/semantic_model/models.py`](../packages/agami-core/src/semantic_model/models.py) **are** the spec (they `forbid` unknown keys). Provider-portable declarative fields — `default_filters`, `value_transform`, `caveats`, `value_pattern`, `sensitive`, `default_time_window`, join `cardinality` — are applied generically by the MCP/runtime, so behavior is identical across LLMs.
+The Pydantic models in [`packages/agami-core/src/semantic_model/models.py`](../packages/agami-core/src/semantic_model/models.py) **are** the spec (they `forbid` unknown keys). Provider-portable declarative fields — `value_transform`, `caveats`, `value_pattern`, `default_time_window`, join `cardinality` — are applied generically by the MCP/runtime, so behavior is identical across LLMs. Two are declarative only. `default_filters` is not AND-ed into a statement; the receipt reports, per table reference, which of a table's declared filters the statement applied, omitted, or left undetermined. `sensitive` does not gate anything: it marks a column the author wants handled carefully, the receipt reports when an answer projected one, and the authoring guidance asks the assistant to prefer aggregates — but nothing refuses. A column whose values must not be returned is left out of the model, which puts it out of scope, or is blocked by the connecting role's grants.
 
 Every write is gated by the validator at [`packages/agami-core/src/semantic_model/validator.py`](../packages/agami-core/src/semantic_model/validator.py) (driven via `python3 -m semantic_model.cli validate <root>`). **No model that fails validation is ever persisted.**
 
@@ -278,11 +278,28 @@ Fields per line:
 
 **Local-only** — never sent. Records every query. Grep / aggregate it in your own tooling if you want personal analytics.
 
+The MCP server writes to this same file when no database is configured, and its records carry the audit fields instead of the skill's rendering fields:
+
+| Field    | Type           | Description                                                                                                                                              |
+| -------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`     | string         | The execution's id — the same value the tool response returned as `audit_id`. When a database *is* configured this is `query_executions.id`.              |
+| `profile`  | string       | The datasource the statement ran against                                                                                                                 |
+| `source`   | string       | What wrote the record (`mcp_server`)                                                                                                                     |
+| `status`   | enum         | `ok`, `refused` (agami declined the statement) or `failed` (the database rejected it). Absent on entries written before this field existed — read those as `ok`. |
+| `reason`   | enum or null | Refusals only: `unsafe`, `out_of_scope` or `undetermined`                                                                                                |
+| `rule`     | string or null | Refusals only: which gate fired (`read_only`, `table_scope`, `column_scope`, …)                                                                        |
+| `sql_truncated` | boolean | The `sql` above was cut to the audit bound (8,000 characters) and is not the whole statement            |
+| `org_id`   | string       | The tenant the query ran for (`local` on a single-tenant install)                                                                                        |
+
+**Read the log filtered.** Anything treating "the last entry" as "the query you just ran" — the save-correction and reopen-chart flows both do — must skip entries whose `status` is not `ok`: a refused or failed statement never returned a result to correct or a chart to reopen.
+
 ---
 
 ## 6. Chart artifacts (`<artifacts_dir>/local/charts/<ts>.html`)
 
-Self-contained Chart.js v4 HTML, rendered from [plugins/agami/shared/chart-template.html](../plugins/agami/shared/chart-template.html) with placeholders substituted (`{{TITLE}}`, `{{CHART_TYPE}}`, `{{LABELS}}`, `{{DATASETS}}`, `{{GENERATED_AT}}`, `{{SQL}}`). Open in any browser.
+Self-contained Chart.js v4 HTML, rendered from [plugins/agami/shared/chart-template.html](../plugins/agami/shared/chart-template.html) with placeholders substituted (`{{REPORT_TITLE}}`, `{{REPORT_SUMMARY_JSON}}`, `{{GENERATED_AT}}`, `{{SECTIONS_JSON}}`, `{{RECEIPT_JSON}}`). Open in any browser.
+
+`{{RECEIPT_JSON}}` is the trust receipt: `model_version` plus five sections (`columns`, `tables`, `joins`, `aggregates`, `assumptions`), each an object with an `items` list and an `undetermined` sentence saying what the section did not establish (`null` when it is complete). The full field list is documented at the top of the template itself; the object is produced by `sm receipt` (`semantic_model.runtime.assemble_receipt`), which is the same builder the MCP server uses, so one statement is described one way on both surfaces.
 
 ## 7. CSV exports (`<artifacts_dir>/local/exports/<ts>.csv`)
 

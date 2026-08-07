@@ -47,9 +47,11 @@ For v1.0 / v1.1 fallback paths (`<artifacts_dir>/local/<profile>.yaml`, `<artifa
 
 ### 1b — find the most recent query
 
-Read the last entry in `<artifacts_dir>/local/query_log.jsonl`. Need `question` and `sql`.
+Read `<artifacts_dir>/local/query_log.jsonl` and take the last entry **whose `status` is `"ok"` or absent**. Need `question` and `sql`.
 
-If the log is empty: "I don't have a recent query to attach this correction to. Ask the question first, then save the correction." Stop.
+The log now records every execution, not only the successful ones: an entry with `"status": "refused"` (agami declined the statement) or `"status": "failed"` (the database rejected it) carries SQL that never returned a result, so attaching a correction to it would teach the example library from a query that never ran. Entries written before the log carried a `status` field have none — treat those as `ok`.
+
+If there is no such entry: "I don't have a recent successful query to attach this correction to. Ask the question first, then save the correction." Stop.
 
 ### 1c — get the corrected SQL
 

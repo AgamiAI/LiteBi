@@ -26,7 +26,11 @@ import model_deploy  # noqa: E402
 import model_store as MS  # noqa: E402
 import tools  # noqa: E402
 from semantic_model import org_record as OR  # noqa: E402
-from semantic_model.models import DisplayConventions, OrgRecord  # noqa: E402
+from semantic_model.models import (  # noqa: E402
+    CrossDatasourceRelationship,
+    DisplayConventions,
+    OrgRecord,
+)
 from store import Store  # noqa: E402
 
 
@@ -54,6 +58,31 @@ def test_write_then_load_round_trips_losslessly():
     assert (
         MS.load_organization_record(s, "org1") == rec
     )  # incl. display_conventions + glossary in doc
+    s.close()
+
+
+def test_cross_datasource_relationships_survive_the_round_trip():
+    # Regression: the OrgRecord writer used to hand-list its fields and silently DROP new buckets — so
+    # the ACE-072 bridge vanished on a Postgres deploy. The lossless dump/validate must round-trip it.
+    s = _store()
+    rec = _full_record().model_copy(
+        update={
+            "cross_datasource_relationships": [
+                CrossDatasourceRelationship(
+                    from_datasource="acme_crm",
+                    to_datasource="acme_erp",
+                    from_dataset="crm.accounts",
+                    to_dataset="erp.customers",
+                    from_columns=["account_key"],
+                    to_columns=["account_key"],
+                )
+            ]
+        }
+    )
+    MS.write_organization_record(s, rec, org_id="org1")
+    loaded = MS.load_organization_record(s, "org1")
+    assert loaded == rec  # the bridge survived — not silently dropped
+    assert loaded.cross_datasource_relationships[0].from_columns == ["account_key"]
     s.close()
 
 

@@ -13,18 +13,59 @@ expected to run under a read-only role. Postgres / Redshift are the primary conc
 are neutral enough to be safe across the other supported engines.
 
 `check_read_only(sql)` returns `None` when the SQL is a single safe read-only
-statement, else a short human-readable reason string. Callers decide how to wrap it
-(the MCP tools attach `kind="permission"`).
+statement, else a `guardrail.Refusal` carrying `rule=read_only`, the rejection text as
+`detail`, and the fix for that specific rejection as `remediation`. Callers relay the
+whole object rather than re-deriving a shape of their own.
 """
 
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
+
+from guardrail import RULE_READ_ONLY, RULE_RECON, RULE_UNPARSEABLE, Refusal, refuse
 
 # Hard cap on SQL length. Prevents a compromised client from POSTing a multi-MB
 # SQL blob that takes the parser / planner / this gate down a slow path. Real
 # analytics SQL fits in ~10KB; 50KB is conservative.
 _MAX_SQL_CHARS = 50_000
+
+# One remediation per rejection, gathered here so a reviewer can audit every fix this gate hands
+# back on a single screen. They are deliberately NOT one shared string: shortening a 60,000-character
+# statement and dropping a `pg_read_file` call are different actions, and a generic "fix your SQL"
+# would make the contract's mandatory-remediation rule vacuous — satisfied in form, useless in fact.
+#
+# Every entry is static prose. That is the property that keeps a refusal from becoming a
+# schema-listing endpoint: a remediation built by interpolating what IS allowed would enumerate the
+# declared surface to a caller who has not been granted it. The only caller-specific text any
+# rejection carries lives in `detail`, and only ever echoes a token the caller itself sent.
+_REMEDIATION: dict[str, str] = {
+    "empty": "Send a SELECT or WITH…SELECT statement.",
+    "too_long": (
+        f"Shorten the statement — the cap is {_MAX_SQL_CHARS:,} characters, "
+        "and analytics SQL fits well under it."
+    ),
+    "bare_line_comment": "Put a space after `--`, or use a `/* … */` block comment.",
+    "hash_ambiguous": (
+        "Rewrite a `#` comment as `-- ` or `/* … */`. A statement that needs `#` inside a NAME "
+        "(a SQL Server temp table, a backtick-quoted identifier) cannot be read unambiguously "
+        "here and has to be reworked without it."
+    ),
+    "mysql_exec_comment": (
+        "Remove the `/*! … */` executable comment; a plain `/* … */` comment is fine."
+    ),
+    "multi_statement": "Send exactly one statement.",
+    "not_a_select": "Rewrite as a read-only SELECT or WITH…SELECT.",
+    "denied_keyword": (
+        "Rewrite as a read-only SELECT — this connection executes no writes, DDL, "
+        "transaction control, session state or prepared statements."
+    ),
+    "row_lock": "Remove the row-lock clause; an analytic read never needs one.",
+    "dangerous_function": (
+        "Remove the call — server-file, OS, process-control, sleep and remote-SQL "
+        "functions are never executed here."
+    ),
+}
 
 # Opening delimiter of a Postgres / Snowflake / DuckDB dollar-quoted string —
 # `$$` or a tagged `$name$`. A positional parameter (`$1`) is NOT an opener (no
@@ -43,15 +84,44 @@ _DOLLAR_OPEN_RE = re.compile(r"\$\w*\$")
 class _GuardReject(Exception):
     """Raised from the scan when SQL uses a construct whose meaning is
     dialect-ambiguous and therefore cannot be neutralized safely with one lexer
-    (see the MySQL comment forms in `_neutralize`). Carries the caller-facing reason.
+    (see the MySQL comment forms in `_neutralize`). Carries both halves of the
+    caller-facing refusal, because the relay in `check_read_only` cannot tell which
+    of the two ambiguous forms fired and so cannot pick the right fix on its own.
     """
 
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
+    def __init__(self, detail: str, remediation: str) -> None:
+        self.detail = detail
+        self.remediation = remediation
+        super().__init__(detail)
 
 
-def _neutralize(sql: str) -> str:
+class _Neutralized(NamedTuple):
+    """The analysis copy of a statement, plus where its quoted identifiers ended up.
+
+    `text` is the neutralized statement, **already stripped**. `quoted` holds one
+    `[start, end)` per double-quoted identifier, naming that identifier's CONTENT in
+    `text`'s own coordinates — never the re-supplied separators around it.
+
+    **One coordinate frame, deliberately.** The scan re-supplies separator spaces and
+    drops delimiters, so input offsets are not output offsets, and stripping afterwards
+    would shift them a third time. Doing the strip *inside* this function and reporting
+    spans against the stripped result is what makes a span usable without any caller
+    reconciling frames. A span in the wrong frame does not fail loudly; it mis-identifies
+    a token, so the frame is collapsed to one rather than documented.
+
+    **Only the niladic recon matcher reads `quoted`.** Every other consumer — the
+    read-only gate above all — matches `text` with the quotes already dropped, because
+    that unwrapping is what keeps `SELECT*FROM"pg_read_file"(...)` visible to a
+    `\\b`-anchored pattern. A quoted bare word is unambiguously an identifier; a quoted
+    name with a trailing `(` is still a call. That distinction is the consumer's to make,
+    which is why this type reports provenance and decides nothing.
+    """
+
+    text: str
+    quoted: tuple[tuple[int, int], ...]
+
+
+def _neutralize(sql: str) -> _Neutralized:
     """Blank out comments and string / dollar-quoted literals, and drop the quote
     delimiters of double-quoted identifiers (keeping their content), in a SINGLE
     left-to-right pass so the FIRST-opened construct wins — exactly how the database
@@ -62,8 +132,17 @@ def _neutralize(sql: str) -> str:
     `$$` inside a `-- ...` comment, desyncs it and can smuggle an injected
     `; DROP ...` past the multi-statement check. The scan below never desyncs
     because at each position it commits to whatever opens there and skips to that
-    construct's own close. Under-matching (an unterminated literal running to EOF)
-    only ever fails *safe* — a stray `;` stays visible and trips the guard.
+    construct's own close.
+
+    Under-matching (a construct running unterminated to EOF) fails *safe*, but by two
+    different routes and it is worth being exact, because the `#` branch below cites this
+    paragraph as its reason for refusing rather than blanking. An unterminated `"` or `$`
+    emits what it swallowed, so a stray `;` stays visible and trips the guard. An
+    unterminated `'` or `/*` instead swallows to EOF and the tail becomes invisible here —
+    safe not because the guard still sees it, but because the ENGINE reads that tail the
+    same way (an unterminated literal or block comment is a syntax error on every engine we
+    speak, so nothing executes). That second route is the one a `#` would NOT have: there,
+    the guard and the engine genuinely disagree about where the statement ends.
 
     Only this analysis copy is transformed; the ORIGINAL sql is what executes.
     Neutralized spans collapse to a single space (never empty — welding tokens like
@@ -73,6 +152,9 @@ def _neutralize(sql: str) -> str:
     identifier are treated as doubled-delimiter escapes (standard SQL). Backslash is
     deliberately NOT an escape here — engines disagree (MySQL yes, standard PG no),
     and not honoring it can only stop a literal *early* (fail safe), never late.
+
+    Returns a `_Neutralized` — the stripped text plus the quoted-identifier spans. See
+    that type for why the strip happens here rather than at the call site.
     """
     def _last_emitted(chunks: list[str]) -> str:
         """The last character actually emitted, skipping empty chunks.
@@ -87,6 +169,14 @@ def _neutralize(sql: str) -> str:
         return ""
 
     out: list[str] = []
+    spans: list[tuple[int, int]] = []
+    width = 0  # running len("".join(out)), so a span can be recorded as it is emitted
+
+    def emit(chunk: str) -> None:
+        nonlocal width
+        out.append(chunk)
+        width += len(chunk)
+
     i, n = 0, len(sql)
     while i < n:
         two = sql[i : i + 2]
@@ -99,22 +189,58 @@ def _neutralize(sql: str) -> str:
             if nxt and nxt not in " \t\r\n\f":
                 raise _GuardReject(
                     "an inline '--' comment must be followed by whitespace "
-                    "(bare '--x' is a comment in Postgres but an operator in MySQL)"
+                    "(bare '--x' is a comment in Postgres but an operator in MySQL)",
+                    _REMEDIATION["bare_line_comment"],
                 )
             j = i + 2
             while j < n and sql[j] not in "\r\n":
                 j += 1
-            out.append(" ")
+            emit(" ")
             i = j
         elif two == "/*":  # block comment
             # `/*! ... */` (and versioned `/*!NNNNN ... */`) is a MySQL *executable*
             # comment — the server runs its body as live SQL. Blanking it as an
             # ordinary comment would smuggle whatever it contains past every check.
             if sql[i + 2 : i + 3] == "!":
-                raise _GuardReject("MySQL executable comments ('/*! ... */') are not allowed")
+                raise _GuardReject(
+                    "MySQL executable comments ('/*! ... */') are not allowed",
+                    _REMEDIATION["mysql_exec_comment"],
+                )
             end = sql.find("*/", i + 2)
             i = n if end == -1 else end + 2
-            out.append(" ")
+            emit(" ")
+        elif sql[i] == "#":  # MySQL line comment, and nothing of the sort elsewhere
+            # MySQL/MariaDB end a `#` comment at the newline. PostgreSQL has no `#` comment at
+            # all — there it is an operator character (bit-string XOR, geometric intersection) —
+            # so the same bytes are a comment on one engine and live SQL on the other. Blanking
+            # to end-of-line would hide a trailing `;DROP` everywhere `#` is not a comment;
+            # leaving it would read a MySQL comment body as SQL, which is the over-refusal this
+            # branch exists to cure. The two dialects genuinely disagree and this lexer has no
+            # dialect, so refuse the ambiguous form rather than pick one — exactly as the bare
+            # `--x` case above does, for exactly the same reason.
+            #
+            # THE WIDENING, MEASURED RATHER THAN GUESSED. `#` outside a literal has four
+            # meanings across the engines the executor speaks, and this refuses all of them:
+            #   - a line comment                     (MySQL, MariaDB) — the case being cured
+            #   - `#` / `#>` / `#>>` operators       (PostgreSQL: bit XOR, geometric
+            #                                         intersection, and the jsonb path
+            #                                         operators, which are ordinary analytics SQL)
+            #   - a temp-table prefix                (SQL Server: `#local`, `##global`)
+            #   - a character inside a backtick or bracket quoted identifier, since this scan
+            #     consumes neither quoting form (that gap is ACE-079's, not fixed here)
+            # Only the first is a comment, which is why neither this refusal's detail nor its
+            # remediation calls it one. All four were allowed before this branch and are refused
+            # now; a repo-wide grep found no golden query using any of them.
+            #
+            # Accepted, because the alternative is worse in the direction that matters: reading
+            # `#` as a comment and blanking to end-of-line hides a trailing `;DROP` on all three
+            # of the non-MySQL readings, and this lexer has no dialect with which to choose.
+            raise _GuardReject(
+                "'#' means different things on different engines (a line comment in MySQL, "
+                "an operator in PostgreSQL, a temp-table prefix in SQL Server), so a statement "
+                "carrying one outside a string literal cannot be read the same way on all of them",
+                _REMEDIATION["hash_ambiguous"],
+            )
         elif sql[i] == "'":  # single-quoted string literal
             j = i + 1
             while j < n:
@@ -125,10 +251,11 @@ def _neutralize(sql: str) -> str:
                     j += 1
                     break
                 j += 1
-            out.append(" ")
+            emit(" ")
             i = j
         elif sql[i] == '"':  # double-quoted identifier — keep content, drop quotes
             j, buf = i + 1, []
+            closed = False
             while j < n:
                 if sql[j] == '"':
                     if j + 1 < n and sql[j + 1] == '"':  # doubled "" escape
@@ -136,6 +263,7 @@ def _neutralize(sql: str) -> str:
                         j += 2
                         continue
                     j += 1
+                    closed = True
                     break
                 buf.append(sql[j])
                 j += 1
@@ -159,11 +287,23 @@ def _neutralize(sql: str) -> str:
             # pinned by an explicit output test, since no current rule distinguishes the
             # two spellings on its own.
             if _last_emitted(out).isalnum() or _last_emitted(out) == "_":
-                out.append(" ")
-            out.append("".join(buf))
+                emit(" ")
+            # Record the span AROUND the content only, between the two separator emits, so
+            # `quoted` names the identifier and never the boundary this branch re-supplied.
+            start = width
+            emit("".join(buf))
+            # Record a span ONLY for an identifier whose closing delimiter we actually consumed.
+            # An unterminated `"` swallows the rest of the statement into `buf`, and a span over
+            # that tail would tell the niladic matcher to skip every keyword inside it — an
+            # UNDER-refusal, the one direction this design must never fail in. It is reachable:
+            # MySQL's default sql_mode treats `"` as a string delimiter with backslash escapes, so
+            # `SELECT "a\"b" , current_user FROM t` re-opens a runaway identifier here while MySQL
+            # executes it and returns CURRENT_USER(). No span means no skip, so the gate refuses.
+            if closed:
+                spans.append((start, width))
             nxt = sql[j] if j < n else ""
             if nxt.isalnum() or nxt == "_":
-                out.append(" ")
+                emit(" ")
             i = j
         elif sql[i] == "$":  # dollar-quoted string literal ($$...$$ or $tag$...$tag$)
             # Only a `$tag$` with a MATCHING close delimiter is a literal we can blank.
@@ -175,14 +315,25 @@ def _neutralize(sql: str) -> str:
             close = sql.find(m.group(0), m.end()) if m else -1
             if m and close != -1:
                 i = close + len(m.group(0))
-                out.append(" ")
+                emit(" ")
             else:
-                out.append("$")
+                emit("$")
                 i += 1
         else:
-            out.append(sql[i])
+            emit(sql[i])
             i += 1
-    return "".join(out)
+    raw = "".join(out)
+    text = raw.strip()
+    lead = len(raw) - len(raw.lstrip())
+    limit = len(text)
+    # Shift every span into the stripped frame, and DROP any the strip disturbed rather
+    # than clamping it. Dropping is the safe direction: a missing span means the niladic
+    # matcher does not skip that token, so the gate over-refuses. Clamping a span that ran
+    # off either end would instead widen the skipped region and could hide a live keyword.
+    kept = tuple(
+        (s - lead, e - lead) for s, e in spans if 0 <= s - lead < e - lead <= limit
+    )
+    return _Neutralized(text, kept)
 
 
 # Allowed opening keyword. `WITH` covers CTEs whose final clause is a SELECT.
@@ -265,14 +416,21 @@ _DANGEROUS_FN_RE = re.compile(
 )
 
 
-def check_read_only(sql: str | None) -> str | None:
-    """Return None if `sql` is a single safe read-only statement, else a reason string.
+def check_read_only(sql: str | None) -> Refusal | None:
+    """Return None if `sql` is a single safe read-only statement, else a `Refusal`.
 
-    Rejection ladder (each step has its own message so the caller can correct):
+    Every rejection is built with `refuse()` rather than `Refusal(...)`, so the reason comes from
+    the contract's pinned table and no step here can classify itself.
+
+    Rejection ladder (each step has its own detail AND its own remediation so the caller can
+    correct — see `_REMEDIATION` for why one shared fix would not do):
       0. Empty SQL
       1. SQL longer than `_MAX_SQL_CHARS`
-      1b. Dialect-ambiguous comment form (bare `--x`, MySQL `/*! ... */`) — raised
-          from `_neutralize` because it can't be neutralized safely with one lexer
+      1b. Dialect-ambiguous form (bare `--x`, MySQL `/*! ... */`, any `#` outside a
+          literal) — raised from `_neutralize` because it can't be neutralized safely
+          with one lexer. Note the third is not only a comment form: `#` is also a
+          PostgreSQL operator and a SQL Server temp-table prefix, which is why the
+          step is "ambiguous form" rather than "ambiguous comment"
       2. Multi-statement (any `;` outside literals/comments, except one trailing `;`)
       3. Doesn't open with SELECT or WITH (leading `(` tolerated)
       4. Contains a forbidden keyword (DML/DDL/TCL/session/pub-sub/lock/prepared/INTO)
@@ -280,12 +438,16 @@ def check_read_only(sql: str | None) -> str | None:
       6. Calls a dangerous function (`pg_sleep`, `pg_read_file`, `dblink`, ...)
     """
     if not sql or not sql.strip():
-        return "empty statement"
+        return refuse(RULE_READ_ONLY, detail="empty statement", remediation=_REMEDIATION["empty"])
 
     if len(sql) > _MAX_SQL_CHARS:
-        return (
-            f"SQL is {len(sql)} characters; the guard caps at {_MAX_SQL_CHARS}. "
-            "Real analytics SQL fits well under this."
+        return refuse(
+            RULE_READ_ONLY,
+            detail=(
+                f"SQL is {len(sql)} characters; the guard caps at {_MAX_SQL_CHARS}. "
+                "Real analytics SQL fits well under this."
+            ),
+            remediation=_REMEDIATION["too_long"],
         )
 
     # Blank out comments and string / dollar literals, and unwrap double-quoted
@@ -293,39 +455,270 @@ def check_read_only(sql: str | None) -> str | None:
     # nothing hidden inside a literal or comment can reach the checks below. See
     # `_neutralize` for why a single scan is required rather than layered regexes.
     try:
-        stripped = _neutralize(sql).strip()
+        stripped = _neutralize(sql).text
     except _GuardReject as reject:
-        return reject.reason
+        return refuse(RULE_READ_ONLY, detail=reject.detail, remediation=reject.remediation)
 
     # Allow exactly one trailing `;`. Any other `;` indicates a second statement —
     # the classic statement-stacking bypass (`COMMIT; DROP SCHEMA public CASCADE`).
     if stripped.endswith(";"):
         stripped = stripped[:-1].rstrip()
     if not stripped:
-        return "empty statement"
+        return refuse(RULE_READ_ONLY, detail="empty statement", remediation=_REMEDIATION["empty"])
     if ";" in stripped:
-        return "multiple statements are not allowed — send one SELECT"
+        return refuse(
+            RULE_READ_ONLY,
+            detail="multiple statements are not allowed — send one SELECT",
+            remediation=_REMEDIATION["multi_statement"],
+        )
 
     if not _READ_ONLY_OPEN_RE.match(stripped):
         head = stripped.lstrip("(").split(None, 1)
         head = head[0].upper() if head else "?"
-        return f"only SELECT / WITH...SELECT is allowed (statement starts with {head})"
+        return refuse(
+            RULE_READ_ONLY,
+            detail=f"only SELECT / WITH...SELECT is allowed (statement starts with {head})",
+            remediation=_REMEDIATION["not_a_select"],
+        )
 
     deny = _DENY_KEYWORD_RE.search(stripped)
     if deny:
-        return (
-            f"keyword '{deny.group(1).upper()}' is not allowed — send a single "
-            "SELECT / WITH...SELECT (no DML, DDL, transaction control, session-state, "
-            "or prepared statements)"
+        return refuse(
+            RULE_READ_ONLY,
+            detail=(
+                f"keyword '{deny.group(1).upper()}' is not allowed — send a single "
+                "SELECT / WITH...SELECT (no DML, DDL, transaction control, session-state, "
+                "or prepared statements)"
+            ),
+            remediation=_REMEDIATION["denied_keyword"],
         )
 
     if _ROW_LOCK_RE.search(stripped):
-        return "row-level lock clauses (FOR UPDATE / FOR SHARE / ...) are not allowed"
+        return refuse(
+            RULE_READ_ONLY,
+            detail="row-level lock clauses (FOR UPDATE / FOR SHARE / ...) are not allowed",
+            remediation=_REMEDIATION["row_lock"],
+        )
 
     fn = _DANGEROUS_FN_RE.search(stripped)
     if fn:
-        return (
-            f"function `{fn.group(1)}` is not allowed — server-file / OS / "
-            "process-control / sleep / remote-SQL functions are blocked"
+        return refuse(
+            RULE_READ_ONLY,
+            detail=(
+                f"function `{fn.group(1)}` is not allowed — server-file / OS / "
+                "process-control / sleep / remote-SQL functions are blocked"
+            ),
+            remediation=_REMEDIATION["dangerous_function"],
         )
     return None
+
+
+# --- Recon / metadata functions (ACE-039) -----------------------------------
+#
+# FUNCTIONS ONLY. No schema names, no relation names, no relation-name prefixes, no system
+# variables. Catalog RELATIONS are the model's to refuse, not this gate's: `check_table_scope`
+# already rejects `pg_class` and `information_schema.tables` as tables the model does not declare,
+# which is the same refusal reached by the gate that owns it. The relation half was therefore
+# redundant where the model gate runs — and where it does not run, it was actively harmful: matching
+# bare schema names on every engine refused a datasource whose `sys` schema holds ordinary user
+# tables. A schema the model declares is a schema the caller may query.
+#
+# The residual is stated rather than hidden: on the vendored plugin layout `semantic_model.runtime`
+# is absent by construction (it needs sqlglot and pydantic; the mirror is stdlib-only), so catalog
+# relations have no gate there at all. Recon denial protects an operator from a caller who is not
+# them, and on that layout the user owns the machine, the credentials and the role.
+#
+# Niladic keywords and register-type casts are in scope because they are the same primitive in a
+# spelling the function matcher never sees: `current_user` is `current_user()` without the parens,
+# and `'x'::regclass` is `to_regclass('x')` without them either — the cast errors when the object is
+# absent, which is an object-existence oracle that rides inside a fully-scoped query.
+
+
+def _recon_group(names: frozenset[str]) -> str:
+    """Alternation body for a set of names, longest first.
+
+    Longest-first is load-bearing rather than tidy: regex alternation takes the first branch that
+    matches at a position, so `current_schema` listed before `current_schemas` would shadow it and
+    the longer name would never match as a whole token.
+    """
+    return "|".join(sorted(names, key=len, reverse=True))
+
+
+# Server / session / account metadata, matched only in their CALL form.
+_RECON_PAREN_FNS = frozenset(
+    {
+        "version",
+        "current_database",
+        "current_schemas",  # pg, plural, takes a bool — the niladic `current_schema` is below
+        "database",
+        "schema",
+        "user",  # MySQL user() / system_user() — the CALL form only
+        "connection_id",
+        "system_user",
+        "current_account",  # snowflake
+        "current_region",
+        "current_version",
+        "current_warehouse",
+        "inet_server_addr",  # server / client network fingerprint (pg)
+        "inet_server_port",
+        "inet_client_addr",
+        "inet_client_port",
+    }
+)
+
+# Niladic metadata keywords — the special function spelled without parens. Bare `user`, `schema` and
+# `database` are DELIBERATELY absent: they are Postgres niladic synonyms but far too common as
+# intended column names, so only their call form (above) is denied. A known, minor
+# username-fingerprint residual, taken knowingly in exchange for not refusing ordinary schemas.
+_RECON_NILADIC = frozenset(
+    {"current_user", "session_user", "current_catalog", "current_schema", "current_role"}
+)
+
+# The privilege-check family, enumerated rather than globbed. `has_\w+_privilege` also matched
+# `has_active_privilege(...)` — a plausible user-defined function, and an over-refusal is the failure
+# mode this list has already produced in real use.
+_RECON_PRIVILEGE_FNS = frozenset(
+    {
+        "has_any_column_privilege",
+        "has_column_privilege",
+        "has_database_privilege",
+        "has_foreign_data_wrapper_privilege",
+        "has_function_privilege",
+        "has_language_privilege",
+        "has_largeobject_privilege",
+        "has_parameter_privilege",
+        "has_schema_privilege",
+        "has_sequence_privilege",
+        "has_server_privilege",
+        "has_table_privilege",
+        "has_tablespace_privilege",
+        "has_type_privilege",
+    }
+)
+
+# Call FAMILIES matched by prefix, each still requiring the trailing `(`. `pg_*` is a namespace ban
+# and deliberately overlaps the dangerous-function list: `check_read_only` runs first and owns the
+# label for what it names, and this is the backstop underneath — including for builtins that ship
+# after this list is written. `to_reg*` resolves a name to an OID, the call form of the casts below.
+_RECON_CALL_FAMILIES = (r"pg_\w+", r"to_reg\w+")
+
+# Register types. `'secret'::regclass` errors when the object is absent, so it answers "does this
+# exist?" without ever naming it in a FROM clause.
+_RECON_REGTYPES = frozenset(
+    {
+        "regclass",
+        "regcollation",
+        "regconfig",
+        "regdictionary",
+        "regnamespace",
+        "regoper",
+        "regoperator",
+        "regproc",
+        "regprocedure",
+        "regrole",
+        "regtype",
+    }
+)
+
+# A quoted name with a trailing `(` is STILL A CALL, so the paren matcher covers the niladic
+# keywords too. Without that union `SELECT "current_schema"()` would be skipped by the niladic
+# matcher (it is a quoted span) and missed by the paren matcher (`current_schemas` needs its `s`) —
+# a hole the false-positive fix would otherwise open. This union is where the FP rule and the
+# deny-list interact, and it is the only place they do.
+_RECON_PAREN_RE = re.compile(
+    r"\b("
+    + _recon_group(_RECON_PAREN_FNS | _RECON_NILADIC | _RECON_PRIVILEGE_FNS)
+    + "|"
+    + "|".join(_RECON_CALL_FAMILIES)
+    + r")\s*\(",
+    re.IGNORECASE,
+)
+# `(?<!\.)` lets a qualified column through (`t.current_user`); the quoted-span check in
+# `_recon_niladic_hit` handles the bare quoted spelling (`"current_user"`), which the neutralizer
+# has by then unwrapped into something this pattern would otherwise match.
+_RECON_NILADIC_RE = re.compile(
+    r"(?<!\.)\b(" + _recon_group(_RECON_NILADIC) + r")\b", re.IGNORECASE
+)
+# Both cast spellings. `::reg*` anchors on the type name because `_neutralize` blanks the literal
+# before it, so `'x'::regclass` arrives as ` ::regclass`. The `CAST(x AS reg*)` arm requires the
+# closing paren so a column aliased `AS regclass` is not caught.
+# The optional `\w+\s*\.\s*` is a SCHEMA QUALIFIER, and it is load-bearing:
+# `'secret_table'::pg_catalog.regclass` is the same object-existence oracle in the spelling a
+# deny-list that anchors straight after `::` never sees. `_neutralize` has already unwrapped quotes
+# by this point, so `"pg_catalog"."regclass"` arrives here as `pg_catalog.regclass` and is covered
+# by the same branch. The call matcher tolerated qualification already; this arm did not.
+_RECON_CAST_RE = re.compile(
+    r"::\s*(?:\w+\s*\.\s*)?(" + _recon_group(_RECON_REGTYPES) + r")\b"
+    r"|\bAS\s+(?:\w+\s*\.\s*)?(" + _recon_group(_RECON_REGTYPES) + r")\s*\)",
+    re.IGNORECASE,
+)
+
+_RECON_REMEDIATION = (
+    "Remove the server-metadata call — query only the tables and columns your model declares. "
+    "Server version, session identity, privilege probes and object-existence casts are never "
+    "executed here."
+)
+
+
+def _recon_niladic_hit(neutral: _Neutralized) -> re.Match[str] | None:
+    """The niladic keyword, skipping any occurrence that was a quoted identifier.
+
+    The ONLY consumer of `_Neutralized.quoted`. A double-quoted bare word is unambiguously an
+    identifier — `SELECT "current_user" FROM audit_log` reads a column — while the same word
+    unquoted is the special function. The neutralizer drops the delimiters (that unwrapping is what
+    keeps a welded `"pg_read_file"(...)` visible to the read-only gate), so the distinction survives
+    only in the spans it reports.
+
+    Containment must be FULL. A partial overlap means the span and the match disagree about where
+    the token is, and the safe reading of a disagreement is not to skip.
+    """
+    for match in _RECON_NILADIC_RE.finditer(neutral.text):
+        if not any(s <= match.start() and match.end() <= e for s, e in neutral.quoted):
+            return match
+    return None
+
+
+def check_no_recon(sql: str | None) -> Refusal | None:
+    """Return ``None`` when ``sql`` calls no metadata / recon function, else a ``Refusal``.
+
+    Runs immediately after :func:`check_read_only` at the shared executor chokepoint, over the SAME
+    neutralized text — comments and literals blanked, quoted identifiers unwrapped — so a recon token
+    hidden in a string cannot smuggle past and a legitimate mention inside one cannot false-trip.
+    No second parser: this module is regex over `_neutralize`, and the sqlglot pass lives in
+    `semantic_model.runtime`, which the vendored mirror cannot import.
+
+    Order is fixed, so the label is deterministic: a name on both this list and the
+    dangerous-function list refuses as ``read_only``, because that gate runs first and owns what it
+    names (principle 9).
+    """
+    if not sql or not sql.strip():
+        return None  # empty — `check_read_only` owns that rejection, and its remediation
+
+    try:
+        neutral = _neutralize(sql)
+    except _GuardReject as reject:
+        # A statement we cannot read is not a statement we caught fingerprinting the server. It
+        # fails closed either way, but as `undetermined`/`unparseable` — labelling it `recon` told
+        # the caller it had tried something it had not, and handed it a recon fix for a parse
+        # problem. Unreachable at the chokepoint, where `check_read_only` runs the same neutralizer
+        # and refuses first; reachable, and covered, as a standalone call.
+        return refuse(
+            RULE_UNPARSEABLE, detail=reject.detail, remediation=reject.remediation
+        )
+
+    match = (
+        _RECON_PAREN_RE.search(neutral.text)
+        or _recon_niladic_hit(neutral)
+        or _RECON_CAST_RE.search(neutral.text)
+    )
+    if match is None:
+        return None
+
+    # Echo the token the caller itself sent, never the alternatives. A refusal that lists what IS
+    # allowed is a schema-listing endpoint.
+    hit = match.group(0).strip(" .(:")
+    return refuse(
+        RULE_RECON,
+        detail=f"metadata/recon access is not allowed (`{hit}`)",
+        remediation=_RECON_REMEDIATION,
+    )

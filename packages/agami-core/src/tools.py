@@ -14,8 +14,8 @@ Design constraints (match the rest of agami):
     `semantic_model` package (Pydantic) lazily and surface a clear "install the model deps" error
     if it's absent — so execution still works on a bare install.
   - **No data leaves the machine.** SQL is executed locally by shelling out to `execute_sql` (the
-    same executor the skills use), which runs the fan/chasm pre-flight + default_filters safety
-    pass; the semantic model is read from `<artifacts_dir>/<profile>/`.
+    same executor the skills use), which runs the scope gates and reports the fan/chasm and
+    aggregation findings on the receipt; the model is read from `<artifacts_dir>/<profile>/`.
 """
 
 from __future__ import annotations
@@ -24,14 +24,17 @@ import csv
 import functools
 import io
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from contextvars import ContextVar, Token
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,31 @@ from typing import Any
 # Paths & config resolution (mirrors execute_sql.py / file-layout.md exactly)
 # ---------------------------------------------------------------------------
 import agami_paths
+
+# The guardrail contract is stdlib-only by construction, so importing it here costs a bare install
+# nothing — unlike `sql_guard`, which is still imported lazily inside `check_read_only`. `Envelope`,
+# `Failure` and `Refusal` are CONSTRUCTED at this layer (the tool edge owns the outcomes that never
+# reach the execution chokepoint), so they cannot be TYPE_CHECKING-only the way `Refusal` was.
+from guardrail import (
+    PRE_MODEL_RULES,
+    RECEIPT_BEFORE_MODEL,
+    RECEIPT_BUILD_FAILED,
+    RECEIPT_GOVERNANCE_DISABLED,
+    RECEIPT_NO_MODEL,
+    RULE_AUDIT_UNAVAILABLE,
+    Envelope,
+    Failure,
+    Receipt,
+    Refusal,
+    receipt_from_assembled,
+    undetermined_receipt,
+)
+
+# The tool edge's logger. The audit write is best-effort — it must never break an answer — but
+# "best-effort" is not "silent": a permanently broken sink has to be distinguishable from a working
+# one, or the audit trail can be absent for weeks with nothing to notice it by. Everything that is
+# swallowed here is logged at WARNING with its exception instead.
+_LOG = logging.getLogger(__name__)
 
 # Secrets + per-user state live under <artifacts_dir>/local/. Re-resolved after bootstrap() in main().
 AGAMI_LOCAL = agami_paths.local_dir()
@@ -72,14 +100,63 @@ SERVER_INSTRUCTIONS = (
     "Flow: (1) list_datasources, then get_datasource_schema for the datasource the question "
     "touches (it sizes itself — pass a `query` to focus metrics, `dataset_names` for full table "
     "detail). (2) Examples-first — call get_prompt_examples and mirror the closest match; use "
-    "metric `calculation`/`bindings` verbatim. (3) execute_sql (safety + default_filters run "
-    "inside it). (4) Read the returned `receipt`: SHOW the user `receipt.warnings` and any "
-    "`receipt.metrics` whose review_state != 'approved' — joins/metrics they haven't signed off; "
-    "never hide them. Don't refuse on an unreviewed metric — answer and warn.\n"
-    "PII: a column marked `sensitive: true` restricts OUTPUT, not the query — you MAY "
-    "COUNT/COUNT(DISTINCT)/filter/GROUP BY/JOIN on it, but never SELECT its raw per-row values. "
-    "'unique emails' → COUNT(DISTINCT email). To disambiguate identical labels, project the "
-    "non-sensitive id. (execute_sql enforces this and errors on a raw sensitive projection.)\n"
+    "metric `calculation`/`bindings` verbatim. (3) execute_sql (the safety pass runs inside it; "
+    "a table's declared `default_filters` are NOT applied — write one into the SQL yourself if "
+    "the question needs it). (4) Read the returned `receipt`. It is on EVERY status, and it is "
+    "five sections — columns, tables, joins, aggregates, assumptions — each `{items, "
+    "undetermined}`. SHOW the user: any join in `receipt.joins.items` that HAS a review_state and "
+    "it is != 'approved', and any item in `receipt.columns.items` with kind 'output' and status "
+    "'matched' whose review_state != 'approved' — joins/metrics they haven't signed off; "
+    "never hide them. A join's review_state is null when its status is not 'declared', which is "
+    "'no declaration matched this join' and NOT 'nobody signed it off'. `receipt.joins.items` is "
+    "one entry per join the STATEMENT wrote, each `{predicate, from_to, scope, status}` with "
+    "status declared (the predicate it wrote matches the relationship named on `name`) / "
+    "undeclared (it matches none, or wrote no predicate to match, AND every declaration between "
+    "its two tables was one we could read) / undeclarable (an endpoint is a relation the statement "
+    "bound for itself) / undetermined (the join could not be read, or a declaration about it could "
+    "not be — NOT a claim that the model does not declare it; that gap is on the section's own "
+    "`undetermined` sentence). `receipt.columns.items` holds TWO kinds of entry and `kind` says "
+    "which: kind 'output' is one per value the statement RETURNS, each `{kind, column, scope, "
+    "status}` plus the matched metric's `{name, area, definition_prose, expression, confidence, "
+    "origin, review_state, signed_off_*}`, with status matched (the value computes that declared "
+    "metric) / unmatched (every declared binding was read and none of them is this value, i.e. the "
+    "number is NOT the org's agreed definition — say so) / undetermined (the value sits behind a "
+    "CTE or derived table we do not read into, or a declared binding could not be parsed — NOT a "
+    "claim that no metric matches); every metric key is null unless status is 'matched'. kind "
+    "'reference' is one per column the statement READ, `{kind, column}` plus `sensitive: true` "
+    "where it applies, and it never carries a metric. Don't refuse on an unreviewed metric — "
+    "answer and warn. ALSO read "
+    "`receipt.tables.items[].filters`: one entry per declared `default_filters` of that table "
+    "reference, each `{expr, status}` with status applied / omitted / undetermined, scoped by the "
+    "sibling `scope` field ('main' or 'cte:<name>', each carrying a trailing '#<n>' arm number "
+    "when that scope is one of two or more arms of a UNION / INTERSECT / EXCEPT, or 'subquery', "
+    "which never takes one) because a "
+    "filter satisfied inside a CTE body is not satisfied for the statement reading it, and a "
+    "filter applied in one arm is not applied in another. Nothing applied them for you, so an "
+    "`omitted` or `undetermined` one is a real gap between what the org means by that table and "
+    "what the answer counted — tell the user, and re-run with the filter written in if the "
+    "question wanted it. ALSO read `receipt.aggregates.items`: one entry per aggregate the "
+    "statement computes, each `{aggregate, scope, status, joins, findings}` with status "
+    "multiplied / not_multiplied / undetermined, and `scope` the same arm label the `tables` "
+    "entries carry. A `multiplied` one means a join multiplied the rows behind THAT number and "
+    "`joins` names the join — say which number and which join, and say that whether it is wrong "
+    "depends on what they asked for, because the same total is right for line-item exposure and "
+    "wrong for order revenue. `undetermined` means the check could not resolve what the aggregate "
+    "reads (a `COUNT(*)`, an unqualified column, a CTE the walk does not enter), so do NOT report "
+    "it as clean. Its sibling `findings` is a different question — whether the arithmetic is "
+    "meaningful at all — and a number can be un-multiplied and still meaningless. ALSO surface "
+    "each section's "
+    "`undetermined` sentence when it is non-null: it says what that section did NOT establish, so "
+    "an empty `items` with a marker means NOT CHECKED while an empty `items` with a null marker "
+    "means checked and clean. Reporting only `items` turns 'not checked' back into 'nothing "
+    "wrong', which is the one reading the receipt exists to prevent.\n"
+    "PII: a column marked `sensitive: true` is the model author asking you to handle it with care. "
+    "Prefer COUNT/COUNT(DISTINCT)/filter/GROUP BY/JOIN over projecting raw per-row values — "
+    "'unique emails' → COUNT(DISTINCT email) — and to disambiguate identical labels, project the "
+    "non-sensitive id. Nothing stops you: this is judgement, not a gate, and the receipt reports "
+    "which sensitive columns an answer projected. Project them when the question genuinely needs "
+    "them and say that you did. A column that must not be readable at all is not in the model, and "
+    "a statement naming it is refused as out-of-scope.\n"
     "Activity log: on EVERY tool call (not just execute_sql), pass a `thread_id` (one per conversation, "
     "reused across all its calls) and a `correlation_id` (one per user question/turn, reused across the "
     "calls answering it, fresh when they ask something new), plus `user_question` (the user's question "
@@ -185,8 +262,8 @@ def _db_type_for(profile: str, creds: dict[str, dict[str, str]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def check_read_only(sql: str) -> str | None:
-    """Return None if the SQL is a safe single read-only statement, else a reason string.
+def check_read_only(sql: str) -> Refusal | None:
+    """Return None if the SQL is a safe single read-only statement, else the gate's `Refusal`.
 
     Thin fail-fast wrapper over the shared `sql_guard` — the SAME gate the executor
     (`execute_sql.py`) enforces — so the stdio server, the HTTP/OAuth server, the
@@ -251,10 +328,69 @@ def _resolve_units(profile: str, sql: str) -> dict[str, str]:
         return {}
 
 
+# What ONE tool call may resolve more than once and must not resolve more than once: the model
+# version pin. Keyed inside by profile, and scoped to a request rather than to the process, for two
+# different reasons that both matter.
+#
+# **Cost.** `_model_version` is not free where it counts. Hosted, it opens a fresh unpooled psycopg2
+# connection, queries and closes it — and a single `ok` call reached it five times (once inside each
+# of the three `get_cached_org` calls, twice more directly), so one query cost up to five new Postgres
+# connections for one unchanging string.
+#
+# **Correctness.** A version that changes mid-request would otherwise let one answer be described by
+# two different model versions. Resolving once per request makes "the receipt pins the model this
+# answer used" true by construction rather than by the two reads happening to race the same way.
+#
+# The assembled receipt was memoized here too, because the legacy flat dict and the Envelope's typed
+# `Receipt` were assembled separately from the same statement. There is one receipt now and one
+# consumer of it, so the memo has nothing left to absorb and the property it delivered — one
+# assembly per request — is pinned by a test on both routes instead of by a cache that hides a
+# second call site.
+#
+# A ContextVar rather than a module global because tool handlers run on parallel worker threads
+# (`mcp_http` off-loads them), and it holds `None` outside a scope so a caller that never opens one
+# (a direct handler call, a test) behaves exactly as it did before this cache existed.
+_request_cache: ContextVar[dict[str, Any] | None] = ContextVar(
+    "agami_request_cache", default=None
+)
+
+
+def begin_request_cache() -> Token[dict[str, Any] | None]:
+    """Open the per-request resolve-once scope. Reset with the returned token in a `finally`, so one
+    request's model version and assembled receipt can never describe the next one."""
+    return _request_cache.set({})
+
+
+def end_request_cache(token: Token[dict[str, Any] | None]) -> None:
+    """Close the scope opened by `begin_request_cache`. Separate from the opener so the pairing is
+    visible at the call site, the same shape as `set_call_source` / `reset_call_source`."""
+    _request_cache.reset(token)
+
+
+def _request_cached(key: Any, resolve: Callable[[], Any]) -> Any:
+    """`resolve()`, once per request per key. Outside a scope it is a plain call-through."""
+    cache = _request_cache.get()
+    if cache is None:
+        return resolve()
+    if key not in cache:
+        cache[key] = resolve()
+    return cache[key]
+
+
 def _model_version(profile: str) -> str | None:
     """The model-version pin the receipt records — the newest model version. Served from the DB
     when AGAMI_DB_URL is set (no file read), else the newest snapshot dir name (a content hash, what
-    the local skill reads). None if absent/unavailable (execute_sql stays usable)."""
+    the local skill reads). None if absent/unavailable (execute_sql stays usable).
+
+    Resolved at most ONCE per request per profile: on the hosted path this opens a database
+    connection, and the callers within one query are several (`get_cached_org` in each model
+    consumer, plus the receipt's own pin)."""
+    return _request_cached(("model_version", profile), lambda: _resolve_model_version(profile))
+
+
+def _resolve_model_version(profile: str) -> str | None:
+    """`_model_version` without the per-request memo — the actual lookup, split out so the memo has
+    something to wrap and so a caller that genuinely wants a fresh read has one to call."""
     from store import Store
 
     store = Store.from_env()
@@ -388,11 +524,18 @@ def get_cached_org(profile: str):
     Reuses one Datasource across the loads within a query AND across queries, until the model version
     changes; a cache miss falls back to a fresh `_load_org`."""
     version = _model_version(profile)  # cheap: one DB row / dir listing, not a full model load
-    if version is None:
-        # No version to detect a model change by (e.g. file mode with no snapshot) — don't cache,
-        # so we can never serve a stale model. The DB-backed server always has a version.
-        return _load_org(profile)
     org_id = _current_org_id()
+    if version is None:
+        # No version to detect a model change by (e.g. file mode with no snapshot) — so nothing may
+        # be cached ACROSS requests, or we could serve a stale model. The DB-backed server always has
+        # a version and never takes this branch.
+        #
+        # WITHIN one request it is cached anyway, and that is not the same tradeoff: the consumers
+        # of the model in a single query (the unit resolver and the receipt assembler) are describing
+        # ONE answer, so serving them separately-loaded models buys no freshness and costs repeated
+        # full loads of the same YAML. Before this, an unversioned local install paid one per
+        # consumer on every query.
+        return _request_cached(("org", org_id, profile), lambda: _load_org(profile))
     key = (org_id, profile, version)
     cached = _ORG_CACHE.get(key)  # fast path: a hit is a single atomic dict.get, no lock
     if cached is not None:
@@ -441,18 +584,101 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
     )
 
 
-def _resolve_receipt(profile: str, sql: str) -> dict | None:
-    """The FULL trust receipt (tables / relationships / metrics+review_state / assumptions
-    / warnings) for this query — the SAME assembler the skill uses, so the 'what did this
-    touch / what's unapproved' panel is identical in Claude Code and Claude Desktop.
-    Returns None only if the model deps aren't importable (execute_sql stays usable)."""
+# The argument-validation outcome: there is no statement, so there is nothing a receipt could be
+# about. Distinct from every reason in `guardrail`, each of which is a statement whose receipt could
+# not be built. It lives here because the tool edge is the only layer that can reach it — the
+# chokepoint is never called without a statement.
+RECEIPT_NO_STATEMENT = (
+    "No statement was supplied, so there was nothing to establish anything about."
+)
+
+
+def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receipt:
+    """The `Envelope.receipt` for a statement this process did NOT run through the chokepoint.
+
+    The fork path needs this. `tools` runs `python -m execute_sql` as a subprocess and rebuilds the
+    Envelope from the child's exit code and stderr, so the receipt the child assembled is destroyed
+    at the process boundary — on exactly the refused and failed outcomes. Building it here is what
+    keeps the two paths saying the same thing about the same statement, without changing the wire
+    format between parent and child (ACE-035 declined to scope that).
+
+    `bounded` picks the echo-bounded assembler, and EVERY non-ok outcome asks for it — the same rule
+    the chokepoint's `_receipt_for` states and for the same reason: a `failed` body is reachable for a
+    name the model declares and the warehouse does not have, so it is a disclosure channel of its own
+    rather than a subset of `ok`'s.
+
+    A build that raises returns an `undetermined` receipt, never `None`. A receipt that could not be
+    built is a fact the caller can act on ("the model deps are not installed here"); `None` was an
+    absence the caller could only read as silence. The two failure reasons are kept apart here
+    exactly as the chokepoint keeps them apart, and they are the chokepoint's own constants: a caller
+    on the default fork path would otherwise never see the actionable one, which is this spec's own
+    defect one layer down.
+
+    CLOSED GAP, and this is where it lived. `sql` here is the statement the CALLER sent, which is the
+    only one this side of the fork has: `_model_safety` runs in the child, so anything it rewrote
+    rebound the child's local before it executed and this described a statement that did not run.
+
+    It closed by subtraction rather than by plumbing the rewritten statement back across the wire.
+    The default-filter injection went first, then the fan/chasm auto-rewrite, and nothing rewrites a
+    statement now — the string below is the one the child executes, byte for byte, and
+    tests/test_ace093_byte_identity.py asserts that at the driver hand-off. The parity this depended
+    on is measured in tests/test_ace088_executed_statement.py, which carried it as a `strict=True`
+    xfail until the last rewrite went.
+
+    Keep the invariant in mind before adding one back: a rewrite anywhere below the fork makes this
+    receipt describe the wrong statement again, and the fork path has no channel to learn about it.
+    """
+    from execute_sql import _model_pass_disabled  # sibling module; no import cycle
+
+    if _model_pass_disabled():
+        # ACE-101, first statement here too, and this side is the more dangerous of the two. The
+        # in-process twin reaches a `_guard_model is None` branch and reports a FALSE cause; this one
+        # does not read `_guard_model` at all. It resolves the model itself, one line down, and when
+        # that model is deployed to the STORE (the normal hosted shape, since `_load_org` reads the DB
+        # and raises rather than falling back to disk once `AGAMI_DB_URL` is set), the resolve succeeds
+        # with the pass off. Left alone it would then assemble a full, CLEAN receipt describing checks
+        # that never ran, which is exactly what the fifth reason exists to prevent, and it would make
+        # the fork path and the in-process path describe one call two different ways (REQ-002).
+        #
+        # On a hosted deployment whose model is only on disk the resolve raises instead and the arm
+        # below answers `RECEIPT_NO_MODEL`, still a false cause, just a quieter one.
+        return undetermined_receipt(RECEIPT_GOVERNANCE_DISABLED)
     try:
         org = get_cached_org(profile)
+    except Exception:
+        # No model for this datasource, or no model deps at all. Both are ordinary states for a bare
+        # local install rather than faults, so they are not server-log events — the fact travels to
+        # the caller on the receipt itself, which is the whole point of returning one. Logged without
+        # `exc_info`: a traceback here would carry the resolved artifacts path into the server log
+        # for an outcome that is not an error at all.
+        _LOG.debug("no model for datasource %r; receipt undetermined", profile)
+        return undetermined_receipt(RECEIPT_NO_MODEL)
+    try:
         from semantic_model import runtime as RT
 
-        return RT.assemble_receipt(org, sql, model_version=_model_version(profile))
+        assemble = RT.assemble_refusal_receipt if bounded else RT.assemble_receipt
+        return receipt_from_assembled(
+            assemble(org, sql, model_version=_model_version(profile))
+        )
     except Exception:
-        return None
+        # A model that loaded and an assembler that then broke IS a fault, and the operator is the
+        # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
+        _LOG.error("could not assemble the receipt for datasource %r", profile, exc_info=True)
+        return undetermined_receipt(RECEIPT_BUILD_FAILED)
+
+
+def _refusal_receipt(profile: str, sql: str, refusal: Refusal) -> Receipt:
+    """The receipt a REFUSED Envelope carries on this side of the fork, chosen by which rule fired.
+
+    The twin of `execute_sql._refusal_receipt`, consulting the same `PRE_MODEL_RULES` set, so one
+    refusal reads one way whichever process decided it. It is also what keeps a refusal the cheap
+    path: a `read_only` or `recon` verdict is reached without a model, so building its receipt must
+    not load one — which on the hosted server is a fresh unpooled connection per refusal, on the one
+    outcome an attacker triggers at will.
+    """
+    if refusal.rule in PRE_MODEL_RULES:
+        return undetermined_receipt(RECEIPT_BEFORE_MODEL)
+    return _resolve_receipt(profile, sql, bounded=True)
 
 
 def tool_list_datasources(_args: dict[str, Any]) -> str:
@@ -958,26 +1184,116 @@ def tool_get_prompt_examples(args: dict[str, Any]) -> str:
 
 
 def _classify_exit(code: int) -> str:
-    return {
-        2: "dsn",  # config / missing credentials / bad profile
-        3: "driver_missing",
-        4: "auth",  # connect / auth failed (also network)
-        5: "syntax",  # SQL execution error
-    }.get(code, "other")
+    """The `Failure.kind` for a CLI exit code — a one-line delegate to `execute_sql`, which owns the
+    exit-code contract (it documents the codes and is the only place that produces them), so the tool
+    edge cannot drift a second copy of the table."""
+    from execute_sql import EXIT_TO_FAILURE_KIND
+
+    return EXIT_TO_FAILURE_KIND.get(code, "other")
 
 
-def _executor_truncated(stderr: str | None) -> bool:
-    """True if execute_sql flagged a bounded-fetch truncation (ACE-038/044). The executor emits a
-    non-error `{"truncated": {"row_cap": N}}` line on stderr alongside any other notices; scan for it."""
+def _stderr_refusal(returncode: int, stderr: str | None) -> dict | None:
+    """The refusal a forked executor wrote to stderr, reconstructed — or None when this exit is not
+    one.
+
+    Exit 1 is the guard's code but not exclusively the read-only guard's: the semantic-model
+    branches still exit 1 after writing today's `{"error": …}` line. Keying off the `"refusal"` key
+    rather than off the code alone is what lets both shapes share the exit without either being
+    reinterpreted as the other.
+
+    The payload is rebuilt through `Refusal` rather than passed along as a raw dict, so the
+    contract's invariants (a known reason, a non-empty detail and remediation) are re-checked on
+    THIS side of the process boundary. A child that somehow emitted a malformed refusal therefore
+    falls back to the generic error path instead of being relayed as a valid one.
+
+    `AttributeError` is in the caught set alongside `TypeError`/`ValueError` because a non-string
+    field (`{"detail": 3}`) reaches `__post_init__`'s `.strip()` and raises it — a third way the same
+    malformed payload can fail, and the one that would escape a fallback this docstring promises."""
+    if returncode != 1:
+        return None
+    from guardrail import Refusal
+
     for line in (stderr or "").splitlines():
         line = line.strip()
-        if line.startswith("{") and '"truncated"' in line:
-            try:
-                if isinstance(json.loads(line).get("truncated"), dict):
-                    return True
-            except ValueError:
-                pass
-    return False
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("refusal"), dict):
+            continue
+        try:
+            return asdict(Refusal(**payload["refusal"]))
+        except (AttributeError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _child_failure_message(returncode: int, stderr: str | None) -> str:
+    """The `Failure.message` for a forked executor that exited non-zero and did **not** write a
+    structured refusal — either the child's own classified diagnostic, or a generic stand-in.
+
+    Relayed only when BOTH hold:
+
+      * the exit code is one the child's CLI contract produces from a `Failure`
+        (`execute_sql.EXIT_TO_FAILURE_KIND` — 2/3/4/5/6). Those are the codes `main` reaches by
+        writing `env.failure.message`, so the text is something the child classified and chose. Any
+        other code — a Python-level crash exiting 1, a signal, a code we do not know — means the
+        child never got that far, so its stderr is whatever happened to be on the way out.
+      * the text carries no Python traceback. Belt and braces on the rule above, and the concrete
+        thing that used to land here: before `execute_guarded` was made total, a malformed
+        credentials file raised `configparser.MissingSectionHeaderError` out of the child, and the
+        parent put the whole traceback — absolute filesystem paths included — into `failure.message`,
+        which is a field the caller is shown.
+
+    What is deliberately still relayed is the child's *authored* config-error text ("No warehouse
+    credentials for profile […]. Set DATASOURCE_URL…"). That is the remediation a misconfigured user
+    needs, and it is the same text the in-process path surfaces from `ExecutorError.msg` — the two
+    paths agreeing on it is a property this slice exists to keep.
+
+    **The sanitized band is RECONSTRUCTED, never relayed (ACE-039).** For every code whose message
+    the child derives from `_ERROR_MESSAGES`, the parent can rebuild that exact sentence from the
+    exit code alone, so relaying stderr for those codes buys nothing and carries real risk: stderr
+    is a *shared* stream, and the child writes to it before the failure line. The concrete case was
+    `_model_safety`'s `[agami] applied default_filters: …` notice — it put a declared row-level
+    predicate, which the caller never sent, into `failure.message` on the DEFAULT transport, while
+    the in-process path returned the clean sentence. (That notice is gone: ACE-042 deleted the
+    injection it announced, and the `[agami] auto-corrected …` notice that replaced it as the
+    example went the same way with the rewrite it announced. What still writes to the child's stderr
+    is anything a library logs: both surviving diagnostic lines went too, when ACE-094 deleted the
+    refusals that wrote them. The reconstruction below is not thereby unnecessary — a library
+    writing to the shared stream has exactly the same reach, and it is the mechanism rather than
+    any one notice that keeps the caller's answer clean. The traceback guard only ever caught the
+    two `exc_info=True` sites.)
+    """
+    from execute_sql import (
+        _AUTHORED_EXIT_CODES,
+        _ERROR_MESSAGES,
+        EXIT_TO_FAILURE_KIND,
+        UNEXPECTED_FAILURE_MESSAGE,
+    )
+
+    text = (stderr or "").strip()
+    # Rebuild rather than relay. The child produced this sentence from the kind, so the kind is all
+    # the parent needs, and the child's stream never touches the caller's answer.
+    kind = EXIT_TO_FAILURE_KIND.get(returncode)
+    if returncode not in _AUTHORED_EXIT_CODES and kind in _ERROR_MESSAGES:
+        return _ERROR_MESSAGES[kind]
+    classified = returncode in EXIT_TO_FAILURE_KIND
+    # `Traceback (most recent call last):` is the stable header of every Python traceback, and a
+    # `  File "…", line N` frame is the line that carries the absolute path. Either one is enough.
+    has_traceback = "Traceback (most recent call last):" in text or '\n  File "' in f"\n{text}"
+    if text and classified and not has_traceback:
+        return text
+    if text:
+        # Not for the caller, but not lost either: the raw stream is exactly what an operator needs
+        # to debug a child that died in a way it could not classify.
+        _LOG.error(
+            "forked executor exited %s with no relayable diagnostic; raw stderr: %s",
+            returncode, text,
+        )
+    return UNEXPECTED_FAILURE_MESSAGE
 
 
 # The composition-root executor (AH-012). ``None`` (the default) means "fork the execute_sql
@@ -1005,17 +1321,25 @@ def set_injected_executor(executor: Any | None) -> None:
 
 
 def _finalize_execution(
-    columns: list, data_rows: list, truncated: bool, *, profile: str, sql: str,
-    execution_ms: int, args: dict[str, Any],
+    columns: list, data_rows: list, *, profile: str, sql: str, execution_ms: int,
 ) -> str:
-    """Shape a successful result (units + exact-render markdown + trust receipt), log the execution
-    through the single sink, and return the tool JSON. Shared by both execution paths — the subprocess
-    fork and the in-process executor — so a **successful** query returns the identical result envelope
-    whichever ran it. (A guard *refusal* is not yet identical across paths: the subprocess surfaces
-    execute_sql's stderr JSON as the remediation, while the in-process path returns a clean generic
-    refusal with the structured detail in the server log. Full structured-refusal parity needs
-    `_model_safety` to *return* its envelope — it currently writes it to stderr, pinned by the
-    fail-closed guard tests — so it's tracked as a follow-up, not folded into this seam.)"""
+    """Shape a successful result (units + exact-render markdown) and return the result JSON. Shared
+    by both execution paths — the subprocess fork and the in-process executor — so a successful query
+    returns the identical payload whichever ran it.
+
+    This is the **`ok` payload only**, and it is frozen: `_emit` merges `status`, `receipt` and
+    `audit_id` onto what this returns and is the only thing that serializes a tool response. It no
+    longer builds a receipt of its own. It used to nest one here — the flat assembler output, under
+    `data.receipt` — beside the Envelope's typed `guardrail.Receipt`, so one answer carried two
+    descriptions of itself that were free to disagree and only the nested one reached an `ok`
+    caller. There is one receipt now, it hangs off the Envelope, and `_emit` puts it on all three
+    statuses.
+
+    It no longer writes the audit row either. This function only ever runs on success, so hanging the
+    write here is precisely why a refusal left no trace; the write moved to `_emit`, which every
+    outcome passes through. Shaping a payload and recording an execution were two jobs in one place —
+    and the `args` parameter went with the write, since the tool arguments were only ever read for
+    the log."""
     # Deterministic, exact rendering — so the numbers a user verifies don't depend on
     # how the host LLM chooses to format them. `markdown` is the table to display
     # verbatim; `rows` stays raw (exact CSV values) for charting / programmatic use.
@@ -1031,88 +1355,281 @@ def _finalize_execution(
         "columns": columns,
         "rows": data_rows,
         "row_count": len(data_rows),
-        "truncated": truncated,
         "units": unit_map,
         "markdown": markdown,  # exact, full numbers (currency symbol + grouping) — render as-is
         "sql": sql,
         "execution_ms": execution_ms,
-        # Trust receipt — provenance + anything unapproved this answer used. Same assembler
-        # the agami-query skill renders, so Desktop gets the same trust panel. Clients should
-        # surface receipt.warnings and any receipt.metrics whose review_state != "approved"
-        # (offer to approve/correct via the save_correction tool).
-        "receipt": _resolve_receipt(profile, sql),
     }
-
-    # Log the execution through the single chokepoint: the DB sink when AGAMI_DB_URL is set (one
-    # query_executions row), else the local jsonl the skills use. Best-effort either way.
-    _record_query(
-        {
-            "ts": _now_iso(),
-            "profile": profile,
-            "question": args.get("raw_query"),
-            "sql": sql,
-            "row_count": len(data_rows),
-            # Same provenance the tool-call row carries, so the two logs can't disagree about what
-            # drove one execution. Unset, this is the value it has always been.
-            "source": current_call_source(),
-        }
-    )
     return json.dumps(result, indent=2, default=str)
 
 
-def _run_in_process(
-    sql: str, profile: str, area: str | None, max_rows: int | None, executor: Any
-) -> tuple[list, list, bool] | dict:
-    """Run through the in-process executor behind the shared guarded envelope (no subprocess, no CSV
-    round-trip). Returns ``(columns, data_rows, truncated)`` on success, or an error dict on a guard
-    refusal / execution failure — the same error shape the subprocess branch produces.
+def _envelope(
+    status: str,
+    *,
+    receipt: Receipt,
+    data: Any | None = None,
+    refusal: Refusal | None = None,
+    failure: Failure | None = None,
+) -> Envelope:
+    """The ONE place the tool edge constructs an `Envelope`, and the one place it mints an
+    `audit_id`.
 
-    Rows are textualized to match the subprocess CSV wire (``None`` → ``""``, else ``str``) so the
-    two paths return observably identical JSON. Native-typed rows are a deliberately deferred decision
-    (see the AH-012 spec); flipping this one coercion is the follow-up once that's settled."""
+    `receipt` is MANDATORY, which is what actually delivers the property this docstring used to
+    claim: an outcome with no receipt to hand must return one that SAYS so, rather than the
+    empty-and-silent default a consumer would read as "checked, found nothing". Every call site
+    already passes one, so the fallback was unreachable — and its reason named the wrong cause for
+    most of the outcomes that could have reached it.
+
+    The execution chokepoint (`execute_sql.execute_guarded`) mints its own for everything that
+    reaches it; this covers the outcomes that never do — a malformed argument, the read-only
+    fast-fail, the subprocess supervisor timeout, and the fork path, whose child's id is
+    deliberately not on the wire. The id minted here is the one that gets RECORDED: `_emit` — the
+    single consumer of what this returns — writes it as `query_executions.id`, so the id a caller
+    reads back off the answer is the primary key of its own audit row."""
+    return Envelope(
+        status=status,
+        data=data,
+        refusal=refusal,
+        failure=failure,
+        receipt=receipt,
+        audit_id=uuid.uuid4().hex,
+    )
+
+
+def _emit(
+    env: Envelope,
+    *,
+    sql: str | None,
+    execution_ms: int | None,
+    profile: str | None = None,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Serialize ONE `Envelope` to the tool-edge JSON — the single serializer `tool_execute_sql`
+    returns through, whichever path produced the Envelope.
+
+    Collapsing the six previous `json.dumps` return sites into this one is the point of the slice: a
+    refusal now reads the same whether the guard ran in-process or in a forked child, because there
+    is only one place that decides how a refusal reads.
+
+    Per status:
+      * `ok`      — `_finalize_execution`'s frozen payload with `status`, `receipt` and `audit_id`
+                    merged on. Its rows are textualized here (`None` → `""`, else `str`) so both
+                    paths emit the same JSON.
+      * `refused` — `{status, refusal, sql?, execution_ms?, receipt, audit_id}`.
+      * `failed`  — `{status, failure, sql?, execution_ms?, receipt, audit_id}`.
+
+    The receipt is attached AFTER the branch, once, for all three — so `Envelope.receipt` is the
+    only receipt a caller can read and there is no per-status decision about whether it appears. It
+    rode the two non-ok bodies only while the `ok` payload owned a `"receipt"` key of its own (the
+    flat legacy dict), because splatting the payload would have silently overwritten one of the two.
+    That key is gone.
+
+    `None` fields are omitted rather than emitted as explicit `null`, so a response never carries a
+    key that says nothing (the argument-validation path, for instance, has no `sql` to report).
+
+    This is also where the audit row is written — see `_record_execution`. Both branches below fall
+    through to ONE record call and ONE `json.dumps`, so "exactly one row per tool call, on every
+    outcome" is a property of the control flow rather than of six call sites staying in step."""
+    if env.status == "ok":
+        columns = list(env.data.columns)
+        rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
+        payload = json.loads(
+            _finalize_execution(
+                columns, rows,
+                profile=profile or "", sql=sql or "", execution_ms=execution_ms or 0,
+            )
+        )
+        body: dict[str, Any] = {"status": "ok", **payload}
+        row_count = payload["row_count"]
+    else:
+        body = {"status": env.status}
+        if env.refusal is not None:
+            body["refusal"] = asdict(env.refusal)
+        if env.failure is not None:
+            body["failure"] = asdict(env.failure)
+        if sql is not None:
+            body["sql"] = sql
+        if execution_ms is not None:
+            body["execution_ms"] = execution_ms
+        # A refused or failed call returned no rows at all — which is not the same fact as a query
+        # that ran and matched nothing, but the row's `status` is what carries that distinction.
+        row_count = 0
+
+    # Outside the branch, so every status carries the Envelope's receipt and exactly one of them.
+    body["receipt"] = asdict(env.receipt)
+    body["audit_id"] = env.audit_id
+
+    _record_execution(env, sql=sql, profile=profile, args=args, row_count=row_count)
+    # Publish the TYPED outcome for the tool-call recorder (ACE-098). It runs later, in the
+    # transport's `finally`, where the Envelope no longer exists and only this serialized string
+    # does — so without this the tool_calls row's account of why a call failed is a `json.loads` of
+    # our own output. Set here rather than in `execute_guarded` because the tool edge is what
+    # decides the final status: the fork path rebuilds the Envelope on the parent side, and the
+    # chokepoint that ran in the child cannot reach this context at all.
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(
+        (env.status, env.refusal.rule if env.refusal is not None else None, row_count)
+    )
+    return json.dumps(body, indent=2, default=str)
+
+
+# The most of a caller's statement that reaches the audit store. Deliberately far below the guard's
+# own 50,000-character cap (`sql_guard._MAX_SQL_CHARS`), because the two bounds answer different
+# questions: the guard's decides what may RUN, this one decides what is worth KEEPING. Since a
+# refusal now writes a row, an oversized statement is refused *for being oversized* and its whole
+# body was still persisted — so an authenticated caller could grow the store without ever reaching
+# the warehouse. 8,000 characters holds any statement a person or a model actually writes (a long
+# generated SELECT is a few KB), and the verdict columns, not the blob, are what make the row useful.
+AUDIT_SQL_MAX_CHARS = 8_000
+
+# The raw driver error is unbounded in a way the statement is not: a PostgreSQL failure can carry a
+# HINT, a CONTEXT chain and every bound parameter. 015's argument applies verbatim — a failed
+# statement must not become a way to grow the store — and this is the operator's diagnostic, so a
+# couple of thousand characters is the whole of what is worth keeping.
+AUDIT_ERROR_DETAIL_MAX_CHARS = 2_000
+
+# The refusal's own sentence, bounded on 015's argument (ACE-098). `Refusal.detail` is authored by
+# us and value-free by contract, so it is nothing like the unbounded driver text above — but it
+# ECHOES identifiers the caller sent, and an echo is caller-controlled length. 1,000 characters is
+# several times the longest detail any gate writes, so this bites only on something that has already
+# gone wrong. `receipt` needs no bound here: `runtime._RECEIPT_MAX_REFS` caps every section before
+# the receipt is built, so its JSON has a ceiling by construction — and truncating JSON would leave
+# a blob that does not parse, which is worse than the row having no receipt at all.
+AUDIT_DETAIL_MAX_CHARS = 1_000
+
+
+def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
+    """The statement as it will be stored, plus whether it had to be cut.
+
+    The flag matters as much as the cut: a truncated statement that does not say so is a statement a
+    reviewer would read as the whole thing, and re-running it would not reproduce the decision.
+    """
+    if len(sql) <= AUDIT_SQL_MAX_CHARS:
+        return sql, False
+    return sql[:AUDIT_SQL_MAX_CHARS], True
+
+
+def _bounded_audit_detail(detail: str) -> str:
+    """The refusal's detail as it will be stored (ACE-098).
+
+    No companion truncation flag, unlike `sql`. The flag exists there because a cut statement reads
+    as the whole one and a reviewer would re-run something that does not reproduce the decision. A
+    detail is prose we authored, not something anyone re-runs, and it is bounded well above what any
+    gate writes — so the flag would be a column that is false on every row ever written.
+    """
+    return detail[:AUDIT_DETAIL_MAX_CHARS]
+
+
+def _record_execution(
+    env: Envelope,
+    *,
+    sql: str | None,
+    profile: str | None,
+    args: dict[str, Any] | None,
+    row_count: int,
+) -> None:
+    """Write the ONE audit row for this call, from the ONE Envelope about to be serialized.
+
+    Called from `_emit`, the single tool-edge serializer, so a row lands for `ok`, `refused` **and**
+    `failed`. It used to hang off `_finalize_execution`, which runs only on success — so the audit
+    trail recorded the queries that worked and silently dropped every decision we made against one.
+
+    `id=env.audit_id` makes the row's primary key the same id the answer carried back, so a caller
+    can find the record of its own execution with no join and no second uuid to reconcile.
+
+    `reason` and `rule` are read off `env.refusal` — the contract object — rather than re-parsed out
+    of the serialized body: the typed fields are already here, and a later change to the wire shape
+    then cannot quietly empty the audit columns.
+
+    `sql` is BOUNDED before it is stored — see `AUDIT_SQL_MAX_CHARS`.
+    """
+    refusal = env.refusal
+    if refusal is not None and refusal.rule == RULE_AUDIT_UNAVAILABLE:
+        # The ONE outcome that writes no row, and the only exemption there is (ACE-097). This
+        # refusal means the store could not be opened, so writing a row to say so is the same write
+        # failing a second time — and on the hosted path a failing write now raises, which would
+        # turn the tidy fail-closed refusal into an unhandled exception at the serializer. Every
+        # other outcome, refusals included, still records.
+        #
+        # Keyed on the RULE rather than on a flag threaded down from the gate: the rule is the fact,
+        # a flag would be a second way to say it, and the two could disagree.
+        return
+    stored_sql, sql_truncated = _bounded_audit_sql(sql or "")
+    # The RAW driver text, for the operator only — the caller's `failure.message` is the classified
+    # value-free sentence and stays that way. Present only when the chokepoint ran in THIS process:
+    # across the fork the child sanitizes and the parent records, so the raw text never crosses and
+    # this is None. `execute_guarded` clears the var on entry, so a stale detail cannot attach to a
+    # later call.
+    from execute_sql import _last_error_detail
+
+    raw_detail = _last_error_detail.get()
+    _record_query(
+        {
+            "id": env.audit_id,
+            "error_detail": (
+                raw_detail[:AUDIT_ERROR_DETAIL_MAX_CHARS] if raw_detail else None
+            ),
+            "ts": _now_iso(),
+            "profile": profile or "",
+            "question": (args or {}).get("raw_query"),
+            "sql": stored_sql,
+            "sql_truncated": sql_truncated,
+            "row_count": row_count,
+            # Same provenance the tool-call row carries, so the two logs can't disagree about what
+            # drove one execution. Unset, this is the value it has always been.
+            "source": current_call_source(),
+            "status": env.status,
+            "reason": refusal.reason if refusal is not None else None,
+            "rule": refusal.rule if refusal is not None else None,
+            # The three that make the row re-derivable (ACE-098). All read off the Envelope this
+            # function already holds, for the same reason `reason` and `rule` are: the typed object
+            # is right here, and re-deriving any of them from the serialized body would make the
+            # record's account depend on a wire shape rather than on the decision.
+            #
+            # `detail` is where "which bound fired, and what it was set to" lives. The statement
+            # timeout and the result bound share ONE rule id by design, so `rule` alone cannot tell
+            # them apart and principle 9's carve-out claims the record does.
+            "detail": _bounded_audit_detail(refusal.detail) if refusal is not None else None,
+            # The whole receipt, verbatim, including every section's `undetermined` marker — the
+            # half that matters, since a section nobody checked has to keep saying so in the record
+            # too. `_emit` serializes the same `asdict` for the caller, so the row and the answer
+            # cannot disagree about what was reported.
+            "receipt": json.dumps(asdict(env.receipt), default=str),
+            # Lifted OUT of the receipt into its own column so a replay can SELECT on it. Inside the
+            # JSON as well, deliberately: see migration 017.
+            "model_version": env.receipt.model_version,
+        }
+    )
+
+
+def _run_in_process(
+    sql: str, profile: str, area: str | None, executor: Any
+) -> Envelope:
+    """Run through the in-process executor behind the shared guarded envelope (no subprocess, no CSV
+    round-trip) and return the `Envelope` it produced — unmodified.
+
+    This function no longer decides anything. It used to collapse every semantic-model refusal into
+    a single `{"kind": "permission", "remediation": "…see server logs…"}`, which is the exact bug
+    the guardrail contract exists to fix: the in-process caller could not tell a table-scope refusal
+    from a column-scope one, while the forked caller could. Now the rule the gate chose travels all
+    the way to the caller on both paths."""
     import execute_sql
 
-    # The per-call cap rides execute_sql's `_max_rows_override` ContextVar (ACE-028) — request-scoped,
-    # so concurrent in-process queries with different caps don't stomp each other. Set/reset via the
-    # token (the `_current_org_ctx` pattern); `run_blocking` copied this request's context into the
-    # worker thread, so the set is isolated to this call.
-    cap_token = execute_sql._max_rows_override.set(max_rows)
     try:
-        result = execute_sql.execute_guarded(
+        return execute_sql.execute_guarded(
             sql, profile, area, executor=executor, org_id=_credential_org_id()
         )
-    except execute_sql.GuardRefused as refusal:
-        # A read-only refusal (envelope present) is already caught by tool_execute_sql's upstream
-        # check_read_only fast-fail, so in practice only the model-safety branch (envelope None) is
-        # reached here; both are handled for defence-in-depth.
-        if refusal.envelope is not None:
-            return {"error": refusal.envelope["error"]}
-        # A model-safety refusal wrote its structured detail to the server log (stderr); surface a
-        # clean refusal here. (The subprocess path instead surfaces that stderr JSON as remediation —
-        # the not-yet-identical refusal envelope tracked as a follow-up.)
-        return {"error": {"kind": "permission",
-                          "remediation": "Query refused by the semantic-model safety pass "
-                                         "(see server logs for the specific rule)."}}
-    except execute_sql.ExecutorError as exc:
-        return {"error": {"kind": _classify_exit(exc.code), "remediation": exc.msg}}
-    except SystemExit as exc:
-        # Defence-in-depth. The known credential/DSN failures now raise ExecutorError (handled above,
-        # carrying their detailed message), so this net catches only a residual/future sys.exit deep
-        # in a driver — ensuring an in-process query can never take down the host; it becomes a
-        # fail-closed tool error instead.
-        code = exc.code if isinstance(exc.code, int) else 2
-        return {"error": {"kind": _classify_exit(code),
-                          "remediation": "Datasource configuration error."}}
-    finally:
-        execute_sql._max_rows_override.reset(cap_token)
-
-    columns = list(result.columns)
-    data_rows = [["" if v is None else str(v) for v in row] for row in result.rows]
-    truncated = result.truncated
-    if max_rows is not None and len(data_rows) > max_rows:  # backstop, matches the subprocess branch
-        data_rows = data_rows[:max_rows]
-        truncated = True
-    return columns, data_rows, truncated
+    except SystemExit:
+        # Defence-in-depth. The known credential/DSN failures become a `failed` Envelope inside
+        # `execute_guarded` (carrying their detailed message), so this net catches only a
+        # residual/future sys.exit deep in a driver — ensuring an in-process query can never take
+        # down the host; it becomes a fail-closed `failed` Envelope instead. The exit code is
+        # deliberately ignored: a driver's exit status is not this module's exit-code contract, and
+        # every reachable case is a datasource-configuration problem.
+        return _envelope("failed", failure=Failure(
+            kind="dsn", message="Datasource configuration error.",
+        ), receipt=_resolve_receipt(profile, sql, bounded=True))
 
 
 def tool_execute_sql(args: dict[str, Any]) -> str:
@@ -1124,34 +1641,94 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
 
     Two execution paths behind the same guard: the default forks the execute_sql subprocess
     (isolation, byte-identical local/single-user); an injected executor (AH-012) runs in-process with
-    native rows. Both funnel through `_finalize_execution`, so a **successful** query's result
-    envelope is identical either way (a guard refusal's envelope is not yet identical across paths —
-    see `_finalize_execution` and the tracked structured-refusal-parity follow-up).
+    native rows. Every outcome on either path becomes ONE `Envelope` and is serialized by `_emit`, so
+    a caller sees the same shape — and, for a refusal, the same rule and the same remediation —
+    whichever path ran.
+
+    The whole body runs inside the per-request resolve-once scope, opened here because this is the
+    one point both paths pass through, and closed in a `finally` for the same reason
+    `_guard_model` is cleared at the entry to every call: a value left behind would describe the
+    next one.
     """
+    cache_token = begin_request_cache()
+    try:
+        return _tool_execute_sql(args)
+    finally:
+        end_request_cache(cache_token)
+
+
+def _pass_child_env() -> dict[str, str]:
+    """The child's environment: this process's, with the ACE-101 posture written in explicitly.
+
+    Everything else is inherited untouched, which the fork depends on: the child re-resolves its own
+    timeout, row cap and credentials from the environment, and the supervisor bound computed on this
+    side is only correct because the child reaches the identical number. This adds one key and
+    overrides nothing else.
+
+    The one key is added because the posture is the one value the two processes must agree on that
+    they would otherwise each read at a different MOMENT. `_pin_model_pass_posture` fixed it on this
+    side; writing the same answer into the child's environment fixes it on the other, so a flip
+    landing between the two reads cannot make the gates and the receipt disagree about one call.
+    Spelled as the canonical `true`/`false` rather than passing the operator's own text through, so
+    the child parses a value this process has already resolved rather than repeating the resolution.
+    """
+    from execute_sql import _model_pass_disabled
+
+    return {**os.environ, "AGAMI_GOVERNANCE_ENFORCED": "false" if _model_pass_disabled() else "true"}
+
+
+def _tool_execute_sql(args: dict[str, Any]) -> str:
+    """`tool_execute_sql`'s body, inside the per-request scope its caller opens."""
+    # Clear the raw-detail carrier for THIS call, at the one point both paths pass through.
+    # `execute_guarded` also clears it on entry, but that only covers the in-process path — on the
+    # fork the parent never calls it, so without this a forked call would record the driver text
+    # left behind by an earlier IN-PROCESS failure in the same server process. Two paths, one
+    # ContextVar, so the reset belongs where the call begins rather than where one of them does.
+    from execute_sql import _last_error_detail, _pin_model_pass_posture
+
+    _last_error_detail.set(None)
+    # And pin the ACE-101 posture here, for the same "one point both paths pass through" reason and
+    # against a sharper failure. `execute_guarded` pins it too, but on the fork that call happens in
+    # the CHILD: the child decides whether the gates run, exits, and only then does this process build
+    # the receipt. Without a pin the two reads are separated by a whole subprocess, so an operator
+    # turning the switch on mid-flight (the operation the per-call read exists to allow) would have
+    # the child execute unguarded and this side assemble a populated receipt saying it did not.
+    # Pinned here, the parent reaches whatever its child reached, and `_pass_child_env` below hands
+    # the child that same value so the agreement is enforced rather than assumed.
+    _pin_model_pass_posture()
+
     sql = args.get("sql")
     if not isinstance(sql, str) or not sql.strip():
-        return json.dumps(
-            {"error": {"kind": "other", "remediation": "Pass a non-empty `sql` string."}}
+        # An argument the caller got wrong, before any gate or database is involved: not a refusal
+        # (we decided nothing about a statement — there is no statement) and `other` is the
+        # catch-all kind for exactly this.
+        return _emit(
+            _envelope("failed", failure=Failure(
+                kind="other", message="Pass a non-empty `sql` string.",
+            ), receipt=undetermined_receipt(RECEIPT_NO_STATEMENT)),
+            sql=None,
+            execution_ms=None,
         )
 
-    reason = check_read_only(sql)
-    if reason is not None:
-        return json.dumps(
-            {
-                "error": {"kind": "permission", "remediation": reason},
-                "sql": sql,
-            },
-            indent=2,
-        )
-
+    # Resolved BEFORE the read-only gate so the refusal it may produce is audited against the
+    # datasource it was aimed at. `resolve_profile` reads an argument, an env var and a local config
+    # file — it opens no connection and touches no credential, so a mutation still never reaches the
+    # warehouse; what it no longer does is land in the audit trail with an empty `datasource`.
     profile = resolve_profile(args.get("datasource"))
-    max_rows = args.get("max_rows")
-    try:
-        max_rows = int(max_rows) if max_rows is not None else None
-    except (TypeError, ValueError):
-        max_rows = None
-    if max_rows is not None:
-        max_rows = max(1, min(max_rows, 10_000))
+
+    refusal = check_read_only(sql)
+    if refusal is not None:
+        # The read-only fast-fail: the same gate `execute_guarded` runs, applied here so a mutation
+        # never even resolves credentials, forks, or consults a semantic model. Same rule, same
+        # remediation as the deeper call would give — and now the same audit row, too. The receipt is
+        # the pre-model one for the same reason: `read_only` is in `PRE_MODEL_RULES`, so there is
+        # nothing a model could have been asked about this statement, and asking one anyway would put
+        # a fresh unpooled database round-trip on the cheapest outcome an attacker can trigger at will.
+        return _emit(
+            _envelope("refused", refusal=refusal,
+                      receipt=_refusal_receipt(profile, sql, refusal)),
+            sql=sql, execution_ms=None, profile=profile, args=args,
+        )
 
     area = str(args["area"]) if args.get("area") else None
 
@@ -1160,27 +1737,38 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
     # when no executor is injected (the default) — that path stays byte-identical.
     if _INJECTED_EXECUTOR is not None:
         started = time.monotonic()
-        outcome = _run_in_process(sql, profile, area, max_rows, _INJECTED_EXECUTOR)
+        env = _run_in_process(sql, profile, area, _INJECTED_EXECUTOR)
         execution_ms = int((time.monotonic() - started) * 1000)
-        if isinstance(outcome, dict):  # guard refusal / execution error
-            return json.dumps({**outcome, "sql": sql, "execution_ms": execution_ms}, indent=2)
-        columns, data_rows, truncated = outcome
-        return _finalize_execution(
-            columns, data_rows, truncated,
-            profile=profile, sql=sql, execution_ms=execution_ms, args=args,
+        return _emit(
+            env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
         )
 
-    # The model safety pass (fan/chasm pre-flight + default_filters) runs inside
-    # execute_sql.py; pass the subject area so default_filters scope correctly.
+    # The model safety pass (fan/chasm pre-flight + scope + PII) runs inside execute_sql.py;
+    # pass the subject area so the gates scope to the right one.
     # Route through the unified executor as a module (the package is installed alongside
-    # this harness), so the read-only safety pass + default_filters + logging run once.
+    # this harness), so the read-only safety pass + logging run once.
     cmd = [sys.executable, "-m", "execute_sql", "--profile", profile, "--sql", sql]
     if args.get("area"):
         cmd += ["--area", str(args["area"])]
-    if max_rows is not None:
-        # ACE-044: cap at the source so the executor's bounded fetch (fetchmany(cap+1)) never
-        # materializes the whole result — not a client-side trim after the fact.
-        cmd += ["--max-rows", str(max_rows)]
+
+    # The supervisor's bound is the OUTERMOST of the four time bounds, and it is DERIVED from the
+    # same resolver every inner layer reads rather than being a number of its own. A fixed 240s
+    # inverted that order for any statement budget approaching it: the supervisor fired FIRST, so a
+    # statement we could have cancelled and refused precisely came back instead as a
+    # `failed`/`timeout` naming nothing the caller can act on. Imported lazily for the same
+    # reason `_run_in_process` does it.
+    #
+    # Resolved HERE and enforced on a child that re-resolves for itself, which only works because the
+    # resolver reads the environment and nothing else: the child inherits `os.environ` (no `env=`
+    # below) and therefore reaches the identical number. A request-scoped override would be the one
+    # thing that could break that — it would outrank the environment on this side of the fork and be
+    # invisible on the other, so a parent bound of 65s could sit against a child budget of 300s and
+    # fire first, inverting the order this whole family exists to hold. There is deliberately no such
+    # override; `_resolve_timeout_s` documents why, and a test pins that the budget keeps exactly one
+    # configuration surface.
+    import execute_sql
+
+    supervisor_timeout_s = execute_sql._resolve_timeout_s() + execute_sql._SUPERVISOR_SKEW_S
 
     started = time.monotonic()
     try:
@@ -1188,42 +1776,72 @@ def tool_execute_sql(args: dict[str, Any]) -> str:
             cmd,
             capture_output=True,
             text=True,
-            timeout=240,
+            timeout=supervisor_timeout_s,
+            env=_pass_child_env(),
         )
     except subprocess.TimeoutExpired:
-        return json.dumps(
-            {"error": {"kind": "timeout", "remediation": "Query exceeded 240s."}, "sql": sql}
+        # A `failed`/`timeout`, NOT a `refused`/`resource_limit` — and the reason is what we can
+        # OBSERVE, not who acted. The bound is ours, but all it tells us is that the child never came
+        # back; it does not say the STATEMENT ran long. The child may have hung in connect, in
+        # credential resolution or in loading the model, and on any of those "narrow the query" is
+        # advice pointing at the wrong thing. A refusal must name a fix, so a kill we cannot attribute
+        # is not one. (Guardrail contract §3: an unresponsive executor is `failed`. The executor's own
+        # per-statement deadline IS a refusal and carries `RULE_RESOURCE_LIMIT`; it can attribute the
+        # cancel to the statement because it is the thing it cancelled. The two bounds coexist, and
+        # this one must not borrow the other's rule.)
+        return _emit(
+            _envelope("failed", failure=Failure(
+                kind="timeout",
+                message="The executor did not respond within the supervisor's bound and was stopped.",
+            ), receipt=_resolve_receipt(profile, sql, bounded=True)),
+            sql=sql,
+            execution_ms=None,
+            profile=profile,
+            args=args,
         )
     execution_ms = int((time.monotonic() - started) * 1000)
 
     if proc.returncode != 0:
-        return json.dumps(
-            {
-                "error": {
-                    "kind": _classify_exit(proc.returncode),
-                    "remediation": (proc.stderr or "").strip() or "execute_sql.py failed",
-                },
-                "sql": sql,
-                "execution_ms": execution_ms,
-            },
-            indent=2,
+        # A structured refusal crosses the process boundary as a refusal, not as raw stderr text
+        # stuffed into a remediation field — the fork path and the in-process path must agree on
+        # what the caller sees, and only the child knows which rule fired. Rebuilding through
+        # `Refusal` here is the second contract check (the first is inside `_stderr_refusal`); it
+        # costs nothing and keeps the Envelope's payload a real contract object, never a loose dict.
+        refusal = _stderr_refusal(proc.returncode, proc.stderr)
+        if refusal is not None:
+            rebuilt = Refusal(**refusal)
+            env = _envelope("refused", refusal=rebuilt,
+                            receipt=_refusal_receipt(profile, sql, rebuilt))
+        else:
+            # Not raw stderr: see `_child_failure_message` for which of the two the caller gets and
+            # why. This field is shown to the caller, so a traceback must never reach it.
+            env = _envelope("failed", failure=Failure(
+                kind=_classify_exit(proc.returncode),
+                message=_child_failure_message(proc.returncode, proc.stderr),
+            ), receipt=_resolve_receipt(profile, sql, bounded=True))
+        # `profile` and `args` travel with the non-ok outcomes too. Omitting them wrote the audit row
+        # with `datasource=''` and `question=NULL` on exactly the rows a reviewer of a refusal most
+        # needs them on — and only on the fork path, which is the default, so the two paths disagreed
+        # about the record of the same decision.
+        return _emit(
+            env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
         )
 
-    # Parse the RFC-4180 CSV emitted on stdout.
+    # Parse the RFC-4180 CSV emitted on stdout. A result that exceeded the ceiling never reaches
+    # here: the child refuses it (ACE-087) and exits non-zero, which the branch above rebuilds.
     reader = csv.reader(io.StringIO(proc.stdout))
     rows_all = list(reader)
     columns = rows_all[0] if rows_all else []
     data_rows = rows_all[1:] if len(rows_all) > 1 else []
-    # The executor caps at the source now (ACE-038/044) and flags it on stderr; surface that so a
-    # truncated result is never presented as complete. Keep the client-side trim as a backstop.
-    truncated = _executor_truncated(proc.stderr)
-    if max_rows is not None and len(data_rows) > max_rows:
-        data_rows = data_rows[:max_rows]
-        truncated = True
 
-    return _finalize_execution(
-        columns, data_rows, truncated,
-        profile=profile, sql=sql, execution_ms=execution_ms, args=args,
+    from execute_sql import ExecResult
+
+    env = _envelope("ok", data=ExecResult(
+        columns=columns,
+        rows=[tuple(r) for r in data_rows],
+    ), receipt=_resolve_receipt(profile, sql))
+    return _emit(
+        env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
     )
 
 
@@ -1245,26 +1863,125 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> bool:
         return False
 
 
+def _audit_is_load_bearing() -> bool:
+    """Whether a failed audit write must break the call — the served deployment, and only it.
+
+    Reads `execute_sql._hosted()` rather than re-testing the environment here, so the question "is
+    this a served deployment?" has ONE answer in the codebase. The same function decides whether
+    `execute_guarded` runs the pre-execution reachability check, and the two must not be able to
+    disagree: a deployment that fails closed at the gate but shrugs at the write would refuse
+    healthy calls and quietly lose the record on the broken ones.
+    """
+    from execute_sql import _hosted
+
+    return _hosted()
+
+
 def _record_query(rec: dict[str, Any]) -> None:
-    """Log a query execution through the DB sink (AGAMI_DB_URL) or the local jsonl. **Best-effort:**
-    a logging failure must never break an otherwise-successful query — so the DB path swallows
-    errors exactly like the jsonl path, and always closes its connection."""
-    from store import Store
+    """Log a query execution through the DB sink (AGAMI_DB_URL) or the local jsonl.
 
-    store = Store.from_env()
-    if store is None:
-        _append_jsonl(QUERY_LOG, rec)
-        return
+    **Served: the write is load-bearing and its failure is raised** (ACE-097, principle 7). An answer
+    that reached the caller with no record of the statement that produced it is the thing the
+    principle forbids, and a warning is not a substitute: the operator reads it hours later, the
+    caller acted on the answer immediately. `execute_guarded` establishes the store is reachable
+    BEFORE executing, so this raise is the narrow residual — the store died between that check and
+    this write — rather than the common path.
+
+    **Local stays best-effort**, and unchanged. `governance-principles.md` scopes the principles to
+    the served deployment; here there is no store and this writes jsonl, so a read-only artifacts
+    directory would otherwise stop a laptop answering. A swallowed failure is still LOGGED at WARNING
+    with its traceback, never passed silently: a sink broken for a month must not look identical to a
+    working one.
+
+    The WHOLE body sits inside the try, `Store.from_env()` included. Constructing the store can
+    itself raise — a malformed DSN, an uninstalled driver — and with that call outside the try the
+    exception escaped onto the success path even locally, breaking every query the deployment logged
+    rather than every log it wrote. That shape is what now lets the served path re-raise deliberately
+    from one place instead of leaking from an arbitrary one."""
     try:
-        from contracts import QueryExecutionRecord
-        from model_store import DbActivitySink
+        from store import Store
 
-        rec.setdefault("org_id", _current_org_id())  # stamp the calling tenant onto the log row
-        DbActivitySink(store).record_query_execution(QueryExecutionRecord(**rec))
+        # Stamped ABOVE the branch, so the field is on the record whichever sink takes it. It used to
+        # be set inside the DB branch only, which left the jsonl rows without the `org_id` the format
+        # spec documents for them — the field was declared for both sinks and written by one.
+        rec.setdefault("org_id", _current_org_id())  # the calling tenant
+
+        store = Store.from_env()
+        if store is None:
+            # The local (no-database) path. `_append_jsonl` swallows its own OSError and reports it
+            # as a False return, which was being discarded — the same invisibility as the bare
+            # `except: pass` below, so it gets the same treatment.
+            if not _append_jsonl(QUERY_LOG, rec):
+                _LOG.warning("query-execution audit write to %s failed", QUERY_LOG)
+            return
+        try:
+            from contracts import QueryExecutionRecord
+            from model_store import DbActivitySink
+
+            DbActivitySink(store).record_query_execution(QueryExecutionRecord(**rec))
+        finally:
+            store.close()
     except Exception:
-        pass  # best-effort: never fail the query because logging failed
-    finally:
-        store.close()
+        if _audit_is_load_bearing():
+            # Served: no record, no answer. Raised rather than logged, and deliberately not wrapped
+            # in a friendlier exception — this escapes past `_emit`, so the caller gets a transport
+            # error and the operator gets the traceback. Converting it into a tidy refusal Envelope
+            # is not available: that Envelope would itself need an audit row, written through this
+            # same broken sink.
+            raise
+        # Local: no SQL, no question, no org — the record's own fields are the caller's data, and
+        # this line goes to the server log. The exception and the stack say where the write broke.
+        _LOG.warning("query-execution audit write failed; the answer is unaffected", exc_info=True)
+
+
+def reset_typed_outcome() -> None:
+    """Clear the published outcome. Run by the transport INSIDE the context it hands the handler.
+
+    Load-bearing, and a test found it: `copy_context()` copies whatever is current, so a verdict
+    published by an earlier `execute_sql` call in this context would be inherited by the next tool's
+    context and read back as that tool's outcome. A tool that never reaches `execute_guarded` — every
+    model-backed one — has nothing to clear it, so a raising `list_datasources` was recorded with the
+    previous query's refusal rule instead of `exception`.
+
+    `execute_guarded` clears it too, on entry, for the calls that do reach it. Both are needed: that
+    one covers a second query in one context, this one covers a different tool after a query.
+    """
+    from execute_sql import _last_outcome
+
+    _last_outcome.set(None)
+
+
+def typed_outcome_overrides(ctx: Any) -> dict[str, Any]:
+    """The `record_tool_call` overrides for a call whose Envelope classified itself (ACE-098).
+
+    The transport runs the tool handler inside a `contextvars.Context` it owns and passes it here.
+    That indirection is load-bearing: a ContextVar set inside `run_blocking`'s worker is invisible
+    to the caller, because anyio gives the thread a copy — so reading the var directly at the
+    recorder would read `None` on the one surface that records tool calls at all.
+
+    Returns `{}` for every other tool. The model-backed tools do not speak the Envelope (they return
+    the older `{"error": {kind, remediation}}` body) and never reach `_emit`, so there is nothing
+    typed to read and the body parse stays their path. `{}` means "derive it the way you always
+    have", which is exactly what `record_tool_call`'s override seam already documents.
+
+    The three come back as a group because that seam forces them to: stating any one replaces all
+    three, so returning a partial dict would silently blank the other two.
+    """
+    from execute_sql import _last_outcome
+
+    outcome = ctx.get(_last_outcome)
+    if outcome is None:
+        return {}
+    status, rule, row_count = outcome
+    success = status == "ok"
+    return {
+        "success": success,
+        # The rule the gate chose, straight off the `Refusal` — strictly more informative than the
+        # status alone, and no longer a `json.loads` of our own output. `status` is the fallback for
+        # a `failed`, which has a kind rather than a rule.
+        "error_kind": None if success else (rule or status),
+        "row_count": row_count,
+    }
 
 
 def record_tool_call(
@@ -1286,9 +2003,12 @@ def record_tool_call(
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
     audit-grade fields are server-observed; `success`/`row_count`/`error_kind` are derived from the
-    result (execute_sql returns an `{"error": ...}` body on a bad query without raising). The self-report
-    fields (`user_question`/`agent_query`/`thread_id`) are whatever Claude supplied — may be None.
-    **Best-effort and never raises** — a logging failure must not break the tool.
+    result (a tool returns a refusal or failure body without raising, so `raised` alone would see
+    almost nothing). The self-report fields (`user_question`/`agent_query`/`thread_id`) are whatever
+    Claude supplied — may be None.
+    **Best-effort locally; load-bearing on the served path** (ACE-097). Locally a logging failure
+    must not break the tool and is warned about. Served, principle 7 makes the row part of the call:
+    the write's failure is raised, and the tool call fails with it.
 
     The trailing parameters are an **override seam for an embedder that dispatches tool handlers
     itself** rather than through this package's transport. Each defaults to `None`, meaning *derive it
@@ -1324,7 +2044,29 @@ def record_tool_call(
         try:
             parsed = json.loads(result_text) if result_text else None
             if isinstance(parsed, dict):
-                if isinstance(parsed.get("error"), dict):
+                # Two body shapes reach this sink. `execute_sql` speaks the guardrail Envelope
+                # (`status` + `refusal`/`failure`); the model-backed tools still return the older
+                # `{"error": {kind, remediation}}`. All three must mark the call unsuccessful —
+                # reading only one of them would silently log blocked or failed queries as
+                # successes.
+                failure, refusal = parsed.get("failure"), parsed.get("refusal")
+                if parsed.get("status") == "failed" and isinstance(failure, dict):
+                    derived_success = False
+                    derived_error_kind = failure.get("kind") or "error"
+                elif parsed.get("status") == "refused" and isinstance(refusal, dict):
+                    # A refusal is `success=0`, which is what it was before the Envelope: the body
+                    # then was `{"error": {"kind": "permission", …}}` and this sink read the `error`
+                    # key. The Envelope moved the verdict into `refusal`, and reading only `failure`
+                    # would have flipped every blocked query to `success=1` — so any dashboard
+                    # counting blocked queries off `tool_calls.success` would silently go to zero on
+                    # deploy. `error_kind` is the rule the gate chose (`table_scope`,
+                    # `column_scope`, …), strictly more informative than the single `permission`
+                    # the old body could say. "Successful" here means the caller's request was
+                    # carried out, not that the server behaved correctly; a refusal is the server
+                    # behaving correctly AND the request not being carried out.
+                    derived_success = False
+                    derived_error_kind = refusal.get("rule") or "refused"
+                elif isinstance(parsed.get("error"), dict):
                     derived_success = False
                     derived_error_kind = parsed["error"].get("kind") or "error"
                 derived_row_count = parsed.get("row_count")
@@ -1377,8 +2119,28 @@ def record_tool_call(
 
 
 def _record_tool_call(rec: dict[str, Any]) -> None:
-    """Write a tool-call record through the DB sink (AGAMI_DB_URL) or the local jsonl. Wrapped so the
-    whole thing is best-effort — even opening the store can't surface an error to the caller."""
+    """Write a tool-call record through the DB sink (AGAMI_DB_URL) or the local jsonl.
+
+    Served: the failure is raised, for the reason `_record_query` gives. Local: swallowed, and now
+    logged rather than passed silently — the `except Exception: pass` this replaced was the quieter
+    of the two swallows this spec closes, and the reason neither had been closed before is that they
+    masked each other exactly: this one hid inside the transport's, and the transport's had nothing
+    to catch once this one stopped raising. Removing either alone was a PR with no observable
+    change, which is indistinguishable from not having done the work.
+
+    The `audit_unavailable` exemption applies here too, and it has to. `_record_execution` skipping
+    the query row is not enough on its own: the HTTP transport writes a tool-call row in a `finally`
+    for EVERY call, so on that surface the row this exemption exists to avoid was written anyway,
+    failed, and raised — replacing the clean fail-closed refusal with a transport error and losing
+    the remediation that tells the operator what to restore. On the surface where an operator most
+    needs it. Found by driving a real server whose store died under it; no unit test saw it, because
+    the exemption looked complete at the one write path a unit test drives.
+
+    Read off `error_kind` because that IS the rule for a refusal — `record_tool_call` derives it as
+    `refusal["rule"]`. ACE-098 replaces that derivation with the typed refusal, and this check moves
+    with it rather than needing its own signal."""
+    if rec.get("error_kind") == RULE_AUDIT_UNAVAILABLE:
+        return
     try:
         from store import Store
 
@@ -1395,7 +2157,9 @@ def _record_tool_call(rec: dict[str, Any]) -> None:
         finally:
             store.close()
     except Exception:
-        pass  # best-effort: never fail the tool because logging failed
+        if _audit_is_load_bearing():
+            raise
+        _LOG.warning("tool-call audit write failed; the answer is unaffected", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1518,9 +2282,21 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_execute_sql,
         "description": (
             "Execute a single read-only SELECT / WITH...SELECT against the local datasource and "
-            "return {columns, rows, row_count, truncated, sql, execution_ms}. SELECT-only is "
-            "enforced (DML/DDL/multi-statement rejected with kind='permission'). Runs entirely "
-            "locally via execute_sql.py — no data leaves the machine."
+            "return {status:'ok', columns, rows, row_count, units, markdown, sql, execution_ms, "
+            "receipt, audit_id} — `markdown` is the table to display verbatim, exact numbers "
+            "already formatted. SELECT-only is "
+            "enforced: DML/DDL/multi-statement come back as {status:'refused', refusal:{reason, "
+            "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
+            "A result larger than the deployment row ceiling is refused the same way rather than "
+            "trimmed, so a partial answer never arrives looking whole. "
+            "Runs entirely locally via execute_sql.py — no data leaves the machine. "
+            # The declared-filter clause. Spec ids stay in comments like this one — this string
+            # ships to every client, and an id only resolves inside the spec repo.
+            "A table's declared `default_filters` are NOT applied to your SQL — if a filter "
+            "matters to the question, write it into the statement yourself. The receipt then "
+            "reports which ones you did: `receipt.tables.items[].filters` carries one "
+            "`{expr, status}` per declared filter of that reference, status applied / omitted / "
+            "undetermined, per REFERENCE and scoped by the sibling `scope` field."
         ),
         "inputSchema": {
             "type": "object",
@@ -1532,7 +2308,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "area": {
                     "type": "string",
-                    "description": "Subject area — scopes the fan/chasm pre-flight + default_filters safety pass.",
+                    "description": "Subject area — scopes the fan/chasm pre-flight and the scope/PII gates.",
                 },
                 "raw_query": {
                     "type": "string",
@@ -1547,7 +2323,6 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "thread_id": _THREAD_ID_PROP,
                 "correlation_id": _CORRELATION_ID_PROP,
-                "max_rows": {"type": "integer", "description": "Row cap (clamped 1–10000)."},
             },
             "required": ["sql"],
             "additionalProperties": False,

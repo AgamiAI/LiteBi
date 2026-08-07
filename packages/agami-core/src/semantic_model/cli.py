@@ -72,7 +72,15 @@ def cmd_validate(args) -> int:
     org = L.load_datasource(args.root, include_rejected=True)
     res = V.validate(org)
     print(V.format_result(res))
-    return 0 if res.ok else 1
+    ok = res.ok
+    # Deployment-level pass (F16 / ACE-072): when the profile sits under a deployment with an
+    # OrgRecord, ALSO validate the cross-datasource bridges — they resolve endpoints ACROSS profiles,
+    # so a single-profile validate can't see them. A no-op (empty, ok) on a pre-F16 layout with no
+    # record, so this stays a superset of the old behaviour. The artifacts dir is the profile's parent.
+    dres = V.validate_deployment(Path(args.root).parent)
+    if dres.findings:
+        print(V.format_result(dres))
+    return 0 if (ok and dres.ok) else 1
 
 
 def cmd_snapshot(args) -> int:
@@ -201,53 +209,78 @@ def cmd_preflight(args) -> int:
 
 
 def cmd_prepare(args) -> int:
-    """Tier-independent safety pass: run the fan/chasm pre-flight, then (unless it
-    refuses) apply the area's default_filters. Returns the SQL to actually execute.
-    The query skill calls this on EVERY tier before handing SQL to psql/mysql/etc.,
-    so the safety guarantees don't depend on going through execute_sql.py."""
+    """Tier-independent safety pass: run the fan/chasm pre-flight and return the SQL to
+    actually execute. The query skill calls this on EVERY tier before handing SQL to
+    psql/mysql/etc.
+
+    **This is not a gate and never was.** It runs the fan/chasm and aggregation-semantics
+    checks, which describe; it does NOT run table scope, the `SELECT *` ban or column scope,
+    which refuse. Those live in `execute_sql` alone. A tier that runs its own SQL after
+    calling this has had the checks, not the gates, and `--no-safety` is therefore never the
+    right flag to pair with it.
+
+    Because the caller RUNS what comes back, this command echoes the statement it was given and
+    never a statement of ours. It used to answer an aggregation-only fan trap with a rewritten
+    string plus a `rewritten: true` flag, which made every non-`execute_sql` tier execute something
+    the caller never wrote.
+
+    **It is now total: exit 0, always.** It refused a fan or chasm trap until ACE-094, which was the
+    last non-zero exit here. Correctness is not a refusal — whether a multiplied total is a bug
+    depends on the question, and this command has the statement but not the question. So it reports
+    what it found and lets the caller, who has both, decide.
+
+    `aggregates` is that report: one entry per aggregate the statement computes, saying whether a
+    join multiplies the rows behind it and which join does. `findings` is the same information
+    projected flat, kept because a caller that only wants "what went wrong" should not have to walk
+    the roster to find it — but it is the roster that carries the cleared aggregates, and a surface
+    reading only `findings` reports a clean number by saying nothing about it.
+
+    **An empty `findings` is not by itself a clean bill of health.** The analysis does not run when
+    sqlglot is missing, when the statement does not parse, or when there is no SELECT, and each of
+    those yields the same empty list a genuinely clean statement does. `unchecked` is what separates
+    them: null when the checks ran, a sentence when they could not. Read both or read neither.
+
+    A table's declared `default_filters` are NOT applied here — ACE-042 deleted the injection, and
+    nothing has replaced it — so this command emits no `applied_filters` key. An always-empty list
+    would read as "we checked, none applied", which is the silence that reads as clean. Which
+    declared filters a statement DID satisfy is reported per table reference by `sm receipt`, on
+    `tables.items[].filters`; it is a fact about the finished statement, so it is assembled where
+    the receipt is and not here."""
     sql = args.sql
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
     pf = RT.pre_flight_check(sql, org)
-    if pf.risk and pf.action == "refuse":
-        _print_json({"action": "refuse", "risk": pf.risk, "reason": pf.reason,
-                     "suggestion": pf.suggestion, "sql": sql})
-        return 1
-    run_sql = pf.rewritten_sql if (pf.action == "auto_rewrite" and pf.rewritten_sql) else sql
-    final_sql, applied = RT.apply_default_filters(run_sql, org, area=args.area)
     _print_json({
-        "action": pf.action,
-        "risk": pf.risk,
-        "sql": final_sql,
-        "rewritten": bool(pf.action == "auto_rewrite"),
-        "applied_filters": applied,
-        # {output_column: unit}, traced through the final SQL — feed straight to
+        "sql": sql,
+        # One entry per aggregate, cleared ones included — the same roster the receipt's
+        # `aggregates` section carries, from the same analysis, so the two surfaces cannot describe
+        # one statement two ways.
+        "aggregates": [a.as_dict() for a in pf.aggregates],
+        "findings": [f.as_dict() for f in pf.findings],
+        # Null when the checks ran. A caller that ignores this reads "skipped" as "clean".
+        "unchecked": pf.unchecked,
+        # {output_column: unit}, traced through the caller's own statement — feed straight to
         # `format-table --units` so summed/aliased currency formats correctly.
-        "units": RT.resolve_result_units(org, final_sql),
-        "reason": pf.reason if pf.risk else None,
+        "units": RT.resolve_result_units(org, sql),
     })
     return 0
 
 
 def cmd_receipt(args) -> int:
     """Assemble the trust receipt for an executed query — deterministically, from the
-    SQL + the model. Replaces the LLM hand-building the receipt JSON in prose: tables,
-    relationships, metrics, unreviewed-warnings, and model_version all come from
-    parsing the SQL against the model (the SAME `runtime.assemble_receipt` the MCP
-    server uses). The LLM may still append ad-hoc metrics + assumptions afterward."""
+    SQL + the model. Replaces the LLM hand-building the receipt JSON in prose: the five
+    sections (columns, tables, joins, aggregates, assumptions) and the model_version pin
+    all come from parsing the SQL against the model (the SAME `runtime.assemble_receipt`
+    the MCP server uses), so the skill and the server describe one statement one way."""
     from . import snapshot as SN
     sql = args.sql
     if args.sql_file:
         sql = Path(args.sql_file).read_text()
     org = L.load_datasource(args.root)
-    pf = RT.pre_flight_check(sql, org)
-    applied = json.loads(args.applied_filters) if args.applied_filters else None
     receipt = RT.assemble_receipt(
         org, sql,
         model_version=SN.newest_version(args.root),
-        applied_filters=applied,
-        pre_flight=pf,
         freshness=args.freshness,
     )
     _print_json(receipt)
@@ -677,10 +710,12 @@ def cmd_seed_examples(args) -> int:
 
 def cmd_seed_validate(args) -> int:
     """Phase-6 trust onboarding: run every written seed against the live DB and emit the
-    examples-validation items. Each seed runs THROUGH execute_sql.py (the agami-query path)
-    so the fan/chasm pre-flight + default_filters always apply — a raw driver could skip
-    that and let a fan-out scan the whole table. A refused/errored seed is surfaced with
-    its `error`, not faked. Replaces ad-hoc 'run all the seeds' scripts."""
+    examples-validation items. Each seed runs THROUGH execute_sql.py (the agami-query path) so the
+    scope gates always apply and every seed carries the same receipt a caller's own query would — a
+    raw driver could skip both. The gates here are table scope, the `SELECT *` ban and column scope;
+    the fan/chasm pre-flight is a report, not a gate, and there is no PII gate, which ACE-094
+    deleted. A refused/errored seed is surfaced with its `error`, not faked. Replaces ad-hoc 'run
+    all the seeds' scripts."""
     import csv as _csv
     import os
     import subprocess
@@ -716,7 +751,8 @@ def cmd_seed_validate(args) -> int:
             capture_output=True, text=True, env=env,
         )
         if proc.returncode != 0:
-            # SQL error, or a fan/chasm pre-flight refusal — surface it; never fake a result.
+            # A SQL error or a scope refusal — surface it; never fake a result. NOT a fan or chasm
+            # trap: those are reported on the receipt of an answer that ran, and exit 0 with them.
             item["error"] = (proc.stderr or "").strip()[:600] or f"execute_sql exit {proc.returncode}"
         else:
             rows = list(_csv.reader(io.StringIO(proc.stdout)))
@@ -1151,7 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sql", required=True)
     sp.set_defaults(func=cmd_preflight)
 
-    sp = sub.add_parser("prepare", help="tier-independent safety pass: pre-flight + default_filters → SQL to run")
+    sp = sub.add_parser("prepare", help="tier-independent safety pass: fan/chasm pre-flight → SQL to run")
     sp.add_argument("root")
     sp.add_argument("--area", default=None)
     sp.add_argument("--sql", default=None)
@@ -1162,9 +1198,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("root")
     sp.add_argument("--sql", default=None)
     sp.add_argument("--sql-file", default=None, dest="sql_file")
-    sp.add_argument("--applied-filters", default=None, dest="applied_filters",
-                    help="JSON list of default_filters applied (from `sm prepare`)")
-    sp.add_argument("--freshness", default=None, help="optional freshness timestamp for tables_used")
+    sp.add_argument("--freshness", default=None,
+                    help="optional freshness timestamp for the receipt's tables section")
     sp.set_defaults(func=cmd_receipt)
 
     sp = sub.add_parser("review-queue", help="trust-review items needing sign-off (Rule 1/2)")

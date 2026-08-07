@@ -245,7 +245,10 @@ def test_execute_sql_rejects_mutation_over_protocol():
     ])
     by_id = {m.get("id"): m for m in out}
     payload = json.loads(by_id[2]["result"]["content"][0]["text"])
-    assert payload["error"]["kind"] == "permission"
+    assert payload["status"] == "refused"
+    assert payload["refusal"]["rule"] == "read_only"
+    assert payload["refusal"]["reason"] == "unsafe"
+    assert payload["refusal"]["remediation"].strip()
 
 
 def test_unknown_method_returns_error():
@@ -308,34 +311,55 @@ def _write_rich_model(tmp_path):
 SQL = "SELECT c.id, SUM(amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id"
 
 
-def test_mcp_receipt_surfaces_unapproved_metric_and_join(monkeypatch, tmp_path):
+def test_mcp_receipt_surfaces_unapproved_metric_and_the_join_the_statement_wrote(
+        monkeypatch, tmp_path):
     import pytest
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, _ = _write_rich_model(tmp_path)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
     r = _resolve_receipt(profile, SQL)
-    assert r is not None
-    # the unapproved metric is surfaced WITH its review_state (drives the approve/change banner)
-    rev = next(m for m in r["metrics"] if m["name"] == "revenue")
+    # The unapproved metric is surfaced WITH its review_state, which is what drives a client's
+    # approve/change banner. It rides the columns section on the item for the OUTPUT COLUMN that
+    # computes it — ACE-058 — so the banner can name the value it is about rather than asserting a
+    # metric against the statement as a whole.
+    rev = next(i for i in r.columns.items
+               if i["kind"] == "output" and i["name"] == "revenue")
     assert rev["review_state"] == "unreviewed"
-    # the unreviewed join is warned about; the ai-written column is flagged as an assumption
-    assert any("unreviewed join" in w for w in r["warnings"])
-    assert any(a["column"].endswith("orders.amount") for a in r["assumptions"])
+    assert rev["status"] == "matched"
+    assert rev["column"] == "total"
+    # The join half. `review_state` used to be borrowed from whichever declared relationship the two
+    # in-scope tables happened to have; the section is one item per join the STATEMENT wrote now, and
+    # this predicate MATCHES that declaration, so the state the server surfaces is a state about this
+    # join rather than about the pair of tables it touches. The predicate rides beside it, which is
+    # what lets a client show the join it is asking the user to sign off on.
+    assert [j["from_to"] for j in r.joins.items] == ["orders → customers"]
+    assert [j["predicate"] for j in r.joins.items] == ["o.customer_id = c.id"]
+    assert [j["status"] for j in r.joins.items] == ["declared"]
+    assert [j["review_state"] for j in r.joins.items] == ["unreviewed"]
+    # The ai-written column is flagged as an assumption.
+    assert any(a["column"].endswith("orders.amount") for a in r.assumptions.items)
 
 
 def test_mcp_receipt_equals_shared_assembler(monkeypatch, tmp_path):
     """Golden parity: the MCP receipt IS the shared assembler's output — no divergent
-    second implementation. (model_version is the only MCP-added field.)"""
+    second implementation. (model_version is the only MCP-added field.)
+
+    Compared section by section over `guardrail.Receipt.SECTIONS`, so a section added to the
+    contract is covered here the day it lands rather than when someone remembers to extend a list
+    of key names.
+    """
     import pytest
     pytest.importorskip("pydantic"); pytest.importorskip("sqlglot")
     art, profile, root = _write_rich_model(tmp_path)
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
+    import guardrail
     from semantic_model import loader as L
     from semantic_model import runtime as RT
-    shared = RT.assemble_receipt(L.load_datasource(root), SQL)
+    shared = guardrail.receipt_from_assembled(
+        RT.assemble_receipt(L.load_datasource(root), SQL))
     mcp = _resolve_receipt(profile, SQL)
-    for key in ("tables_used", "relationships", "metrics", "assumptions", "warnings"):
-        assert mcp[key] == shared[key], key
+    for name in guardrail.Receipt.SECTIONS:
+        assert getattr(mcp, name) == getattr(shared, name), name
 
 
 # save_correction is no longer an MCP tool (it's a skill operation, off both transports), so its

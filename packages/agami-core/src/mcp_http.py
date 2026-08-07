@@ -18,6 +18,7 @@ reliably auto-detected behind a proxy/LB.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import logging
 import os
 import time
@@ -34,7 +35,6 @@ from oss_adapters import (
     FileActivitySink,
     PresenceAuthProvider,
     SingleTenantOrgResolver,
-    WarnOnlyGovernancePolicy,
 )
 from ports import Adapters, AuthProvider, Org, OrgResolver
 from starlette.applications import Starlette
@@ -52,9 +52,11 @@ from tools import (
     _current_org_ctx,
     bootstrap_paths,
     record_tool_call,
+    reset_typed_outcome,
     resolved_org_id,
     server_version,
     set_injected_executor,
+    typed_outcome_overrides,
 )
 
 _log = logging.getLogger(__name__)
@@ -170,7 +172,7 @@ def _build_org_resolver() -> SingleTenantOrgResolver:
 def default_adapters() -> Adapters:
     """The OSS default adapters bundled for the composition root (env-driven auth + org). Used only by
     `create_app(adapters=None)` — the HTTP server's defaults. `create_app` wires `auth_provider` +
-    `org_resolver` into the request path and registers `executor`; `activity_sink` + `governance` are
+    `org_resolver` into the request path and registers `executor`; `activity_sink` is
     carried on the container for consumers.
 
     `executor=BUILTIN_EXECUTOR` (ACE-028) makes the HTTP server run execution **in-process** by default
@@ -181,7 +183,6 @@ def default_adapters() -> Adapters:
         activity_sink=FileActivitySink(),
         org_resolver=_build_org_resolver(),
         auth_provider=_build_auth_provider(),
-        governance=WarnOnlyGovernancePolicy(),
         executor=BUILTIN_EXECUTOR,
     )
 
@@ -363,7 +364,7 @@ def build_server(
 
     `extra_instructions` is APPENDED to `SERVER_INSTRUCTIONS` (never replaces it) and surfaced to the
     model in the MCP `initialize` result — append-only so a consumer can add guidance but can't drop
-    the base protocol's safety directives (e.g. the sensitive-column output rule). None = no-op.
+    the base protocol's safety directives (e.g. the receipt-reporting rules). None = no-op.
 
     `visibility(tool_name) -> bool` narrows the surface PER REQUEST. None (the default) is exactly
     today's behaviour: the whole registry, listed and callable. It exists because a registry assembled
@@ -426,14 +427,27 @@ def build_server(
         started = time.monotonic()
         result_text = None
         raised = False
+        handler_ctx = contextvars.copy_context()
+        # Cleared inside the context we own, before the handler can run. `copy_context()`
+        # copies whatever is current, so a verdict published by an earlier call would be
+        # inherited here and read back as THIS tool's outcome — and a tool that never
+        # reaches `execute_guarded` has nothing else to clear it.
+        handler_ctx.run(reset_typed_outcome)
         try:
             # Run the tool handler OFF the event loop. The heavy handlers block for the whole query —
-            # execute_sql shells out to a subprocess (up to 240 s) and hits the warehouse — so on the
-            # loop a single slow query would freeze every other in-flight request. This completes
-            # ACE-048 (which off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
+            # execute_sql runs it under the executor's own bounds (the per-statement budget, plus the
+            # supervisor's slack on the fork path) and hits the warehouse — so on the loop a single
+            # slow query would freeze every other in-flight request. This completes ACE-048 (which
+            # off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
             # `run_blocking` (anyio.to_thread) copies the request context into the worker thread, so
             # the org-scoped model cache (ACE-045, read via `_current_org_ctx`) stays tenant-correct.
-            result_text = await run_blocking(meta["handler"], arguments or {})
+            # Run the handler inside a context THIS frame owns, so the classified outcome it
+            # publishes can be read back afterwards (ACE-098). `run_blocking` hands the worker a
+            # copy of the current context, and a `ContextVar.set` inside a copy is invisible here —
+            # verified, not assumed. Giving the handler a `Context` object we hold is what makes the
+            # verdict readable at the audit write below, instead of it having to `json.loads` the
+            # body this call is about to return.
+            result_text = await run_blocking(handler_ctx.run, meta["handler"], arguments or {})
             return [mt.TextContent(type="text", text=result_text)]
         except Exception:
             raised = True
@@ -441,19 +455,32 @@ def build_server(
         finally:
             # The per-call audit write opens a fresh Store + INSERT + close; run it off the event loop so
             # it doesn't add DB latency to every tool call on the loop (ACE-048). `_actor_ctx.get()` is read
-            # here (on the loop) and passed in. Still best-effort — a logging failure never breaks the tool.
-            try:
-                await run_blocking(
-                    record_tool_call,
-                    name=name,
-                    arguments=arguments,
-                    result_text=result_text,
-                    execution_ms=int((time.monotonic() - started) * 1000),
-                    actor=_actor_ctx.get(),
-                    raised=raised,
-                )
-            except Exception:
-                pass
+            # here (on the loop) and passed in.
+            #
+            # NOT wrapped (ACE-097). This `try` held an `except Exception: pass`, the second of the
+            # two swallows that made a lost audit row invisible: it caught whatever
+            # `_record_tool_call` raised, and `_record_tool_call` swallowed internally so it never
+            # raised anything for this to catch. Each made the other unobservable, which is why
+            # removing either alone changed nothing and neither was ever removed.
+            #
+            # `record_tool_call` decides what a failure means, by deployment: served, it raises and
+            # the call fails; local, it warns and returns. That decision belongs there, beside the
+            # write, rather than being pre-empted here by a transport that cannot tell the two
+            # deployments apart. Raising from a `finally` replaces the handler's own result, which is
+            # the intended outcome: a call whose record was lost must not read as a success.
+            await run_blocking(
+                record_tool_call,
+                name=name,
+                arguments=arguments,
+                result_text=result_text,
+                execution_ms=int((time.monotonic() - started) * 1000),
+                actor=_actor_ctx.get(),
+                raised=raised,
+                # The classified outcome, when the handler produced one (ACE-098). Empty for every
+                # tool that does not speak the Envelope, which means "derive it the way you always
+                # have" — so those tools keep the body parse and nothing about them changes.
+                **typed_outcome_overrides(handler_ctx),
+            )
 
     return server
 
@@ -538,6 +565,42 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        # Say the posture out loud before serving anything (ACE-101). `AGAMI_GOVERNANCE_ENFORCED`
+        # defaults OFF, so a server can be brought up with table scope, column scope, the star ban and
+        # the engine-mismatch check all inert, which is a supported deployment and a surprising one.
+        # The only other place it is visible is the absence of a refusal, and nobody reads an absence.
+        #
+        # Here rather than in `create_app`'s body because this runs when the process SERVES, while the
+        # body also runs for every embedding harness and every test that builds an app. Once per
+        # worker process, not once per deployment: `main()` runs uvicorn with `WORKERS=N` and uvicorn
+        # re-invokes the factory in each child, so N workers legitimately log N lines.
+        from execute_sql import _model_pass_disabled_by_env
+
+        if _model_pass_disabled_by_env():
+            # The SAME predicate every enforcement site reads, not a second spelling of it. An earlier
+            # draft dropped the `_hosted()` half and so announced "the gates are off" on a file-mode
+            # server where they were fully on. A warning that is wrong in the safe direction is still
+            # a warning an operator learns to discount, which is the one thing this line cannot afford.
+            #
+            # The `_by_env` reader rather than the pinned one, and that distinction is the point of
+            # its existing: this runs ONCE at startup, before any request, so there is no call for it
+            # to be scoped to. Reading the pinned value would make a startup statement depend on
+            # request-scoped state, which is None in a served process but need not be in an embedding
+            # harness that ran a query before building an app. Found by driving the boot path after a
+            # query in one process, where the stale pin made this line fire on all four postures.
+            #
+            # `is not enabled` rather than `is not set`: the variable is also not enabled when it IS
+            # set to `false`, `0`, or a typo like `ture`, and telling an operator who typed something
+            # that they typed nothing sends them to check env plumbing instead of their own value.
+            _log.warning(
+                "AGAMI_GOVERNANCE_ENFORCED is not enabled (value: %r): the semantic-model pass is "
+                "OFF, so table scope, column scope, the SELECT * ban and the engine-mismatch check "
+                "will not run. This server can read any table and any column the connecting role is "
+                "granted, including columns excluded from the model, and can enumerate the schema "
+                "through catalog relations. Read-only, dangerous-function and resource-bound "
+                "protection are unaffected.",
+                os.environ.get("AGAMI_GOVERNANCE_ENFORCED", ""),
+            )
         # Heal the schema before serving: apply any pending migrations so freshly-deployed code never hits
         # an old DB shape (a column a migration adds, selected before it's applied, 500s the admin). This
         # is fail-closed — a failing migration propagates and aborts startup; a half-migrated DB never

@@ -114,7 +114,20 @@ class Store:
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
         cur = self.conn.cursor()
-        cur.execute(self._adapt(sql), params)
+        # **No params argument at all when there are none**, and that is not a tidy-up.
+        # psycopg2 treats a non-None `params` as a request to interpolate, so it reads `%` in the SQL
+        # as a placeholder marker — and a literal percent is every `LIKE 'thing%'` ever written. With
+        # `params=()` such a statement raises `IndexError: tuple index out of range` on Postgres and
+        # runs fine on SQLite, whose driver never inspects the string.
+        #
+        # That divergence is the dangerous part rather than the crash: the suite runs on SQLite and
+        # deployments run on Postgres, so the first `LIKE` anybody writes passes every test and fails
+        # in production, with an IndexError that points nowhere near the SQL. Skipping the argument
+        # makes psycopg2 skip the interpolation, so one statement means one thing on both engines.
+        if params:
+            cur.execute(self._adapt(sql), params)
+        else:
+            cur.execute(self._adapt(sql))
         return cur
 
     def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
