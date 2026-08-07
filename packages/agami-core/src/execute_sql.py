@@ -246,9 +246,12 @@ def _load_credentials(profile: str, org_id: str = "local") -> dict[str, str]:
         # `org_id == "local"` is the distinction the module already draws (see `_env_datasource_dsn`):
         # one operator, their own machine, their own file — where listing what IS configured is the
         # most useful thing the message can say and discloses nothing they do not own.
-        known = f" Sections present: {cfg.sections()}" if org_id == "local" else ""
+        # The separator travels WITH the list, so a message that says nothing more ends on the path
+        # itself. This file's other credential errors do the same (`Run: chmod 600 <artifacts_dir>/
+        # local/credentials`) — a trailing period on a path is a character somebody copies by mistake.
+        known = f". Sections present: {cfg.sections()}" if org_id == "local" else ""
         raise ExecutorError(
-            f"Profile [{profile}] not found in <artifacts_dir>/local/credentials.{known}",
+            f"Profile [{profile}] not found in <artifacts_dir>/local/credentials{known}",
             code=2,
         )
 
