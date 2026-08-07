@@ -73,6 +73,11 @@ def test_a_literal_percent_runs_on_postgres_too():
     A fake cursor cannot reproduce it: the failure is psycopg2's own interpolation step, so only the
     real driver raises.
     """
+    # The same two guards the sibling integration test uses, and for the reason it gives: an opt-in
+    # test must SKIP when its environment is absent, not fail. Without them, setting the password on
+    # a machine with no driver — or with the fixture stopped — turns this into a red build that says
+    # nothing about the code.
+    pytest.importorskip("psycopg2")
     dsn = (
         f"postgresql://{os.environ.get('AGAMI_IT_PG_USER', 'agami_test')}:"
         f"{os.environ['AGAMI_IT_PG_PASSWORD']}@"
@@ -80,7 +85,10 @@ def test_a_literal_percent_runs_on_postgres_too():
         f"{os.environ.get('AGAMI_IT_PG_PORT', '55432')}/"
         f"{os.environ.get('AGAMI_IT_PG_DB', 'shop')}"
     )
-    store = Store.connect(dsn)
+    try:
+        store = Store.connect(dsn)
+    except Exception as exc:  # no reachable Postgres here → skip, don't fail
+        pytest.skip(f"no reachable Postgres for the integration half ({exc})")
     try:
         assert store.query(LIKE_A_PERCENT) == [{"ok": 1}]
         # And a bound parameter still binds on this engine, where `?` is rewritten to `%s` — the
