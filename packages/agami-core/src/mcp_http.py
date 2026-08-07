@@ -18,9 +18,11 @@ reliably auto-detected behind a proxy/LB.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import logging
 import os
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -33,7 +35,6 @@ from oss_adapters import (
     FileActivitySink,
     PresenceAuthProvider,
     SingleTenantOrgResolver,
-    WarnOnlyGovernancePolicy,
 )
 from ports import Adapters, AuthProvider, Org, OrgResolver
 from starlette.applications import Starlette
@@ -51,9 +52,11 @@ from tools import (
     _current_org_ctx,
     bootstrap_paths,
     record_tool_call,
+    reset_typed_outcome,
     resolved_org_id,
     server_version,
     set_injected_executor,
+    typed_outcome_overrides,
 )
 
 _log = logging.getLogger(__name__)
@@ -63,19 +66,63 @@ _log = logging.getLogger(__name__)
 # only receives (name, arguments), and a contextvar set in the BaseHTTPMiddleware wouldn't reach it.
 _actor_ctx: ContextVar[str | None] = ContextVar("agami_tool_actor", default=None)
 
+# The CLIENT AUTHORIZATION behind the in-flight tool call — what tells two windows under one login apart.
+# Set alongside `_actor_ctx` and for the same reason. None whenever the caller's auth has no session
+# notion (presence auth, a hand-minted bearer): consumers must read that as "no session", not an error.
+_session_ctx: ContextVar[str | None] = ContextVar("agami_tool_session", default=None)
 
-def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
-    """The authenticated user's subject for this /mcp request: the principal the auth middleware already
-    validated (carried on the ASGI scope state), or — if that didn't propagate — re-validated from the
-    bearer header on the scope (robust fallback). None under presence auth or if absent."""
+
+def current_session_id() -> str | None:
+    """The session id for the request being served, or None.
+
+    Public because a consumer's tool handler needs it and the request never reaches the handler — only
+    this contextvar does. Same shape as `tools.current_org_id`, so consumers don't have to reach into a
+    private module attribute the way they otherwise would.
+    """
+    return _session_ctx.get()
+
+
+def _principal_from_scope(scope: dict, auth: AuthProvider) -> object | None:
+    """The authenticated caller for this /mcp request: the principal the auth middleware already validated
+    (carried on the ASGI scope state), or — if that didn't propagate — re-validated from the bearer header
+    on the scope (robust fallback). None under presence auth or if absent.
+
+    ONE validation, from which every derived value is read. The subject and the session must describe the
+    same caller, so deriving them from two independent `validate_token` calls would both double the work on
+    the fallback path (a second signature check, or a second lookup for a DB-backed provider) and let them
+    diverge if a provider's validation isn't deterministic.
+    """
     principal = (scope.get("state") or {}).get("principal")
     if principal is not None:
-        return getattr(principal, "subject", None)
+        return principal
     for key, value in scope.get("headers", []):
         if key == b"authorization" and value[:7].lower() == b"bearer ":
-            revalidated = auth.validate_token(value[7:].strip().decode("latin-1"))
-            return getattr(revalidated, "subject", None) if revalidated is not None else None
+            return auth.validate_token(value[7:].strip().decode("latin-1"))
     return None
+
+
+def _actor_from_scope(scope: dict, auth: AuthProvider) -> str | None:
+    """The authenticated user's subject for this /mcp request, or None. Thin wrapper over
+    `_principal_from_scope` — `handle_mcp` resolves the principal once and reads both values off it, so this
+    exists for callers that want only the subject."""
+    return getattr(_principal_from_scope(scope, auth), "subject", None)
+
+
+def _normalized_session(principal: object | None) -> str | None:
+    """A principal's session id, or None — enforcing the `str | None` shape the contextvar promises.
+
+    `AuthProvider` is a `@runtime_checkable` Protocol, so conformance is method presence only: a
+    third-party provider's principal may expose no `session_id` at all, or a non-string one. Without this
+    an unexpected type would reach `_session_ctx` and, through it, consumers using the value as a key.
+    Same rule as `JwtAuthProvider.validate_token`'s read — non-string or blank is "no session"."""
+    sid = getattr(principal, "session_id", None)
+    return sid if isinstance(sid, str) and sid.strip() else None
+
+
+def _session_from_scope(scope: dict, auth: AuthProvider) -> str | None:
+    """The session id for this /mcp request, or None. Thin wrapper over `_principal_from_scope`, the mirror
+    of `_actor_from_scope`."""
+    return _normalized_session(_principal_from_scope(scope, auth))
 
 
 def _org_id_from_scope(scope: dict) -> str | None:
@@ -113,8 +160,10 @@ def _build_org_resolver() -> SingleTenantOrgResolver:
     # Load-bearing for a hand-rolled DB-only deploy: log the resolved id + where it came from, so an
     # operator can see "org_id=local (default)" and realize organization.yaml/AGAMI_ORG_ID isn't reaching the
     # server (see F14's documented residual risk).
-    source = "env" if os.environ.get("AGAMI_ORG_ID", "").strip() else (
-        "default" if org_id == "local" else "organization.yaml"
+    source = (
+        "env"
+        if os.environ.get("AGAMI_ORG_ID", "").strip()
+        else ("default" if org_id == "local" else "organization.yaml")
     )
     _log.info("single-tenant org_id=%s (source=%s)", org_id, source)
     return SingleTenantOrgResolver(Org(id=org_id))
@@ -123,7 +172,7 @@ def _build_org_resolver() -> SingleTenantOrgResolver:
 def default_adapters() -> Adapters:
     """The OSS default adapters bundled for the composition root (env-driven auth + org). Used only by
     `create_app(adapters=None)` — the HTTP server's defaults. `create_app` wires `auth_provider` +
-    `org_resolver` into the request path and registers `executor`; `activity_sink` + `governance` are
+    `org_resolver` into the request path and registers `executor`; `activity_sink` is
     carried on the container for consumers.
 
     `executor=BUILTIN_EXECUTOR` (ACE-028) makes the HTTP server run execution **in-process** by default
@@ -134,7 +183,6 @@ def default_adapters() -> Adapters:
         activity_sink=FileActivitySink(),
         org_resolver=_build_org_resolver(),
         auth_provider=_build_auth_provider(),
-        governance=WarnOnlyGovernancePolicy(),
         executor=BUILTIN_EXECUTOR,
     )
 
@@ -305,18 +353,52 @@ async def _auth_server(request: Request) -> JSONResponse:
     )
 
 
-def build_server(registry: dict | None = None, extra_instructions: str | None = None):
+def build_server(
+    registry: dict | None = None,
+    extra_instructions: str | None = None,
+    visibility: Callable[[str], bool] | None = None,
+):
     """A low-level MCP Server whose tool surface IS the given registry — list_tools / call_tool read
     from it, so HTTP advertises exactly what stdio does (no duplicate defs). Defaults to the shared
     `tools.TOOLS`; `create_app` passes a merged copy (base + a consumer's extra tools).
 
     `extra_instructions` is APPENDED to `SERVER_INSTRUCTIONS` (never replaces it) and surfaced to the
     model in the MCP `initialize` result — append-only so a consumer can add guidance but can't drop
-    the base protocol's safety directives (e.g. the sensitive-column output rule). None = no-op."""
+    the base protocol's safety directives (e.g. the receipt-reporting rules). None = no-op.
+
+    `visibility(tool_name) -> bool` narrows the surface PER REQUEST. None (the default) is exactly
+    today's behaviour: the whole registry, listed and callable. It exists because a registry assembled
+    once at composition time cannot answer "may THIS caller see this tool", and for a consumer running a
+    server-side agent that is the difference between a control and a suggestion: the model decides what
+    to call, so withholding the tool is the control and "it shouldn't call that" is not.
+
+    An empty hook by design — this module decides nothing about who may see what. The predicate is the
+    consumer's, and it reads the request context itself: this callable runs inside the request's task
+    (see `handle_mcp`), so `_actor_ctx` / `_session_ctx` / `tools._current_org_ctx` are all live in it.
+
+    SUBTRACTIVE ONLY. It filters the one shared registry; it never adds, renames, or reshapes a tool. A
+    surviving tool's description and inputSchema pass through untouched, so a consumer cannot fork the
+    surface into a private variant under cover of "visibility".
+    """
     import mcp.types as mt
     from mcp.server.lowlevel import Server
 
     registry = TOOLS if registry is None else registry
+
+    def _visible(name: str) -> bool:
+        """Applied at BOTH seams. Listing alone would leave an unlisted tool callable by name, which is
+        worse than either control on its own — the surface would look narrowed while remaining open."""
+        if visibility is None:
+            return True
+        try:
+            return bool(visibility(name))
+        except Exception:
+            # A consumer's predicate that raises must not be an accidental grant. Refuse the tool and
+            # keep serving; the alternative (propagating) turns one bad classification into a dead
+            # transport for every caller.
+            _log.exception("tool visibility predicate failed for %r; hiding the tool", name)
+            return False
+
     # Appended, never replacing: SERVER_INSTRUCTIONS carries the PII output rule, so replace-semantics
     # would let a consumer silently drop a safety directive.
     instructions = SERVER_INSTRUCTIONS
@@ -329,26 +411,43 @@ def build_server(registry: dict | None = None, extra_instructions: str | None = 
         return [
             mt.Tool(name=name, description=meta["description"], inputSchema=meta["inputSchema"])
             for name, meta in registry.items()
+            if _visible(name)
         ]
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict) -> list:
         meta = registry.get(name)
-        if meta is None:
+        # A hidden tool answers as an ABSENT one, not as a refused one: the same `Unknown tool` a typo
+        # gets. Distinguishing them would turn the list into an oracle — a caller could enumerate what
+        # exists but is withheld, which is the fact hiding it was meant to keep.
+        if meta is None or not _visible(name):
             raise ValueError(f"Unknown tool: {name}")
         # Record every tool call to the admin activity log — timed, attributed to the authenticated
         # actor, never allowed to break the tool (logging is best-effort + double-guarded).
         started = time.monotonic()
         result_text = None
         raised = False
+        handler_ctx = contextvars.copy_context()
+        # Cleared inside the context we own, before the handler can run. `copy_context()`
+        # copies whatever is current, so a verdict published by an earlier call would be
+        # inherited here and read back as THIS tool's outcome — and a tool that never
+        # reaches `execute_guarded` has nothing else to clear it.
+        handler_ctx.run(reset_typed_outcome)
         try:
             # Run the tool handler OFF the event loop. The heavy handlers block for the whole query —
-            # execute_sql shells out to a subprocess (up to 240 s) and hits the warehouse — so on the
-            # loop a single slow query would freeze every other in-flight request. This completes
-            # ACE-048 (which off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
+            # execute_sql runs it under the executor's own bounds (the per-statement budget, plus the
+            # supervisor's slack on the fork path) and hits the warehouse — so on the loop a single
+            # slow query would freeze every other in-flight request. This completes ACE-048 (which
+            # off-loaded the KDF/OIDC/audit calls but left the handler on the loop).
             # `run_blocking` (anyio.to_thread) copies the request context into the worker thread, so
             # the org-scoped model cache (ACE-045, read via `_current_org_ctx`) stays tenant-correct.
-            result_text = await run_blocking(meta["handler"], arguments or {})
+            # Run the handler inside a context THIS frame owns, so the classified outcome it
+            # publishes can be read back afterwards (ACE-098). `run_blocking` hands the worker a
+            # copy of the current context, and a `ContextVar.set` inside a copy is invisible here —
+            # verified, not assumed. Giving the handler a `Context` object we hold is what makes the
+            # verdict readable at the audit write below, instead of it having to `json.loads` the
+            # body this call is about to return.
+            result_text = await run_blocking(handler_ctx.run, meta["handler"], arguments or {})
             return [mt.TextContent(type="text", text=result_text)]
         except Exception:
             raised = True
@@ -356,19 +455,32 @@ def build_server(registry: dict | None = None, extra_instructions: str | None = 
         finally:
             # The per-call audit write opens a fresh Store + INSERT + close; run it off the event loop so
             # it doesn't add DB latency to every tool call on the loop (ACE-048). `_actor_ctx.get()` is read
-            # here (on the loop) and passed in. Still best-effort — a logging failure never breaks the tool.
-            try:
-                await run_blocking(
-                    record_tool_call,
-                    name=name,
-                    arguments=arguments,
-                    result_text=result_text,
-                    execution_ms=int((time.monotonic() - started) * 1000),
-                    actor=_actor_ctx.get(),
-                    raised=raised,
-                )
-            except Exception:
-                pass
+            # here (on the loop) and passed in.
+            #
+            # NOT wrapped (ACE-097). This `try` held an `except Exception: pass`, the second of the
+            # two swallows that made a lost audit row invisible: it caught whatever
+            # `_record_tool_call` raised, and `_record_tool_call` swallowed internally so it never
+            # raised anything for this to catch. Each made the other unobservable, which is why
+            # removing either alone changed nothing and neither was ever removed.
+            #
+            # `record_tool_call` decides what a failure means, by deployment: served, it raises and
+            # the call fails; local, it warns and returns. That decision belongs there, beside the
+            # write, rather than being pre-empted here by a transport that cannot tell the two
+            # deployments apart. Raising from a `finally` replaces the handler's own result, which is
+            # the intended outcome: a call whose record was lost must not read as a success.
+            await run_blocking(
+                record_tool_call,
+                name=name,
+                arguments=arguments,
+                result_text=result_text,
+                execution_ms=int((time.monotonic() - started) * 1000),
+                actor=_actor_ctx.get(),
+                raised=raised,
+                # The classified outcome, when the handler produced one (ACE-098). Empty for every
+                # tool that does not speak the Envelope, which means "derive it the way you always
+                # have" — so those tools keep the body parse and nothing about them changes.
+                **typed_outcome_overrides(handler_ctx),
+            )
 
     return server
 
@@ -422,7 +534,14 @@ def create_app(
     # Merge the consumer's extra tools over a COPY of TOOLS — the module global is never mutated.
     registry = {**TOOLS, **(extra_tools or {})}
     session_manager = StreamableHTTPSessionManager(
-        app=build_server(registry, extra_instructions=extra_instructions),
+        # `tool_visibility` is read from the adapters rather than taken as a `create_app` parameter, so it
+        # rides the seam a consumer already swaps (`replace(default_adapters(), …)`) instead of adding a
+        # second, parallel way to configure the surface. None on the OSS defaults ⇒ unchanged behaviour.
+        app=build_server(
+            registry,
+            extra_instructions=extra_instructions,
+            visibility=getattr(adapters, "tool_visibility", None),
+        ),
         json_response=True,
         stateless=True,
     )
@@ -431,17 +550,57 @@ def create_app(
         # Set the actor + resolved org for this request's tool calls, then run the MCP dispatch in the same
         # task so the contextvars reach `_call_tool` and the per-process model cache. Prefer what the auth
         # middleware attached to the scope state; the actor falls back to re-validating the bearer.
-        actor = _actor_from_scope(scope, auth_provider)
-        token = _actor_ctx.set(actor)
+        # Resolve the caller ONCE: the subject and the session must describe the same principal, and on the
+        # fallback path two lookups would mean validating the same bearer twice.
+        principal = _principal_from_scope(scope, auth_provider)
+        token = _actor_ctx.set(getattr(principal, "subject", None))
         org_token = _current_org_ctx.set(_org_id_from_scope(scope))
+        session_token = _session_ctx.set(_normalized_session(principal))
         try:
             await session_manager.handle_request(scope, receive, send)
         finally:
             _actor_ctx.reset(token)
             _current_org_ctx.reset(org_token)
+            _session_ctx.reset(session_token)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        # Say the posture out loud before serving anything (ACE-101). `AGAMI_GOVERNANCE_ENFORCED`
+        # defaults OFF, so a server can be brought up with table scope, column scope, the star ban and
+        # the engine-mismatch check all inert, which is a supported deployment and a surprising one.
+        # The only other place it is visible is the absence of a refusal, and nobody reads an absence.
+        #
+        # Here rather than in `create_app`'s body because this runs when the process SERVES, while the
+        # body also runs for every embedding harness and every test that builds an app. Once per
+        # worker process, not once per deployment: `main()` runs uvicorn with `WORKERS=N` and uvicorn
+        # re-invokes the factory in each child, so N workers legitimately log N lines.
+        from execute_sql import _model_pass_disabled_by_env
+
+        if _model_pass_disabled_by_env():
+            # The SAME predicate every enforcement site reads, not a second spelling of it. An earlier
+            # draft dropped the `_hosted()` half and so announced "the gates are off" on a file-mode
+            # server where they were fully on. A warning that is wrong in the safe direction is still
+            # a warning an operator learns to discount, which is the one thing this line cannot afford.
+            #
+            # The `_by_env` reader rather than the pinned one, and that distinction is the point of
+            # its existing: this runs ONCE at startup, before any request, so there is no call for it
+            # to be scoped to. Reading the pinned value would make a startup statement depend on
+            # request-scoped state, which is None in a served process but need not be in an embedding
+            # harness that ran a query before building an app. Found by driving the boot path after a
+            # query in one process, where the stale pin made this line fire on all four postures.
+            #
+            # `is not enabled` rather than `is not set`: the variable is also not enabled when it IS
+            # set to `false`, `0`, or a typo like `ture`, and telling an operator who typed something
+            # that they typed nothing sends them to check env plumbing instead of their own value.
+            _log.warning(
+                "AGAMI_GOVERNANCE_ENFORCED is not enabled (value: %r): the semantic-model pass is "
+                "OFF, so table scope, column scope, the SELECT * ban and the engine-mismatch check "
+                "will not run. This server can read any table and any column the connecting role is "
+                "granted, including columns excluded from the model, and can enumerate the schema "
+                "through catalog relations. Read-only, dangerous-function and resource-bound "
+                "protection are unaffected.",
+                os.environ.get("AGAMI_GOVERNANCE_ENFORCED", ""),
+            )
         # Heal the schema before serving: apply any pending migrations so freshly-deployed code never hits
         # an old DB shape (a column a migration adds, selected before it's applied, 500s the admin). This
         # is fail-closed — a failing migration propagates and aborts startup; a half-migrated DB never

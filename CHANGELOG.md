@@ -12,6 +12,409 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Added
+
+- **A server can now run with the semantic-model pass off, and always says so
+  (`AGAMI_GOVERNANCE_ENFORCED`, ACE-101).** The model-scoping checks refuse on facts about *our*
+  parser and *our* model resolution rather than about your SQL, so a dialect drift or a model that
+  will not resolve could refuse every query on a server until an operator intervened, and there was
+  no way to bring that server up without them. There is now one switch, read per request so flipping
+  it takes effect on the next query with no redeploy.
+
+  **It is off by default,** which means a fresh server does not enforce table scope, column scope,
+  the `SELECT *` ban, or the engine-mismatch check until you turn it on. With it off, a query may
+  read anything the connecting role is granted, including columns you excluded from the model, and
+  may enumerate your schema through catalog relations. Turn it on once the checks have been
+  validated against your data; see the [self-hosting reference](docs/self-hosting.md) and
+  [SECURITY.md](SECURITY.md).
+
+  **What the switch cannot reach:** the read-only guard, the dangerous-function guard, the statement
+  timeout and the row cap. Those are composed outside the pass and enforce in both postures, as does
+  the read-only database role. And nothing ever claims the checks ran: every answer and every audit
+  row carries "the semantic-model checks are turned off in this deployment", on all five receipt
+  sections, with no findings attached.
+
+  The server logs one warning at startup naming the variable and the exposure whenever it boots with
+  the pass off.
+
+### Fixed
+
+- **Catalog and dictionary reads no longer hit the row cap that exists to bound your queries.** The
+  executor refuses (never truncates) any result over `AGAMI_SQL_MAX_ROWS`, default 1000. That bound
+  is sized for a question someone asks; a *catalog* read exceeds it on schema size alone. The visible
+  symptom was `sm enrich-metadata` dying on any platform whose data dictionary is a real table
+  (`RuntimeError: … "rule": "resource_limit"`), but the quieter cases were worse: the bulk
+  `information_schema.columns` read behind `sm discover`, and the table/foreign-key reads behind
+  `sm introspect`, discard a refused read instead of reporting it — so on a wide catalog they
+  degraded to one round-trip per table, or produced a model with no join graph, and said nothing
+  about either.
+
+  The connect skill now runs those three commands with a raised cap and **tells you it did, along
+  with your unchanged query-time cap**. Nothing about the bound on an ordinary question changes: a
+  query returning more than the cap is still refused rather than quietly truncated, and no new lever
+  is reachable from a generated query.
+
+- **The guard now reads your SQL in your database's own grammar, and refuses what it cannot read
+  (ACE-079).** Every model-scoping check decided by parsing the statement, and every one of them
+  parsed in a generic SQL dialect rather than your engine's. On MySQL, BigQuery, Databricks and SQL
+  Server that is not a subtlety: a backtick is not an identifier quote in the generic grammar, so
+  `` SELECT `ssn` FROM `customers` `` parsed to **no tables and no columns**. The scope checks were
+  not bypassed by a trick — they inspected the tree, found nothing to object to, and passed. So on
+  those engines a query could read any table in the database regardless of what your model declared,
+  and the trust receipt reported no tables read, which made the answer look clean.
+
+  The error posture was the other half. `error_level="ignore"` was not a lenient setting, it was no
+  setting at all: sqlglot compares that argument against enum members, so a string matched no branch
+  and every parse error was silently discarded, leaving a truncated tree that read as valid. Both
+  halves are fixed together, because either alone leaves a hole.
+
+  Four situations are now refused rather than run blind, each with the next step it actually needs:
+
+  - the datasource does not say which engine it runs on (undeclared, unmapped, or two connections
+    disagreeing) — `model_unavailable`, and the fix is the operator's: declare
+    `storage_connections[].storage_type`. It does not invite you to retry the query, because no
+    rewrite of the query helps.
+  - the statement does not parse in that engine's grammar — `unparseable`, and you can re-emit it.
+  - a double-quoted token on a backtick-quoting engine, which means a column under `ANSI_QUOTES` and
+    a string literal otherwise. The server setting is not visible to the guard, so rather than guess
+    it asks for the statement in the engine's own quoting.
+  - the statement parses, reads from something, and resolves to no named table at all — `unscopable`.
+    A backstop that does not depend on the engine map being complete.
+
+  A model that declares one engine while its credentials connect to another is also refused
+  (`engine_mismatch`): those are two independent pieces of configuration, and a mismatch means the
+  statement was checked against the wrong grammar.
+
+  **If your model does not declare a `storage_type`, queries against it now refuse** with the
+  message above. This is deliberate: a datasource whose engine is unknown cannot be governed, and
+  the alternative was to keep parsing it in a grammar no engine uses.
+
+### Changed
+
+- **The receipt now reports on every number your query computes, not just the ones with a problem
+  (ACE-060).** The `aggregates` section listed findings, so a total no join had multiplied produced
+  no entry at all — and an entry that is absent looks exactly like a check that never ran. It also
+  named the measure *table*, so a query computing two numbers over one table told you a join
+  multiplied "orders" and left you to work out which of your two numbers it meant.
+
+  There is now one entry per aggregate, saying the aggregate as parsed, whether a join multiplies
+  the rows behind it, and which join does. A number nothing multiplied **says so**, which is the
+  point: reading "not multiplied" beside a total is the difference between a clean answer and an
+  unchecked one.
+
+  An aggregate whose reads could not be resolved reports `undetermined` rather than clean.
+  `COUNT(*)` is the case that matters: it names no column, so nothing tells us which table's rows it
+  counts, and a fan-out around it is invisible to the check. Reporting that as clean would put a
+  clean bill of health on the one number a join had multiplied.
+
+  The section's `undetermined` line is now composed per query from what *that* query left open, so
+  it can finally be empty. It used to carry a sentence on every answer, including "whether this is a
+  problem depends on the question" — true of every answer forever, and the reason the section could
+  never say "checked, and complete". A trap is still reported and still never refused.
+
+- **The audit row now says what the decision was made against, and what you were told (ACE-098).**
+  A row recorded the verdict — `ok` / `refused` / `failed`, and for a refusal which rule under which
+  reason — but nothing about the basis for it, so nobody could take a row and check the decision
+  again. Three columns close that: `detail` (the refusal's own sentence, which is where "which bound
+  fired and what it was set to" lives, since the statement timeout and the row bound share one rule),
+  `receipt` (everything the trust receipt reported, including its `undetermined` markers), and
+  `model_version` as a column you can filter on.
+
+  A test now takes those rows and **re-derives each refusal with no database connection at all**,
+  matching what was recorded. That is the check that tells whether the fields are sufficient rather
+  than merely present. The two runtime bounds are exempt and stay exempt: whether a statement
+  outruns its budget is a property of the run, not of the SQL, so it is not reproducible offline by
+  anyone.
+
+  Also, the **tool-call log now reads the verdict rather than re-reading the answer**. It used to
+  parse the response body to work out whether a call failed and why, which made the audit trail
+  depend on the wire format; it now takes the classified outcome directly.
+
+- **A self-hosted server that cannot record a query no longer runs it (ACE-097).** Recording was
+  best-effort in three places, and two of them were silent, so a deployment could execute SQL
+  against your database and keep no record of having done so with nothing anywhere saying the
+  record was lost.
+
+  On a **server** (one with `AGAMI_DB_URL` or `APP_DATABASE_URL` configured), the audit store is now
+  checked before the statement runs. If it cannot be opened the call is refused, with
+  `rule: audit_unavailable` and a remediation naming the operator action, and the statement never
+  reaches your database. If the store was reachable at that check and the write fails afterwards,
+  the call fails rather than returning an answer whose statement left no trace. The connection is
+  read-only, so nothing was changed and re-running costs only the round trip.
+
+  **Local single-player use is unchanged.** With no database configured there is no audit store to
+  reach: the log is a local jsonl file, a write failure is still logged and never breaks your query,
+  and a read-only artifacts directory cannot stop you asking questions.
+
+  For operators this is an availability change, and a deliberate one: a briefly unreachable audit
+  database now produces refusals rather than unrecorded answers.
+
+### Added
+
+- **The receipt now tells you which of a table's declared filters your statement actually applied
+  (ACE-099).** Declaring `default_filters` on a table has never applied them to your SQL, and since
+  the filter injector was removed nothing reported on them either — so `SELECT COUNT(*) FROM orders`
+  returned every row where it once returned the undeleted ones, and nothing on the answer said the
+  number meant something different from what the model says the table means.
+
+  Each entry in the receipt's `tables` section now carries `filters`, one `{expr, status}` per
+  declared filter, with `status` one of `applied`, `omitted` or `undetermined`, plus a `scope`
+  naming where in the statement that reference sits.
+
+  The determination is **per reference, not per table**, which is the part that makes it worth
+  trusting. A filter satisfied inside a CTE and absent from the outer query is two different answers
+  about the same table, and reporting one verdict for both is what made the old injection unsafe:
+
+  ```
+  WITH recent AS (SELECT id FROM orders o WHERE o.status != 'cancelled')
+  SELECT o.id FROM orders o JOIN recent r ON o.id = r.id
+  ```
+  ```
+  orders  scope=cte:recent  filters=[{expr: "o.status != 'cancelled'", status: applied}]
+  orders  scope=main        filters=[{expr: "o.status != 'cancelled'", status: omitted}]
+  ```
+
+  `applied` means the declared predicate is one of the top-level `AND` conjuncts of that reference's
+  own scope; extra conditions beside it do not weaken that. Anything the check cannot stand behind
+  is `undetermined` rather than a verdict — a predicate on the same column that is not identical, one
+  reachable only through an `OR`, one that only appears in an outer join's `ON`. Only an outright
+  absence is `omitted`, because a confident "you left this out" that turns out to be wrong is worse
+  than saying nothing. **An omitted filter is never a refusal**: whether it matters depends on the
+  question, which only you have.
+
+  The shipped sample declares one (`orders`: `status != 'cancelled'`), so this is visible the first
+  time you run it.
+
+### Changed
+
+- **A result too large to return is refused, not trimmed.** A query whose result exceeded the
+  deployment ceiling (`AGAMI_SQL_MAX_ROWS`, default 1000, unchanged) used to come back cut down to
+  that many rows with a flag saying so. It now comes back as a structured refusal carrying no rows.
+
+  The trim was unsound before it was anything else. Without an `ORDER BY` a SQL result has no
+  defined prefix, so what you got was whichever rows the engine happened to emit first — different
+  between runs, different between engines, and presented as the answer. It was not a smaller version
+  of your result; it was an arbitrary sample of it.
+
+  The refusal tells you which fix applies to the statement you sent, because the wrong one is worse
+  than none: a row listing should be bounded with a `LIMIT` and an `ORDER BY`, while an aggregate
+  should have its grouping narrowed or a filter added — putting a `LIMIT` on a grouped result drops
+  groups, and the breakdown you get back reads exactly like a complete one.
+
+### Removed
+
+- **`max_rows` is no longer an argument to `execute_sql`,** and `--max-rows` is gone from the
+  command line. It could only ever *lower* the deployment ceiling, so the one case where a caller
+  knows better than the operator — wanting more data — was the case it could not serve. Ask for the
+  rows you want in the statement: `LIMIT 200` says what it means to everything that reads it.
+
+- **`truncated` is no longer a field on a successful result.** With an oversized result refused, it
+  could only ever be `false`, and a field that is always `false` is one a client can only branch on
+  wrongly.
+
+- **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
+  across a one-to-many join, touching the many side nowhere but the `ON` clause, used to have that
+  join silently dropped and the rewritten statement executed in place of yours. Your statement is
+  what runs now, byte for byte — comments, whitespace and quoting included — and that is asserted
+  rather than assumed.
+
+- **Four correctness checks stopped refusing.** A fan trap, a chasm trap, a `SUM` of a rate or an
+  identifier, and a `SUM` of a balance across time were all refused. They **return a result** now,
+  and what the check found rides on the answer's receipt, under `aggregates`.
+
+  This is the point of the change rather than a relaxation of it. Whether a multiplied total is
+  *wrong* depends on what you asked: the same statement is wrong for order revenue and right for
+  line-item exposure. The check has your SQL and your model and never your question, so it describes
+  what it found and leaves the judgement to you — or to the assistant, which does have the question
+  and is asked to say out loud when it restructures a query because of a finding.
+
+  A statement that trips two conditions now reports both. The old code stopped at the first, so a
+  query that both fanned out *and* summed a rate was reported as having one problem.
+
+- **`sensitive` is a description, not a gate.** Marking a column `sensitive` no longer blocks
+  projecting it. The answer's receipt reports which sensitive columns it projected, under
+  `columns`, and the authoring guidance asks the assistant to prefer aggregates and to say when it
+  did project them.
+
+  **If you relied on this to keep values from coming back, read this.** The gate was never a
+  boundary: it inspected the projection list and nothing else, so `WHERE email LIKE …` always
+  answered the same question one bit at a time. What it bounded was the *rate* of that, which is an
+  access policy, and Agami holds none of its own — it reads exactly as the connecting database role
+  reads. Two things do enforce, and neither changed: a column left out of the model is out of scope
+  and any statement naming it is refused, and the connecting role's grants and your warehouse's
+  masking policies apply as they always did. If a value must not come back, exclude the column from
+  the model or make sure the role cannot read it.
+
+- **The `model_safety` refusal rule is gone.** It stood in for two branches that refused without
+  naming a rule. Both branches went, so every refusal now names the gate that chose it. A consumer
+  keying on `refusal.rule == "model_safety"` will stop matching, which is the point.
+
+### Contract changes
+
+- Receipt `tables` items carry an **arm ordinal on `scope`** (ACE-043). When a reference's scope is
+  one of two or more arms of a `UNION` / `INTERSECT` / `EXCEPT`, its label gains a trailing 1-based
+  `#<n>`: `main#1`, `main#2`, `cte:recent#2`. A plain `SELECT` and a single-arm CTE body are
+  unchanged and carry no suffix, and `subquery` never takes one. **If you branch on
+  `scope === 'main'` or `scope === 'cte:x'`, that branch stops matching inside a set operation —
+  strip the ordinal with `scope.replace(/#\d+$/, '')` (or `scope.rsplit('#', 1)[0]`) and branch on
+  that.** Split from the RIGHT, not the left: the CTE-name half is caller-written text, and it is
+  only sanitization to an identifier alphabet excluding `#` that keeps a left split working today. The ordinal is the arm's position in the SQL, which
+  is not the order of this list: items are in parse-walk order, so a capped receipt can list
+  ordinals that are neither contiguous nor monotonic, and the largest one is not the arm count.
+- Receipt `tables` items gain **`scope`** and **`filters`** (ACE-099). `ref` is unchanged and is
+  still a string. A `refused` or `failed` receipt is unchanged too — it carries `{ref, declared}`
+  and neither new field, because a declared filter names the columns and literals the model author
+  wrote and a refusal is the one outcome a caller can provoke on purpose.
+- `tables.undetermined` is now **`null` when the section is complete** (ACE-099). It used to be a
+  fixed sentence on every receipt saying the filter accounting was not done. It now names only what
+  was genuinely not established — references whose filters could not be accounted for, references a
+  shadowing CTE name stopped resolving, and the count the reference cap dropped. If you branch on
+  this field being present, that branch changes meaning: present now means something really is
+  missing.
+- `sm receipt --applied-filters` is **gone**, and the receipt no longer emits a top-level
+  `default_filters_applied` key (ACE-099). Nothing had produced either since the filter injector was
+  removed; the fact lives in `tables.items[].filters` now, in one shape rather than two.
+- `sm prepare` returns `{sql, findings, units}` and **always exits 0**. It previously returned
+  `{action, risk, sql, units, reason}`, or exited 1 with a refusal. It runs the reporting checks,
+  not the refusing gates — do not pair it with `--no-safety`.
+- `sm preflight` returns `{findings: [...]}`, replacing the single
+  `{risk, action, reason, suggestion, triggering_joins}` verdict.
+- The receipt's `aggregates` section can now be non-empty, and its `undetermined` sentence changed:
+  it says the checks ran and names what they still do not reach, rather than saying the check does
+  not happen. `columns` items may carry `sensitive: true`.
+- The `{"error": {"kind": "preflight_refused"}}` and `{"kind": "sensitive_columns"}` diagnostics no
+  longer appear on stderr. Every refusal is a single JSON object on every path.
+- A refused `SELECT *` reports `reason: "undetermined"`, not `reason: "out_of_scope"`. The refusal
+  and its message are unchanged; only the reason moves. If you route, count or alert on `reason`,
+  this row changes bucket.
+
+### Changed
+
+- **A `#` is no longer mistaken for the SQL it hides, and is now refused wherever it appears
+  outside a string (ACE-096).** `SELECT a FROM t # DROP TABLE t` came back as *"keyword 'DROP' is
+  not allowed"*, and `... # note; more` as *"multiple statements are not allowed"* — both refusals
+  of valid MySQL, and both naming a fix that would not have helped, because neither the `DROP` nor
+  the second statement was ever going to run.
+
+  The guard reads every statement with one grammar and no engine, and `#` means four different
+  things across the engines it speaks: a line comment in MySQL and MariaDB, the `#` / `#>` / `#>>`
+  operators in PostgreSQL, a temp-table prefix in SQL Server (`#tmp`, `##global`), and an ordinary
+  character inside a backtick- or bracket-quoted identifier. It cannot tell them apart, so it now
+  declines to pick a reading and says which ambiguity it hit — the same call it already makes for
+  a bare `--x`.
+
+  **This is a widening: all four shapes ran before and are refused now**, not just the comment.
+  If you use jsonb path operators, SQL Server temp tables, or a `#` inside a quoted identifier,
+  those statements will start coming back refused. It is the accepted cost of one grammar; the
+  other direction lets a trailing `;DROP` ride through inside text the guard decided to ignore.
+  Rewrite a `#` comment as `-- ` or `/* … */`; a `#` inside a name has to be spelled another way.
+
+- **The trust receipt is five sections, and each one says what it did NOT establish (ACE-088).**
+  Every answer's receipt now carries `columns`, `tables`, `joins`, `aggregates` and `assumptions`,
+  always all five, each an object `{items, undetermined}` beside the `model_version` pin.
+  `undetermined` is a plain sentence naming what that section did not check; it is `null` only when
+  the section is complete. **This is the point of the change**: before it, a section nobody had
+  checked and a section that found nothing were both the empty list, so silence read as clean.
+  Aggregate fan-out is the live example — the receipt now states, where you read the answer, that
+  whether a join multiplies the rows an aggregate is computed from was not checked, instead of
+  shipping an empty section you would read as "no problem". `assumptions` is the section that most
+  often has nothing to admit, and it earns its `null` rather than assuming it: it lists at most
+  three AI-written column meanings and counts any beyond that onto its own marker, because a
+  truncated list under a null marker is a positive claim of completeness.
+
+  The receipt also rides on **every** status, not just `ok`. Every non-ok body carries the bounded
+  form — the caller's own identifiers and, per reference, whether the model declares that name;
+  nothing else about the model. `tables` is now **one entry per reference** rather than per table,
+  so a table read twice is listed twice and a reference the model does not declare says so. A name
+  the statement defined for itself — a CTE, including one that shadows a real table — is not a
+  declared table in ANY section: it borrows no row estimate, no schema-qualified column label and
+  no model-written column meaning, in every spelling of a column reference.
+
+  **Breaking for anything reading the old flat keys.** `tables_used` → `tables.items[]`;
+  `relationships` → `joins.items[]`; `metrics` → the `columns.items[]` entries whose `metric` is
+  non-null; `assumptions` → `assumptions.items[]`; `warnings` → derive it from `joins.items[]`
+  filtered to `review_state != "approved"` (a review state can be counted and linked back to its
+  join; a pre-rendered sentence could only be printed); `named_filters` and `sql` are gone (nothing
+  ever produced the former, and the statement is on the response body). The HTML report, the MCP
+  server instructions, `render_chart.py` and the `agami-query` skill all move with it, and
+  `render_chart.py` now **rejects** a receipt that is missing a section rather than silently
+  rendering nothing for it.
+
+- **The answer report renders the whole receipt.** The provenance panel draws every section with its
+  marker, lists tables per reference (an undeclared one explains itself instead of showing blanks),
+  and adds the columns the statement referenced. The unreviewed-join banner is derived from the join
+  review states, so it can count them and name each one. The unapproved-metric banner and its
+  Approve / Change write-back are unchanged in behaviour. Two long-standing display bugs fixed while
+  repointing: an unreviewed entry read "confidence ?" to every user (the phrase tested `confidence`
+  as a number; it is a label), and a named-filters block that no producer ever filled is deleted.
+
+### Removed
+
+- **The `GovernancePolicy` port and the `Adapters.governance` field (ACE-095).** `GovernancePolicy`,
+  its `GovernanceVerdict` value type, and the `WarnOnlyGovernancePolicy` default adapter are gone,
+  along with the `governance` field on `ports.Adapters`. The port was declared but never called: no
+  core call site ever evaluated it, so removing it changes no behaviour and touches nothing on the
+  `execute_sql` enforcement path. `Adapters` is public API, so a consumer that constructed it with
+  `governance=...` drops that keyword; the remaining ports (`ActivitySink`, `OrgResolver`,
+  `AuthProvider`, `Executor`) are unchanged. **`Adapters` is not keyword-only, so a consumer that
+  built it POSITIONALLY must also re-check its call**: the 4th positional slot was `governance` and
+  is now `executor`, so `Adapters(sink, resolver, auth, my_policy)` still constructs but binds the
+  policy as the executor and fails later at query time with `AttributeError: 'MyPolicy' object has
+  no attribute 'execute'`. Construct `Adapters` by keyword.
+
+### Docs
+
+- **Read-only datasource role is now a stated deploy obligation, not a suggestion (ACE-036).** The
+  self-host guide and `readonly-grants.md` now frame the SELECT-only role as the **required**
+  `DATASOURCE_URL` posture for a deploy (single-player stays *recommended*), spell out the app-role vs
+  operator/owner-role split, and clarify that the role guarantees integrity/confinement but **not**
+  availability/recon — bounding runaway work and recon is app-side, and the docs now state which of
+  those bounds exist today (the result-row cap) and which do not yet (a per-statement query timeout,
+  error-text/recon hardening). Docs only — no behaviour or config change.
+
+## [0.5.3] — 2026-07-31
+
+### Added
+
+- **Override seam on the tool-call audit log (`record_tool_call`).** An embedder that dispatches the
+  tool handlers itself can now supply the values the log would otherwise infer from the model's own
+  tool arguments and result body — `source`, `thread_id`, `correlation_id`, `user_question`,
+  `org_id`, and the outcome (`success`, `row_count`, `error_kind`). Each of these override
+  parameters defaults to `None` = "derive it the way you always have" (the recorded fact `raised` is
+  a separate boolean, default `False`), so a caller that passes none of them gets byte-identical
+  rows — the in-repo transport path is regression-pinned identical to before the seam existed. `_record_query`'s source is likewise
+  readable from a context var, so the query log and the tool-call log can't disagree about what drove
+  one execution.
+
+### Changed
+
+- **The audit row now fails toward honesty.** A caller with no result body to parse can now record a
+  failure (previously the row defaulted to success — the one direction an audit log must never fail
+  in); a raise outranks every override; naming an `error_kind` is itself a statement of failure; and
+  a success never carries an error kind, so the row can't contradict itself.
+- **Honest question provenance in the Activity drawer.** The `· self-reported` trust marker was
+  stamped on every question unconditionally (the `source` column was never even selected). The column
+  is now projected and a per-turn flag derived, so the marker is dropped only where the caller
+  observed the question directly — and kept under any disagreement or uncertainty, because
+  overstating trust is the one direction it must not fail.
+
+## [0.5.2] — 2026-07-30
+
+### Added
+
+- **Per-request tool-visibility seam (`Adapters.tool_visibility`).** A consumer can now narrow the
+  advertised MCP tool surface per caller via an optional `tool_visibility(tool_name) -> bool` on the
+  adapters, applied in `build_server`. It is applied at *both* the list and the call seam — filtering
+  only the list would leave an unlisted tool callable by name, a surface that looks narrowed while
+  remaining open. A hidden tool answers as *absent* (the same `Unknown tool` a typo gets), not as
+  refused, so the list can't be used as an oracle for what exists but is withheld. A predicate that
+  raises hides the tool rather than granting it, and is logged rather than propagated, so one broken
+  classification can't become an accidental grant or a dead transport for every other caller.
+  Subtractive only — a surviving tool's description and input schema pass through untouched. `None`
+  (the OSS default) is byte-identical to prior behaviour.
+
+## [0.5.1] — 2026-07-30
+
 ### Security
 
 - **Closed a read-only-guard bypass via a welded quoted identifier.** A double-quoted

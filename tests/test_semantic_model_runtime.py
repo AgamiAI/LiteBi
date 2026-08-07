@@ -18,6 +18,47 @@ from semantic_model import runtime as rt  # noqa: E402
 
 
 def _sales_org():
+    """Four tables, three many-to-one edges, and a declared grain for every table.
+
+    `tables_defined` used to be absent, which made `_model_table_index(org)` empty. ACE-060 derives
+    its `visible` set from that index, so no aggregate on this org could ever be seen behind, and
+    `not_multiplied` — the positive claim that a number is clean — was unreachable here for every
+    statement. The tests below already assert things like "aggregating the many side is allowed",
+    a claim the fixture could not express. Declaring the tables is what lets them say it.
+
+    Two things are deliberately NOT declared. Every `Column.aggregation` stays at its default
+    `unknown` and no `metrics` are declared, which is what keeps `_check_aggregation_semantics`
+    silent: a declared `averageable` or a semi-additive metric would add `bad_aggregation` /
+    `semi_additive` findings to the exact risk lists the tests below assert, and those lists are
+    about the fan/chasm detector, not about aggregation class.
+
+    Extended in place rather than beside: a second sales org is drift, and every assertion here is
+    written against this one set of names and edges.
+    """
+    tables = [
+        m.Table(name="orders", schema="public", storage_connection="c", grain=["id"],
+                description="orders",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="customer_id", type="integer"),
+                         m.Column(name="total_amount", type="decimal"),
+                         m.Column(name="revenue", type="decimal"),
+                         m.Column(name="status", type="string"),
+                         m.Column(name="created_at", type="timestamp"),
+                         m.Column(name="flag", type="boolean")]),
+        m.Table(name="order_items", schema="public", storage_connection="c",
+                grain=["order_id", "product_id"], description="order items",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="order_id", type="integer"),
+                         m.Column(name="product_id", type="integer"),
+                         m.Column(name="quantity", type="integer")]),
+        m.Table(name="customers", schema="public", storage_connection="c", grain=["id"],
+                description="customers",
+                columns=[m.Column(name="id", type="integer")]),
+        m.Table(name="tickets", schema="public", storage_connection="c", grain=["id"],
+                description="support tickets",
+                columns=[m.Column(name="id", type="integer"),
+                         m.Column(name="customer_id", type="integer")]),
+    ]
     rels = [
         m.Relationship(from_table="order_items", to_table="orders", from_column="order_id",
                        to_column="id", relationship="many_to_one"),
@@ -27,73 +68,140 @@ def _sales_org():
                        to_column="id", relationship="many_to_one"),
     ]
     return m.Datasource(datasource="Shop",
-                          subject_areas=[m.SubjectArea(name="sales", relationships=rels)])
+                          subject_areas=[m.SubjectArea(name="sales", tables_defined=tables,
+                                                       relationships=rels)])
 
 
 # --- pre-flight ---
 
 
-def test_fan_trap_auto_rewrite():
+def test_the_aggregation_only_fan_trap_is_reported_not_rewritten_and_not_refused():
+    """The shape with the longest history here. It was auto-rewritten by dropping the join, on the
+    grounds that the transform was result-preserving; ACE-093 deleted that and left it refusing;
+    this reports it and runs the statement.
+
+    Both subtractions came from the same place. The transform WAS result-preserving, and the
+    refusal WAS well-founded, and neither was ours to decide: whether a multiplied total is wrong
+    depends on the question, and this layer has the statement and the model and never the question.
+
+    The finding is asserted for what it does not carry. There is no `suggestion` — that field gave
+    a refused caller a way forward, and naming one on an answer that came back presumes intent."""
     org = _sales_org()
-    pf = rt.pre_flight_check(
-        "SELECT SUM(orders.total_amount) FROM orders JOIN order_items ON order_items.order_id = orders.id",
-        org)
-    assert pf.risk == "fan_trap" and pf.action == "auto_rewrite"
-    assert "order_items" not in pf.rewritten_sql
+    sql = ("SELECT SUM(orders.total_amount) FROM orders "
+           "JOIN order_items ON order_items.order_id = orders.id")
+    pf = rt.pre_flight_check(sql, org)
+
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
+    assert "rewrite" not in pf.findings[0].reason.lower(), pf.findings[0].reason
+    assert not hasattr(pf.findings[0], "suggestion")
+    assert "order_items" in pf.findings[0].reason  # names the many side rather than removing it
+    assert pf.findings[0].triggering_joins == ["orders (1) <- order_items (N)"]
 
 
-def test_chasm_trap_refuse_with_suggestion():
+def test_chasm_trap_is_reported():
+    """One entry per AGGREGATE the cross-product inflates, not one for the pair of tables.
+
+    This asserted a single finding, which was right when a finding was about the pair. The caller
+    holds two totals and both are inflated, so both are reported — and `pf.aggregates` is the shape
+    that says which is which.
+    """
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT c.id, SUM(o.revenue), COUNT(t.id) FROM customers c "
         "LEFT JOIN orders o ON o.customer_id=c.id LEFT JOIN tickets t ON t.customer_id=c.id "
         "GROUP BY c.id", org)
-    assert pf.risk == "chasm_trap" and pf.action == "refuse" and pf.suggestion
+    assert [f.risk for f in pf.findings] == ["chasm_trap", "chasm_trap"]
+    assert [(a.aggregate, a.status) for a in pf.aggregates] == [
+        ("SUM(o.revenue)", rt.MULTIPLIED), ("COUNT(t.id)", rt.MULTIPLIED)]
 
 
-def test_fan_trap_mixed_raw_and_aggregate_refuse():
+def test_fan_trap_mixed_raw_and_aggregate_is_reported():
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT orders.id, orders.created_at, SUM(orders.total_amount) FROM orders "
         "JOIN order_items ON order_items.order_id=orders.id GROUP BY orders.id, orders.created_at",
         org)
-    assert pf.risk == "fan_trap" and pf.action == "refuse"
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
 
 
-def test_explicit_cross_product_allowed():
+def test_explicit_cross_product_is_not_a_trap():
+    """A cross-product with nothing aggregated over it multiplies no number, so there is nothing
+    to report — both traps are statements about the rows an aggregate is computed from.
+
+    `unchecked` is asserted beside the empty finding list for the reason
+    `test_aggregating_many_side_is_allowed` states: an empty list is also what a statement that did
+    not parse returns, so on its own it cannot tell "nothing is wrong" from "nothing was
+    established". This statement is a comma join with a `SELECT *` and no GROUP BY, which is exactly
+    the shape a parser or a scope gate is most likely to give up on quietly.
+
+    The empty aggregate roster is the other half, and it is the premise rather than a bonus: the
+    finding list is empty BECAUSE there is no aggregate, not because a fan was cleared."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT * FROM orders, tickets WHERE orders.customer_id = tickets.customer_id", org)
-    assert pf.action == "allow" and pf.risk is None
+    assert pf.unchecked is None, pf.unchecked
+    assert pf.findings == []
+    assert pf.aggregates == []
 
 
-def test_fan_trap_in_a_set_operation_arm_is_refused():
-    """A fan/chasm trap in ANY set-operation arm refuses the whole query. The set
-    operation parses to exp.SetOperation, so gating on isinstance(tree, exp.Select) would
-    skip every arm. Arms are not auto-rewritten, so a would-be auto_rewrite fan trap
-    (see test_fan_trap_auto_rewrite) becomes a refuse when it sits inside a UNION arm."""
+def test_fan_trap_in_a_set_operation_arm_is_reported():
+    """A trap in ANY set-operation arm is reported. The set operation parses to exp.SetOperation,
+    so gating on isinstance(tree, exp.Select) would skip every arm, and the finding has to come
+    from visiting the arm since the statement as a whole is not a SELECT.
+
+    The walk used to stop at the first arm that would have refused, which is right for a verdict
+    and wrong for a description: the second arm's trap is not made false by the first one's. It
+    accumulates now, and `test_every_trapped_arm_is_reported` pins that."""
     org = _sales_org()
     fan = ("SELECT SUM(orders.total_amount) FROM orders "
            "JOIN order_items ON order_items.order_id = orders.id")
     pf = rt.pre_flight_check(f"SELECT 1 AS n UNION ALL {fan}", org)
-    assert pf.risk == "fan_trap" and pf.action == "refuse"
+    assert [f.risk for f in pf.findings] == ["fan_trap"]
+
+
+def test_every_trapped_arm_is_reported():
+    """Two trapped arms, two findings. The old walk returned on the first, so the caller was told
+    one arm's aggregate was inflated and never that the other one's was too."""
+    org = _sales_org()
+    fan = ("SELECT SUM(orders.total_amount) FROM orders "
+           "JOIN order_items ON order_items.order_id = orders.id")
+    pf = rt.pre_flight_check(f"{fan} UNION ALL {fan}", org)
+    assert [f.risk for f in pf.findings] == ["fan_trap", "fan_trap"]
 
 
 def test_clean_set_operation_passes_preflight():
-    """A set operation with no trapped arm still passes — arm-walking must not over-refuse."""
+    """A set operation with no trapped arm reports nothing — arm-walking must not over-report.
+
+    A set operation parses to `exp.SetOperation` rather than to `exp.Select`, so a walk that gave up
+    on it would report nothing too, and this test's whole subject is the walk. `unchecked` is what
+    separates the two readings: null says the analysis ran over both arms and found nothing, where
+    the empty finding list on its own says only that nothing came back.
+
+    Neither arm aggregates, so the roster is empty as well, and that is the reason the finding list
+    is: no aggregate means no fan and no chasm before either arm's tables are considered."""
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT id FROM orders UNION SELECT id FROM customers", org)
-    assert pf.action == "allow" and pf.risk is None
+    assert pf.unchecked is None, pf.unchecked
+    assert pf.findings == []
+    assert pf.aggregates == []
 
 
 def test_aggregating_many_side_is_allowed():
-    # aggregating the MANY side (order_items) is legitimate, not a fan trap
+    """Aggregating the MANY side (order_items) is legitimate, not a fan trap.
+
+    The status is asserted alongside the empty finding list because an empty list is also what a
+    statement the analysis could not read returns, so on its own it cannot tell "nothing is wrong"
+    apart from "nothing was established". `not_multiplied` is the positive claim, and it is the one
+    this test's name has always made.
+    """
     org = _sales_org()
     pf = rt.pre_flight_check(
         "SELECT SUM(order_items.quantity) FROM orders JOIN order_items ON order_items.order_id=orders.id",
         org)
-    assert pf.action == "allow"
+    assert pf.findings == []
+    assert [(a.aggregate, a.status) for a in pf.aggregates] == [
+        ("SUM(order_items.quantity)", rt.NOT_MULTIPLIED)]
 
 
 # --- examples-first ---
@@ -157,57 +265,16 @@ def test_resolve_entity_instance(kwargs, expected):
     assert rt.resolve_entity_instance(e, **kwargs) == expected
 
 
-# --- apply_default_filters ---
-
-
-def _filter_org():
-    t = m.Table(name="orders", schema="public", storage_connection="c", grain=["id"],
-                description="o",
-                columns=[m.Column(name="id", type="integer"),
-                         m.Column(name="deleted_at", type="timestamp"),
-                         m.Column(name="total", type="decimal"),
-                         m.Column(name="tenant_id", type="integer")],
-                default_filters=["{alias}.deleted_at IS NULL"])
-    return m.Datasource(datasource="S",
-                          subject_areas=[m.SubjectArea(name="s",
-                              tables=[m.TableRef(storage_connection="c", schema="public", table="orders")],
-                              tables_defined=[t])])
-
-
-def test_apply_default_filters_with_where():
-    org = _filter_org()
-    new, applied = rt.apply_default_filters("SELECT SUM(o.total) FROM orders o WHERE o.total > 0",
-                                            org, area="s")
-    assert "deleted_at IS NULL" in new and "o.total > 0" in new and applied
-
-
-def test_apply_default_filters_no_where():
-    org = _filter_org()
-    new, applied = rt.apply_default_filters("SELECT SUM(orders.total) FROM orders", org, area="s")
-    assert "WHERE" in new.upper() and applied
-
-
-def test_apply_default_filters_skips_unresolved_param():
-    org = _filter_org()
-    org.subject_areas[0].tables_defined[0].default_filters.append("{alias}.tenant_id = :tenant_id")
-    new, applied = rt.apply_default_filters("SELECT 1 FROM orders o", org, area="s")
-    assert not any("tenant_id" in a for a in applied)
+# The three `apply_default_filters` tests that lived here were deleted by ACE-042 along with the
+# injector they asserted. Their replacement is tests/test_ace042_no_filter_injection.py, which
+# pins the absence at the `_model_safety` chokepoint plus the CTE case the injection got wrong.
 
 
 # --- receipt ---
-
-
-def test_build_receipt_surfaces_trust_and_rewrite():
-    rel = m.Relationship(from_table="a", to_table="b", from_column="x", to_column="y",
-                         relationship="many_to_one", confidence="confirmed",
-                         signed_off_by="dl@x.com", signed_off_role="data_lead")
-    pf = rt.PreFlightResult("fan_trap", "auto_rewrite", "SELECT SUM(a.v) FROM a JOIN b ON ...",
-                            rewritten_sql="SELECT SUM(a.v) FROM a", reason="dropped fan-out join")
-    receipt = rt.build_receipt(sql="SELECT SUM(a.v) FROM a", relationships_used=[rel],
-                               pre_flight=pf, caveats=["heads up"],
-                               default_filters_applied=["a.deleted_at IS NULL"])
-    assert receipt["relationships"][0]["signed_off_by"] == "dl@x.com"
-    assert receipt["pre_flight"]["action"] == "auto_rewrite"
-    assert receipt["pre_flight"]["rewritten_sql"] == "SELECT SUM(a.v) FROM a"
-    assert receipt["caveats"] == ["heads up"]
-    assert receipt["default_filters_applied"] == ["a.deleted_at IS NULL"]
+#
+# `build_receipt` was a SECOND receipt builder here — its own key names (`from`/`to`, `caveats`,
+# `original_sql`/`rewritten_sql`), assembled from a caller-supplied relationship list rather than
+# from the SQL. Its only caller was the test that covered it, so it was two descriptions of one
+# thing with one of them unreachable. `assemble_receipt` is the builder that ships, and the whole
+# of its behaviour is covered by tests/test_ace088_receipt_sections.py. Deleted rather than
+# deprecated: nothing else was covering it, because there was nothing else to cover.

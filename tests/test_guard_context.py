@@ -70,9 +70,6 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
 
         monkeypatch.setattr(rt, name, wrapper)
 
-    # A query on `orders` only — which declares no default_filters — so apply_default_filters
-    # injects nothing and we isolate the "guards don't re-parse the query SQL" claim (a table
-    # WITH default_filters legitimately parses each filter fragment to inject it).
     sql = "SELECT COUNT(orders.id) AS n FROM orders"
     ctx = rt.build_guard_context(sql, org)
     # Full battery WITH ctx — none of these should parse or rebuild an index again.
@@ -80,8 +77,7 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
     rt.check_no_select_star(sql, ctx=ctx)
     rt.check_column_scope(sql, org, ctx=ctx)
     rt.pre_flight_check(sql, org, ctx=ctx)
-    rt.check_sensitive_projection(sql, org, ctx=ctx)
-    rt.apply_default_filters(sql, org, ctx=ctx)
+    rt.projected_sensitive_columns(sql, org, ctx=ctx)
 
     assert counts == {"parse": 1, "_column_index": 1, "_cardinality_index": 1,
                       "_sensitive_by_table": 1, "_model_table_index": 1}
@@ -90,23 +86,33 @@ def test_build_context_parses_and_indexes_each_once(monkeypatch):
 @pytest.mark.parametrize("sql", [
     _CLEAN,                                             # allow
     "SELECT * FROM orders",                             # star ban
-    "SELECT customers.email FROM customers",            # sensitive projection refuse
+    "SELECT customers.email FROM customers",            # a reported sensitive projection
     "SELECT customers.bogus_col FROM customers",        # column-scope refuse
     "SELECT ghost.x FROM ghost",                        # table-scope refuse
-    "SELECT customers.name FROM customers",             # allow + default_filter applied
+    "SELECT customers.name FROM customers",             # allow (customers declares a default_filter,
+                                                        # which ACE-042 stopped applying)
 ])
 def test_verdict_parity_with_and_without_ctx(sql):
     """Every guard returns byte-identical results whether it builds its own work or is
-    handed a shared ctx — the behaviour-preserving guarantee."""
+    handed a shared ctx — the behaviour-preserving guarantee.
+
+    The three scope gates return `guardrail.Refusal | None`, so their parity is a plain `==` on a
+    frozen dataclass rather than a dict round-trip. That is strictly stronger: `as_dict()` compared
+    only the keys it chose to project, while `==` compares the whole object and would also catch a
+    differing `reason` or `rule`.
+
+    The other two are no longer gates at all. `pre_flight_check` returns findings and
+    `projected_sensitive_columns` returns column names, so both compare directly too — the
+    `as_dict()` round-trip they used was a concession to result objects that no longer exist.
+    """
     org = _org()
     ctx = rt.build_guard_context(sql, org)
-    assert rt.check_table_scope(sql, org).as_dict() == rt.check_table_scope(sql, org, ctx=ctx).as_dict()
-    assert rt.check_no_select_star(sql).as_dict() == rt.check_no_select_star(sql, ctx=ctx).as_dict()
-    assert rt.check_column_scope(sql, org).as_dict() == rt.check_column_scope(sql, org, ctx=ctx).as_dict()
-    assert rt.pre_flight_check(sql, org).as_dict() == rt.pre_flight_check(sql, org, ctx=ctx).as_dict()
-    assert (rt.check_sensitive_projection(sql, org).as_dict()
-            == rt.check_sensitive_projection(sql, org, ctx=ctx).as_dict())
-    assert rt.apply_default_filters(sql, org) == rt.apply_default_filters(sql, org, ctx=ctx)
+    assert rt.check_table_scope(sql, org) == rt.check_table_scope(sql, org, ctx=ctx)
+    assert rt.check_no_select_star(sql) == rt.check_no_select_star(sql, ctx=ctx)
+    assert rt.check_column_scope(sql, org) == rt.check_column_scope(sql, org, ctx=ctx)
+    assert rt.pre_flight_check(sql, org) == rt.pre_flight_check(sql, org, ctx=ctx)
+    assert (rt.projected_sensitive_columns(sql, org)
+            == rt.projected_sensitive_columns(sql, org, ctx=ctx))
 
 
 def test_unparseable_sql_ctx_tree_is_none_and_guards_allow():
@@ -115,5 +121,5 @@ def test_unparseable_sql_ctx_tree_is_none_and_guards_allow():
     org = _org()
     bad = "NOT SQL AT ALL ;;;"
     ctx = rt.build_guard_context(bad, org)
-    assert rt.check_table_scope(bad, org, ctx=ctx).action == "allow"
-    assert rt.check_no_select_star(bad, ctx=ctx).action == "allow"
+    assert rt.check_table_scope(bad, org, ctx=ctx) is None
+    assert rt.check_no_select_star(bad, ctx=ctx) is None

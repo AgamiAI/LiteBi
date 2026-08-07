@@ -127,7 +127,7 @@ For growth rates (QoQ, MoM, YoY):
 
 ## Safety Rules
 
-- **Result-set size policy** — do NOT auto-append `LIMIT 1000` (or any other implicit cap). Queries run unbounded by default. The query-database skill applies a per-org `max_rows` cap (configured in `<datasource_path>/local/.config.json`) when present, and a per-query "top N" cap when the user explicitly asks for "top N" / "first N" / "limit to N". For all other queries, return the full result set. See [query SKILL.md → Result-set size policy](../skills/agami-query/SKILL.md#result-set-size-policy) for the canonical contract.
+- **Result-set size policy** — do NOT auto-append `LIMIT 1000` (or any other implicit cap): write the `LIMIT` the question actually calls for, or none. There is a deployment ceiling on how many rows one result may carry (`AGAMI_SQL_MAX_ROWS`, default 1000), and a result that exceeds it is **refused, not trimmed** — you get a structured refusal and no rows, never a partial answer that reads as a whole one. So: add a `LIMIT` (with an `ORDER BY`, or the rows you get are arbitrary) when the user asks for "top N" / "first N" / "the largest", or when you expect a long row listing and only need a sample. For an **aggregate**, do not reach for `LIMIT` if the refusal comes back — a `LIMIT` on a grouped result drops groups and the breakdown will look complete when it is not; narrow the grouping or add a filter instead. The refusal's `remediation` says which of the two applies to the statement you sent.
 - Never generate `DROP`, `DELETE`, `TRUNCATE`, `ALTER`, `INSERT`, `UPDATE`, or `CREATE` statements
 - Never include actual credential values in SQL comments or strings
 - Use `NULLIF(denominator, 0)` to guard against division by zero

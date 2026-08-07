@@ -14,6 +14,7 @@ pytest.importorskip("mcp")
 pytest.importorskip("starlette")
 
 import mcp_http  # noqa: E402
+import tools  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 
 BASE = "https://demo.example.com"
@@ -100,8 +101,11 @@ def test_browser_hitting_mcp_gets_a_branded_html_401(base_url):
     assert "<html" in r.text and "MCP endpoint" in r.text
     assert r.headers.get("www-authenticate", "").startswith("Bearer ")
     # claude.ai (JSON / event-stream Accept) still gets the JSON body it expects.
-    j = c.post("/mcp", headers={"accept": "application/json"},
-               json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    j = c.post(
+        "/mcp",
+        headers={"accept": "application/json"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
     assert j.status_code == 401 and "application/json" in j.headers["content-type"]
 
 
@@ -148,17 +152,22 @@ def test_mcp_bare_path_is_not_307_redirected(base_url):
         "Accept": "application/json, text/event-stream",
     }
     init = {
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                   "clientInfo": {"name": "t", "version": "1"}},
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "1"},
+        },
     }
     with TestClient(mcp_http.build_app(), follow_redirects=False) as c:
         # Auth still gates the bare path (the shim must not become a bypass) — no bearer → 401, not a 307.
         assert c.post("/mcp", json=init).status_code == 401
         bare = c.post("/mcp", headers=headers, json=init)
         slashed = c.post("/mcp/", headers=headers, json=init)
-    assert bare.status_code != 307              # the fix: the bare path is served, not redirected
-    assert bare.status_code == 200              # reaches `initialize` directly
+    assert bare.status_code != 307  # the fix: the bare path is served, not redirected
+    assert bare.status_code == 200  # reaches `initialize` directly
     assert bare.status_code == slashed.status_code  # parity with the trailing-slash form
 
 
@@ -195,3 +204,192 @@ def test_http_tools_list_is_the_same_four(base_url):
         payload = json.loads(re.search(r"\{.*\}", tl.text, re.DOTALL).group(0))
         names = {t["name"] for t in payload["result"]["tools"]}
     assert names == PRODUCT_TOOLS
+
+
+def test_presence_auth_yields_no_session_id(base_url):
+    """The fallback that matters most: presence auth mints no token at all, so there is no session to
+    report. It must read as "no session" — never break the caller."""
+    from oss_adapters import PresenceAuthProvider
+
+    principal = PresenceAuthProvider().validate_token("present")
+    assert principal is not None and principal.subject == "local"
+    assert principal.session_id is None
+
+
+def test_the_session_id_reaches_a_tool_handler(base_url, monkeypatch):
+    """End to end over the real transport: a tool runs on a WORKER THREAD, so the contextvar set in
+    `handle_mcp` only reaches it because anyio copies the request context across the thread hop. Assert
+    that rather than trusting it — it is the whole delivery mechanism for a consumer's session key."""
+    seen = {}
+
+    def _probe(args: dict) -> str:
+        seen["session"] = mcp_http.current_session_id()
+        return "ok"
+
+    tool = {
+        "handler": _probe,
+        "description": "probe",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+
+    class _P:
+        subject = "jordan@example.com"
+        session_id = "sess-42"
+
+    class _Auth:
+        def validate_token(self, token):
+            return _P() if (token or "").strip() else None
+
+    from dataclasses import replace
+
+    adapters = replace(mcp_http.default_adapters(), auth_provider=_Auth())
+    app = mcp_http.create_app(extra_tools={"probe": tool}, adapters=adapters)
+    headers = {
+        "Authorization": "Bearer anything",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(app) as c:
+        c.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "1"},
+                },
+            },
+        )
+        c.post(
+            "/mcp", headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+        r = c.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "probe", "arguments": {}},
+            },
+        )
+        assert r.status_code == 200, r.text
+    assert seen["session"] == "sess-42"
+    # ...and it does not leak past the request.
+    assert mcp_http.current_session_id() is None
+
+
+# --- the tool-visibility seam --------------------------------------------------
+
+
+def _visibility_app(predicate):
+    """An app whose advertised surface is narrowed by `predicate`, wired the way a consumer would."""
+    from dataclasses import replace
+
+    probe = {
+        "handler": lambda a: "ran",
+        "description": "probe",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    }
+    adapters = replace(mcp_http.default_adapters(), tool_visibility=predicate)
+    return mcp_http.create_app(extra_tools={"probe": probe}, adapters=adapters)
+
+
+def _mcp(c, method, params=None, rid=1):
+    headers = {
+        "Authorization": "Bearer present",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    body = {"jsonrpc": "2.0", "id": rid, "method": method}
+    if params is not None:
+        body["params"] = params
+    return c.post("/mcp", headers=headers, json=body)
+
+
+def _handshake(c):
+    _mcp(
+        c,
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "1"},
+        },
+        rid=1,
+    )
+    _mcp(c, "notifications/initialized")
+
+
+def test_no_visibility_predicate_leaves_the_surface_unchanged(base_url):
+    """The default must be byte-identical to before the seam existed — this is an additive hook."""
+    with TestClient(_visibility_app(None)) as c:
+        _handshake(c)
+        names = {t["name"] for t in _mcp(c, "tools/list", {}, rid=2).json()["result"]["tools"]}
+    assert "probe" in names
+    assert names >= set(tools.TOOLS)  # every core tool still advertised
+
+
+def test_a_hidden_tool_is_absent_from_the_list(base_url):
+    with TestClient(_visibility_app(lambda name: name != "probe")) as c:
+        _handshake(c)
+        listed = _mcp(c, "tools/list", {}, rid=2).json()["result"]["tools"]
+        names = {t["name"] for t in listed}
+    assert "probe" not in names
+    assert "execute_sql" in names  # subtractive: only the named tool goes
+
+
+def test_a_hidden_tool_is_also_not_callable(base_url):
+    """Listing alone would leave it callable by name — a surface that looks narrowed but is not."""
+    with TestClient(_visibility_app(lambda name: name != "probe")) as c:
+        _handshake(c)
+        r = _mcp(c, "tools/call", {"name": "probe", "arguments": {}}, rid=2)
+    assert "Unknown tool" in r.text  # answers as ABSENT, not as refused — the list is no oracle
+
+
+def test_a_visible_tool_still_runs(base_url):
+    with TestClient(_visibility_app(lambda name: True)) as c:
+        _handshake(c)
+        r = _mcp(c, "tools/call", {"name": "probe", "arguments": {}}, rid=2)
+    assert "ran" in r.text
+
+
+def test_a_predicate_that_raises_hides_rather_than_grants(base_url):
+    """A consumer's broken predicate must not be an accidental grant, and must not kill the transport."""
+
+    def boom(name):
+        raise RuntimeError("classification blew up")
+
+    with TestClient(_visibility_app(boom)) as c:
+        _handshake(c)
+        names = {t["name"] for t in _mcp(c, "tools/list", {}, rid=2).json()["result"]["tools"]}
+        called = _mcp(c, "tools/call", {"name": "execute_sql", "arguments": {}}, rid=3)
+    assert names == set()  # everything hidden, nothing granted
+    assert "Unknown tool" in called.text
+
+
+def test_the_predicate_sees_the_request_context(base_url):
+    """The whole point of a per-request hook: the consumer's predicate can read who is asking."""
+    seen = {}
+
+    def by_caller(name):
+        seen["actor"] = mcp_http._actor_ctx.get()
+        return True
+
+    with TestClient(_visibility_app(by_caller)) as c:
+        _handshake(c)
+        _mcp(c, "tools/list", {}, rid=2)
+    assert "actor" in seen  # ran inside the request, not at composition time
+
+
+def test_a_surviving_tools_schema_is_untouched(base_url):
+    """Subtractive only — a filter may remove a tool but never reshape one that survives."""
+    with TestClient(_visibility_app(lambda name: name != "probe")) as c:
+        _handshake(c)
+        listed = {t["name"]: t for t in _mcp(c, "tools/list", {}, rid=2).json()["result"]["tools"]}
+    assert listed["execute_sql"]["inputSchema"] == tools.TOOLS["execute_sql"]["inputSchema"]
+    assert listed["execute_sql"]["description"] == tools.TOOLS["execute_sql"]["description"]

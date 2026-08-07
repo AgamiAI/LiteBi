@@ -1366,7 +1366,7 @@
       if ((table.grain || []).length || (table.caveats || []).length || (table.default_filters || []).length) {
         const chips = el('div', { class: 'table-chips' });
         (table.grain || []).forEach(g => chips.appendChild(el('span', { class: 'mini-chip', text: 'grain: ' + g })));
-        (table.default_filters || []).forEach(d => chips.appendChild(el('span', { class: 'mini-chip', text: 'filter: ' + d })));
+        (table.default_filters || []).forEach(d => chips.appendChild(el('span', { class: 'mini-chip', text: 'declared filter: ' + d })));
         body.appendChild(chips);
         if ((table.caveats || []).length) body.appendChild(el('div', { class: 'field-hint', text: '⚠ ' + table.caveats.join(' · ') }));
       }
@@ -1377,8 +1377,8 @@
       if (editOpen.has(table.qname)) body.appendChild(renderEditForm(table, 'table', [
         { field: 'caveats', label: 'Caveats (things to watch out for)', type: 'list', current: table.caveats, rows: 3,
           hint: 'Notes about this whole table that agami should remember when it writes SQL. One per line. For example: "There is one row per customer per month — use the latest month" · "Deleted rows are still here, so leave them out".' },
-        { field: 'default_filters', label: 'Always-on filters', type: 'list', current: table.default_filters, rows: 2,
-          hint: 'Conditions added to every query on this table automatically, so you never have to repeat them. Write one SQL condition per line and use {alias} where the table name goes. For example: "{alias}.deleted_at IS NULL" keeps only rows that are not deleted · "{alias}.is_test = false" skips test rows.' },
+        { field: 'default_filters', label: 'Declared filters (describe, not enforced — but reported)', type: 'list', current: table.default_filters, rows: 2,
+          hint: 'Conditions that say what this table MEANS — which rows count as real. They are NOT added to your queries automatically; agami reads them when it writes SQL and puts in the ones the question needs. Every answer then reports which of them the query it ran actually used, so you can see when one was left out. Write one SQL condition per line and use {alias} where the table name goes. For example: "{alias}.deleted_at IS NULL" keeps only rows that are not deleted · "{alias}.is_test = false" skips test rows.' },
       ]));
 
       renderFieldsGrouped(body, table);

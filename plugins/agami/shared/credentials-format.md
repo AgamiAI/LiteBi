@@ -24,6 +24,8 @@ Resolution order when a skill needs to know which profile to use:
 
 agami only ever runs read-only SELECT queries, so the `user` you put here only needs read access. Connecting a **read-only database user** is the safest posture (especially against production) and never limits what agami can do. Copy-paste `CREATE USER` / `GRANT SELECT` SQL for every dialect is in [`readonly-grants.md`](readonly-grants.md).
 
+For the **single-player** flow (this file) a read-only user is *recommended*. For a **hosted / self-host deploy** — where the datasource DSN travels in `DATASOURCE_URL`, not this file — a read-only role is the **required** posture, not just a nicety; the same [`readonly-grants.md`](readonly-grants.md) recipe covers both, and explains the app-role vs operator-role split.
+
 ## Format
 
 ```ini

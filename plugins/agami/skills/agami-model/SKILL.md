@@ -19,7 +19,7 @@ This skill orchestrates:
 Trust-spine semantics — three actions on the same `review_state` field:
 - **Exclude / Reject** → `rejected`. The loader drops rejected tables, columns, metrics, entities, and relationships entirely (`include_rejected=False` at runtime) — never in prompts, never joined, never aggregated. ("Exclude" is the verb for tables/columns; "Reject" for metrics/entities/joins — same op.)
 - **Include** → back to `unreviewed`.
-- **Approve** → `approved` + a sign-off stamp (`signed_off_by`/`_at`/`_role`). **Rule 1** (metrics) — a query that uses an unsigned metric still answers but carries a "not signed off" **warning** on its receipt until it's approved; **Rule 2** (entities, inferred joins) is usable while unreviewed and self-approves through use. Only `rejected` entries are dropped from the runtime entirely. Approving requires the curator's email + role (Phase 0) — the validator rejects an approved entry with no sign-off stamp.
+- **Approve** → `approved` + a sign-off stamp (`signed_off_by`/`_at`/`_role`). **Rule 1** (metrics) — a query that uses an unsigned metric still answers, and the metric arrives on the answer's receipt carrying its `review_state`, which is what raises the report's approve/change banner until it's approved; **Rule 2** (entities, inferred joins) is usable while unreviewed and self-approves through use, with an unreviewed join raising the report's trust banner. Only `rejected` entries are dropped from the runtime entirely. Approving requires the curator's email + role (Phase 0) — the validator rejects an approved entry with no sign-off stamp.
 
 ## Conversation style
 
@@ -243,7 +243,7 @@ The trust spine has always read `agami.review_state`. The model loader in [`plug
 
 - **Never appear in the schema context** the SQL generator sees (Phase 2b).
 - **Are not joinable** — the join-path picker skips relationships whose endpoints reference a rejected dataset.
-- **Dropped from the runtime** — a *rejected* metric or named filter is excluded entirely; a query that would have referenced one gets a "metric not found" path, not an error. (An *unreviewed* metric is different — it's still used, just with a receipt warning.)
+- **Dropped from the runtime** — a *rejected* metric or named filter is excluded entirely; a query that would have referenced one gets a "metric not found" path, not an error. (An *unreviewed* metric is different — it's still used, and arrives on the receipt carrying `review_state: unreviewed`, which is what puts it in the report's approve/change banner.)
 - **Stay in the YAML** for audit. The user can `include` them later without re-introspect.
 
 Reject (on the Review tab or any metric/entity/join card) and Exclude (on tables/columns) are the same `rejected` operation — this dashboard is the one surface for both the bulk tables-as-units curation and the per-entry sign-off.
