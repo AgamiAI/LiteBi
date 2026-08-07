@@ -437,8 +437,8 @@ class DbActivitySink:
         self._store.execute(
             "INSERT INTO tool_calls (id, ts, org_id, actor, tool_name, datasource, sql, row_count, "
             "execution_ms, success, error_kind, source, user_question, agent_query, thread_id, "
-            "correlation_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "correlation_id, refusal_detail, refusal_remediation) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid4().hex,
                 record.ts,
@@ -456,6 +456,12 @@ class DbActivitySink:
                 record.agent_query,
                 record.thread_id,
                 record.correlation_id,
+                # The gate's own two sentences (018). `getattr` with a default, like the execution
+                # row's later columns above: an embedder still on the older record shape writes NULLs
+                # rather than raising, and NULL is the ordinary value here anyway — only a refusal
+                # has them.
+                getattr(record, "refusal_detail", None),
+                getattr(record, "refusal_remediation", None),
             ),
         )
         self._store.commit()
@@ -467,7 +473,8 @@ class DbActivitySink:
 
 _TOOL_CALL_COLS = (
     "id, ts, actor, tool_name, datasource, sql, row_count, execution_ms, success, error_kind, "
-    "user_question, agent_query, thread_id, correlation_id, source"
+    "user_question, agent_query, thread_id, correlation_id, source, "
+    "refusal_detail, refusal_remediation"
 )
 
 

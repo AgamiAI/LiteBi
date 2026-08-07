@@ -2038,6 +2038,18 @@ def record_tool_call(
     """
     args = arguments or {}
     derived_success, derived_row_count, derived_error_kind = True, None, None
+    # The refusal's own two sentences, for the reader of THIS log. `error_kind` says which rule fired;
+    # these say what it fired on and what to do about it — "orders_archive is not declared in the
+    # model", not just `table_scope`. Without them an administrator reading a conversation can tell a
+    # server fault from a user fault but cannot act on either without shell access to the server log.
+    #
+    # Safe to store and to show BY CONTRACT, not by inspection: `guardrail.Refusal` requires both to
+    # be value-free — never raw SQL, never driver text, never a data value — so this is the opposite
+    # of `query_executions.error_detail`, which holds the driver's own words for the operator alone
+    # and is deliberately never surfaced. That distinction is why a field for these could not simply
+    # be added beside the driver text.
+    derived_refusal_detail: str | None = None
+    derived_refusal_remediation: str | None = None
     if raised:
         derived_success, derived_error_kind = False, "exception"
     else:
@@ -2066,6 +2078,14 @@ def record_tool_call(
                     # behaving correctly AND the request not being carried out.
                     derived_success = False
                     derived_error_kind = refusal.get("rule") or "refused"
+                    # Bounded on the same argument as the execution row's copy: the detail ECHOES
+                    # identifiers the caller sent, so its length is caller-controlled even though its
+                    # content is ours.
+                    detail, remediation = refusal.get("detail"), refusal.get("remediation")
+                    if isinstance(detail, str) and detail:
+                        derived_refusal_detail = _bounded_audit_detail(detail)
+                    if isinstance(remediation, str) and remediation:
+                        derived_refusal_remediation = _bounded_audit_detail(remediation)
                 elif isinstance(parsed.get("error"), dict):
                     derived_success = False
                     derived_error_kind = parsed["error"].get("kind") or "error"
@@ -2082,6 +2102,11 @@ def record_tool_call(
         derived_success = success if success is not None else error_kind is None
         derived_error_kind = None if derived_success else error_kind
         derived_row_count = row_count
+        # The sentences belong to the classification, so they are replaced WITH it rather than
+        # surviving it. A caller who states the outcome is not offering these, and body-derived
+        # prose describing a rule the caller just overrode would explain a decision the row no
+        # longer claims — the same contradiction the coherence rule above exists to prevent.
+        derived_refusal_detail = derived_refusal_remediation = None
     if raised:
         # A raise outranks every override. `raised` is not a classification the caller is offering —
         # it is a fact this function was told about what the tool actually did, and no argument can
@@ -2093,6 +2118,10 @@ def record_tool_call(
         # the success rule above. Their success claim loses; their diagnosis has no reason to.
         derived_success = False
         derived_error_kind = error_kind or derived_error_kind or "exception"
+        # A call that threw did not reach a gate, so any sentences parsed out of a body are not this
+        # call's account of itself. Dropped rather than kept beside `"exception"`, where they would
+        # read as the reason it threw.
+        derived_refusal_detail = derived_refusal_remediation = None
     rec: dict[str, Any] = {
         "ts": _now_iso(),
         "tool_name": name,
@@ -2104,6 +2133,8 @@ def record_tool_call(
         "execution_ms": execution_ms,
         "success": derived_success,
         "error_kind": derived_error_kind,
+        "refusal_detail": derived_refusal_detail,
+        "refusal_remediation": derived_refusal_remediation,
         "user_question": user_question if user_question is not None else args.get("user_question"),
         "agent_query": args.get("raw_query"),  # the existing arg is the agent's framing of the query
         "thread_id": thread_id if thread_id is not None else args.get("thread_id"),

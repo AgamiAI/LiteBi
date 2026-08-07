@@ -1,0 +1,39 @@
+-- Record WHAT a refusal fired on, next to the call it refused. `tool_calls.error_kind` already names
+-- the rule (`table_scope`, `column_scope`, `read_only`); these two carry the gate's own sentences —
+-- "orders_archive is not declared in the semantic model", and what to do instead. Without them a
+-- console reader can tell a server fault from a user fault and can act on neither, because the only
+-- copy of the specific fact is a line in the server log correlatable by timestamp, by someone with
+-- shell access to the container. That is the same as not recording it.
+--
+-- SAFE TO STORE AND TO SHOW, BY CONTRACT. `guardrail.Refusal` requires `detail` and `remediation` to
+-- be value-free — never raw SQL, never driver text, never a data value — and enforces it at
+-- construction. That is what makes these two different in kind from
+-- `query_executions.error_detail` (016), which holds the DRIVER's own words: those name declared
+-- columns the caller never sent and are deliberately operator-only. The absence of a column for a
+-- refusal's own sentence, next to a column holding text that must never be shown, is exactly why
+-- this could not be solved by reading what was already there.
+--
+-- COLUMNS ON `tool_calls`, though `query_executions` already stores `detail`. The two logs are read
+-- independently and already overlap on purpose — `sql`, `row_count`, `source` and the rule all
+-- appear in both — because each has to be legible on its own. They are also not joinable: there is
+-- no key between them (`Envelope.audit_id` is `query_executions.id`, which `tool_calls` does not
+-- carry), so the alternative is not "read the existing column" but "add a foreign key, add the
+-- missing `remediation` over there, and join" — more schema, for a row that is 1:1 either way. This
+-- is the argument 014 and 016 both make.
+--
+-- NULL IS THE ORDINARY CASE, not a gap: only a refusal has these, so every successful call and every
+-- failure leaves them NULL — a failure carries the database's error, not a rule of ours. Rows written
+-- before this migration ran are NULL because the sentence was never kept, and a back-fill would be
+-- inventing history.
+--
+-- BOUNDED BY THE WRITER (`tools.AUDIT_DETAIL_MAX_CHARS`, the bound the execution row's copy already
+-- uses). The content is ours, but a detail ECHOES identifiers the caller sent, so its length is
+-- caller-controlled — and 015's argument applies verbatim: a refused statement must not become a way
+-- to grow the store.
+--
+-- Forward-only and portable (runs on SQLite + Postgres unchanged) — same shape as
+-- 016_query_executions_error_detail.sql. No `IF NOT EXISTS`: SQLite's ALTER TABLE does not accept it,
+-- and re-run safety comes from the runner's `schema_migrations` ledger, which skips an applied file.
+
+ALTER TABLE tool_calls ADD COLUMN refusal_detail TEXT;
+ALTER TABLE tool_calls ADD COLUMN refusal_remediation TEXT;
