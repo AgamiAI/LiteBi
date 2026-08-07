@@ -2118,10 +2118,9 @@ def record_tool_call(
         # the success rule above. Their success claim loses; their diagnosis has no reason to.
         derived_success = False
         derived_error_kind = error_kind or derived_error_kind or "exception"
-        # A call that threw did not reach a gate, so any sentences parsed out of a body are not this
-        # call's account of itself. Dropped rather than kept beside `"exception"`, where they would
-        # read as the reason it threw.
-        derived_refusal_detail = derived_refusal_remediation = None
+        # Nothing to clear here: `raised` skips the body parse entirely (the `else` above), so a call
+        # that threw has no sentences to begin with. Setting them to None again would be a line that
+        # can never change anything.
     rec: dict[str, Any] = {
         "ts": _now_iso(),
         "tool_name": name,
