@@ -12,6 +12,8 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-08-08
+
 ### Added
 
 - **A server can now run with the semantic-model pass off, and always says so
@@ -37,57 +39,39 @@ below corresponds to one such version.
   The server logs one warning at startup naming the variable and the exposure whenever it boots with
   the pass off.
 
-### Fixed
+- **The receipt now tells you which of a table's declared filters your statement actually applied
+  (ACE-099).** Declaring `default_filters` on a table has never applied them to your SQL, and since
+  the filter injector was removed nothing reported on them either — so `SELECT COUNT(*) FROM orders`
+  returned every row where it once returned the undeleted ones, and nothing on the answer said the
+  number meant something different from what the model says the table means.
 
-- **Catalog and dictionary reads no longer hit the row cap that exists to bound your queries.** The
-  executor refuses (never truncates) any result over `AGAMI_SQL_MAX_ROWS`, default 1000. That bound
-  is sized for a question someone asks; a *catalog* read exceeds it on schema size alone. The visible
-  symptom was `sm enrich-metadata` dying on any platform whose data dictionary is a real table
-  (`RuntimeError: … "rule": "resource_limit"`), but the quieter cases were worse: the bulk
-  `information_schema.columns` read behind `sm discover`, and the table/foreign-key reads behind
-  `sm introspect`, discard a refused read instead of reporting it — so on a wide catalog they
-  degraded to one round-trip per table, or produced a model with no join graph, and said nothing
-  about either.
+  Each entry in the receipt's `tables` section now carries `filters`, one `{expr, status}` per
+  declared filter, with `status` one of `applied`, `omitted` or `undetermined`, plus a `scope`
+  naming where in the statement that reference sits.
 
-  The connect skill now runs those three commands with a raised cap and **tells you it did, along
-  with your unchanged query-time cap**. Nothing about the bound on an ordinary question changes: a
-  query returning more than the cap is still refused rather than quietly truncated, and no new lever
-  is reachable from a generated query.
+  The determination is **per reference, not per table**, which is the part that makes it worth
+  trusting. A filter satisfied inside a CTE and absent from the outer query is two different answers
+  about the same table, and reporting one verdict for both is what made the old injection unsafe:
 
-- **The guard now reads your SQL in your database's own grammar, and refuses what it cannot read
-  (ACE-079).** Every model-scoping check decided by parsing the statement, and every one of them
-  parsed in a generic SQL dialect rather than your engine's. On MySQL, BigQuery, Databricks and SQL
-  Server that is not a subtlety: a backtick is not an identifier quote in the generic grammar, so
-  `` SELECT `ssn` FROM `customers` `` parsed to **no tables and no columns**. The scope checks were
-  not bypassed by a trick — they inspected the tree, found nothing to object to, and passed. So on
-  those engines a query could read any table in the database regardless of what your model declared,
-  and the trust receipt reported no tables read, which made the answer look clean.
+  ```
+  WITH recent AS (SELECT id FROM orders o WHERE o.status != 'cancelled')
+  SELECT o.id FROM orders o JOIN recent r ON o.id = r.id
+  ```
+  ```
+  orders  scope=cte:recent  filters=[{expr: "o.status != 'cancelled'", status: applied}]
+  orders  scope=main        filters=[{expr: "o.status != 'cancelled'", status: omitted}]
+  ```
 
-  The error posture was the other half. `error_level="ignore"` was not a lenient setting, it was no
-  setting at all: sqlglot compares that argument against enum members, so a string matched no branch
-  and every parse error was silently discarded, leaving a truncated tree that read as valid. Both
-  halves are fixed together, because either alone leaves a hole.
+  `applied` means the declared predicate is one of the top-level `AND` conjuncts of that reference's
+  own scope; extra conditions beside it do not weaken that. Anything the check cannot stand behind
+  is `undetermined` rather than a verdict — a predicate on the same column that is not identical, one
+  reachable only through an `OR`, one that only appears in an outer join's `ON`. Only an outright
+  absence is `omitted`, because a confident "you left this out" that turns out to be wrong is worse
+  than saying nothing. **An omitted filter is never a refusal**: whether it matters depends on the
+  question, which only you have.
 
-  Four situations are now refused rather than run blind, each with the next step it actually needs:
-
-  - the datasource does not say which engine it runs on (undeclared, unmapped, or two connections
-    disagreeing) — `model_unavailable`, and the fix is the operator's: declare
-    `storage_connections[].storage_type`. It does not invite you to retry the query, because no
-    rewrite of the query helps.
-  - the statement does not parse in that engine's grammar — `unparseable`, and you can re-emit it.
-  - a double-quoted token on a backtick-quoting engine, which means a column under `ANSI_QUOTES` and
-    a string literal otherwise. The server setting is not visible to the guard, so rather than guess
-    it asks for the statement in the engine's own quoting.
-  - the statement parses, reads from something, and resolves to no named table at all — `unscopable`.
-    A backstop that does not depend on the engine map being complete.
-
-  A model that declares one engine while its credentials connect to another is also refused
-  (`engine_mismatch`): those are two independent pieces of configuration, and a mismatch means the
-  statement was checked against the wrong grammar.
-
-  **If your model does not declare a `storage_type`, queries against it now refuse** with the
-  message above. This is deliberate: a datasource whose engine is unknown cannot be governed, and
-  the alternative was to keep parsing it in a grammar no engine uses.
+  The shipped sample declares one (`orders`: `status != 'cancelled'`), so this is visible the first
+  time you run it.
 
 ### Changed
 
@@ -149,44 +133,6 @@ below corresponds to one such version.
   For operators this is an availability change, and a deliberate one: a briefly unreachable audit
   database now produces refusals rather than unrecorded answers.
 
-### Added
-
-- **The receipt now tells you which of a table's declared filters your statement actually applied
-  (ACE-099).** Declaring `default_filters` on a table has never applied them to your SQL, and since
-  the filter injector was removed nothing reported on them either — so `SELECT COUNT(*) FROM orders`
-  returned every row where it once returned the undeleted ones, and nothing on the answer said the
-  number meant something different from what the model says the table means.
-
-  Each entry in the receipt's `tables` section now carries `filters`, one `{expr, status}` per
-  declared filter, with `status` one of `applied`, `omitted` or `undetermined`, plus a `scope`
-  naming where in the statement that reference sits.
-
-  The determination is **per reference, not per table**, which is the part that makes it worth
-  trusting. A filter satisfied inside a CTE and absent from the outer query is two different answers
-  about the same table, and reporting one verdict for both is what made the old injection unsafe:
-
-  ```
-  WITH recent AS (SELECT id FROM orders o WHERE o.status != 'cancelled')
-  SELECT o.id FROM orders o JOIN recent r ON o.id = r.id
-  ```
-  ```
-  orders  scope=cte:recent  filters=[{expr: "o.status != 'cancelled'", status: applied}]
-  orders  scope=main        filters=[{expr: "o.status != 'cancelled'", status: omitted}]
-  ```
-
-  `applied` means the declared predicate is one of the top-level `AND` conjuncts of that reference's
-  own scope; extra conditions beside it do not weaken that. Anything the check cannot stand behind
-  is `undetermined` rather than a verdict — a predicate on the same column that is not identical, one
-  reachable only through an `OR`, one that only appears in an outer join's `ON`. Only an outright
-  absence is `omitted`, because a confident "you left this out" that turns out to be wrong is worse
-  than saying nothing. **An omitted filter is never a refusal**: whether it matters depends on the
-  question, which only you have.
-
-  The shipped sample declares one (`orders`: `status != 'cancelled'`), so this is visible the first
-  time you run it.
-
-### Changed
-
 - **A result too large to return is refused, not trimmed.** A query whose result exceeded the
   deployment ceiling (`AGAMI_SQL_MAX_ROWS`, default 1000, unchanged) used to come back cut down to
   that many rows with a flag saying so. It now comes back as a structured refusal carrying no rows.
@@ -200,95 +146,6 @@ below corresponds to one such version.
   than none: a row listing should be bounded with a `LIMIT` and an `ORDER BY`, while an aggregate
   should have its grouping narrowed or a filter added — putting a `LIMIT` on a grouped result drops
   groups, and the breakdown you get back reads exactly like a complete one.
-
-### Removed
-
-- **`max_rows` is no longer an argument to `execute_sql`,** and `--max-rows` is gone from the
-  command line. It could only ever *lower* the deployment ceiling, so the one case where a caller
-  knows better than the operator — wanting more data — was the case it could not serve. Ask for the
-  rows you want in the statement: `LIMIT 200` says what it means to everything that reads it.
-
-- **`truncated` is no longer a field on a successful result.** With an oversized result refused, it
-  could only ever be `false`, and a field that is always `false` is one a client can only branch on
-  wrongly.
-
-- **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
-  across a one-to-many join, touching the many side nowhere but the `ON` clause, used to have that
-  join silently dropped and the rewritten statement executed in place of yours. Your statement is
-  what runs now, byte for byte — comments, whitespace and quoting included — and that is asserted
-  rather than assumed.
-
-- **Four correctness checks stopped refusing.** A fan trap, a chasm trap, a `SUM` of a rate or an
-  identifier, and a `SUM` of a balance across time were all refused. They **return a result** now,
-  and what the check found rides on the answer's receipt, under `aggregates`.
-
-  This is the point of the change rather than a relaxation of it. Whether a multiplied total is
-  *wrong* depends on what you asked: the same statement is wrong for order revenue and right for
-  line-item exposure. The check has your SQL and your model and never your question, so it describes
-  what it found and leaves the judgement to you — or to the assistant, which does have the question
-  and is asked to say out loud when it restructures a query because of a finding.
-
-  A statement that trips two conditions now reports both. The old code stopped at the first, so a
-  query that both fanned out *and* summed a rate was reported as having one problem.
-
-- **`sensitive` is a description, not a gate.** Marking a column `sensitive` no longer blocks
-  projecting it. The answer's receipt reports which sensitive columns it projected, under
-  `columns`, and the authoring guidance asks the assistant to prefer aggregates and to say when it
-  did project them.
-
-  **If you relied on this to keep values from coming back, read this.** The gate was never a
-  boundary: it inspected the projection list and nothing else, so `WHERE email LIKE …` always
-  answered the same question one bit at a time. What it bounded was the *rate* of that, which is an
-  access policy, and Agami holds none of its own — it reads exactly as the connecting database role
-  reads. Two things do enforce, and neither changed: a column left out of the model is out of scope
-  and any statement naming it is refused, and the connecting role's grants and your warehouse's
-  masking policies apply as they always did. If a value must not come back, exclude the column from
-  the model or make sure the role cannot read it.
-
-- **The `model_safety` refusal rule is gone.** It stood in for two branches that refused without
-  naming a rule. Both branches went, so every refusal now names the gate that chose it. A consumer
-  keying on `refusal.rule == "model_safety"` will stop matching, which is the point.
-
-### Contract changes
-
-- Receipt `tables` items carry an **arm ordinal on `scope`** (ACE-043). When a reference's scope is
-  one of two or more arms of a `UNION` / `INTERSECT` / `EXCEPT`, its label gains a trailing 1-based
-  `#<n>`: `main#1`, `main#2`, `cte:recent#2`. A plain `SELECT` and a single-arm CTE body are
-  unchanged and carry no suffix, and `subquery` never takes one. **If you branch on
-  `scope === 'main'` or `scope === 'cte:x'`, that branch stops matching inside a set operation —
-  strip the ordinal with `scope.replace(/#\d+$/, '')` (or `scope.rsplit('#', 1)[0]`) and branch on
-  that.** Split from the RIGHT, not the left: the CTE-name half is caller-written text, and it is
-  only sanitization to an identifier alphabet excluding `#` that keeps a left split working today. The ordinal is the arm's position in the SQL, which
-  is not the order of this list: items are in parse-walk order, so a capped receipt can list
-  ordinals that are neither contiguous nor monotonic, and the largest one is not the arm count.
-- Receipt `tables` items gain **`scope`** and **`filters`** (ACE-099). `ref` is unchanged and is
-  still a string. A `refused` or `failed` receipt is unchanged too — it carries `{ref, declared}`
-  and neither new field, because a declared filter names the columns and literals the model author
-  wrote and a refusal is the one outcome a caller can provoke on purpose.
-- `tables.undetermined` is now **`null` when the section is complete** (ACE-099). It used to be a
-  fixed sentence on every receipt saying the filter accounting was not done. It now names only what
-  was genuinely not established — references whose filters could not be accounted for, references a
-  shadowing CTE name stopped resolving, and the count the reference cap dropped. If you branch on
-  this field being present, that branch changes meaning: present now means something really is
-  missing.
-- `sm receipt --applied-filters` is **gone**, and the receipt no longer emits a top-level
-  `default_filters_applied` key (ACE-099). Nothing had produced either since the filter injector was
-  removed; the fact lives in `tables.items[].filters` now, in one shape rather than two.
-- `sm prepare` returns `{sql, findings, units}` and **always exits 0**. It previously returned
-  `{action, risk, sql, units, reason}`, or exited 1 with a refusal. It runs the reporting checks,
-  not the refusing gates — do not pair it with `--no-safety`.
-- `sm preflight` returns `{findings: [...]}`, replacing the single
-  `{risk, action, reason, suggestion, triggering_joins}` verdict.
-- The receipt's `aggregates` section can now be non-empty, and its `undetermined` sentence changed:
-  it says the checks ran and names what they still do not reach, rather than saying the check does
-  not happen. `columns` items may carry `sensitive: true`.
-- The `{"error": {"kind": "preflight_refused"}}` and `{"kind": "sensitive_columns"}` diagnostics no
-  longer appear on stderr. Every refusal is a single JSON object on every path.
-- A refused `SELECT *` reports `reason: "undetermined"`, not `reason: "out_of_scope"`. The refusal
-  and its message are unchanged; only the reason moves. If you route, count or alert on `reason`,
-  this row changes bucket.
-
-### Changed
 
 - **A `#` is no longer mistaken for the SQL it hides, and is now refused wherever it appears
   outside a string (ACE-096).** `SELECT a FROM t # DROP TABLE t` came back as *"keyword 'DROP' is
@@ -350,6 +207,52 @@ below corresponds to one such version.
 
 ### Removed
 
+- **`max_rows` is no longer an argument to `execute_sql`,** and `--max-rows` is gone from the
+  command line. It could only ever *lower* the deployment ceiling, so the one case where a caller
+  knows better than the operator — wanting more data — was the case it could not serve. Ask for the
+  rows you want in the statement: `LIMIT 200` says what it means to everything that reads it.
+
+- **`truncated` is no longer a field on a successful result.** With an oversized result refused, it
+  could only ever be `false`, and a field that is always `false` is one a client can only branch on
+  wrongly.
+
+- **Agami no longer rewrites your SQL to fix a fan-out join.** A query that aggregated a measure
+  across a one-to-many join, touching the many side nowhere but the `ON` clause, used to have that
+  join silently dropped and the rewritten statement executed in place of yours. Your statement is
+  what runs now, byte for byte — comments, whitespace and quoting included — and that is asserted
+  rather than assumed.
+
+- **Four correctness checks stopped refusing.** A fan trap, a chasm trap, a `SUM` of a rate or an
+  identifier, and a `SUM` of a balance across time were all refused. They **return a result** now,
+  and what the check found rides on the answer's receipt, under `aggregates`.
+
+  This is the point of the change rather than a relaxation of it. Whether a multiplied total is
+  *wrong* depends on what you asked: the same statement is wrong for order revenue and right for
+  line-item exposure. The check has your SQL and your model and never your question, so it describes
+  what it found and leaves the judgement to you — or to the assistant, which does have the question
+  and is asked to say out loud when it restructures a query because of a finding.
+
+  A statement that trips two conditions now reports both. The old code stopped at the first, so a
+  query that both fanned out *and* summed a rate was reported as having one problem.
+
+- **`sensitive` is a description, not a gate.** Marking a column `sensitive` no longer blocks
+  projecting it. The answer's receipt reports which sensitive columns it projected, under
+  `columns`, and the authoring guidance asks the assistant to prefer aggregates and to say when it
+  did project them.
+
+  **If you relied on this to keep values from coming back, read this.** The gate was never a
+  boundary: it inspected the projection list and nothing else, so `WHERE email LIKE …` always
+  answered the same question one bit at a time. What it bounded was the *rate* of that, which is an
+  access policy, and Agami holds none of its own — it reads exactly as the connecting database role
+  reads. Two things do enforce, and neither changed: a column left out of the model is out of scope
+  and any statement naming it is refused, and the connecting role's grants and your warehouse's
+  masking policies apply as they always did. If a value must not come back, exclude the column from
+  the model or make sure the role cannot read it.
+
+- **The `model_safety` refusal rule is gone.** It stood in for two branches that refused without
+  naming a rule. Both branches went, so every refusal now names the gate that chose it. A consumer
+  keying on `refusal.rule == "model_safety"` will stop matching, which is the point.
+
 - **The `GovernancePolicy` port and the `Adapters.governance` field (ACE-095).** `GovernancePolicy`,
   its `GovernanceVerdict` value type, and the `WarnOnlyGovernancePolicy` default adapter are gone,
   along with the `governance` field on `ports.Adapters`. The port was declared but never called: no
@@ -361,6 +264,97 @@ below corresponds to one such version.
   is now `executor`, so `Adapters(sink, resolver, auth, my_policy)` still constructs but binds the
   policy as the executor and fails later at query time with `AttributeError: 'MyPolicy' object has
   no attribute 'execute'`. Construct `Adapters` by keyword.
+
+### Fixed
+
+- **Catalog and dictionary reads no longer hit the row cap that exists to bound your queries.** The
+  executor refuses (never truncates) any result over `AGAMI_SQL_MAX_ROWS`, default 1000. That bound
+  is sized for a question someone asks; a *catalog* read exceeds it on schema size alone. The visible
+  symptom was `sm enrich-metadata` dying on any platform whose data dictionary is a real table
+  (`RuntimeError: … "rule": "resource_limit"`), but the quieter cases were worse: the bulk
+  `information_schema.columns` read behind `sm discover`, and the table/foreign-key reads behind
+  `sm introspect`, discard a refused read instead of reporting it — so on a wide catalog they
+  degraded to one round-trip per table, or produced a model with no join graph, and said nothing
+  about either.
+
+  The connect skill now runs those three commands with a raised cap and **tells you it did, along
+  with your unchanged query-time cap**. Nothing about the bound on an ordinary question changes: a
+  query returning more than the cap is still refused rather than quietly truncated, and no new lever
+  is reachable from a generated query.
+
+- **The guard now reads your SQL in your database's own grammar, and refuses what it cannot read
+  (ACE-079).** Every model-scoping check decided by parsing the statement, and every one of them
+  parsed in a generic SQL dialect rather than your engine's. On MySQL, BigQuery, Databricks and SQL
+  Server that is not a subtlety: a backtick is not an identifier quote in the generic grammar, so
+  `` SELECT `ssn` FROM `customers` `` parsed to **no tables and no columns**. The scope checks were
+  not bypassed by a trick — they inspected the tree, found nothing to object to, and passed. So on
+  those engines a query could read any table in the database regardless of what your model declared,
+  and the trust receipt reported no tables read, which made the answer look clean.
+
+  The error posture was the other half. `error_level="ignore"` was not a lenient setting, it was no
+  setting at all: sqlglot compares that argument against enum members, so a string matched no branch
+  and every parse error was silently discarded, leaving a truncated tree that read as valid. Both
+  halves are fixed together, because either alone leaves a hole.
+
+  Four situations are now refused rather than run blind, each with the next step it actually needs:
+
+  - the datasource does not say which engine it runs on (undeclared, unmapped, or two connections
+    disagreeing) — `model_unavailable`, and the fix is the operator's: declare
+    `storage_connections[].storage_type`. It does not invite you to retry the query, because no
+    rewrite of the query helps.
+  - the statement does not parse in that engine's grammar — `unparseable`, and you can re-emit it.
+  - a double-quoted token on a backtick-quoting engine, which means a column under `ANSI_QUOTES` and
+    a string literal otherwise. The server setting is not visible to the guard, so rather than guess
+    it asks for the statement in the engine's own quoting.
+  - the statement parses, reads from something, and resolves to no named table at all — `unscopable`.
+    A backstop that does not depend on the engine map being complete.
+
+  A model that declares one engine while its credentials connect to another is also refused
+  (`engine_mismatch`): those are two independent pieces of configuration, and a mismatch means the
+  statement was checked against the wrong grammar.
+
+  **If your model does not declare a `storage_type`, queries against it now refuse** with the
+  message above. This is deliberate: a datasource whose engine is unknown cannot be governed, and
+  the alternative was to keep parsing it in a grammar no engine uses.
+
+### Contract changes
+
+- Receipt `tables` items carry an **arm ordinal on `scope`** (ACE-043). When a reference's scope is
+  one of two or more arms of a `UNION` / `INTERSECT` / `EXCEPT`, its label gains a trailing 1-based
+  `#<n>`: `main#1`, `main#2`, `cte:recent#2`. A plain `SELECT` and a single-arm CTE body are
+  unchanged and carry no suffix, and `subquery` never takes one. **If you branch on
+  `scope === 'main'` or `scope === 'cte:x'`, that branch stops matching inside a set operation —
+  strip the ordinal with `scope.replace(/#\d+$/, '')` (or `scope.rsplit('#', 1)[0]`) and branch on
+  that.** Split from the RIGHT, not the left: the CTE-name half is caller-written text, and it is
+  only sanitization to an identifier alphabet excluding `#` that keeps a left split working today. The ordinal is the arm's position in the SQL, which
+  is not the order of this list: items are in parse-walk order, so a capped receipt can list
+  ordinals that are neither contiguous nor monotonic, and the largest one is not the arm count.
+- Receipt `tables` items gain **`scope`** and **`filters`** (ACE-099). `ref` is unchanged and is
+  still a string. A `refused` or `failed` receipt is unchanged too — it carries `{ref, declared}`
+  and neither new field, because a declared filter names the columns and literals the model author
+  wrote and a refusal is the one outcome a caller can provoke on purpose.
+- `tables.undetermined` is now **`null` when the section is complete** (ACE-099). It used to be a
+  fixed sentence on every receipt saying the filter accounting was not done. It now names only what
+  was genuinely not established — references whose filters could not be accounted for, references a
+  shadowing CTE name stopped resolving, and the count the reference cap dropped. If you branch on
+  this field being present, that branch changes meaning: present now means something really is
+  missing.
+- `sm receipt --applied-filters` is **gone**, and the receipt no longer emits a top-level
+  `default_filters_applied` key (ACE-099). Nothing had produced either since the filter injector was
+  removed; the fact lives in `tables.items[].filters` now, in one shape rather than two.
+- `sm prepare` returns `{sql, findings, units}` and **always exits 0**. It previously returned
+  `{action, risk, sql, units, reason}`, or exited 1 with a refusal. It runs the reporting checks,
+  not the refusing gates — do not pair it with `--no-safety`.
+- `sm preflight` returns `{findings: [...]}`, replacing the single
+  `{risk, action, reason, suggestion, triggering_joins}` verdict.
+- The receipt's `aggregates` section can now be non-empty, and its `undetermined` sentence changed:
+  it says the checks ran and names what they still do not reach, rather than saying the check does
+  not happen. `columns` items may carry `sensitive: true`.
+- The `{"error": {"kind": "preflight_refused"}}` and `{"kind": "sensitive_columns"}` diagnostics no
+  longer appear on stderr. Every refusal is a single JSON object on every path.
+- A refused `SELECT *` reports `reason: "undetermined"`, not `reason: "out_of_scope"`. The refusal
+  and its message are unchanged; only the reason moves. If you route, count or alert on `reason`,
+  this row changes bucket.
 
 ### Docs
 
