@@ -2050,6 +2050,11 @@ def record_tool_call(
     # be added beside the driver text.
     derived_refusal_detail: str | None = None
     derived_refusal_remediation: str | None = None
+    # The rule the BODY said fired, kept apart from `derived_error_kind` because the override block
+    # below overwrites that one. It is what lets a stated outcome be checked for AGREEMENT with the
+    # body rather than assumed to replace it — see the override block for why that distinction is the
+    # whole difference between this feature working and not.
+    body_refusal_rule: str | None = None
     if raised:
         derived_success, derived_error_kind = False, "exception"
     else:
@@ -2078,6 +2083,7 @@ def record_tool_call(
                     # behaving correctly AND the request not being carried out.
                     derived_success = False
                     derived_error_kind = refusal.get("rule") or "refused"
+                    body_refusal_rule = derived_error_kind
                     # Bounded on the same argument as the execution row's copy: the detail ECHOES
                     # identifiers the caller sent, so its length is caller-controlled even though its
                     # content is ours.
@@ -2102,11 +2108,22 @@ def record_tool_call(
         derived_success = success if success is not None else error_kind is None
         derived_error_kind = None if derived_success else error_kind
         derived_row_count = row_count
-        # The sentences belong to the classification, so they are replaced WITH it rather than
-        # surviving it. A caller who states the outcome is not offering these, and body-derived
-        # prose describing a rule the caller just overrode would explain a decision the row no
-        # longer claims — the same contradiction the coherence rule above exists to prevent.
-        derived_refusal_detail = derived_refusal_remediation = None
+        # **Kept when the stated outcome AGREES with the body, dropped when it does not.**
+        #
+        # This block used to clear them unconditionally, reasoning that a caller who states the
+        # outcome is not offering these. That is true of a caller who CONTRADICTS the body, and
+        # false of every real one: both surfaces state an outcome they derived from this same call,
+        # so the unconditional clear meant the sentences were recorded on exactly one path — a
+        # caller that hands over a body and states nothing — which is the path neither the served
+        # MCP transport (`typed_outcome_overrides`) nor a consumer's own sink actually takes. The
+        # column was therefore NULL on every production refusal while the unit tests, which state no
+        # overrides, passed.
+        #
+        # Agreement is `derived_error_kind == body_refusal_rule`, and the failure it still guards is
+        # unchanged: a stated success has no refusal to explain, and a stated kind naming a
+        # DIFFERENT failure is describing something these sentences are not about.
+        if derived_success or derived_error_kind != body_refusal_rule:
+            derived_refusal_detail = derived_refusal_remediation = None
     if raised:
         # A raise outranks every override. `raised` is not a classification the caller is offering —
         # it is a fact this function was told about what the tool actually did, and no argument can

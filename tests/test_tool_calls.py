@@ -174,6 +174,35 @@ def test_a_call_that_was_not_refused_records_no_sentences(db):
     assert r["refusal_detail"] is None and r["refusal_remediation"] is None
 
 
+def test_a_stated_outcome_that_agrees_with_the_body_keeps_the_sentences(db):
+    """**The path every real caller takes, and the one the first version of this got wrong.**
+
+    Both surfaces state the outcome rather than leaving it to be parsed: the served MCP transport
+    passes `typed_outcome_overrides` for every tool that speaks the Envelope, and a consumer's own
+    sink states `success`/`error_kind` from what it observed. Clearing the sentences whenever an
+    outcome is stated therefore recorded them on exactly one path — a caller that hands over a body
+    and states nothing — which is the path nothing in production uses. Every real refusal wrote NULL,
+    while the tests below, which state no overrides, passed.
+
+    The stated kind here is the rule the body already named, because that is what a caller derives
+    from this same call. Agreement means the sentences still describe the decision the row claims.
+    """
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT id FROM orders_archive"},
+        result_text=json.dumps({"status": "refused", "refusal": {
+            "reason": "out_of_scope", "rule": "table_scope",
+            "detail": "orders_archive is not declared in the semantic model",
+            "remediation": "Declare the table, or ask a question that stays in scope."}}),
+        execution_ms=1, actor="a",
+        # What a real caller states, derived from the same outcome.
+        success=False, error_kind="table_scope",
+    )
+    (r,) = _rows(db)
+    assert r["error_kind"] == "table_scope"
+    assert r["refusal_detail"] == "orders_archive is not declared in the semantic model"
+    assert r["refusal_remediation"] == "Declare the table, or ask a question that stays in scope."
+
+
 def test_an_overridden_outcome_drops_sentences_parsed_from_the_body(db):
     """The sentences are replaced WITH the classification, not left behind it.
 
@@ -189,6 +218,20 @@ def test_an_overridden_outcome_drops_sentences_parsed_from_the_body(db):
     )
     (r,) = _rows(db)
     assert r["error_kind"] == "stated_by_the_caller"
+    assert r["refusal_detail"] is None and r["refusal_remediation"] is None
+
+
+def test_a_stated_success_drops_them_however_the_body_read(db):
+    """The other half of agreement, and the one that matters most: a successful call has no refusal
+    to explain, so prose from the body would assert a decision the row denies."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text=json.dumps({"status": "refused", "refusal": {
+            "reason": "unsafe", "rule": "read_only", "detail": "d", "remediation": "r"}}),
+        execution_ms=1, actor="a", success=True, row_count=1,
+    )
+    (r,) = _rows(db)
+    assert r["success"] == 1
     assert r["refusal_detail"] is None and r["refusal_remediation"] is None
 
 
