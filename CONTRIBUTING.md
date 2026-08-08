@@ -97,10 +97,13 @@ So: **bump the version on any commit that changes user-visible behavior.**
 
 ### When to bump what
 
-The version lives in **three places across two files**. They must always match:
+The version lives in **four places across three files**. They must always match:
 
 - `.claude-plugin/marketplace.json` — `metadata.version` and `plugins[0].version`
 - `plugins/agami/.claude-plugin/plugin.json` — `version`
+- `packages/agami-core/pyproject.toml` — `version`, the one published to PyPI. `release-pypi.yml`
+  fails the publish when the release tag doesn't match it, so a bump that misses this file doesn't
+  ship a wrong version — it doesn't ship at all.
 
 Use semver:
 
@@ -137,7 +140,12 @@ When opening a PR that warrants a version bump, the checklist is:
 
 1. `.claude-plugin/marketplace.json` — bump both `metadata.version` and `plugins[0].version` to the same string.
 2. `plugins/agami/.claude-plugin/plugin.json` — bump `version`.
-3. Add a note to the PR description summarizing the user-visible change and which version it lands in.
+3. `packages/agami-core/pyproject.toml` — bump `version` to that same string.
+4. Add a note to the PR description summarizing the user-visible change and which version it lands in.
+
+Publishing is a **separate, deliberate step**: merging the bump ships nothing. `release-pypi.yml` and
+`release-image.yml` both trigger on `release: published`, so PyPI and GHCR only move once a GitHub
+release is cut with a `v<version>` tag matching `packages/agami-core/pyproject.toml`.
 
 Record notable user-visible changes in [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog format) under the version that ships them.
 
