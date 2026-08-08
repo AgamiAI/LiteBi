@@ -34,12 +34,12 @@ below corresponds to one such version.
   naming a different failure is describing something these sentences are not about. No consumer
   change is needed — both surfaces already state the rule itself.
 
-  The tests are worth naming, because they were the real defect. Every test covering these sentences
-  drove the recorder the way no production caller does — handing over a body and stating nothing — so
-  they went on passing against behaviour that recorded nothing. A test can be demonstrably wired to
-  the line it covers and still say nothing about whether that line is reached the way the world
-  reaches it. The new tests state the outcome the way a caller does, and fail against the shipped
-  behaviour.
+  The tests are worth naming, because they were the real defect. Every test that asserted these
+  sentences were **present** drove the recorder the way no production caller does — handing over a
+  body and stating nothing — so they went on passing while every path the world actually takes
+  recorded nothing. A test can be demonstrably wired to the line it covers and still say nothing
+  about whether that line is reached the way the world reaches it. The new test that states an
+  outcome agreeing with the body is the one that fails against the shipped behaviour.
 
 ## [0.6.0] — 2026-08-08
 
