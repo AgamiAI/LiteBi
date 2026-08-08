@@ -12,6 +12,35 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-08-08
+
+### Fixed
+
+- **A refusal's own sentence reaches the audit row again, so a console reader can act on it.**
+  `tool_calls.refusal_detail` and `tool_calls.refusal_remediation` — the two columns added in 0.6.0 so
+  that a row says what the decision was made against and what you were told — were **NULL on every
+  refusal a real deployment recorded**. The rule was recorded; neither sentence was.
+
+  The cause was the coherence rule that shipped beside them. It cleared both whenever a caller
+  *stated* the outcome rather than leaving it to be parsed out of the response body, reasoning that
+  such a caller is not offering these sentences. That is true of a caller who **contradicts** the
+  body, and false of every real one: the served MCP transport states the outcome for every tool that
+  speaks the Envelope, which `execute_sql` does, and a consumer's own sink states what it observed
+  with no body to hand over. So the sentences survived on exactly one path — a caller that hands over
+  a body and states nothing — and nothing in production takes it.
+
+  They are now kept when the stated outcome **agrees** with the body, and dropped when it does not.
+  What the rule guarded is unchanged: a stated success has no refusal to explain, and a stated kind
+  naming a different failure is describing something these sentences are not about. No consumer
+  change is needed — both surfaces already state the rule itself.
+
+  The tests are worth naming, because they were the real defect. Every test that asserted these
+  sentences were **present** drove the recorder the way no production caller does — handing over a
+  body and stating nothing — so they went on passing while every path the world actually takes
+  recorded nothing. A test can be demonstrably wired to the line it covers and still say nothing
+  about whether that line is reached the way the world reaches it. The new test that states an
+  outcome agreeing with the body is the one that fails against the shipped behaviour.
+
 ## [0.6.0] — 2026-08-08
 
 ### Added
