@@ -17,9 +17,9 @@ below corresponds to one such version.
 ### Fixed
 
 - **A refusal's own sentence reaches the audit row again, so a console reader can act on it.**
-  `tool_calls.refusal_detail` and `refusal_remediation` — the two columns added in 0.6.0 so that a row
-  says what the decision was made against and what you were told — were **NULL on every refusal a real
-  deployment recorded**. The rule was recorded; neither sentence was.
+  `tool_calls.refusal_detail` and `tool_calls.refusal_remediation` — the two columns added in 0.6.0 so
+  that a row says what the decision was made against and what you were told — were **NULL on every
+  refusal a real deployment recorded**. The rule was recorded; neither sentence was.
 
   The cause was the coherence rule that shipped beside them. It cleared both whenever a caller
   *stated* the outcome rather than leaving it to be parsed out of the response body, reasoning that
