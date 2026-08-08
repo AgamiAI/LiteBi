@@ -267,6 +267,21 @@ below corresponds to one such version.
 
 ### Fixed
 
+- **Updating the plugin now updates the library it runs on.** The plugin's own files are refetched on
+  every version bump — the cache directory is the version — but the pip-installed `agami-core` was
+  not, and the loader prefers that installed package over the fresh copy bundled beside the scripts.
+  The readiness check only asked whether the library *imported*, which a stale one does perfectly
+  well, so updating the plugin left new skills running against an old library with nothing anywhere
+  saying so.
+
+  This release is the first where that combination breaks outright rather than drifting quietly: the
+  receipt below is five sections, and the chart renderer rejects a receipt shaped the old way, so
+  every charted query would have failed on `receipt.columns is missing` until the library was
+  upgraded by hand. The launcher now compares the installed distribution against the plugin's own
+  version and reinstalls with `--upgrade` when it is behind. A library at or above that floor is left
+  alone, so this costs nothing on an ordinary run, and a source checkout with no distribution
+  metadata is not disturbed.
+
 - **Catalog and dictionary reads no longer hit the row cap that exists to bound your queries.** The
   executor refuses (never truncates) any result over `AGAMI_SQL_MAX_ROWS`, default 1000. That bound
   is sized for a question someone asks; a *catalog* read exceeds it on schema size alone. The visible

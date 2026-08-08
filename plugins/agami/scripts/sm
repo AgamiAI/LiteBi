@@ -105,17 +105,67 @@ _pip_try() {
 # sys.path[0]).
 _imports_ok() { ( cd / && "$PY" -c 'import semantic_model.cli, pydantic, sqlglot, yaml' ) 2>/dev/null; }
 
+# The installed agami-core must be at least as new as the plugin — and `_imports_ok` cannot see when it
+# isn't, because a stale library imports perfectly well. That gap is silent and it bites: the plugin's
+# own files are refetched on every version bump (the cache dir is the version), but the pip-installed
+# library is not, and `_agami_lib.ensure_importable()` prefers that installed package over the fresh copy
+# bundled in `lib/`. So a user who updates the plugin runs new skills against an old library — 0.6.0's
+# render_chart.py rejects a pre-0.6.0 receipt outright, and every charted query dies on the first run.
+#
+# $VER is the floor because the plugin and the package are bumped to the same string on every release
+# (CONTRIBUTING → "Files to touch on a release"), so the plugin's own version is exactly the library its
+# skills were written against — no second constant to drift out of sync with the first.
+_version_ok() {
+  # Only meaningful in a versioned cache dir. A dev checkout's $VER is a directory name, not a version,
+  # and its editable install already tracks the source.
+  case "$VER" in [0-9]*) ;; *) return 0 ;; esac
+  ( cd / && "$PY" - "$VER" <<'PY'
+import re, sys
+try:
+    from importlib.metadata import PackageNotFoundError, version
+except ImportError:      # Python too old to ask — not this gate's problem to report.
+    sys.exit(0)
+try:
+    have = version("agami-core")
+except PackageNotFoundError:
+    # Importable but carrying no distribution metadata: a source/PYTHONPATH layout a developer set up
+    # deliberately. There is nothing to compare, and forcing a reinstall over "unknown" would churn a
+    # working environment, so treat it as satisfied.
+    sys.exit(0)
+
+def release(v: str) -> tuple:
+    """The numeric release segment only, so `0.6.0rc1` and `0.6.0.dev3` both compare as 0.6.0 —
+    a prerelease of the floor is close enough to run, and packaging isn't guaranteed importable here."""
+    m = re.match(r"\d+(?:\.\d+)*", v)
+    return tuple(int(p) for p in m.group(0).split(".")) if m else ()
+
+sys.exit(0 if release(have) >= release(sys.argv[1]) else 1)
+PY
+  ) 2>/dev/null
+}
+
 ensure_pkg() {
-  _imports_ok && return 0
-  echo "agami: installing agami-core (semantic model) into $PY …" >&2
-  # Re-verify the imports after each attempt: a pip that exits 0 but leaves the import broken (e.g.
+  _imports_ok && _version_ok && return 0
+  # A MISSING library and a STALE one need different pip invocations: pip counts an already-present
+  # distribution as satisfying a bare requirement, so the stale case would no-op without `--upgrade`
+  # and leave the user exactly where they started — with the failure still ahead of them.
+  local up=""
+  if _imports_ok; then
+    up="--upgrade"
+    echo "agami: agami-core in $PY is older than this plugin ($VER); upgrading …" >&2
+  else
+    echo "agami: installing agami-core (semantic model) into $PY …" >&2
+  fi
+  # Re-verify after each attempt: a pip that exits 0 but leaves the import broken (e.g.
   # "already satisfied" into the wrong site) must fall through to the next source, not falsely succeed.
-  { [ -n "$DEV_PKG_DIR" ] && _pip_try -e "$DEV_PKG_DIR[model]"; } && _imports_ok && return 0
-  _pip_try "agami-core[model]" && _imports_ok && return 0
-  _pip_try "agami-core[model] @ ${GIT_BASE}@${GIT_REF}#subdirectory=packages/agami-core" && _imports_ok && return 0
-  _pip_try "agami-core[model] @ ${GIT_BASE}@main#subdirectory=packages/agami-core" && _imports_ok && return 0
-  echo "agami: couldn't install agami-core into $PY." >&2
-  echo "       Try:  $PY -m pip install --user \"agami-core[model] @ ${GIT_BASE}@${GIT_REF}#subdirectory=packages/agami-core\"" >&2
+  # The version is re-checked too, so a source that resolves to a too-old build (an index that hasn't
+  # published this release yet) falls through to git rather than passing as done.
+  { [ -n "$DEV_PKG_DIR" ] && _pip_try ${up:+"$up"} -e "$DEV_PKG_DIR[model]"; } && _imports_ok && _version_ok && return 0
+  _pip_try ${up:+"$up"} "agami-core[model]" && _imports_ok && _version_ok && return 0
+  _pip_try ${up:+"$up"} "agami-core[model] @ ${GIT_BASE}@${GIT_REF}#subdirectory=packages/agami-core" && _imports_ok && _version_ok && return 0
+  _pip_try ${up:+"$up"} "agami-core[model] @ ${GIT_BASE}@main#subdirectory=packages/agami-core" && _imports_ok && _version_ok && return 0
+  echo "agami: couldn't install a current agami-core into $PY." >&2
+  echo "       Try:  $PY -m pip install --user --upgrade \"agami-core[model] @ ${GIT_BASE}@${GIT_REF}#subdirectory=packages/agami-core\"" >&2
   echo "       Or point agami at a Python that has it:  export AGAMI_PYTHON=/path/to/python" >&2
   exit 3
 }
