@@ -65,6 +65,29 @@ sys.exit(0)
 """
 
 
+# A library that IMPORTS fine but is older than the plugin — the case `_imports_ok` alone cannot see.
+# The import probe (`-c`) always passes; the version probe (`python - <ver>`, script on stdin) fails
+# until an `--upgrade` install lands the marker. Without the version gate this shim would make `sm`
+# return immediately and log no install at all, which is exactly the silent staleness being fixed.
+_SHIM_STALE = """#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+with open(os.environ["SM_SHIM_LOG"], "a") as f:
+    f.write(" ".join(args) + "\\n")
+marker = os.environ["SM_SHIM_INSTALLED"]
+if args[:1] == ["-c"]:
+    sys.exit(0)                                    # the stale library imports perfectly well
+if args[:1] == ["-"]:
+    sys.exit(0 if os.path.exists(marker) else 1)   # ...but is below the floor until upgraded
+if "pip" in args and "install" in args:
+    if "--upgrade" not in args:
+        sys.exit(1)      # pip would treat the present dist as satisfying a bare requirement
+    open(marker, "w").close()
+    sys.exit(0)
+sys.exit(0)
+"""
+
+
 def _run_install(sm_path: Path, tmp_path: Path, shim_src: str = _SHIM):
     shim = tmp_path / "pyshim"
     shim.write_text(shim_src)
@@ -120,6 +143,46 @@ def test_pep668_reaches_break_system_packages(tmp_path):
     r, installs = _run_install(SM, tmp_path, shim_src=_SHIM_PEP668)
     assert r.returncode == 0, r.stderr
     assert any("--break-system-packages" in ln for ln in installs), installs
+
+
+def test_stale_library_is_upgraded_not_left_alone(tmp_path):
+    # The regression this guards: the plugin's own files are refetched on a version bump, but the
+    # pip-installed library is not — and `_agami_lib` prefers that installed package over the fresh
+    # bundled `lib/`. An import-only readiness check passes, so new skills run against an old library
+    # (0.6.0's render_chart.py rejects a pre-0.6.0 receipt and every charted query dies).
+    cache = tmp_path / "agami-core" / PLUGIN_VERSION
+    shutil.copytree(SCRIPTS, cache / "scripts")
+    shutil.copytree(LIB, cache / "lib")
+    r, installs = _run_install(cache / "scripts" / "sm", tmp_path, shim_src=_SHIM_STALE)
+
+    assert r.returncode == 0, r.stderr
+    assert installs, "a stale-but-importable library was left in place — no install attempted"
+    assert all("--upgrade" in ln.split() for ln in installs), (
+        f"every attempt must carry --upgrade or pip no-ops on the present dist: {installs}"
+    )
+    assert f"older than this plugin ({PLUGIN_VERSION})" in r.stderr, r.stderr
+
+
+def test_current_library_is_left_alone(tmp_path):
+    # The other half: a library at or above the floor must NOT provoke a reinstall on every invocation.
+    # Same shim, but the marker exists from the start, so the version probe passes immediately.
+    cache = tmp_path / "agami-core" / PLUGIN_VERSION
+    shutil.copytree(SCRIPTS, cache / "scripts")
+    shutil.copytree(LIB, cache / "lib")
+    (tmp_path / "installed.marker").write_text("")
+    r, installs = _run_install(cache / "scripts" / "sm", tmp_path, shim_src=_SHIM_STALE)
+
+    assert r.returncode == 0, r.stderr
+    assert installs == [], f"a current library must not be reinstalled: {installs}"
+
+
+def test_version_floor_is_the_plugin_version_not_a_second_constant():
+    # The floor must stay the plugin's own version. A hand-maintained constant is one a release can
+    # forget to bump, which would silently retire the gate this test exists to protect.
+    txt = SM.read_text()
+    assert "_version_ok" in txt, "the version floor gate must exist"
+    assert 'version("agami-core")' in txt, "the gate must read the INSTALLED distribution's version"
+    assert "_imports_ok && _version_ok" in txt, "readiness must require both probes, not just imports"
 
 
 def test_readiness_probes_cli_entrypoint_and_isolates_cwd():
