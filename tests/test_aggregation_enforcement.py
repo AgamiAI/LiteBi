@@ -86,6 +86,49 @@ def test_count_of_id_is_allowed():
     assert r.findings == []
 
 
+@pytest.mark.parametrize("predicate", [
+    "state NOT IN (6, 7, 8)",   # exp.In      — was NOT caught, so this was a false positive
+    "state BETWEEN 1 AND 3",    # exp.Between — likewise
+    "state = 1",                # exp.EQ      — caught only because EQ happens to be exp.Binary
+    "state IS NULL",            # exp.Is      — likewise
+    "state IN (1) AND state != 9",
+])
+def test_a_case_predicates_column_is_not_the_summed_value(predicate):
+    """`SUM(CASE WHEN <predicate> THEN 1 ELSE 0 END)` sums the literal 1, not the column the
+    predicate tests. Reading the column out of the predicate reported "SUM(state) is meaningless"
+    about an expression the statement never wrote — and put that beside the receipt's own
+    `columns` section calling the same output the org's approved, signed-off metric.
+
+    The old guard (`find(exp.Binary) is None`) caught `=` and `IS NULL` by accident and missed
+    `IN`/`BETWEEN`, which are not Binary subclasses, so the same conditional count was flagged or
+    cleared on nothing but which operator it happened to use. All five spellings are one query.
+    """
+    org = _org([_col("state", "integer", "dimension")])
+    r = RT.pre_flight_check(
+        f"SELECT SUM(CASE WHEN {predicate} THEN 1 ELSE 0 END) FROM facts", org)
+    assert r.findings == []
+
+
+def test_a_bare_column_is_still_the_summed_value():
+    """The narrowing must not cost the check its real cases — SUM over a dimension, and over a
+    DISTINCT dimension, are what this rule exists to catch."""
+    org = _org([_col("state", "integer", "dimension")])
+    for sql in ("SELECT SUM(state) FROM facts", "SELECT SUM(DISTINCT state) FROM facts"):
+        r = RT.pre_flight_check(sql, org)
+        assert [f.risk for f in r.findings] == ["bad_aggregation"], sql
+        assert "state" in r.findings[0].reason
+
+
+def test_the_finding_quotes_the_aggregate_the_statement_wrote():
+    """The reason is synthesized from the extracted column while the `aggregate` field carries the
+    parsed expression, so a wrong extraction printed a reason naming an expression that appears
+    nowhere in the statement. Pin that the two agree."""
+    org = _org([_col("state", "integer", "dimension")])
+    r = RT.pre_flight_check("SELECT SUM(state) FROM facts", org)
+    assert r.findings[0].aggregate == "SUM(state)"
+    assert "SUM(state)" in r.findings[0].reason
+
+
 # --- #3 semi-additive enforcement ------------------------------------------
 
 def _balance_org():
@@ -135,3 +178,15 @@ def test_semi_additive_is_table_scoped_no_cross_table_misfire():
     # facts.balance IS → reported
     r2 = RT.pre_flight_check("SELECT snapshot_date, SUM(balance) FROM facts GROUP BY snapshot_date", org)
     assert [f.risk for f in r2.findings] == ["semi_additive"]
+
+
+def test_a_multi_column_distinct_is_not_one_bare_column():
+    """`COUNT(DISTINCT a, b)` aggregates a TUPLE. DISTINCT carries a list, so unwrapping it
+    blindly would hand back its first element and describe a two-column aggregate as a
+    one-column one. COUNT is exempt from the class check, so this guards the extractor itself
+    rather than a finding."""
+    import sqlglot
+    from sqlglot import exp
+
+    agg = next(sqlglot.parse_one("SELECT COUNT(DISTINCT a, b) FROM t").find_all(exp.AggFunc))
+    assert RT._bare_aggregate_column(agg) is None

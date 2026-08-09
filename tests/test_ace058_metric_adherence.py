@@ -776,25 +776,76 @@ def test_matching_does_not_scan_every_declared_metric(org):
     idx = rt._by_binding(cands)
     # `broken_metric` will not parse, so it is absent from the index while staying a candidate —
     # the list is what decides `unmatched` vs `undetermined`, the index only answers "which metric".
-    assert "broken_metric" not in {c.metric.name for c in idx.values()}
+    indexed = {c.metric.name for bucket in idx.values() for c in bucket}
+    assert "broken_metric" not in indexed
     assert "broken_metric" in {c.metric.name for c in cands}
-    assert idx[rt._reduced_binding(PAID_REVENUE, "postgres")].metric.name == "paid_revenue"
+    bucket = idx[rt._reduced_binding(PAID_REVENUE, "postgres")]
+    assert [c.metric.name for c in bucket] == ["paid_revenue"]
 
 
-def test_two_metrics_declaring_one_binding_resolve_the_same_way_every_run(tmp_path):
-    """First declaration wins, so the receipt is identical on every run (REQ-022). Two names for one
-    expression is a model-authoring question, not one this layer decides — but it must not decide it
-    differently on different runs."""
+def test_two_metrics_declaring_one_binding_name_neither(tmp_path):
+    """An expression two metrics both declare does not identify either of them.
+
+    REQ-022 says two names for one expression is a model-authoring question and NOT one this layer
+    decides. Keeping only the first candidate satisfied that in letter — the same one every run —
+    while breaking it in substance, because silently picking one IS deciding it. `undetermined` is
+    the answer that actually declines to decide, and the section already has the word.
+
+    Not hypothetical: a model auto-suggesting one `*_count` per table declares `COUNT(*)` once per
+    table, and on a wide model that made one table's count report as an unrelated table's count
+    metric — `matched`, `confirmed`, `approved`. One authoritative false attribution is worse than
+    dozens of obvious ones: it is indistinguishable from a true one.
+    """
     org = _org_with_metric(tmp_path, "duplicate_binding",
                            bindings={"PostgreSQL": PAID_REVENUE})
     cands = rt._metric_candidates(org, rt._storage_type_of(org), rt._dialect_of(org)[0])
-    winner = rt._by_binding(cands)[rt._reduced_binding(PAID_REVENUE, "postgres")].metric.name
-    assert all(
-        rt._by_binding(rt._metric_candidates(
-            org, rt._storage_type_of(org), rt._dialect_of(org)[0]
-        ))[rt._reduced_binding(PAID_REVENUE, "postgres")].metric.name == winner
-        for _ in range(5)
-    )
+    bucket = rt._by_binding(cands)[rt._reduced_binding(PAID_REVENUE, "postgres")]
+    assert {c.metric.name for c in bucket} == {"paid_revenue", "duplicate_binding"}, \
+        "both declarations must be carried — dropping one is what made the false match possible"
+
+    # Both declare `source_tables: [orders]`, so reading `orders` cannot separate them either.
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders",
+                     drop=("broken_metric",))
+    assert rows == [("revenue", rt.UNDETERMINED, None)]
+
+
+def test_the_tables_the_statement_reads_separate_two_metrics_sharing_a_binding(tmp_path):
+    """The guard DISCRIMINATES — it only ever narrows a field the expression left ambiguous.
+
+    `_strip_qualifiers` names `source_tables` as the thing to add "if a false match shows up". This
+    is that guard: with the same binding declared twice but for different tables, the statement's own
+    FROM decides, and the answer is a real match rather than a shrug.
+    """
+    org = _org_with_metric(tmp_path, "customer_revenue",
+                           bindings={"PostgreSQL": PAID_REVENUE},
+                           source_tables=["customers"])
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM customers",
+                     drop=("broken_metric",))
+    assert rows == [("revenue", rt.MATCHED, "customer_revenue")]
+
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders",
+                     drop=("broken_metric",))
+    assert rows == [("revenue", rt.MATCHED, "paid_revenue")]
+
+
+def test_a_metric_declaring_no_source_tables_is_never_eliminated_by_the_guard(tmp_path):
+    """An absent declaration is not evidence against a metric. `source_tables` is optional and empty
+    across much of the real model, so a guard that treated "not declared" as "does not apply" would
+    silently delete true matches — the failure mode that kept this guard out of the code until a
+    false match justified it."""
+    org = _org_with_metric(tmp_path, "unscoped_revenue",
+                           bindings={"PostgreSQL": PAID_REVENUE},
+                           source_tables=[])
+    # `paid_revenue` (orders) and `unscoped_revenue` (nothing declared) both survive reading
+    # `orders`, so the field is still ambiguous and the honest answer is still undetermined.
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders",
+                     drop=("broken_metric",))
+    assert rows == [("revenue", rt.UNDETERMINED, None)]
+
+    # And reading a table `paid_revenue` does NOT declare leaves the unscoped one alone standing.
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM customers",
+                     drop=("broken_metric",))
+    assert rows == [("revenue", rt.MATCHED, "unscoped_revenue")]
 
 
 def test_a_missing_parser_does_not_poison_the_binding_cache(monkeypatch):
@@ -830,3 +881,44 @@ def test_a_binding_is_reduced_once_and_not_once_per_request(org):
     # every time after.
     assert info.misses == 4
     assert info.hits >= 16
+
+
+def test_a_shared_binding_whose_declarers_are_all_elsewhere_is_undetermined(tmp_path):
+    """Zero survivors, not one. The guard can eliminate EVERY ambiguous candidate — two metrics
+    sharing a binding, both declared on tables this statement does not read. `undetermined` is
+    right for the same reason it is right with several survivors: the expression named a metric,
+    and nothing establishes which. Falling back to first-wins here would be the original bug with
+    an extra step."""
+    org = _org_with_metric(tmp_path, "customer_revenue",
+                           bindings={"PostgreSQL": PAID_REVENUE},
+                           source_tables=["customers"])
+    # `paid_revenue` declares `orders`, `customer_revenue` declares `customers`; the statement
+    # reads a CTE, so neither can be established off the tables in scope.
+    rows = _statuses(
+        org,
+        f"WITH t AS (SELECT * FROM orders) SELECT {PAID_REVENUE} AS revenue FROM t",
+        drop=("broken_metric",),
+    )
+    assert rows == [("revenue", rt.UNDETERMINED, None)]
+
+
+def test_the_arm_source_map_is_resolved_once_for_all_of_an_arms_columns(tmp_path, monkeypatch):
+    """`_arm_sources` shares `_reads_only_visible`'s memo — same key, same map, one resolve per arm.
+
+    Driven through `assemble_receipt` rather than the `_statuses` helper: that helper hands each
+    column a FRESH `{}`, so it cannot observe the memo at all and a test written against it would
+    measure the helper. `assemble_receipt` is where the one real memo lives (`own_alias_memo`).
+
+    An ambiguous column reaches the source map through the new guard and a settled one reaches it
+    through the scope check; both must land on the same cached entry, because `_own_alias_map`
+    walks a subtree and this is on the receipt path of every executed query.
+    """
+    org = _org_with_metric(tmp_path, "duplicate_binding",
+                           bindings={"PostgreSQL": PAID_REVENUE})
+    calls = []
+    real = rt._own_alias_map
+    monkeypatch.setattr(rt, "_own_alias_map", lambda sel: (calls.append(id(sel)), real(sel))[1])
+    rt.assemble_receipt(
+        org, f"SELECT {PAID_REVENUE} AS a, {PAID_REVENUE} AS b, id AS c FROM orders")
+    assert calls, "the source map was never resolved — this test would pass vacuously"
+    assert len(calls) == 1, f"resolved the same arm's sources {len(calls)} times"
