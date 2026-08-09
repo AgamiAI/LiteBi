@@ -1236,7 +1236,13 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
         # mid-decision, and the useful reply is the list they were choosing from. Without this split
         # both arrived as "no such datasource: default", which reads to an administrator like the
         # customer's data has gone missing, and to a model like a reason to invent another name.
-        if args.get("datasource") is None:
+        #
+        # FALSY, not `is None`, and the two must agree with `resolve_profile`'s own `if explicit:`.
+        # It treats `""` as omitted and falls through to the fallback chain, so an `is None` test here
+        # would send a caller who sent `"datasource": ""` down the typo branch and hand them back the
+        # exact `no such datasource: default` sentence this function exists to stop. One notion of
+        # "named nothing", checked the same way in both places.
+        if not args.get("datasource"):
             choose = _choose_datasource_error(_current_org_id())
             if choose is not None:
                 return choose

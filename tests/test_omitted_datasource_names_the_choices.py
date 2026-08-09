@@ -52,6 +52,21 @@ def test_omitting_the_datasource_returns_the_organizations_own_datasources(serve
     assert "default" not in json.dumps(out)
 
 
+def test_an_empty_datasource_counts_as_omitted_not_as_a_name(served):
+    """`resolve_profile` treats `""` as omitted — its check is `if explicit:` — so a caller who sends
+    an empty string lands on exactly the fallback chain an absent argument does, and must get the same
+    answer here. Testing `is None` instead would send them down the typo branch and hand back the
+    `no such datasource: default` sentence this whole change exists to remove.
+
+    Whitespace is deliberately NOT special-cased: `resolve_profile` returns `"   "` unchanged, so it
+    is a name that does not exist, and reporting it as a name is the honest answer.
+    """
+    out = json.loads(tools.tool_get_datasource_schema({"datasource": ""}))
+    assert out["error"]["kind"] == "datasource_required"
+    assert out["error"]["datasources"] == ["acme_crm", "acme_erp", "acme_tickets"]
+    assert "default" not in json.dumps(out)
+
+
 def test_naming_a_datasource_that_does_not_exist_still_says_so(served):
     """A typo is not an undecided choice. Answering it with the catalog would bury the correction."""
     out = json.loads(tools.tool_get_datasource_schema({"datasource": "acme_crmm"}))
