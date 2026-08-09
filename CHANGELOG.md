@@ -12,6 +12,38 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-08-09
+
+### Fixed
+
+- **An omitted `datasource` names the org's real datasources instead of one nobody has.** 0.6.1 removed
+  the invented `'default'` for a deployment serving exactly ONE datasource; serving several, resolution
+  still fell through to that literal and the caller heard `no such datasource: default`. Two audiences
+  read that and both were misled — an administrator sees a name no customer has and concludes their data
+  has gone missing, and a model sees a failed lookup and invents another name, because the tool's own
+  description told it a default existed. Both halves are fixed: the three tool descriptions now say what
+  is true on each install and point at `list_datasources`, and an omitted argument gets the catalogue
+  back (`datasource_required`) while a NAMED one that does not exist is still told so. An empty string
+  counts as omitted, matching `resolve_profile`'s own `if explicit:`. (#218)
+
+- **A CASE predicate is not what a SUM aggregates, and a shared expression names no metric.** (#215)
+
+### Changed
+
+- **The tool surface reports what it checked, and accepts what it advertises** — nine findings from a
+  connector audit, all one shape: the server stated something it had not established, or named a field
+  the agent could not reach. `model_present` dropped from the served listing (it was the literal `True`);
+  `resolve_profile` consults the store; a hosted server no longer claims "All execution is local";
+  `bindings` is actually sent; `area` reaches `get_prompt_examples`; `list_datasources` returns
+  `description`; `for_questions_about` dropped from the payload. (#216)
+
+  **Released as a patch deliberately, and it is the one judgement call in this version.** #216 REMOVES
+  fields from emitted tool payloads, which a consumer reading them would notice — normally a minor bump
+  under 0.x. It ships as 0.6.2 because every field removed was provably dead: `model_present` could only
+  ever be `True` on that path, and `for_questions_about` had no writer anywhere in the product. A
+  consumer reading either was reading a constant or an empty list. The field stays DECLARED on the model
+  format, so no model on disk fails to load.
+
 ## [0.6.1] — 2026-08-08
 
 ### Fixed
