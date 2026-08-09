@@ -7,7 +7,7 @@
   },
   "metadata": {
     "description": "The trust layer between AI and your data. A governed semantic model for AI-to-database access — every join approved, every metric signed off, every answer with a receipt. Local-first: no infra, no servers, no data leaves your machine.",
-    "version": "0.6.1",
+    "version": "0.6.2",
     "pluginRoot": "./plugins",
     "tags": ["data", "sql", "governance", "trust-layer", "semantic-model", "local-first", "fair-code"],
     "repository": "https://github.com/AgamiAI/agami-core",
@@ -18,7 +18,7 @@
       "name": "agami-core",
       "source": "./plugins/agami",
       "description": "A governed trust layer between AI and your database: every join FK-derived or human-approved, every metric signed off, every answer with a receipt (the SQL, the model version, who vouched for each definition). Runs entirely on your machine via Claude's Bash / Read / Write tools — no MCP server or Python required if you have psql/mysql or DuckDB (an optional local MCP server is available for use from Claude Desktop).",
-      "version": "0.6.1",
+      "version": "0.6.2",
       "keywords": ["database", "governance", "trust-layer", "semantic-model", "sql", "postgres", "snowflake"],
       "category": "data"
     }
