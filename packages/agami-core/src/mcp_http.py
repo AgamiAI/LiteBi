@@ -46,7 +46,6 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from store import Store
 from tools import (
-    SERVER_INSTRUCTIONS,
     SERVER_NAME,
     TOOLS,
     _current_org_ctx,
@@ -54,6 +53,7 @@ from tools import (
     record_tool_call,
     reset_typed_outcome,
     resolved_org_id,
+    server_instructions,
     server_version,
     set_injected_executor,
     typed_outcome_overrides,
@@ -362,7 +362,7 @@ def build_server(
     from it, so HTTP advertises exactly what stdio does (no duplicate defs). Defaults to the shared
     `tools.TOOLS`; `create_app` passes a merged copy (base + a consumer's extra tools).
 
-    `extra_instructions` is APPENDED to `SERVER_INSTRUCTIONS` (never replaces it) and surfaced to the
+    `extra_instructions` is APPENDED to `server_instructions()` (never replaces it) and surfaced to the
     model in the MCP `initialize` result — append-only so a consumer can add guidance but can't drop
     the base protocol's safety directives (e.g. the receipt-reporting rules). None = no-op.
 
@@ -399,9 +399,10 @@ def build_server(
             _log.exception("tool visibility predicate failed for %r; hiding the tool", name)
             return False
 
-    # Appended, never replacing: SERVER_INSTRUCTIONS carries the PII output rule, so replace-semantics
-    # would let a consumer silently drop a safety directive.
-    instructions = SERVER_INSTRUCTIONS
+    # Appended, never replacing: the instructions carry the PII output rule, so replace-semantics
+    # would let a consumer silently drop a safety directive. Resolved per build_server rather than
+    # read off a module constant, so a hosted deployment does not ship the local privacy claim.
+    instructions = server_instructions()
     if extra_instructions:
         instructions = f"{instructions}\n{extra_instructions}"
     server = Server(SERVER_NAME, version=server_version(), instructions=instructions)

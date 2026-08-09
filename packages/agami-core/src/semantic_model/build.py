@@ -453,7 +453,9 @@ def extract_cross_area_relationships(
         if fa and ta and fa != ta:
             data = r.model_dump(exclude_none=True, by_alias=True)
             data.update(from_subject_area=fa, to_subject_area=ta, executable="same_engine")
-            data.setdefault("for_questions_about", [])
+            # No `setdefault("for_questions_about", [])` — it seeded an empty list into every
+            # generated edge and NOTHING ever filled it (see the field's own note on
+            # `Relationship`), so it only spread a dead key into new models on disk.
             out.append(CrossSubjectAreaRelationship(**data))
     return out
 

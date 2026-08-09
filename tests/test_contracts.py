@@ -55,26 +55,49 @@ def test_list_datasources_empty_note_roundtrip():
 
 
 def test_get_datasource_schema_index_roundtrip_is_subject_area_primary():
-    # Pass-1 index — the local shape is SUBJECT-AREA-primary (not config→table→metric).
+    # Pass-1 index — the local shape is SUBJECT-AREA-primary (not config→table→metric). `index`
+    # carries a table COUNT per area; the table list is what `summary`/`full` carry instead.
     sample = {
         "datasource": "acme",
         "organization": "Acme Inc.",
+        "mode": "index",
         "subject_areas": [
-            {
-                "name": "sales",
-                "description": "Orders + revenue",
-                "default_time_window": "last_90_days",
-                "tables": ["orders", "order_items"],
-            },
+            {"name": "sales", "description": "Orders + revenue", "table_count": 2},
         ],
         "cross_area_relationships": [
-            {"from": "sales", "to": "finance", "for_questions_about": "revenue recognition"},
+            {"from": "sales", "to": "finance", "from_table": "orders", "to_table": "ledger"},
         ],
         "note": "Per-table detail is lazy-loaded.",
     }
     out = _roundtrip(DatasourceSchemaResult, sample)
     assert out == sample
     assert "subject_areas" in out and "config" not in out  # subject-area-primary local shape
+
+
+def test_get_datasource_schema_summary_roundtrip_carries_named_tables():
+    """`summary`/`full` name each area's tables with their one-line descriptions — objects, not
+    bare strings. The contract declared `list[str]` for long enough that a real payload could not
+    have validated against it; `tests/test_get_datasource_schema_sizing.py` now checks the real
+    payload rather than a sample written to agree with the contract."""
+    sample = {
+        "datasource": "acme",
+        "organization": "Acme Inc.",
+        "mode": "summary",
+        "subject_areas": [
+            {
+                "name": "sales",
+                "description": "Orders + revenue",
+                "default_time_window": "last_90_days",
+                "tables": [
+                    {"name": "orders", "description": "one row per order"},
+                    {"name": "order_items", "description": "one row per line"},
+                ],
+            },
+        ],
+        "metric_index": {"revenue": "Sum of paid order amounts"},
+        "large_tables": {"orders": 2_000_000},
+    }
+    assert _roundtrip(DatasourceSchemaResult, sample) == sample
 
 
 def test_cross_area_relationship_from_alias():

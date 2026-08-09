@@ -572,6 +572,18 @@ class Relationship(_Base):
     relationship: Cardinality
     executable: Executable = "same_engine"
     description: str = ""
+    # DEPRECATED — accepted, never populated, never served.
+    #
+    # No code path anywhere writes it: it was `setdefault`-ed empty when an edge was generated and
+    # left that way, including in the sample model this product ships (twelve edges, twelve empty
+    # lists). It is a natural-language field, so it could only come from LLM enrichment, and that
+    # pass covers subject areas and tables but not edges. `get_datasource_schema` used to project
+    # it onto every cross-area edge, so a long edge list carried a fraction of its length in
+    # distinct facts; the payload now names the endpoint tables instead.
+    #
+    # Kept DECLARED rather than deleted: these models `forbid` unknown keys, so removing the field
+    # would fail every model already on disk that carries `for_questions_about: []` — which is what
+    # generation wrote, so that is most of them. Dropping it needs a format migration, not an edit.
     for_questions_about: list[str] = Field(default_factory=list)
 
     # trust block (flattened for ergonomic YAML authoring)

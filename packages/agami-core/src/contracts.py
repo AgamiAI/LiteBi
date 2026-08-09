@@ -43,13 +43,18 @@ class ListDatasourcesRequest(_Contract):
 class SchemaRequest(_Contract):
     datasource: str | None = None
     dataset_names: list[str] | None = None
-    query: str | None = None  # context only; not used for ranking locally
+    query: str | None = None  # ranks metrics; also scopes on the served path
+    metric_names: list[str] | None = None
+    mode: str | None = None  # auto | full | summary | index
 
 
 class PromptExamplesRequest(_Contract):
     datasource: str | None = None
     query: str | None = None
-    top_k: int | None = None  # accepted for parity; not applied locally
+    area: str | None = None  # narrows to one subject area PLUS the cross-area bucket
+    # Applied on the served path (defaults to 10, within a ~20k-char budget); the local file path
+    # returns the curated YAML whole and ignores it. The comment here used to say the opposite.
+    top_k: int | None = None
 
 
 class ExecuteSqlRequest(_Contract):
@@ -80,8 +85,12 @@ class ExecuteSqlRequest(_Contract):
 
 class DatasourceInfo(_Contract):
     datasource: str
+    description: str | None = None  # the model's own one-liner — what a router chooses on
     database_type: str | None = None
     table_count: int = 0
+    # Local path only: there it is a real check (does `<profile>/datasource.yaml` exist?). The
+    # served listing is built FROM the model rows, so it omits the field rather than send a
+    # constant `True` dressed as a check.
     model_present: bool = False
     is_active: bool = False
 
@@ -98,27 +107,46 @@ class ListDatasourcesResult(_Contract):
 # ---------------------------------------------------------------------------
 
 
+class SubjectAreaTable(_Contract):
+    """One table named on an area summary: enough to decide whether to ask for its full context."""
+
+    name: str
+    description: str | None = None
+
+
 class SubjectAreaSummary(_Contract):
     name: str
     description: str | None = None
     default_time_window: str | None = None
-    tables: list[str] = Field(default_factory=list)
+    # `summary`/`full` carry the table list; `index` carries the count instead. Exactly one of
+    # these is present per mode, so both are optional here.
+    tables: list[SubjectAreaTable] = Field(default_factory=list)
+    table_count: int | None = None
 
 
 class CrossAreaRelationship(_Contract):
     # "from" is a Python keyword — alias the wire key.
     from_: str = Field(alias="from")
     to: str
-    for_questions_about: str | None = None
+    # The endpoint tables, which are what make one edge distinguishable from the eleven others
+    # between the same pair of areas.
+    from_table: str | None = None
+    to_table: str | None = None
 
 
 class DatasourceSchemaResult(_Contract):
     datasource: str
     organization: str | None = None
+    mode: str | None = None
+    requested_mode: str | None = None  # present when a scope was given and no downgrade applied
     # Pass 1 (index): subject areas + cross-area relationships.
     subject_areas: list[SubjectAreaSummary] | None = None
     cross_area_relationships: list[CrossAreaRelationship] | None = None
+    # The never-hide net: every metric the model declares, and the tables big enough to matter.
+    metric_index: dict[str, Any] | None = None
+    large_tables: dict[str, int] | None = None  # {table: estimated_row_count}
     note: str | None = None
+    truncated: bool | None = None
     # Pass 2 (dataset_names): per-table context + relationships/metrics from get_table_context.
     # Kept loose — these come straight from the loader and carry many provenance fields.
     tables: dict[str, Any] | None = None

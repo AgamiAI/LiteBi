@@ -34,10 +34,10 @@ import sys
 from typing import Any, Callable
 
 from tools import (
-    SERVER_INSTRUCTIONS,
     SERVER_NAME,
     TOOLS,
     bootstrap_paths,
+    server_instructions,
     server_version,
 )
 
@@ -73,7 +73,7 @@ def _handle_initialize(req_id: Any, params: dict[str, Any]) -> None:
         "protocolVersion": protocol,
         "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": SERVER_NAME, "version": server_version()},
-        "instructions": SERVER_INSTRUCTIONS,
+        "instructions": server_instructions(),
     })
 
 

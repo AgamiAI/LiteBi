@@ -94,9 +94,23 @@ def server_version() -> str:
 
 # Client-facing usage guidance, surfaced by both transports. Describes the 4-tool flow;
 # no save_correction (that's a skill operation, not on the MCP surface).
-SERVER_INSTRUCTIONS = (
+#
+# The opening sentence is the ONE part that differs by deployment, and it has to: it is a privacy
+# claim. "All execution is local — no data leaves the machine" is true and worth saying on the
+# stdio/skill path, and simply false on a hosted server, where the SQL runs in the container and the
+# rows come back over the wire. It shipped verbatim on both. Everything after it is identical, so
+# the split is one sentence rather than two copies of the flow.
+_LOCAL_PREAMBLE = (
     "agami local datasource agent. The NL→SQL intelligence runs on your side; these tools provide "
     "the local semantic model + curated examples and execute SQL locally. All execution is local.\n"
+)
+_HOSTED_PREAMBLE = (
+    "agami datasource agent, running as a HOSTED server. The NL→SQL intelligence runs on your "
+    "side; these tools provide the deployment's semantic model + curated examples, and execute "
+    "SQL on the server against the configured warehouse — query text and result rows leave your "
+    "machine and are recorded in this deployment's activity log.\n"
+)
+_SHARED_INSTRUCTIONS = (
     "Flow: (1) list_datasources, then get_datasource_schema for the datasource the question "
     "touches (it sizes itself — pass a `query` to focus metrics, `dataset_names` for full table "
     "detail). (2) Examples-first — call get_prompt_examples and mirror the closest match; use "
@@ -166,6 +180,26 @@ SERVER_INSTRUCTIONS = (
 )
 
 
+def server_instructions() -> str:
+    """The client-facing instructions for THIS deployment.
+
+    Read at build_server / initialize time rather than at import, because `AGAMI_DB_URL` — the
+    signal `_hosted()` reads, and the same one `Store.from_env` and `tools._audit_is_load_bearing`
+    use — is environment, and a module constant froze the local wording into every hosted image.
+
+    Still not replaceable by a consumer: `build_server(extra_instructions=...)` appends to this and
+    never substitutes for it, so the PII rule below cannot be dropped by composition.
+    """
+    from execute_sql import _hosted  # local import: keeps the module import graph acyclic
+
+    return (_HOSTED_PREAMBLE if _hosted() else _LOCAL_PREAMBLE) + _SHARED_INSTRUCTIONS
+
+
+# Back-compat for anything importing the constant: the LOCAL wording, which is what it always held.
+# Both transports call `server_instructions()`; this exists so an out-of-tree import does not break.
+SERVER_INSTRUCTIONS = _LOCAL_PREAMBLE + _SHARED_INSTRUCTIONS
+
+
 def bootstrap_paths() -> None:
     """Re-resolve the module-level paths at startup. agami_paths.bootstrap() also runs a one-time
     migration of any *legacy* ~/.agami install into the current <artifacts_dir>/local layout — new
@@ -190,8 +224,53 @@ def _load_config() -> dict[str, Any]:
     return {}
 
 
+@functools.lru_cache(maxsize=8)
+def _sole_served_datasource(org_id: str) -> "str | None":
+    """The datasource this deployment serves, when it serves exactly ONE. Else None.
+
+    "Exactly one" is the whole rule. With one served model there is no ambiguity about which
+    datasource an omitted `datasource` argument means; with two there is, and guessing would be
+    worse than the refusal — so several (or none) returns None and the caller falls through.
+
+    Memoized per org: this sits under `resolve_profile`, which is on the per-request path, and the
+    alternative is a fresh Store connection per tool call. Models are deployed by `model_deploy`
+    before the server process starts, so the set this reads does not change under a running server.
+    Tests that vary the store must call `.cache_clear()`, as they do for `resolved_org_id`.
+
+    Never raises: profile resolution has to produce a name even with the store unreachable, and
+    'default' is the answer that was always given when nothing else resolved.
+    """
+    try:
+        from store import Store
+
+        store = Store.from_env()
+        if store is None:
+            return None
+        try:
+            from model_store import list_datasources
+
+            served = [ds for ds in list_datasources(store, org_id=org_id) if ds]
+        finally:
+            store.close()
+    except Exception:
+        return None
+    return served[0] if len(served) == 1 else None
+
+
 def resolve_profile(explicit: str | None = None) -> str:
-    """Resolution order: explicit arg → AGAMI_PROFILE → .config.active_profile → 'default'."""
+    """Resolution order: explicit arg → AGAMI_PROFILE → .config.active_profile → the sole served
+    datasource → 'default'.
+
+    The store step is what makes this true on a served deployment. `.config` lives under
+    `<artifacts_dir>/local/` and a DB-only deploy reads NO files at runtime, so before it every
+    served install with `AGAMI_PROFILE` unset fell through to the literal `'default'` — a profile
+    that does not exist. Three things followed from that one string: `list_datasources` reported
+    `active_datasource: "default"` beside the real datasource; `is_active` was structurally
+    incapable of ever being true (it compares against this); and omitting `datasource`, which every
+    tool description says "defaults to the active profile", refused with `model_unavailable`
+    because no model resolves under that name. "Active profile" was a local-CLI concept leaking
+    onto the served path with nothing behind it.
+    """
     if explicit:
         return explicit
     env = os.environ.get("AGAMI_PROFILE")
@@ -200,6 +279,9 @@ def resolve_profile(explicit: str | None = None) -> str:
     active = _load_config().get("active_profile")
     if isinstance(active, str) and active:
         return active
+    served = _sole_served_datasource(_current_org_id())
+    if served:
+        return served
     return "default"
 
 
@@ -696,17 +778,26 @@ def tool_list_datasources(_args: dict[str, Any]) -> str:
     store = Store.from_env()
     if store is not None:
         try:
-            from model_store import list_datasources, model_table_counts
+            from model_store import list_datasources, model_descriptions, model_table_counts
 
             org_id = _current_org_id()
-            counts = model_table_counts(store, org_id=org_id)  # one grouped query, not per-datasource
+            # Two grouped queries, not per-datasource. `description` is what makes this tool able to
+            # answer the question it exists for — "which datasource does this question touch?" —
+            # which datasource/database_type/table_count cannot. Without it an agent had to call
+            # get_datasource_schema on each candidate purely to choose, and that is the ~60 KB call.
+            counts = model_table_counts(store, org_id=org_id)
+            descriptions = model_descriptions(store, org_id=org_id)
             out = [
                 {
                     "datasource": ds,
                     "database_type": _served_db_type(ds),
                     "table_count": counts.get(ds, 0),
-                    "model_present": True,
+                    # No `model_present` here. It was the literal `True`: this list is built FROM
+                    # `datasource_model` rows, so the field could never be false, and reporting a
+                    # constant as though a check ran implies a verification that did not happen.
+                    # Locally (below) it IS a real check, which is why it survives on that path.
                     "is_active": ds == active,
+                    **({"description": descriptions[ds]} if ds in descriptions else {}),
                 }
                 for ds in list_datasources(store, org_id=org_id)
                 if ds  # defensive: only real, named datasources (never an empty name)
@@ -919,8 +1010,32 @@ def _match_metrics(query: str | None, metrics: dict[str, tuple[Any, str | None]]
     return result[: max(_METRIC_MATCH_TOP_K, len(strong_hits))]
 
 
-def _metric_full(m, area: str | None) -> dict[str, Any]:
-    return {
+def _engine_of(org) -> "str | None":
+    """The one engine this datasource's SQL runs on, as `Metric.bindings` spells it (`PostgreSQL`,
+    `Snowflake`, …). None when no connection declares one, or two declare different ones — the same
+    rule `semantic_model.runtime._storage_type_of` applies, restated here rather than imported so
+    the schema payload does not pull in the runtime."""
+    engines = {sc.storage_type for sc in (getattr(org, "storage_connections", None) or [])}
+    return engines.pop() if len(engines) == 1 else None
+
+
+def _metric_full(m, area: str | None, engine: "str | None" = None) -> dict[str, Any]:
+    """One metric in full, INCLUDING the binding for this deployment's engine.
+
+    The server instructions and this tool's own description both tell the agent to use a metric's
+    `calculation`/`bindings` VERBATIM — and `bindings` was not among the keys this returned, on the
+    very call those instructions describe. So the agent was told, in capitals, to reuse a field it
+    never received, leaving it to hand-roll SQL from the prose `calculation` instead. That also
+    costs the receipt a true match: hand-rolled SQL does not reduce to the declared binding, so the
+    output column reads `unmatched` rather than naming the metric it computes.
+
+    ONE binding, the one for this engine — not the whole per-dialect dict. The agent is writing for
+    a single warehouse, and on an unscoped `full` call `selected` is every metric the model
+    declares, so shipping every dialect would multiply the largest block in the payload to no end.
+    A metric declaring nothing for this engine simply has no `binding` key, which is a fact about
+    the model's coverage and reads as one.
+    """
+    out = {
         "name": m.name,
         "area": area,
         "description": m.description,
@@ -928,6 +1043,10 @@ def _metric_full(m, area: str | None) -> dict[str, Any]:
         "other_names": list(m.other_names or []),
         "review_state": m.review_state,
     }
+    binding = (m.bindings or {}).get(engine) if engine else None
+    if binding and binding.strip():
+        out["binding"] = binding
+    return out
 
 
 def _large_tables(org) -> dict[str, int]:
@@ -972,11 +1091,26 @@ def _schema_payload(
         "datasource": profile,
         "organization": org.description or None,
         "mode": mode,
+        # One entry per declared cross-area edge, named by its ENDPOINT TABLES.
+        #
+        # This used to project `{from, to, for_questions_about}`, and `for_questions_about` has no
+        # writer anywhere — it is `setdefault`-ed empty and never filled, including in the sample
+        # model this product ships. So each entry was a bare pair of area names, and a model with
+        # a dozen distinct FK edges from `sales` to `people` (assigned_to, created_by,
+        # approved_by, …) emitted `sales → people` a dozen identical times. On a wide model
+        # that is a long list carrying a fraction of its length in distinct facts.
+        #
+        # The endpoints are what tell them apart, and they are the routing question this block
+        # answers — WHICH table bridges the areas, so the agent knows what to ask for next. The join
+        # mechanics (columns, `on`, cardinality, trust) stay off this tier deliberately: a
+        # `dataset_names` call returns them in full via `_relationships_among`, so repeating 65
+        # whole relationship objects here would restate what the next call states better.
         "cross_area_relationships": [
             {
                 "from": r.from_subject_area,
                 "to": r.to_subject_area,
-                "for_questions_about": r.for_questions_about,
+                "from_table": r.from_table,
+                "to_table": r.to_table,
             }
             for r in org.cross_subject_area_relationships
         ],
@@ -1007,8 +1141,9 @@ def _schema_payload(
     # metrics in full: the matched set (a query/metric_names limits them); else every metric in
     # full mode (back-compat); else none (rely on metric_index).
     selected = matched if matched else (list(metrics) if mode == "full" else [])
+    engine = _engine_of(org)  # resolved once, not per metric
     result["metrics"] = [
-        _metric_full(metrics[n][0], metrics[n][1]) for n in selected if n in metrics
+        _metric_full(metrics[n][0], metrics[n][1], engine) for n in selected if n in metrics
     ]
     return result
 
@@ -1159,12 +1294,20 @@ def tool_get_prompt_examples(args: dict[str, Any]) -> str:
 
     artifacts = resolve_artifacts_dir()
     ex_dir = artifacts / profile / "prompt_examples"
+    # `area` narrows here too. It has to: now that the parameter is advertised on the tool schema,
+    # a client sends it, and a path that globbed every area regardless would honour it on a served
+    # deployment and silently ignore it on a local one — the same schema, two behaviours. The
+    # served query is `area = ? OR area IS NULL`, i.e. that area PLUS the cross-area bucket; on
+    # disk the bucket has no directory to live in, so the named area alone is the whole of it.
+    wanted = (args.get("area") or "").strip()
     blocks: list[str] = []
     if ex_dir.is_dir():
         for ex_file in sorted(ex_dir.glob("*/examples.yaml")):
+            area = ex_file.parent.name
+            if wanted and area != wanted:
+                continue
             text = _read_text(ex_file)
             if text and text.strip():
-                area = ex_file.parent.name
                 blocks.append(f"## subject area: {area}\n```yaml\n{text}\n```")
     if not blocks:
         return json.dumps(
@@ -2238,9 +2381,10 @@ TOOLS: dict[str, dict[str, Any]] = {
     "list_datasources": {
         "handler": tool_list_datasources,
         "description": (
-            "List the local agami datasources (credential profiles) and whether each has a "
-            "semantic model. Local analog of the hosted list_organizations. Call this first "
-            "when the datasource is not yet known; the others accept an optional `datasource`."
+            "List the datasources this deployment serves, each with the description its model "
+            "declares — enough to route a question without pulling a schema per candidate. "
+            "Call this first when the datasource is not yet known; the others accept an "
+            "optional `datasource`."
         ),
         "inputSchema": {
             "type": "object",
@@ -2255,7 +2399,7 @@ TOOLS: dict[str, dict[str, Any]] = {
     "get_datasource_schema": {
         "handler": tool_get_datasource_schema,
         "description": (
-            "Fetch the local semantic model for a datasource, sized to fit context. `mode=auto` "
+            "Fetch the semantic model for a datasource, sized to fit context. `mode=auto` "
             "(default) picks verbosity by subject-area count (full/summary/index) under a char "
             "budget; `dataset_names=[...]` returns full get_table_context (columns scoped by "
             "expose_column_groups, default_filters, relationships, caveats, value_transforms, "
@@ -2299,9 +2443,9 @@ TOOLS: dict[str, dict[str, Any]] = {
     "get_prompt_examples": {
         "handler": tool_get_prompt_examples,
         "description": (
-            "Fetch the curated few-shot NL→SQL examples for a datasource (one block per subject "
-            "area, from prompt_examples/<area>/examples.yaml). Use before generating SQL to ground "
-            "dialect and house style; match on the question, then reuse the tagged tables/columns/SQL."
+            "Fetch the curated few-shot NL→SQL examples for a datasource, grouped by subject area. "
+            "Use before generating SQL to ground dialect and house style; match on the question, "
+            "then reuse the tagged tables/columns/SQL."
         ),
         "inputSchema": {
             "type": "object",
@@ -2312,11 +2456,25 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "query": {
                     "type": "string",
-                    "description": "The user's NL question (context only).",
+                    "description": "The user's NL question — ranks examples by word overlap.",
+                },
+                "area": {
+                    "type": "string",
+                    # The handler has always passed this through and `select_examples` has always
+                    # implemented it (`area = ? OR area IS NULL` — the area PLUS the cross-area
+                    # bucket). It was simply absent from this schema, and `additionalProperties`
+                    # is false, so no compliant client could ever send it and the branch was dead
+                    # on every call. By step 3 of the documented flow the agent has already chosen
+                    # a subject area, so it knows what to pass.
+                    "description": "Narrow to one subject area (cross-area examples still included).",
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Accepted for hosted-parity; not applied locally.",
+                    "description": (
+                        "Max examples to return. Applied on a served deployment (default 10, "
+                        "within a ~20,000-char budget); the local file path returns the curated "
+                        "YAML whole and ignores it."
+                    ),
                 },
                 "user_question": _USER_QUESTION_PROP,
                 "thread_id": _THREAD_ID_PROP,
@@ -2336,7 +2494,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "rule, detail, remediation}} — relay the remediation, it says how to get an answer. "
             "A result larger than the deployment row ceiling is refused the same way rather than "
             "trimmed, so a partial answer never arrives looking whole. "
-            "Runs entirely locally via execute_sql.py — no data leaves the machine. "
+            "Executed by execute_sql.py — locally on a skill install, on the server for a hosted "
+            "deployment (where the SQL and its result rows are recorded in the activity log). "
             # The declared-filter clause. Spec ids stay in comments like this one — this string
             # ships to every client, and an id only resolves inside the spec repo.
             "A table's declared `default_filters` are NOT applied to your SQL — if a filter "
