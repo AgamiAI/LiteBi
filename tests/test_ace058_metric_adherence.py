@@ -923,3 +923,58 @@ def test_the_arm_source_map_is_resolved_once_for_all_of_an_arms_columns(tmp_path
         org, f"SELECT {PAID_REVENUE} AS a, {PAID_REVENUE} AS b, id AS c FROM orders")
     assert calls, "the source map was never resolved — this test would pass vacuously"
     assert len(calls) == 1, f"resolved the same arm's sources {len(calls)} times"
+
+
+def test_a_schema_qualified_source_table_still_discriminates(tmp_path):
+    """`source_tables` may be schema-qualified, and the guard must normalize it the way the rest
+    of the codebase does.
+
+    `_tkey` only lowercases — it does NOT strip a schema — while the written side of the
+    comparison is bare table names off `_own_alias_map`. Matching the two with `_tkey` alone makes
+    a metric declaring `public.orders` invisible to a statement reading `orders`, and the failure
+    is not limited to a false `undetermined`: a candidate declaring NO `source_tables` is never
+    eliminated, so when the correctly-declared one is wrongly dropped the undeclared one is left
+    standing alone and gets NAMED. That is the false attribution this guard exists to prevent,
+    reintroduced by a normalization mismatch.
+
+    `loader._metrics_for` has always compared these through `bare_name`; this is the same rule.
+    """
+    org = _org_with_metric(tmp_path, "qualified_revenue",
+                           bindings={"PostgreSQL": PAID_REVENUE},
+                           source_tables=["public.orders"])
+    # `paid_revenue` declares plain `orders`; `qualified_revenue` declares `public.orders`. Both
+    # genuinely apply to a statement reading `orders`, so neither may be silently eliminated and
+    # the honest answer is that the expression names neither.
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders",
+                     drop=("broken_metric",))
+    assert rows == [("revenue", rt.UNDETERMINED, None)]
+
+
+def test_an_undeclared_metric_is_not_left_standing_by_a_qualifier_mismatch(tmp_path):
+    """The false-match half, stated on its own because it is the dangerous one.
+
+    One metric declares the table it applies to, schema-qualified. The other declares nothing. A
+    guard that cannot read the qualifier eliminates the RIGHT one and names the WRONG one —
+    `matched`, with whatever sign-off that metric carries.
+    """
+    yaml = __import__("yaml")
+    root = tmp_path / "q"
+    root.mkdir(parents=True)
+    _write_model(root)
+    mdir = root / "subject_areas" / "s" / "metrics"
+    # Re-declare paid_revenue's binding on a metric that names no source table at all...
+    (mdir / "unscoped_twin.yaml").write_text(yaml.safe_dump(
+        {"name": "unscoped_twin", "calculation": "whatever", "description": "unscoped_twin",
+         "bindings": {"PostgreSQL": PAID_REVENUE}, "source_tables": [],
+         "confidence": "proposed", "review_state": "unreviewed"}))
+    # ...and schema-qualify the one that genuinely applies.
+    doc = yaml.safe_load((mdir / "paid_revenue.yaml").read_text())
+    doc["source_tables"] = ["public.orders"]
+    (mdir / "paid_revenue.yaml").write_text(yaml.safe_dump(doc))
+    org = L.load_datasource(root)
+
+    rows = _statuses(org, f"SELECT {PAID_REVENUE} AS revenue FROM orders",
+                     drop=("broken_metric",))
+    assert rows != [("revenue", rt.MATCHED, "unscoped_twin")], \
+        "the qualified declaration was dropped and the undeclared metric was named in its place"
+    assert rows == [("revenue", rt.UNDETERMINED, None)]

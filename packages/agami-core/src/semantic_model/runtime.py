@@ -5477,11 +5477,16 @@ def _arm_sources(oc: OutputColumn, memo: dict[int, dict[str, str]]) -> set[str]:
 
     Shares `memo` with `_reads_only_visible` — same key, same map, resolved once per arm — so
     consulting it costs nothing on a statement whose columns already reached that check.
+
+    `_bare` as well as `_tkey`, so this side is normalized identically to the DECLARED side in
+    `_discriminate`. `_tkey` only lowercases; a schema left on either half would make two spellings
+    of one table fail to compare. `_own_alias_map` already returns bare names, so this is belt and
+    braces here — and it is the half that makes the pair provably symmetric.
     """
     scope_map = memo.get(id(oc.sel))
     if scope_map is None:
         scope_map = memo[id(oc.sel)] = _own_alias_map(oc.sel)
-    return {_tkey(src) for src in scope_map.values()}
+    return {_tkey(_bare(src)) for src in scope_map.values()}
 
 
 def _discriminate(cands: list[MetricCandidate], sources: set[str]) -> Optional[MetricCandidate]:
@@ -5498,11 +5503,19 @@ def _discriminate(cands: list[MetricCandidate], sources: set[str]) -> Optional[M
     it to exactly one. None means `undetermined`, which is the honest answer: `COUNT(*)` over
     `orders ⋈ customers` is neither the order count nor the customer count, and saying so beats
     naming either.
+
+    `source_tables` may be SCHEMA-QUALIFIED, so it is normalized with `_bare` before comparison —
+    the rule `loader._metrics_for` has always applied to this same field. `_tkey` alone only
+    lowercases, and a metric declaring `public.orders` would then be invisible to a statement
+    reading `orders`. The consequence is not merely a false `undetermined`: because a candidate
+    declaring nothing is never eliminated, dropping the correctly-declared one leaves the
+    undeclared one standing ALONE, and it gets named — the exact false attribution this guard was
+    added to prevent, reintroduced by a mismatch between the two sides of one comparison.
     """
     survivors = [
         c for c in cands
         if not c.metric.source_tables
-        or any(_tkey(s) in sources for s in c.metric.source_tables)
+        or any(_tkey(_bare(s)) in sources for s in c.metric.source_tables)
     ]
     return survivors[0] if len(survivors) == 1 else None
 
