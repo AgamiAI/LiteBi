@@ -102,6 +102,33 @@ def guarded(tmp_path, monkeypatch):
 # --- the deletion itself ----------------------------------------------------
 
 
+
+def _instruction_variants() -> tuple[str, str]:
+    """The client-facing instructions as BOTH deployments serve them (local, hosted).
+
+    The opening privacy sentence branches on `_hosted()`, so asserting against the module constant
+    would check these properties on one path only — and the hosted preamble is new text that has to
+    satisfy them too.
+    """
+    import os
+
+    import tools
+
+    saved = {k: os.environ.get(k) for k in ("AGAMI_DB_URL", "APP_DATABASE_URL")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        local = tools.server_instructions()
+        os.environ["AGAMI_DB_URL"] = "sqlite:///tmp/variants.db"
+        hosted = tools.server_instructions()
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+    return local, hosted
+
+
 def test_the_injector_is_gone_not_wrapped():
     """Deleted, not left as an empty shell. A surviving `-> list[str]` reporter would be ACE-099's
     job a wave early, built on the same `find_all(exp.Table)` scoping ACE-099 exists to replace."""
@@ -177,7 +204,7 @@ def test_the_surfaces_say_filters_are_unapplied_and_reported():
     import tools
     from semantic_model import models as m
 
-    for surface in (tools.TOOLS["execute_sql"]["description"], tools.SERVER_INSTRUCTIONS):
+    for surface in (tools.TOOLS["execute_sql"]["description"], *_instruction_variants()):
         assert "default_filters" in surface
         # Still not applied for you.
         assert "NOT applied" in surface
@@ -209,7 +236,8 @@ def test_no_shipped_surface_still_says_the_report_does_not_exist():
 
     surfaces: list[tuple[str, str]] = [
         ("tools.TOOLS['execute_sql'].description", tools.TOOLS["execute_sql"]["description"]),
-        ("tools.SERVER_INSTRUCTIONS", tools.SERVER_INSTRUCTIONS),
+        *[(f"tools.server_instructions() [{m}]", v)
+          for m, v in zip(("local", "hosted"), _instruction_variants())],
         ("Table.default_filters.description", m.Table.model_fields["default_filters"].description),
     ]
     trees = [
@@ -242,7 +270,7 @@ def test_no_notice_leaks_a_spec_id_to_a_client():
 
     spec_id = re.compile(r"\b(?:ACE|AH|REQ)-\d+", re.IGNORECASE)
     for surface in (tools.TOOLS["execute_sql"]["description"],
-                    tools.SERVER_INSTRUCTIONS,
+                    *_instruction_variants(),
                     m.Table.model_fields["default_filters"].description):
         assert not spec_id.search(surface), surface
 

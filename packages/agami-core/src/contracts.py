@@ -91,7 +91,12 @@ class DatasourceInfo(_Contract):
     # Local path only: there it is a real check (does `<profile>/datasource.yaml` exist?). The
     # served listing is built FROM the model rows, so it omits the field rather than send a
     # constant `True` dressed as a check.
-    model_present: bool = False
+    #
+    # `None`, not `False`. Defaulting to False would make a consumer that validates a served entry
+    # read `model_present is False` — "no model" — for a datasource that definitionally has one:
+    # the same defect this field's removal was fixing, moved one layer down into the contract.
+    # Absent must say "not asserted", which is the only thing absence can honestly mean here.
+    model_present: bool | None = None
     is_active: bool = False
 
 

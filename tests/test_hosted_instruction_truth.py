@@ -83,3 +83,51 @@ def test_an_unreachable_store_does_not_break_profile_resolution(monkeypatch, tmp
     assert tools._sole_served_datasource("local") is None
     assert tools.resolve_profile() == "default"
     tools._sole_served_datasource.cache_clear()
+
+
+def test_an_unreachable_store_is_retried_rather_than_pinned(monkeypatch, tmp_path):
+    """A failure must NOT be memoized.
+
+    `lru_cache` would pin the `None` returned when the store is unreachable, so a container that
+    starts before its database is ready — or takes one blip on its first tool call — would fall
+    back to the literal 'default' for the life of the process, silently reinstating every symptom
+    the store step exists to fix: `active_datasource` naming a profile that does not exist,
+    `is_active` never true, and an omitted `datasource` refusing.
+    """
+    import model_store
+
+    monkeypatch.delenv("AGAMI_PROFILE", raising=False)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    url = "sqlite://" + str(tmp_path / "m.db")
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+    tools._sole_served_datasource.cache_clear()
+
+    # First call while the store is down.
+    boom = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("connection refused"))
+    monkeypatch.setattr(model_store, "list_datasources", boom)
+    assert tools.resolve_profile() == "default"
+
+    # The store recovers; the very next call must see it.
+    monkeypatch.setattr(model_store, "list_datasources", lambda *a, **k: ["recovered"])
+    assert tools.resolve_profile() == "recovered", \
+        "a transient failure was cached and never retried"
+    tools._sole_served_datasource.cache_clear()
+
+
+def test_a_successful_resolution_is_memoized(monkeypatch, tmp_path):
+    """The positive IS cached — it cannot change under a running server (models are deployed
+    before the process starts), and the alternative is a Store connection per tool call."""
+    import model_store
+
+    monkeypatch.delenv("AGAMI_PROFILE", raising=False)
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setenv("AGAMI_DB_URL", "sqlite://" + str(tmp_path / "m.db"))
+    tools._sole_served_datasource.cache_clear()
+
+    calls = []
+    monkeypatch.setattr(model_store, "list_datasources",
+                        lambda *a, **k: (calls.append(1), ["only"])[1])
+    assert tools.resolve_profile() == "only"
+    assert tools.resolve_profile() == "only"
+    assert len(calls) == 1, f"queried the store {len(calls)} times for a stable answer"
+    tools._sole_served_datasource.cache_clear()

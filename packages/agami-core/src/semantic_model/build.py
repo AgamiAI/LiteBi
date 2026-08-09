@@ -453,9 +453,10 @@ def extract_cross_area_relationships(
         if fa and ta and fa != ta:
             data = r.model_dump(exclude_none=True, by_alias=True)
             data.update(from_subject_area=fa, to_subject_area=ta, executable="same_engine")
-            # No `setdefault("for_questions_about", [])` — it seeded an empty list into every
-            # generated edge and NOTHING ever filled it (see the field's own note on
-            # `Relationship`), so it only spread a dead key into new models on disk.
+            # The `setdefault("for_questions_about", [])` that stood here was already a no-op: the
+            # field defaults to `[]` rather than None, so `exclude_none` keeps it and the dump
+            # always carried it. Dropping the dead key from what gets WRITTEN is `_model_dump`'s
+            # job, not this one — see the exclusion there.
             out.append(CrossSubjectAreaRelationship(**data))
     return out
 
@@ -470,7 +471,18 @@ def _dump(obj: Any) -> str:
 
 
 def _model_dump(model) -> dict:
-    return model.model_dump(exclude_none=True, by_alias=True)
+    """Serialize a model for writing to disk.
+
+    `for_questions_about` is excluded because it is deprecated and inert: nothing populates it and
+    nothing serves it (see the field's note on `Relationship`), so writing it only spreads a dead
+    key into every new model on disk. It defaults to `[]` rather than None, so `exclude_none` does
+    not drop it and the exclusion has to be named. The field stays DECLARED — models already
+    carrying `for_questions_about: []` must keep loading under `extra="forbid"` — so this stops it
+    spreading without breaking anything already written. Pydantic ignores an `exclude` key the
+    model does not have, so the one call site serves every model type here.
+    """
+    return model.model_dump(exclude_none=True, by_alias=True,
+                            exclude={"for_questions_about"})
 
 
 @dataclass

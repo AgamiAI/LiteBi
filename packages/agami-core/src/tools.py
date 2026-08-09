@@ -224,7 +224,10 @@ def _load_config() -> dict[str, Any]:
     return {}
 
 
-@functools.lru_cache(maxsize=8)
+# Successful resolutions only — see `_sole_served_datasource` for why a failure must not be cached.
+_SOLE_SERVED: dict[str, str] = {}
+
+
 def _sole_served_datasource(org_id: str) -> "str | None":
     """The datasource this deployment serves, when it serves exactly ONE. Else None.
 
@@ -232,14 +235,22 @@ def _sole_served_datasource(org_id: str) -> "str | None":
     datasource an omitted `datasource` argument means; with two there is, and guessing would be
     worse than the refusal — so several (or none) returns None and the caller falls through.
 
-    Memoized per org: this sits under `resolve_profile`, which is on the per-request path, and the
-    alternative is a fresh Store connection per tool call. Models are deployed by `model_deploy`
-    before the server process starts, so the set this reads does not change under a running server.
-    Tests that vary the store must call `.cache_clear()`, as they do for `resolved_org_id`.
+    Memoized per org, because this sits under `resolve_profile` on the per-request path and the
+    alternative is a fresh Store connection per tool call.
+
+    **Only a SUCCESS is memoized.** An `lru_cache` here would also pin the `None` this returns when
+    the store is unreachable — and a container that starts before its database is ready, or takes
+    one blip on its first tool call, would then fall back to the literal 'default' for the life of
+    the process, silently reinstating every symptom this resolution step exists to fix. A negative
+    is cheap to recompute and must stay retryable; a positive cannot change under a running server,
+    since models are deployed by `model_deploy` before the process starts.
 
     Never raises: profile resolution has to produce a name even with the store unreachable, and
     'default' is the answer that was always given when nothing else resolved.
     """
+    hit = _SOLE_SERVED.get(org_id)
+    if hit is not None:
+        return hit
     try:
         from store import Store
 
@@ -254,7 +265,15 @@ def _sole_served_datasource(org_id: str) -> "str | None":
             store.close()
     except Exception:
         return None
-    return served[0] if len(served) == 1 else None
+    if len(served) != 1:
+        return None
+    _SOLE_SERVED[org_id] = served[0]
+    return served[0]
+
+
+# Same name tests already reach for on `resolved_org_id`, so a test that varies the store clears
+# this the same way rather than having to know it is a plain dict.
+_sole_served_datasource.cache_clear = _SOLE_SERVED.clear  # type: ignore[attr-defined]
 
 
 def resolve_profile(explicit: str | None = None) -> str:
