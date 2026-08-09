@@ -158,6 +158,24 @@ def list_datasources(store: Store, org_id: str = DEFAULT_ORG) -> list[str]:
     return [r["datasource"] for r in rows]
 
 
+def model_descriptions(store: Store, org_id: str = DEFAULT_ORG) -> dict[str, str]:
+    """`{datasource: description}` for the org's served datasources, in ONE grouped query.
+
+    `description` is a promoted column on `datasource_model` — written beside the doc at deploy
+    time — so this is a column read, not a JSON decode of the org blob. Same no-N+1 shape as
+    `model_table_counts`, and separate from `list_datasources` so that function's `list[str]`
+    contract (the admin model view reads it) is unchanged.
+
+    A datasource whose model declares no description simply won't appear in the map; the caller
+    leaves the field off rather than sending an empty string, which would read as "described as
+    nothing" instead of "not described".
+    """
+    rows = store.query(
+        "SELECT datasource, description FROM datasource_model WHERE org_id = ?", (org_id,)
+    )
+    return {r["datasource"]: r["description"] for r in rows if (r["description"] or "").strip()}
+
+
 def model_table_counts(store: Store, org_id: str = DEFAULT_ORG) -> dict[str, int]:
     """`{datasource: table_count}` for the org's served datasources, in ONE grouped query — so the
     datasource listing sizes itself without a per-datasource round trip (no N+1) and without

@@ -248,9 +248,61 @@ def test_tool_list_datasources_reads_the_served_store(env):
 
     assert [d["datasource"] for d in result["datasources"]] == ["SALES_DATA"]
     entry = result["datasources"][0]
-    assert entry["model_present"] is True
     assert entry["table_count"] >= 1  # ORG seeds `orders` + `products`
     assert "note" not in result  # the "run agami-connect" note must NOT fire when a model is served
+    # No `model_present`: this list is built FROM the model rows, so it could only ever be the
+    # literal True — a constant dressed as a check. It survives on the local path, where it really
+    # does check whether `<profile>/datasource.yaml` exists.
+    assert "model_present" not in entry
+
+
+def test_the_served_listing_carries_the_description_a_router_chooses_on(env):
+    """The tool exists to answer "which datasource does this question touch?", and
+    datasource/database_type/table_count cannot. Without a description an agent had to call
+    get_datasource_schema on every candidate purely to choose — and that is the ~60 KB call."""
+    import json
+
+    import tools
+
+    _seed(env, "SALES_DATA")
+    entry = json.loads(tools.tool_list_datasources({}))["datasources"][0]
+    assert entry["description"] == "Acme Commerce — the deployed model."
+
+
+def test_the_sole_served_datasource_is_the_active_one(env):
+    """`resolve_profile` resolved explicit -> AGAMI_PROFILE -> `.config` -> the literal 'default'.
+    A DB-only deploy never populates `.config`, so a served install with AGAMI_PROFILE unset always
+    landed on 'default' — a profile that does not exist. `active_datasource` then named it beside
+    the real datasource, `is_active` was structurally incapable of being true, and omitting
+    `datasource` (which every tool description says defaults to the active profile) refused."""
+    import json
+
+    import tools
+
+    tools._sole_served_datasource.cache_clear()
+    _seed(env, "SALES_DATA")
+    result = json.loads(tools.tool_list_datasources({}))
+    assert result["active_datasource"] == "SALES_DATA"
+    assert result["datasources"][0]["is_active"] is True
+    assert tools.resolve_profile() == "SALES_DATA"
+    tools._sole_served_datasource.cache_clear()
+
+
+def test_two_served_datasources_leave_the_active_one_unguessed(env):
+    """"Exactly one" is the whole rule. With two models deployed there is no defensible answer to
+    "which did they mean", and guessing would be worse than the refusal an omitted `datasource`
+    already gives."""
+    import json
+
+    import tools
+
+    tools._sole_served_datasource.cache_clear()
+    _seed(env, "SALES_DATA")
+    _seed(env, "FINANCE_DATA")
+    result = json.loads(tools.tool_list_datasources({}))
+    assert result["active_datasource"] == "default"
+    assert not any(d["is_active"] for d in result["datasources"])
+    tools._sole_served_datasource.cache_clear()
 
 
 def test_tool_list_datasources_served_but_empty_gives_a_deploy_hint(env):
@@ -618,3 +670,49 @@ def test_stale_datasource_param_falls_back_to_first(client, env):
     r = client.get("/admin/model?datasource=DOES_NOT_EXIST")
     assert r.status_code == 200
     assert "acme" in r.text and "Subject areas" in r.text
+
+
+def test_a_model_with_no_description_omits_the_key_rather_than_sending_empty(env):
+    """Absent, not "". An empty string reads as "described as nothing"; omitting the key says
+    "this model declares no description", which is the true statement and the one a router can
+    act on."""
+    import json
+
+    import tools
+
+    org = dict(ORG)
+    org.pop("description")
+    s = Store.connect(env)
+    s.run_migrations()
+    model_store.write_datasource(s, "NO_DESC", Datasource.model_validate(org))
+    s.close()
+
+    entry = json.loads(tools.tool_list_datasources({}))["datasources"][0]
+    assert entry["datasource"] == "NO_DESC"
+    assert "description" not in entry
+
+
+def test_no_served_model_leaves_the_profile_unresolved(env):
+    """Zero served datasources is not "one", so the store step contributes nothing and the literal
+    fallback stands. The deploy hint is what should fire here, not a guessed profile."""
+    import json
+
+    import tools
+
+    tools._sole_served_datasource.cache_clear()
+    result = json.loads(tools.tool_list_datasources({}))
+    assert result["datasources"] == []
+    assert tools.resolve_profile() == "default"
+    tools._sole_served_datasource.cache_clear()
+
+
+def test_an_explicit_profile_still_wins_over_the_served_model(env):
+    """The store step is a FALLBACK — it sits below the explicit argument and AGAMI_PROFILE, so it
+    can only ever fill in where nothing else answered. A deployment that names its profile keeps
+    naming it."""
+    import tools
+
+    tools._sole_served_datasource.cache_clear()
+    _seed(env, "SALES_DATA")
+    assert tools.resolve_profile("CHOSEN") == "CHOSEN"
+    tools._sole_served_datasource.cache_clear()

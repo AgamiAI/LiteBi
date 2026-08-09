@@ -66,3 +66,35 @@ def test_db_type_label_covers_advertised_databases():
     }
     for url, expected in cases.items():
         assert tools._db_type_for("p", {"p": {"url": url}}) == expected, url
+
+
+def test_every_argument_a_handler_reads_is_declared_on_its_own_schema():
+    """A parameter the handler consumes but the schema does not advertise is unreachable.
+
+    Every tool sets `additionalProperties: false`, so a client sending an undeclared key is
+    REJECTED and a client omitting it gets None — the branch behind it can never run. That is not
+    theoretical: `get_prompt_examples` passed `area=args.get("area")` into `select_examples`, which
+    implements area scoping correctly (`area = ? OR area IS NULL` — the area plus the cross-area
+    bucket), and `area` was missing from the schema. A finished, correct feature, dead on every
+    call, and invisible to CI because nothing compared the two halves.
+
+    Reads the handler's own source rather than a hand-kept list, so a parameter added to a handler
+    without its schema entry fails here on the next run instead of shipping unreachable.
+    """
+    import inspect
+    import re
+
+    # `args.get("x")` / `args.get('x', default)` — the one way these handlers read their input.
+    reads = re.compile(r"""\bargs\.get\(\s*["']([a-z_][a-z0-9_]*)["']""")
+    for name, meta in tools.TOOLS.items():
+        try:
+            src = inspect.getsource(meta["handler"])
+        except (OSError, TypeError):  # a consumer-registered handler with no readable source
+            continue
+        declared = set(meta["inputSchema"].get("properties", {}))
+        undeclared = sorted(set(reads.findall(src)) - declared)
+        assert not undeclared, (
+            f"{name} reads {undeclared} but does not declare it; "
+            f"additionalProperties is {meta['inputSchema'].get('additionalProperties')!r}, "
+            "so no client can send it"
+        )
