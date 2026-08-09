@@ -1318,7 +1318,15 @@ def tool_get_prompt_examples(args: dict[str, Any]) -> str:
     # deployment and silently ignore it on a local one — the same schema, two behaviours. The
     # served query is `area = ? OR area IS NULL`, i.e. that area PLUS the cross-area bucket; on
     # disk the bucket has no directory to live in, so the named area alone is the whole of it.
-    wanted = (args.get("area") or "").strip()
+    _area = args.get("area")
+    # `isinstance` rather than a bare truthiness test: `(x or "").strip()` raises on any TRUTHY
+    # non-string (`True`, `1`), and this handler is reachable outside a schema-validating
+    # transport — tests and embedders call it directly. Before `area` was honoured here the local
+    # path ignored it entirely and could not crash on it, so guarding is keeping a promise this
+    # function already made rather than hardening it. A non-string is treated as no scope, which
+    # is what the caller got before, rather than being refused: this path returns the curated
+    # library and has no vocabulary for an input error.
+    wanted = _area.strip() if isinstance(_area, str) else ""
     blocks: list[str] = []
     if ex_dir.is_dir():
         for ex_file in sorted(ex_dir.glob("*/examples.yaml")):

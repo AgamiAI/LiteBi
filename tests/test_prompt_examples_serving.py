@@ -132,3 +132,23 @@ def test_an_area_with_no_examples_on_disk_gives_the_empty_note(local_library):
         {"datasource": local_library, "area": "nonexistent"}))
     assert out["examples"] == []
     assert "prompt_examples" in out["note"]
+
+
+@pytest.mark.parametrize("bad", [True, 1, 0, [], {}, 3.5])
+def test_a_non_string_area_does_not_crash_the_local_path(local_library, bad):
+    """`(x or "").strip()` raises on any TRUTHY non-string, and this handler is reachable outside
+    a schema-validating transport — tests and embedders call it directly.
+
+    It is a regression risk specific to this change: before `area` was honoured on the local path
+    the argument was ignored entirely, so no input could crash it. Treated as "no scope" rather
+    than refused — this path returns the curated library and has no vocabulary for an input error.
+    """
+    out = tools.tool_get_prompt_examples({"datasource": local_library, "area": bad})
+    assert "subject area: sales" in out and "subject area: assets" in out
+
+
+def test_a_whitespace_only_area_is_no_scope_not_an_empty_scope(local_library):
+    """`"  "` is not the name of an area. Stripping to empty must read as "no scope given",
+    not as "an area named nothing", which would match no directory and return the empty note."""
+    out = tools.tool_get_prompt_examples({"datasource": local_library, "area": "   "})
+    assert "subject area: sales" in out and "subject area: assets" in out
