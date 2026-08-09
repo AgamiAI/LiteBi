@@ -251,6 +251,25 @@ def _sole_served_datasource(org_id: str) -> "str | None":
     hit = _SOLE_SERVED.get(org_id)
     if hit is not None:
         return hit
+    served = _served_datasources(org_id)
+    if served is None or len(served) != 1:
+        return None
+    _SOLE_SERVED[org_id] = served[0]
+    return served[0]
+
+
+def _served_datasources(org_id: str) -> "list[str] | None":
+    """Every datasource this deployment serves, or None when the store cannot answer.
+
+    None and `[]` are deliberately different. `[]` means "asked, and this org has none"; None means
+    "could not ask" — an unreachable store, or a local install with no store at all. Only the second
+    is a reason to stay silent about the choices, and a caller that conflates them tells a customer
+    they have no datasources when the truth is that we could not look.
+
+    Not memoized here. The one hot caller, `_sole_served_datasource`, keeps its own positive-only
+    cache for the reason its docstring gives; the other caller runs on a path that has already
+    failed to resolve a model, where one query is not the cost that matters.
+    """
     try:
         from store import Store
 
@@ -260,15 +279,45 @@ def _sole_served_datasource(org_id: str) -> "str | None":
         try:
             from model_store import list_datasources
 
-            served = [ds for ds in list_datasources(store, org_id=org_id) if ds]
+            return [ds for ds in list_datasources(store, org_id=org_id) if ds]
         finally:
             store.close()
     except Exception:
         return None
-    if len(served) != 1:
+
+
+def _choose_datasource_error(org_id: str) -> "str | None":
+    """The refusal for an omitted `datasource` that resolved to nothing — naming the real choices.
+
+    Returns None when the store cannot answer, so the caller keeps whatever message it already had:
+    a guess about the customer's datasources is exactly what this function exists to stop.
+    """
+    served = _served_datasources(org_id)
+    if served is None:
         return None
-    _SOLE_SERVED[org_id] = served[0]
-    return served[0]
+    if not served:
+        return json.dumps(
+            {
+                "error": {
+                    "kind": "not_found",
+                    "remediation": "no datasources are deployed for this organization.",
+                }
+            },
+            indent=2,
+        )
+    return json.dumps(
+        {
+            "error": {
+                "kind": "datasource_required",
+                "datasources": served,
+                "remediation": (
+                    "name one of this organization's datasources in `datasource`: "
+                    + ", ".join(served)
+                ),
+            }
+        },
+        indent=2,
+    )
 
 
 # Same name tests already reach for on `resolved_org_id`, so a test that varies the store clears
@@ -1182,6 +1231,15 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
     try:
         org = get_cached_org(profile)
     except FileNotFoundError as e:
+        # An omission and a typo deserve different answers. A caller who NAMED a datasource wants to
+        # hear that that name is wrong; a caller who named none has not made a mistake yet — they are
+        # mid-decision, and the useful reply is the list they were choosing from. Without this split
+        # both arrived as "no such datasource: default", which reads to an administrator like the
+        # customer's data has gone missing, and to a model like a reason to invent another name.
+        if args.get("datasource") is None:
+            choose = _choose_datasource_error(_current_org_id())
+            if choose is not None:
+                return choose
         return json.dumps({"error": {"kind": "not_found", "remediation": str(e)}}, indent=2)
     except ImportError:
         return json.dumps(
@@ -2439,7 +2497,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "datasource": {
                     "type": "string",
-                    "description": "Profile name; defaults to the active profile.",
+                    "description": (
+                        "Datasource name — call list_datasources first if you do not know it. "
+                        "Omitting it resolves to the active profile locally, or to the sole "
+                        "served datasource; where several are served there is no default."
+                    ),
                 },
                 "mode": {
                     "type": "string",
@@ -2479,7 +2541,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "datasource": {
                     "type": "string",
-                    "description": "Profile name; defaults to the active profile.",
+                    "description": (
+                        "Datasource name — call list_datasources first if you do not know it. "
+                        "Omitting it resolves to the active profile locally, or to the sole "
+                        "served datasource; where several are served there is no default."
+                    ),
                 },
                 "query": {
                     "type": "string",
@@ -2537,7 +2603,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "sql": {"type": "string", "description": "One SELECT or WITH...SELECT statement."},
                 "datasource": {
                     "type": "string",
-                    "description": "Profile name; defaults to the active profile.",
+                    "description": (
+                        "Datasource name — call list_datasources first if you do not know it. "
+                        "Omitting it resolves to the active profile locally, or to the sole "
+                        "served datasource; where several are served there is no default."
+                    ),
                 },
                 "area": {
                     "type": "string",
