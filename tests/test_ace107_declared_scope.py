@@ -437,3 +437,75 @@ def test_a_selector_naming_something_out_of_scope_does_not_widen_the_scope(profi
     h = _head(profile, dataset_names=["orders"], metric_names=["headcount"])
     assert "headcount" not in h["metric_index"]
     assert all(m["name"] != "headcount" for m in h["metrics"])
+
+
+# --- scope RESOLUTION edge cases ----------------------------------------------------------------
+#
+# Coverage said the resolver was fully exercised; these are the CASES behind those lines, which is
+# a different question. The parameter-interaction defects were invisible to line coverage too.
+
+
+def test_several_tables_union_their_metrics(profile):
+    """Naming two tables is one scope, not two calls: the metrics of both, deduped."""
+    got = set(_head(profile, dataset_names=["orders", "returns"])["metric_index"])
+    assert got == {"order_count", "return_rate", "sales_health"} | CROSS_AREA
+
+
+def test_tables_from_different_areas_union_across_both(profile):
+    """A scope may span areas. `sales_health` (un-sourced, sales) and `headcount` (people) are
+    both in scope because a table from each area is."""
+    got = set(_head(profile, dataset_names=["orders", "users"])["metric_index"])
+    assert got == {"order_count", "sales_health", "headcount"} | CROSS_AREA
+
+
+def test_a_schema_qualified_table_name_resolves_to_the_same_scope(profile):
+    """The caller may pass `public.orders`; the model keys on bare names. Same fold as
+    `source_tables`, and the same reason: two spellings of one table must not disagree."""
+    assert (_head(profile, dataset_names=["public.orders"])["metric_index"]
+            == _head(profile, dataset_names=["orders"])["metric_index"])
+
+
+def test_an_empty_dataset_names_is_not_a_declaration(profile):
+    """`[]` declares nothing, so it must not resolve to an empty table scope — which would be a
+    scope containing no metrics at all, i.e. everything hidden."""
+    h = _head(profile, dataset_names=[])
+    assert h["scope"]["level"] == "datasource"
+    assert set(h["metric_index"]) == ALL_METRICS
+
+
+def test_a_blank_area_is_not_a_declaration(profile):
+    """Whitespace is not an area name. Treating `"   "` as declared would fail validation and
+    refuse a call the caller meant as unscoped."""
+    h = _head(profile, area="   ")
+    assert h["scope"] == {"level": "datasource", "area": None, "tables": []}
+    assert set(h["metric_index"]) == ALL_METRICS
+
+
+def test_an_explicit_mode_is_honoured_within_a_scope(profile):
+    """Scope and verbosity are independent dials: `area` picks WHAT, `mode` picks HOW MUCH. An
+    explicit mode must survive the scope-aware `auto` sizing."""
+    h = _head(profile, area=SALES, mode="index")
+    assert h["mode"] == "index"
+    assert h["subject_areas"][0]["table_count"] == 2 and "tables" not in h["subject_areas"][0]
+    assert set(h["metric_index"]) == {"order_count", "return_rate", "sales_health"} | CROSS_AREA
+
+
+def test_area_validation_accepts_a_table_the_area_only_REFERENCES(tmp_path, monkeypatch):
+    """`area` + `dataset_names` validates membership, and membership includes a `TableRef`.
+
+    Requiring the table be DEFINED in the area would reject the shared-dimension case the model
+    supports on purpose — the same shape that produced the metric hide the review panel found.
+    """
+    import yaml
+
+    art = tmp_path / "art"
+    root = art / "acme"
+    _write_model(root)
+    sa = root / "subject_areas" / SALES / "subject_area.yaml"
+    doc = yaml.safe_load(sa.read_text())
+    doc["tables"].append({"storage_connection": "c", "schema": "public", "table": "users"})
+    sa.write_text(yaml.safe_dump(doc))
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
+
+    h = _head("acme", area=SALES, dataset_names=["users"])
+    assert h["scope"] == {"level": "table", "area": SALES, "tables": ["users"]}

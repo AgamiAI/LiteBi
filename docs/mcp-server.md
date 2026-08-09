@@ -25,7 +25,7 @@ Four tools, mirroring the hosted connector so the client experience is identical
 | Tool | What it does |
 |---|---|
 | `list_datasources` | Enumerate local profiles (credential sections) and whether each has a model. |
-| `get_datasource_schema` | Return the semantic model: the subject-area index, full per-table detail for requested `dataset_names`, plus `datasource.md` / `USER_MEMORY.md`. |
+| `get_datasource_schema` | Return the semantic model **within the scope you declare** — nothing in that scope is hidden. `area` narrows to one subject area; `dataset_names` narrows to those tables and returns their columns, **their joins**, and the metrics that apply to them. Neither → the whole datasource. `query`/`metric_names` rank and select detail, they do not scope. Plus `datasource.md` / `USER_MEMORY.md`. |
 | `get_prompt_examples` | Return the curated `examples.yaml` few-shot library. |
 | `execute_sql` | Run **one read-only** `SELECT` / `WITH...SELECT` locally and return `{columns, rows, row_count, ...}`. DML/DDL/multi-statement are rejected. |
 

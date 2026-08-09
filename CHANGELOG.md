@@ -12,6 +12,25 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- `get_datasource_schema` answers **within the scope the caller declares**, and the never-hide
+  guarantee is now stated relative to that scope: within it, nothing is hidden — the scope's own
+  metrics plus the cross-area bucket. A new `area` parameter narrows to one subject area
+  (completing the set `execute_sql` and `get_prompt_examples` already had); `dataset_names`
+  narrows to those tables. `query` and `metric_names` rank and select detail and do **not** scope,
+  because narrowing on something the caller never declared is silent deprivation. The response
+  echoes the `scope` it resolved.
+- The appended domain context no longer repeats the subject-area listing that the same response
+  already carries as structured `subject_areas`.
+
+### Fixed
+
+- A table-scoped `get_datasource_schema` call returned columns and **no way to join them**. It had
+  resolved the relationships and metrics for those tables and discarded them, while the tool's own
+  description promised both. It now returns them, with each metric carrying the binding for the
+  deployment's engine — so one call carries the columns, the joins and the declared expression.
+
 ## [0.6.1] — 2026-08-08
 
 ### Fixed
