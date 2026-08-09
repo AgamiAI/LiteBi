@@ -1081,8 +1081,7 @@ def _large_tables(org) -> dict[str, int]:
     return out
 
 
-def _table_contexts(org, table_names: list[str], L, index=None, area: "str | None" = None
-                    ) -> dict[str, Any]:
+def _table_contexts(org, table_names: list[str], L, index=None) -> dict[str, Any]:
     """Full get_table_context for the named tables: `{"tables": {name: ctx}, "relationships": [...]}`.
 
     `index` (from L.build_table_index) resolves tables in O(1) instead of a per-table linear scan
@@ -1095,15 +1094,17 @@ def _table_contexts(org, table_names: list[str], L, index=None, area: "str | Non
     re-projects the in-scope set through `_metric_full`, because the loader's raw dump carries
     every dialect's binding and this surface sends one.
 
-    `area` narrows the lookup when the caller declared one, which is what disambiguates a table
-    name defined in two areas.
+    Each table is resolved in ITS OWN owning area (`area_of`). A declared `area` deliberately does
+    not override that: forcing a named table into the declared area returns "not found in scope"
+    for any table outside it, while its metrics stay advertised — a silent hide.
     """
     area_of = {t.name: sa.name for sa in org.subject_areas for t in sa.tables_defined}
     by_area: dict[str | None, list[str]] = {}
     for t in table_names:
-        by_area.setdefault(area or area_of.get(t), []).append(t)
+        by_area.setdefault(area_of.get(t), []).append(t)
     contexts: dict[str, Any] = {}
     relationships: list[Any] = []
+    seen: set[tuple] = set()
     for grp_area, tbls in by_area.items():
         ctx = L.get_table_context(
             org,
@@ -1113,15 +1114,30 @@ def _table_contexts(org, table_names: list[str], L, index=None, area: "str | Non
             index=index,
         )
         contexts.update(ctx.get("tables", {}))
-        relationships.extend(ctx.get("relationships", []))
+        for rel in ctx.get("relationships", []):
+            # `_relationships_among` returns a cross-area edge for EITHER endpoint, so an edge
+            # whose two tables land in different area groups arrives once per group. Dedupe on the
+            # endpoints rather than the whole dict: two genuinely distinct edges between the same
+            # pair differ by their join columns, which are part of the key.
+            key = (rel.get("from_table"), rel.get("to_table"),
+                   rel.get("from_column"), rel.get("to_column"), rel.get("on"))
+            if key not in seen:
+                seen.add(key)
+                relationships.append(rel)
     return {"tables": contexts, "relationships": relationships}
 
 
 def _bare_name(name: str) -> str:
-    """A table name with any schema qualifier stripped — the fold the model's own
-    `bare_name` applies, restated here so the schema payload does not import the model
-    package at module scope."""
-    return (name or "").split(".")[-1]
+    """A table name with any schema qualifier stripped.
+
+    Delegates to the model's `bare_name`, which documents itself as the single source of truth so
+    the several places that strip the prefix stay in lockstep — a second copy of a fold rule is
+    how two halves of one comparison come to disagree. Imported lazily, as this module does for
+    every other `semantic_model` symbol.
+    """
+    from semantic_model.models import bare_name
+
+    return bare_name(name or "")
 
 
 class Scope(NamedTuple):
@@ -1148,7 +1164,7 @@ def _resolve_scope(args: dict[str, Any]) -> Scope:
     """
     area = args.get("area")
     area = area.strip() if isinstance(area, str) and area.strip() else None
-    tables = tuple(str(n).split(".")[-1] for n in (args.get("dataset_names") or []))
+    tables = tuple(_bare_name(str(n)) for n in (args.get("dataset_names") or []))
     if tables:
         return Scope("table", area, tables)
     if area:
@@ -1197,22 +1213,38 @@ def _scoped_metrics(
 
 
 def _areas_owning(org, tables: set[str]) -> set[str]:
-    """The subject areas that DEFINE any of `tables` (a table is defined in exactly one area)."""
-    return {
-        sa.name
-        for sa in org.subject_areas
-        for t in sa.tables_defined
-        if _bare_name(t.name) in tables
-    }
+    """Every subject area that can query any of `tables`.
+
+    A table is DEFINED in exactly one area but may be REFERENCED by others through a `TableRef` —
+    a shared dimension belongs to whoever needs it. `loader._find_table` and
+    `get_subject_area_bundle` both implement that fallback, and it matters here: the
+    "an undeclared `source_tables` cannot exclude" rule has to fire for every area that can query
+    the table. Reading only `tables_defined` drops a referencing area's un-sourced metric, which is
+    a hide inside the declared scope.
+    """
+    out: set[str] = set()
+    for sa in org.subject_areas:
+        defines = any(_bare_name(t.name) in tables for t in sa.tables_defined)
+        refers = any(_bare_name(getattr(ref, "table", "")) in tables for ref in sa.tables)
+        if defines or refers:
+            out.add(sa.name)
+    return out
 
 
 def _schema_payload(
     org, profile: str, mode: str, matched: list[str], metrics: dict[str, tuple[Any, str | None]], L,
     scope: Scope, index=None,
 ) -> dict[str, Any]:
-    """Build the structured schema payload at the given verbosity. `metric_index` + `large_tables`
-    are always present (the never-hide net); `metrics` carries FULL detail for the matched set, or
-    every metric in `full` with no query."""
+    """Build the structured schema payload at the given verbosity, WITHIN `scope`.
+
+    `metric_index` + `large_tables` are always present — the never-hide net, now stated relative to
+    the declared scope: every metric IN SCOPE is listed, whatever the verbosity. `metrics` carries
+    FULL detail for the matched set, or every in-scope metric in `full` with no query.
+
+    Only the datasource and area tiers reach this function; the table tier builds its own payload
+    (it emits no `subject_areas`, and its `relationships` block answers the join question better
+    than the org-level edge list).
+    """
     result: dict[str, Any] = {
         "datasource": profile,
         "organization": org.description or None,
@@ -1286,13 +1318,18 @@ def _schema_payload(
 def tool_get_datasource_schema(args: dict[str, Any]) -> str:
     """Return the semantic model for a datasource, **sized to fit the client's context**.
 
-    `mode="auto"` (default) picks verbosity by subject-area count (full <=12, summary <=50, index
-    51+); a hard ~60K-char budget then downgrades one rung at a time (full→summary→index) even for
-    an explicit `mode="full"`, setting `truncated=true`. `dataset_names=[...]` returns full
-    `get_table_context` for the named tables (an explicit scope is respected — no downgrade).
-    `query="<question>"` lexically ranks metrics so the client never ingests the whole catalog;
-    `metric_index` (name->description for EVERY metric) + `large_tables` are always present.
-    Plus datasource.md / USER_MEMORY.md domain context.
+    **Scope is what the caller DECLARES**, and nothing inside it is hidden. `area="<name>"` narrows
+    to one subject area; `dataset_names=[...]` narrows to those tables and returns their columns,
+    their JOINS and the metrics that apply to them (an explicit scope is respected — no downgrade).
+    Give neither and the scope is the whole datasource. The cross-area metric bucket belongs to no
+    area, so it is in scope at every tier. `query` and `metric_names` do NOT scope — they rank and
+    select which metrics come back in full detail. The response echoes the `scope` it resolved.
+
+    `mode="auto"` (default) picks verbosity by the IN-SCOPE subject-area count (full <=12, summary
+    <=50, index 51+); a hard ~60K-char budget then downgrades one rung at a time
+    (full→summary→index) even for an explicit `mode="full"`, setting `truncated=true`.
+    `metric_index` (name->description for every metric in scope) + `large_tables` are always
+    present. Plus datasource.md / USER_MEMORY.md domain context.
     """
     profile = resolve_profile(args.get("datasource"))
     try:
@@ -1315,6 +1352,15 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
 
     requested_mode = (args.get("mode") or "auto").lower()
     scope = _resolve_scope(args)
+    if scope.area and not any(sa.name == scope.area for sa in org.subject_areas):
+        # Fail loudly. "Nothing in your scope is hidden" is vacuously true of a scope that does not
+        # exist, and an empty model reads to an agent as "this datasource has none" — after which
+        # it invents table names. Every neighbouring surface names the miss: `get_table_context`
+        # returns `{"error": "not found in scope"}` per table, `get_subject_area_bundle` raises.
+        known = ", ".join(sorted(sa.name for sa in org.subject_areas))
+        return json.dumps({"error": {"kind": "not_found", "remediation":
+                          f"No subject area named {scope.area!r} in {profile!r}. "
+                          f"Known areas: {known}."}}, indent=2)
     # Never-hide, within the scope the caller DECLARED. `metric_index` and the full `metrics`
     # block are both projected from this one set, so they cannot disagree about what is in scope.
     metrics = _scoped_metrics(org, _all_metrics(org), scope)
@@ -1324,8 +1370,7 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
         # Explicit table scope — full detail for the named tables, no budget downgrade. Build the
         # O(1) name→table index so this resolves each table by lookup, not a per-table rescan
         # (scalability-audit finding P12).
-        ctx = _table_contexts(org, list(scope.tables), L, index=L.build_table_index(org),
-                              area=scope.area)
+        ctx = _table_contexts(org, list(scope.tables), L, index=L.build_table_index(org))
         result: dict[str, Any] = {
             "datasource": profile,
             "organization": org.description or None,
@@ -1350,9 +1395,14 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
     else:
         explicit = [n for n in (args.get("metric_names") or []) if n in metrics]
         matched = list(dict.fromkeys(explicit + _match_metrics(args.get("query"), metrics)))
-        mode = (
-            _auto_mode_for(len(org.subject_areas)) if requested_mode == "auto" else requested_mode
+        # Sized by the areas IN SCOPE, not by the whole datasource. The ladder and the budget are
+        # unchanged (both out of this spec's scope); what changes is the count fed to the selector,
+        # because a one-area response on a sixty-area model is a small payload and starting it at
+        # `index` — which lists no tables at all — narrows the content while defeating the point.
+        in_scope_areas = sum(
+            1 for sa in org.subject_areas if scope.level == "datasource" or sa.name == scope.area
         )
+        mode = _auto_mode_for(in_scope_areas) if requested_mode == "auto" else requested_mode
         if mode not in _SCHEMA_MODE_DOWNGRADE:
             mode = "summary"
         # Only full mode assembles the per-table `tables` block (the sole index consumer), and the
@@ -1406,11 +1456,12 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
         [org],
         company_narrative=company_md,
         source_narratives=[org_md_raw],
-        # The JSON above already carries the areas, structured, in `subject_areas` — on the tiers
-        # that emit it. Rendering them again as prose repeats a block the reader has in hand. The
-        # narrative, glossary, coded-value legends and counts still render: they are the parts
-        # that can change an answer and they are duplicated nowhere.
-        with_area_list=False,
+        # Suppressed only where the JSON above actually carries the areas. The justification is
+        # "the reader already has this block", so it has to be conditioned on the reader having
+        # it: the table tier emits no `subject_areas`, and dropping the prose there too would
+        # remove the listing from both surfaces at once. The narrative, glossary, coded-value
+        # legends and counts always render — they can change an answer and are duplicated nowhere.
+        with_area_list="subject_areas" not in result,
     )
     if domain_context:
         parts.append(f"\n## Domain context\n{domain_context}")

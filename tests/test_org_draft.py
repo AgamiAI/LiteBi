@@ -153,3 +153,45 @@ def test_explorer_org_md_is_human_only_derived_is_a_separate_field(tmp_path):
     m3 = build_manifest(tmp_path, "acme")
     assert m3["datasource_md"] == "# About\nWe are a lending startup."
     assert "Subject areas" in m3["derived_context_md"]
+
+
+def test_derived_context_can_exclude_the_subject_area_listing(tmp_path):
+    """`with_area_list=False` drops the `### Subject areas` block and nothing else.
+
+    `get_datasource_schema` carries the areas as STRUCTURED `subject_areas` in the very same
+    response, so rendering them again as prose repeats a block the reader already has. Same
+    reasoning as `with_curated_glossary=False`, which the explorer uses because it presents the
+    glossary as an editable panel instead.
+
+    The counts, the conventions and the glossary must survive — they change an answer and are
+    duplicated nowhere. Only the listing goes.
+    """
+    from semantic_model import org_draft
+    from semantic_model.loader import load_datasource
+
+    _model(tmp_path)
+    org = load_datasource(tmp_path)
+    full = org_draft.derived_context(org)
+    trimmed = org_draft.derived_context(org, with_area_list=False)
+    assert "### Subject areas" in full and "orders & customers" in full
+    assert "### Subject areas" not in trimmed
+    assert "orders & customers" not in trimmed, "the per-area descriptions go with the listing"
+    # Everything the JSON does NOT duplicate stays.
+    assert "**acme** — 1 table across 1 subject area" in trimmed
+    assert "1 metric and 1 entity are defined" in trimmed
+    assert "### Conventions" in trimmed and "INR" in trimmed
+
+
+def test_the_area_list_flag_threads_through_both_composition_paths(tmp_path):
+    """It has to reach `derived_context` on the two-level path AND on the no-record fallback, or
+    the dedup silently does not apply to a deployment that has no org record."""
+    from semantic_model import org_draft
+    from semantic_model.loader import load_datasource
+
+    _model(tmp_path)
+    org = load_datasource(tmp_path)
+    assert "### Subject areas" not in org_draft.compose_context("", org, with_area_list=False)
+    assert "### Subject areas" in org_draft.compose_context("", org), "default is unchanged"
+    # `org_record=None` is the pre-F15 degradation path.
+    assert "### Subject areas" not in org_draft.compose_org_context(
+        None, [org], with_area_list=False)

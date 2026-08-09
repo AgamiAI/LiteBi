@@ -278,7 +278,93 @@ def test_the_scope_echo_is_a_declared_contract_field(profile):
 # --- A13: the response is materially smaller ---------------------------------------------------
 
 
-def test_a_table_scoped_response_is_smaller_than_an_unscoped_one(profile):
-    """Asserted as strictly-less on a fixture where the in-scope and full sets differ, rather
-    than against an invented percentage."""
+def test_a_table_scoped_response_carries_only_the_in_scope_catalogue(profile):
+    """The size claim, stated as the thing that actually changed.
+
+    A scoped response was ALREADY smaller than an unscoped one before this change — it omitted
+    `subject_areas` and the metric detail block — so comparing two lengths passes on reverted code
+    and measures nothing. What is new is that the metric catalogue itself shrank to the scope, so
+    that is what this asserts: strictly fewer entries, and specifically not the whole model.
+    """
+    scoped = _head(profile, dataset_names=["orders"])["metric_index"]
+    full = _head(profile)["metric_index"]
+    assert set(scoped) < set(full), "the catalogue must be a proper subset, not the whole model"
     assert len(_raw(profile, dataset_names=["orders"])) < len(_raw(profile))
+
+
+# --- findings from the review panel, each with the repro that produced it ------------------------
+
+
+def test_a_referencing_areas_unsourced_metric_is_in_scope_for_a_shared_table(tmp_path, monkeypatch):
+    """A table is DEFINED in one area but may be REFERENCED by others through a `TableRef`.
+
+    Reading only `tables_defined` drops a referencing area's metric that declares no
+    `source_tables` — and by this change's own rule such a metric "might apply to any table in its
+    area". That is a hide inside the declared scope, which is the worst outcome here. Found by the
+    review panel; no fixture in the suite had a shared table, so nothing caught it.
+    """
+    import yaml
+
+    art = tmp_path / "art"
+    root = art / "acme"
+    _write_model(root)
+    # `sales` now REFERENCES people's `users` without defining it.
+    sa = root / "subject_areas" / SALES / "subject_area.yaml"
+    doc = yaml.safe_load(sa.read_text())
+    doc["tables"].append({"storage_connection": "c", "schema": "public", "table": "users"})
+    sa.write_text(yaml.safe_dump(doc))
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
+
+    got = set(_head("acme", dataset_names=["users"])["metric_index"])
+    assert "sales_health" in got, "the referencing area's un-sourced metric was hidden"
+    assert "headcount" in got, "the defining area's metric is still in scope"
+
+
+def test_an_unknown_area_is_an_error_not_an_empty_model(profile):
+    """"Nothing in your scope is hidden" is vacuously true of a scope that does not exist, and an
+    empty model reads to an agent as "this datasource has none" — after which it invents table
+    names. Every neighbouring surface names the miss instead."""
+    out = json.loads(tools.tool_get_datasource_schema({"datasource": profile, "area": "salez"}))
+    assert out["error"]["kind"] == "not_found"
+    assert SALES in out["error"]["remediation"], "say which areas do exist"
+
+
+def test_a_cross_area_edge_is_returned_once_when_the_scope_spans_both_its_areas(profile):
+    """`_relationships_among` returns a cross-area edge for EITHER endpoint, and the tables are
+    resolved one group per area, so an edge spanning the scope arrived once per group."""
+    rels = _head(profile, dataset_names=["orders", "users"])["relationships"]
+    keys = [(r.get("from_table"), r.get("to_table"), r.get("from_column")) for r in rels]
+    assert len(keys) == len(set(keys)), f"duplicate edges: {keys}"
+
+
+def test_area_scope_sizes_verbosity_by_the_areas_in_scope(tmp_path, monkeypatch):
+    """`mode=auto` sized by the whole datasource meant an area-scoped call on a wide model started
+    at the `index` tier — which lists no tables at all — so the scope narrowed the content while
+    defeating the point of asking for it. The ladder and the budget are unchanged; only the count
+    fed to the selector is scope-aware."""
+    import yaml
+
+    art = tmp_path / "art"
+    root = art / "acme"
+    _write_model(root)
+    doc = yaml.safe_load((root / "datasource.yaml").read_text())
+    # Pad past the summary threshold so an unscoped `auto` would land on `index`.
+    for i in range(60):
+        name = f"filler{i}"
+        adir = root / "subject_areas" / name
+        (adir / "tables").mkdir(parents=True)
+        (adir / "tables" / f"f{i}.yaml").write_text(yaml.safe_dump({
+            "name": f"f{i}", "schema": "public", "storage_connection": "c", "grain": ["id"],
+            "description": "filler", "columns": [{"name": "id", "type": "integer",
+                                                  "primary_key": True}]}))
+        (adir / "subject_area.yaml").write_text(yaml.safe_dump({
+            "name": name, "description": "filler area",
+            "tables": [{"storage_connection": "c", "schema": "public", "table": f"f{i}"}]}))
+        doc["subject_areas"].append(f"subject_areas/{name}")
+    (root / "datasource.yaml").write_text(yaml.safe_dump(doc))
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(art))
+
+    assert _head("acme")["mode"] == "index", "unscoped, this model is index-tier"
+    scoped = _head("acme", area=SALES)
+    assert scoped["mode"] == "full", "one area is a small payload — size it that way"
+    assert scoped["subject_areas"][0]["tables"], "the tier that lists tables actually lists them"
