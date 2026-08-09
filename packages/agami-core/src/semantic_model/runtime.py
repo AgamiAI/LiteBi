@@ -2319,13 +2319,24 @@ def _lookup_column(col: "exp.Column", scope: dict[str, str],
 
 
 def _bare_aggregate_column(agg: "exp.AggFunc") -> Optional["exp.Column"]:
-    """The single column an aggregate is applied to, ONLY when the argument is that
-    bare column (optionally DISTINCT). Returns None for composite args like
-    SUM(price * qty) — those can be legitimately additive even if a part isn't."""
-    cols = list(agg.find_all(exp.Column))
-    if len(cols) == 1 and agg.find(exp.Binary) is None:
-        return cols[0]
-    return None
+    """The single column an aggregate is applied to, ONLY when the argument IS that bare
+    column (optionally DISTINCT). Returns None for composite args like SUM(price * qty) —
+    those can be legitimately additive even if a part isn't.
+
+    Reads the aggregate's DIRECT argument. It used to walk the whole subtree
+    (`find_all(exp.Column)`, guarded by `find(exp.Binary) is None`), which reads a column out
+    of a CASE *predicate* and reports it as the summed value: `SUM(CASE WHEN state NOT IN
+    (6,7,8) THEN 1 ELSE 0 END)` returned `state`, and the caller published "SUM(state) is
+    meaningless" about an expression the statement never wrote. The `exp.Binary` guard caught
+    `=` and `IS NULL` by accident and missed `IN`/`BETWEEN`, which are not Binary subclasses —
+    so the same logical query was flagged or cleared on which operator the CASE happened to
+    use. A subtree walk cannot answer "what is being aggregated"; only the argument can."""
+    arg = agg.this
+    if isinstance(arg, exp.Distinct):
+        # DISTINCT holds a LIST — `COUNT(DISTINCT a, b)` aggregates a tuple, not a column.
+        exprs = arg.expressions
+        arg = exprs[0] if len(exprs) == 1 else None
+    return arg if isinstance(arg, exp.Column) else None
 
 
 def _semi_additive_columns(org: Datasource) -> dict[tuple[str, str], "Metric"]:
@@ -5431,12 +5442,24 @@ def _reads_only_visible(oc: OutputColumn, visible: set[str],
 
 
 def _by_binding(candidates: list[MetricCandidate]) -> dict:
-    """Candidates indexed by their reduced binding, first declaration winning a tie.
+    """Candidates indexed by their reduced binding — EVERY candidate declaring it, in declaration
+    order.
 
-    First-wins in candidate order, so two metrics declaring the SAME binding always resolve to the
-    same one and the receipt is identical on every run (REQ-022). Two names for one expression is a
-    model-authoring question and not one this layer decides; picking by iteration order would make
-    the answer depend on a dict's insertion history.
+    This used to keep only the first (`setdefault`). REQ-022 is satisfied either way — it asks for
+    the same receipt on every run for the same statement, and both a stable first-wins pick and a
+    stable `undetermined` deliver that. What first-wins did was answer a question this layer cannot
+    answer: **which of several metrics declaring one expression is the one this column computes.**
+
+    A model that auto-suggests one `*_count` per table declares `COUNT(*)` once per table — dozens
+    of times on a wide model — so `COUNT(*)` resolved to whichever metric happened to sort first,
+    and a receipt could report one table's count as an unrelated table's count metric: `matched`,
+    `approved`, signed off. One authoritative false attribution is worse than none: it is
+    indistinguishable from a true one, on the surface whose whole job is to say which declared
+    metric an answer computes. This is a deliberate contract change, not a REQ-022 conformance fix.
+
+    Carrying the list lets `_match_output_column` discriminate on the tables the statement actually
+    reads, and say `undetermined` when it still cannot. Determinism is unaffected — the order is the
+    candidate order, and a list has no insertion-history ambiguity to resolve.
 
     Candidates whose binding could not be read carry `reduced is None` and are absent here. They are
     still in `candidates`, because whether ANY of them is unread is what decides between `unmatched`
@@ -5445,8 +5468,56 @@ def _by_binding(candidates: list[MetricCandidate]) -> dict:
     out: dict = {}
     for cand in candidates:
         if cand.reduced is not None:
-            out.setdefault(cand.reduced, cand)
+            out.setdefault(cand.reduced, []).append(cand)
     return out
+
+
+def _arm_sources(oc: OutputColumn, memo: dict[int, dict[str, str]]) -> set[str]:
+    """The bare relations this output column's own SELECT reads, folded for comparison.
+
+    Shares `memo` with `_reads_only_visible` — same key, same map, resolved once per arm — so
+    consulting it costs nothing on a statement whose columns already reached that check.
+
+    `_bare` as well as `_tkey`, so this side is normalized identically to the DECLARED side in
+    `_discriminate`. `_tkey` only lowercases; a schema left on either half would make two spellings
+    of one table fail to compare. `_own_alias_map` already returns bare names, so this is belt and
+    braces here — and it is the half that makes the pair provably symmetric.
+    """
+    scope_map = memo.get(id(oc.sel))
+    if scope_map is None:
+        scope_map = memo[id(oc.sel)] = _own_alias_map(oc.sel)
+    return {_tkey(_bare(src)) for src in scope_map.values()}
+
+
+def _discriminate(cands: list[MetricCandidate], sources: set[str]) -> Optional[MetricCandidate]:
+    """The one candidate whose declared `source_tables` fits what the statement reads, or None.
+
+    Only ever consulted when several metrics declare the SAME binding, i.e. when the expression by
+    itself cannot name one. `_strip_qualifiers` names this guard as the thing to add "if a false
+    match shows up" — one has, and unlike when that was written the guard is not inert here: the
+    auto-suggested `*_count` metrics that collide all carry `source_tables`.
+
+    It DISCRIMINATES, it never rejects. A candidate declaring no `source_tables` is not eliminated —
+    the field is optional, and an absent declaration is not evidence against a metric. So the guard
+    can only ever narrow a field that was already ambiguous, and returns None when it cannot narrow
+    it to exactly one. None means `undetermined`, which is the honest answer: `COUNT(*)` over
+    `orders ⋈ customers` is neither the order count nor the customer count, and saying so beats
+    naming either.
+
+    `source_tables` may be SCHEMA-QUALIFIED, so it is normalized with `_bare` before comparison —
+    the rule `loader._metrics_for` has always applied to this same field. `_tkey` alone only
+    lowercases, and a metric declaring `public.orders` would then be invisible to a statement
+    reading `orders`. The consequence is not merely a false `undetermined`: because a candidate
+    declaring nothing is never eliminated, dropping the correctly-declared one leaves the
+    undeclared one standing ALONE, and it gets named — the exact false attribution this guard was
+    added to prevent, reintroduced by a mismatch between the two sides of one comparison.
+    """
+    survivors = [
+        c for c in cands
+        if not c.metric.source_tables
+        or any(_tkey(_bare(s)) in sources for s in c.metric.source_tables)
+    ]
+    return survivors[0] if len(survivors) == 1 else None
 
 
 def _declarations_unread(org: Datasource, storage_type: "str | None",
@@ -5486,8 +5557,9 @@ def _match_output_column(oc: OutputColumn, unread: bool,
     The branch ORDER is the contract, and each rung is a claim the analysis has earned:
 
     1. **A match, if the expressions are equal**, looked up in `by_binding` rather than scanned
-       for. Ties there are resolved first-declaration-wins, so the same statement names the same
-       metric on every run (REQ-022).
+       for. When several metrics declare that one binding the expression cannot name one of them,
+       so the tables the statement reads decide — and when they cannot narrow it to exactly one,
+       the answer is `undetermined`, not a guess (see `_discriminate`).
     2. **`undetermined` when the column sits behind a boundary we do not enter** — see
        `_reads_only_visible`. Asked only AFTER the match, because a column whose expression we DID
        compare successfully has been established regardless of what else is in scope.
@@ -5504,9 +5576,13 @@ def _match_output_column(oc: OutputColumn, unread: bool,
         # `__eq__` — both derive from the node's structure — so the equality this comparison is
         # defined as is exactly what the lookup performs, and 50 output columns against a model
         # declaring hundreds of metrics costs 50 hashes rather than their product.
-        cand = by_binding.get(_reduced_projection(oc.expr, dialect))
-        if cand is not None:
-            return MATCHED, cand
+        cands = by_binding.get(_reduced_projection(oc.expr, dialect))
+        if cands:
+            if len(cands) == 1:
+                return MATCHED, cands[0]
+            # Several metrics declare this one expression, so it does not identify any of them.
+            cand = _discriminate(cands, _arm_sources(oc, memo))
+            return (MATCHED, cand) if cand is not None else (UNDETERMINED, None)
     if not _reads_only_visible(oc, visible, memo):
         return UNDETERMINED, None
     if unread:
