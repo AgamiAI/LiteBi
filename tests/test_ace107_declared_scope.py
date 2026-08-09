@@ -368,3 +368,72 @@ def test_area_scope_sizes_verbosity_by_the_areas_in_scope(tmp_path, monkeypatch)
     scoped = _head("acme", area=SALES)
     assert scoped["mode"] == "full", "one area is a small payload — size it that way"
     assert scoped["subject_areas"][0]["tables"], "the tier that lists tables actually lists them"
+
+
+# --- parameter INTERACTION: two, three and four at once -----------------------------------------
+#
+# Every parameter must mean the same thing in every combination, or mean nothing and say so. A
+# parameter that is accepted, echoed, and then ignored is the defect this whole surface has been
+# cleaned of twice already.
+
+
+def test_area_and_dataset_names_compose_when_they_agree(profile):
+    """The natural pairing: the documented flow picks an area at step 2, then names tables."""
+    h = _head(profile, area=SALES, dataset_names=["orders"])
+    assert h["scope"] == {"level": "table", "area": SALES, "tables": ["orders"]}
+    assert set(h["metric_index"]) == {"order_count", "sales_health"} | CROSS_AREA
+
+
+def test_a_table_outside_the_declared_area_is_a_contradiction_not_a_silent_win(profile):
+    """`area` VALIDATES here, it does not override the per-table lookup.
+
+    Overriding is what an earlier revision did, and it returned "not found in scope" for the table
+    while its metrics stayed advertised. Ignoring it instead makes the scope echo a false
+    statement: it reports an area the response is not scoped to. A pair that cannot both be true
+    is a caller error worth naming.
+    """
+    out = json.loads(tools.tool_get_datasource_schema(
+        {"datasource": profile, "area": PEOPLE, "dataset_names": ["orders"]}))
+    assert out["error"]["kind"] == "not_found"
+    assert "orders" in out["error"]["remediation"] and PEOPLE in out["error"]["remediation"]
+
+
+def test_query_selects_detail_identically_at_every_tier(profile):
+    """`query` narrowed the detail block at datasource and area scope and was silently dropped at
+    table scope — the same argument doing two different things one tier apart, with no signal.
+
+    It narrows DETAIL, never SCOPE: `metric_index` is unchanged in each case below.
+    """
+    for scope_args, expected_index in (
+        ({}, ALL_METRICS),
+        ({"area": SALES}, {"order_count", "return_rate", "sales_health"} | CROSS_AREA),
+        ({"dataset_names": ["orders"]}, {"order_count", "sales_health"} | CROSS_AREA),
+    ):
+        h = _head(profile, query="order count", **scope_args)
+        assert [m["name"] for m in h["metrics"]] == ["order_count"], scope_args
+        assert set(h["metric_index"]) == expected_index, scope_args
+
+
+def test_metric_names_selects_detail_identically_at_every_tier(profile):
+    for scope_args in ({}, {"area": SALES}, {"dataset_names": ["orders"]}):
+        h = _head(profile, metric_names=["order_count"], **scope_args)
+        assert [m["name"] for m in h["metrics"]] == ["order_count"], scope_args
+
+
+def test_all_four_parameters_together(profile):
+    """Scope from the two that declare it, detail from the two that select it. No interaction
+    beyond that, and nothing silently dropped."""
+    h = _head(profile, area=SALES, dataset_names=["orders"],
+              query="order count", metric_names=["sales_health"])
+    assert h["scope"] == {"level": "table", "area": SALES, "tables": ["orders"]}
+    assert set(h["metric_index"]) == {"order_count", "sales_health"} | CROSS_AREA
+    # both selectors contribute, union not override, and both are in scope
+    assert {m["name"] for m in h["metrics"]} == {"sales_health", "order_count"}
+
+
+def test_a_selector_naming_something_out_of_scope_does_not_widen_the_scope(profile):
+    """`metric_names` selects among what is IN SCOPE. Naming an out-of-scope metric must not drag
+    it in — that would let a detail selector silently widen a declared boundary."""
+    h = _head(profile, dataset_names=["orders"], metric_names=["headcount"])
+    assert "headcount" not in h["metric_index"]
+    assert all(m["name"] != "headcount" for m in h["metrics"])

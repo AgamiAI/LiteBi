@@ -1352,6 +1352,26 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
 
     requested_mode = (args.get("mode") or "auto").lower()
     scope = _resolve_scope(args)
+    if scope.level == "table" and scope.area:
+        # `area` + `dataset_names` is a compound declaration: these tables, in that area. It
+        # VALIDATES rather than overriding the per-table lookup — overriding is what returned
+        # "not found in scope" for a table outside the area while its metrics stayed advertised.
+        # A table that is not in the declared area makes the two halves contradict each other, and
+        # answering anyway would echo a scope the response does not have.
+        misplaced = [
+            tbl for tbl in scope.tables
+            if not any(
+                sa.name == scope.area
+                and (any(_bare_name(d.name) == tbl for d in sa.tables_defined)
+                     or any(_bare_name(getattr(r, "table", "")) == tbl for r in sa.tables))
+                for sa in org.subject_areas
+            )
+        ]
+        if misplaced:
+            return json.dumps({"error": {"kind": "not_found", "remediation":
+                              f"Table(s) {', '.join(sorted(misplaced))} are not in subject area "
+                              f"{scope.area!r}. Drop `area` to scope by table alone, or name "
+                              f"tables from that area."}}, indent=2)
     if scope.area and not any(sa.name == scope.area for sa in org.subject_areas):
         # Fail loudly. "Nothing in your scope is hidden" is vacuously true of a scope that does not
         # exist, and an empty model reads to an agent as "this datasource has none" — after which
@@ -1365,6 +1385,14 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
     # block are both projected from this one set, so they cannot disagree about what is in scope.
     metrics = _scoped_metrics(org, _all_metrics(org), scope)
     engine = _engine_of(org)
+
+    # `query` ranks and `metric_names` selects WHICH in-scope metrics come back in full detail.
+    # Resolved once, for every tier: they meant nothing on the table branch before, so the same
+    # argument narrowed the detail block at area scope and was silently dropped one tier down.
+    # Neither narrows the SCOPE — `metric_index` still lists everything in it.
+    explicit = [n for n in (args.get("metric_names") or []) if n in metrics]
+    matched = list(dict.fromkeys(explicit + _match_metrics(args.get("query"), metrics)))
+    selected = matched or list(metrics)
 
     if scope.level == "table":
         # Explicit table scope — full detail for the named tables, no budget downgrade. Build the
@@ -1384,7 +1412,9 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
             # through `_metric_full` rather than shipped raw, because the loader's dump carries the
             # whole per-dialect `bindings` dict and this surface sends one engine's binding.
             "relationships": ctx["relationships"],
-            "metrics": [_metric_full(m, a, engine) for (m, a) in metrics.values()],
+            "metrics": [
+                _metric_full(metrics[n][0], metrics[n][1], engine) for n in selected
+            ],
             "metric_index": {n: (m.description or n) for n, (m, _a) in metrics.items()},
             "large_tables": _large_tables(org),
         }
@@ -1393,8 +1423,6 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
         # `relationships` above answers "how do I join these" better than the org-level edge list,
         # which carries only endpoints.
     else:
-        explicit = [n for n in (args.get("metric_names") or []) if n in metrics]
-        matched = list(dict.fromkeys(explicit + _match_metrics(args.get("query"), metrics)))
         # Sized by the areas IN SCOPE, not by the whole datasource. The ladder and the budget are
         # unchanged (both out of this spec's scope); what changes is the count fed to the selector,
         # because a one-area response on a sixty-area model is a small payload and starting it at
