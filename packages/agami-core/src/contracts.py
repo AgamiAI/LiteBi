@@ -42,9 +42,15 @@ class ListDatasourcesRequest(_Contract):
 
 class SchemaRequest(_Contract):
     datasource: str | None = None
+    # The two DECLARED scopes. Never-hide applies within whichever the caller states: the whole
+    # datasource when neither is given, that area, or those tables.
+    area: str | None = None
     dataset_names: list[str] | None = None
-    query: str | None = None  # ranks metrics; also scopes on the served path
-    metric_names: list[str] | None = None
+    # Ranks which metrics get full detail. Does NOT scope — narrowing on a ranking hint would
+    # deprive a caller who never declared a scope, and the match is lexical, so a poor match would
+    # hide the very metric they could not name.
+    query: str | None = None
+    metric_names: list[str] | None = None  # selects detail; does not scope
     mode: str | None = None  # auto | full | summary | index
 
 
@@ -152,6 +158,10 @@ class DatasourceSchemaResult(_Contract):
     large_tables: dict[str, int] | None = None  # {table: estimated_row_count}
     note: str | None = None
     truncated: bool | None = None
+    # The scope this response was built for: {"level", "area", "tables"}. Declared rather than
+    # ridden in on `extra="allow"` — never-hide is stated relative to a scope, so the scope has to
+    # be part of the contract for the guarantee to be checkable by a consumer.
+    scope: dict[str, Any] | None = None
     # Pass 2 (dataset_names): per-table context + relationships/metrics from get_table_context.
     # Kept loose — these come straight from the loader and carry many provenance fields.
     tables: dict[str, Any] | None = None

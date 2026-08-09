@@ -47,7 +47,8 @@ def _strip_comments(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
-def derived_context(org: "Datasource", *, with_curated_glossary: bool = True) -> str:
+def derived_context(org: "Datasource", *, with_curated_glossary: bool = True,
+                    with_area_list: bool = True) -> str:
     """The model-DERIVED factual context: shape + subject areas + conventions + glossary.
 
     Computed fresh from the structured model every time and NOT persisted into datasource.md
@@ -58,7 +59,13 @@ def derived_context(org: "Datasource", *, with_curated_glossary: bool = True) ->
 
     `with_curated_glossary=False` omits the curated `key_terminology` terms (the enum legends
     still render) — the explorer uses this so it can present the curated glossary as an
-    EDITABLE panel instead, while the rest of this block stays read-only."""
+    EDITABLE panel instead, while the rest of this block stays read-only.
+
+    `with_area_list=False` omits the `### Subject areas` listing for the same class of reason:
+    `get_datasource_schema` carries the areas as STRUCTURED `subject_areas` in the very same
+    response, so rendering them again as prose repeats a block the reader already has. Counts and
+    glossary still render — they are not duplicated anywhere. Both defaults are `True`, so every
+    other consumer is untouched."""
     areas = list(org.subject_areas)
     n_tables = sum(len(sa.tables_defined) for sa in areas)
     n_metrics = sum(len(sa.metrics) for sa in areas) + len(org.cross_subject_area_metrics)
@@ -68,7 +75,7 @@ def derived_context(org: "Datasource", *, with_curated_glossary: bool = True) ->
         f"**{org.datasource}** — {_plural(n_tables, 'table')} across {_plural(len(areas), 'subject area')}.",
         "",
     ]
-    if areas:
+    if areas and with_area_list:
         lines.append("### Subject areas")
         lines.append("")
         for sa in areas[:_MAX_AREAS_LISTED]:
@@ -102,14 +109,14 @@ def derived_context(org: "Datasource", *, with_curated_glossary: bool = True) ->
     return "\n".join(lines).strip()
 
 
-def compose_context(human_md: str, org: "Datasource") -> str:
+def compose_context(human_md: str, org: "Datasource", *, with_area_list: bool = True) -> str:
     """Read-time assembly of the full org context: the human's narrative (HTML comments
     stripped) followed by the model-derived summary under its OWN heading. The two parts stay
     SEPARATE — the human's prose is never mixed with auto content, so nothing can be
     accidentally overwritten. Either part may be empty. Used by the MCP, the query skill, and
     the explorer's Datasource view."""
     human = _strip_comments(human_md)
-    derived = derived_context(org)
+    derived = derived_context(org, with_area_list=with_area_list)
     parts: list[str] = []
     if human:
         parts.append(human)
@@ -153,14 +160,14 @@ def _company_block(record: "OrgRecord", narrative: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _source_block(org: "Datasource", narrative: str) -> str:
+def _source_block(org: "Datasource", narrative: str, *, with_area_list: bool = True) -> str:
     """One datasource's context: its optional source-specific narrative + the model-derived summary,
     under a heading naming the datasource (so a federated answer keeps the vocabularies apart)."""
     seg = [f"## {org.datasource} — datasource context"]
     src = _strip_comments(narrative)
     if src:
         seg.append(src)
-    body = derived_context(org)
+    body = derived_context(org, with_area_list=with_area_list)
     if body:
         seg.append(body)
     return "\n\n".join(seg).strip()
@@ -172,6 +179,7 @@ def compose_org_context(
     *,
     company_narrative: str = "",
     source_narratives: "list[str] | None" = None,
+    with_area_list: bool = True,
 ) -> str:
     """Two-level org context (F15 / ACE-069). Renders the shared COMPANY block ONCE from the ``OrgRecord``
     (name/description + the root ``organization.md`` narrative + display conventions + company glossary),
@@ -192,10 +200,14 @@ def compose_org_context(
 
     if org_record is None:
         # No record: fall back to the pre-F15 single-level assembly, one block per ontology.
-        return "\n\n".join(compose_context(narrs[i], org) for i, org in enumerate(ontologies)).strip()
+        return "\n\n".join(
+            compose_context(narrs[i], org, with_area_list=with_area_list)
+            for i, org in enumerate(ontologies)
+        ).strip()
 
     parts = [_company_block(org_record, company_narrative)]
-    parts += [_source_block(org, narrs[i]) for i, org in enumerate(ontologies)]
+    parts += [_source_block(org, narrs[i], with_area_list=with_area_list)
+              for i, org in enumerate(ontologies)]
     return "\n\n".join(p for p in parts if p).strip()
 
 
