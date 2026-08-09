@@ -16,15 +16,20 @@ below corresponds to one such version.
 
 ### Fixed
 
-- **An omitted `datasource` names the org's real datasources instead of one nobody has.** 0.6.1 removed
-  the invented `'default'` for a deployment serving exactly ONE datasource; serving several, resolution
-  still fell through to that literal and the caller heard `no such datasource: default`. Two audiences
-  read that and both were misled — an administrator sees a name no customer has and concludes their data
-  has gone missing, and a model sees a failed lookup and invents another name, because the tool's own
-  description told it a default existed. Both halves are fixed: the three tool descriptions now say what
-  is true on each install and point at `list_datasources`, and an omitted argument gets the catalogue
-  back (`datasource_required`) while a NAMED one that does not exist is still told so. An empty string
-  counts as omitted, matching `resolve_profile`'s own `if explicit:`. (#218)
+- **An omitted `datasource` names the org's real datasources instead of one nobody has.** #216 (also in
+  this release) removed the invented `'default'` for a deployment serving exactly ONE datasource;
+  serving several, resolution still fell through to that literal and the caller heard
+  `no such datasource: default` — so the one-datasource case and the several-datasource case are fixed
+  together in this release, and nothing in 0.6.1 or earlier ever consulted the store to resolve a
+  profile at all.
+
+  Two audiences read that sentence and both were misled: an administrator sees a name no customer has
+  and concludes their data has gone missing, and a model sees a failed lookup and invents another name,
+  because the tool's own description told it a default existed. So the description is fixed as well as
+  the refusal — all three tools now say what is true on each install and point at `list_datasources`.
+  An omitted argument gets the catalogue back (`datasource_required`); a NAMED one that does not exist
+  is still told so; an empty string counts as omitted, matching `resolve_profile`'s own
+  `if explicit:`. (#218)
 
 - **A CASE predicate is not what a SUM aggregates, and a shared expression names no metric.** (#215)
 
