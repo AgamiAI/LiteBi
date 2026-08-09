@@ -2714,15 +2714,14 @@ TOOLS: dict[str, dict[str, Any]] = {
     "get_datasource_schema": {
         "handler": tool_get_datasource_schema,
         "description": (
-            "Fetch the semantic model for a datasource, sized to fit context. "
-            "SCOPE — nothing in the scope you declare is hidden, and you declare it two ways: "
-            "`area` narrows to one subject area, `dataset_names=[...]` narrows to those tables "
-            "and returns their columns, THEIR JOINS, and the metrics that apply to them. Give "
-            "neither and you get the whole datasource. Cross-area metrics are in scope at every "
-            "level. `query` and `metric_names` do NOT scope — they only pick which metrics come "
-            "back in full detail. `mode=auto` (default) picks verbosity by subject-area count "
-            "(full/summary/index) under a char budget. `metric_index` lists every metric in "
-            "scope; the response echoes the `scope` it resolved. Plus datasource.md / "
+            "Fetch the semantic model for a datasource, sized to fit context. Narrow it two "
+            "ways: `area` to one subject area; `dataset_names=[...]` to those tables, which also "
+            "returns their joins and the metrics that apply to them — so that is the call to "
+            "make before writing SQL. Give neither for the whole datasource. Cross-area metrics "
+            "come back at every level. `query` and `metric_names` pick which metrics come back "
+            "in full detail; they do NOT narrow. `metric_index` lists every metric in the "
+            "current scope, and the response reports that scope. `mode=auto` (default) picks "
+            "verbosity (full/summary/index) under a char budget. Plus datasource.md / "
             "USER_MEMORY.md context. Use metric `calculation`/`bindings` VERBATIM."
         ),
         "inputSchema": {
@@ -2744,8 +2743,8 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "area": {
                     "type": "string",
                     "description": (
-                        "Scope to one subject area. Narrows the model to that area plus the "
-                        "cross-area metrics; nothing in that scope is hidden."
+                        "Scope to one subject area: its tables and metrics, plus the "
+                        "cross-area metrics."
                     ),
                 },
                 "dataset_names": {
