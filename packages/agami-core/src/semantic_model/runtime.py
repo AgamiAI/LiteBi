@@ -5445,15 +5445,17 @@ def _by_binding(candidates: list[MetricCandidate]) -> dict:
     """Candidates indexed by their reduced binding — EVERY candidate declaring it, in declaration
     order.
 
-    This used to keep only the first (`setdefault`), which made two metrics declaring one binding
-    resolve to the same one on every run and called that REQ-022 satisfied. It is not: REQ-022 says
-    two names for one expression is a model-authoring question and *not one this layer decides*, and
-    silently picking the first IS deciding it. A model that auto-suggests one `*_count` per table
-    declares `COUNT(*)` once per table — dozens of times on a wide model — so `COUNT(*)` resolved to
-    whichever metric happened to sort first, and a receipt could report one table's count as an
-    unrelated table's count metric: `matched`, `approved`, signed off. One authoritative false
-    attribution is worse than none — it is indistinguishable from a true one, on the surface whose
-    whole job is to say which declared metric an answer computes.
+    This used to keep only the first (`setdefault`). REQ-022 is satisfied either way — it asks for
+    the same receipt on every run for the same statement, and both a stable first-wins pick and a
+    stable `undetermined` deliver that. What first-wins did was answer a question this layer cannot
+    answer: **which of several metrics declaring one expression is the one this column computes.**
+
+    A model that auto-suggests one `*_count` per table declares `COUNT(*)` once per table — dozens
+    of times on a wide model — so `COUNT(*)` resolved to whichever metric happened to sort first,
+    and a receipt could report one table's count as an unrelated table's count metric: `matched`,
+    `approved`, signed off. One authoritative false attribution is worse than none: it is
+    indistinguishable from a true one, on the surface whose whole job is to say which declared
+    metric an answer computes. This is a deliberate contract change, not a REQ-022 conformance fix.
 
     Carrying the list lets `_match_output_column` discriminate on the tables the statement actually
     reads, and say `undetermined` when it still cannot. Determinism is unaffected — the order is the

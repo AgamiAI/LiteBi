@@ -786,10 +786,11 @@ def test_matching_does_not_scan_every_declared_metric(org):
 def test_two_metrics_declaring_one_binding_name_neither(tmp_path):
     """An expression two metrics both declare does not identify either of them.
 
-    REQ-022 says two names for one expression is a model-authoring question and NOT one this layer
-    decides. Keeping only the first candidate satisfied that in letter — the same one every run —
-    while breaking it in substance, because silently picking one IS deciding it. `undetermined` is
-    the answer that actually declines to decide, and the section already has the word.
+    REQ-022 asks for the same receipt on every run, and both a stable first-wins pick and a stable
+    `undetermined` deliver that — so this is not a REQ-022 fix. It is a deliberate contract change:
+    keeping only the first candidate answered a question this layer cannot answer, namely which of
+    several metrics declaring one expression the column computes. `undetermined` declines to answer
+    it, and the section already has the word.
 
     Not hypothetical: a model auto-suggesting one `*_count` per table declares `COUNT(*)` once per
     table, and on a wide model that made one table's count report as an unrelated table's count
