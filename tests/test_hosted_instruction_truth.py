@@ -59,6 +59,47 @@ def test_the_safety_directives_survive_on_both(monkeypatch):
         assert "receipt" in text
 
 
+def test_the_instructions_name_the_metric_sql_key_the_payload_actually_sends(monkeypatch):
+    """An instruction that says "reuse this field VERBATIM" must name a field that arrives.
+
+    This is the same defect as the one at the top of this file, one layer down: text shipped to a
+    client asserting something the server does not do. Both instruction surfaces said to reuse a
+    metric's `calculation`/**`bindings`** — the MODEL's field name, and the natural thing to write
+    — while `_metric_full` emits **`binding`**, singular, already resolved to this deployment's
+    engine. No payload has ever carried a `bindings` key. An agent told in capitals to reuse a
+    field it never receives hand-rolls the SQL instead, and hand-rolled SQL does not reduce to the
+    declared binding, so the receipt then reads `unmatched` on a column that does compute the
+    metric. A wrong word in the instructions costs a true match on the receipt.
+
+    Derived from `_metric_full` rather than spelled out: rename the key and this fails, instead of
+    the text and the payload drifting apart again in silence.
+    """
+    class _Metric:  # duck-typed on purpose — this pins the payload, not the pydantic model
+        name = "revenue"
+        description = "Closed-won value."
+        calculation = "the value of deals that reached the won stage"
+        other_names: list[str] = []
+        review_state = "approved"
+        bindings = {"PostgreSQL": "SUM(amount) FILTER (WHERE stage = 'won')"}
+
+    emitted = set(tools._metric_full(_Metric(), "sales", "PostgreSQL"))
+    assert emitted & {"binding", "bindings"}, "no metric-SQL key at all — the field is gone"
+
+    surfaces = {
+        "hosted server_instructions": _instructions(monkeypatch, hosted=True),
+        "local server_instructions": _instructions(monkeypatch, hosted=False),
+        "get_datasource_schema description": tools.TOOLS["get_datasource_schema"]["description"],
+    }
+    for where, text in surfaces.items():
+        for candidate in ("binding", "bindings"):
+            named = f"`{candidate}`" in text
+            sent = candidate in emitted
+            assert named == sent, (
+                f"{where} {'names' if named else 'does not name'} `{candidate}`, but the payload "
+                f"{'sends' if sent else 'does not send'} it"
+            )
+
+
 def test_a_local_install_with_no_store_still_resolves_a_profile(monkeypatch, tmp_path):
     """`resolve_profile`'s store step must be inert on a local install. `Store.from_env()` returns
     None with no DB configured, and the fallback that was always there has to stand."""

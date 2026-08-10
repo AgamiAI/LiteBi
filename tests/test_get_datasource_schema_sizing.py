@@ -174,6 +174,11 @@ def test_dataset_names_full_detail_no_downgrade(monkeypatch, tmp_path):
     head = _schema(prof, dataset_names=["t0_0"])
     assert head["mode"] == "full" and "truncated" not in head  # explicit scope respected
     assert "t0_0" in head["tables"]
+    # A declared scope is answered, not merely accepted: the call carries the joins and the
+    # metrics for those tables. Both were resolved and discarded before ACE-107, which left this
+    # call unable to tell a client how to join the tables it had just described.
+    assert "relationships" in head and "metrics" in head
+    assert head["scope"] == {"level": "table", "area": None, "tables": ["t0_0"]}
 
 
 # --- the contract, checked against the REAL payload ------------------------------------------
@@ -188,13 +193,19 @@ def test_dataset_names_full_detail_no_downgrade(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["index", "summary", "full"])
-def test_the_real_payload_validates_against_the_published_contract(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("scope", [{}, {"area": "area0"}, {"dataset_names": ["t0_0"]}],
+                         ids=["datasource", "area", "table"])
+def test_the_real_payload_validates_against_the_published_contract(
+    monkeypatch, tmp_path, mode, scope
+):
+    """Mode x SCOPE TIER, not mode alone. The scope echo and the scoped branch's `relationships` /
+    `metrics` are payload the contract has to describe at every tier it can be produced at."""
     pytest.importorskip("pydantic")
     from contracts import DatasourceSchemaResult
 
     prof = _run(monkeypatch, tmp_path, n_areas=2, tables_per_area=2,
                 metrics={0: ["revenue"], 1: ["churn_rate"]})
-    head = _schema(prof, mode=mode)
+    head = _schema(prof, mode=mode, **scope)
     parsed = DatasourceSchemaResult.model_validate(head)
     # Lossless: every key the tool sent survives the contract. `extra="allow"` would let an
     # undeclared key ride along silently, so compare the round-trip to the payload itself.
