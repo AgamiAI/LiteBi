@@ -30,6 +30,13 @@ below corresponds to one such version.
   resolved the relationships and metrics for those tables and discarded them, while the tool's own
   description promised both. It now returns them, with each metric carrying the binding for the
   deployment's engine — so one call carries the columns, the joins and the declared expression.
+- **The instructions named a metric field the payload does not send.** Both instruction surfaces
+  told the agent to reuse a metric's `calculation`/`bindings` VERBATIM; the payload key is
+  `binding`, singular, already resolved to this deployment's engine. An agent told in capitals to
+  reuse a field it never receives hand-rolls the SQL instead — and hand-rolled SQL does not reduce
+  to the declared binding, so the receipt reads `unmatched` on a column that does compute the
+  metric. The text and the payload are now pinned to each other by a test derived from the
+  projection itself.
 
 ## [0.6.2] — 2026-08-09
 

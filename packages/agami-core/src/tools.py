@@ -116,7 +116,7 @@ _SHARED_INSTRUCTIONS = (
     "metrics; a `dataset_names` call also returns those tables' joins and metrics, so it is what "
     "you need to write the SQL). (2) Examples-first — call get_prompt_examples and mirror the "
     "closest match; use "
-    "metric `calculation`/`bindings` verbatim. (3) execute_sql (the safety pass runs inside it; "
+    "metric `calculation`/`binding` verbatim. (3) execute_sql (the safety pass runs inside it; "
     "a table's declared `default_filters` are NOT applied — write one into the SQL yourself if "
     "the question needs it). (4) Read the returned `receipt`. It is on EVERY status, and it is "
     "five sections — columns, tables, joins, aggregates, assumptions — each `{items, "
@@ -1092,12 +1092,18 @@ def _engine_of(org) -> "str | None":
 def _metric_full(m, area: str | None, engine: "str | None" = None) -> dict[str, Any]:
     """One metric in full, INCLUDING the binding for this deployment's engine.
 
-    The server instructions and this tool's own description both tell the agent to use a metric's
-    `calculation`/`bindings` VERBATIM — and `bindings` was not among the keys this returned, on the
-    very call those instructions describe. So the agent was told, in capitals, to reuse a field it
-    never received, leaving it to hand-roll SQL from the prose `calculation` instead. That also
-    costs the receipt a true match: hand-rolled SQL does not reduce to the declared binding, so the
-    output column reads `unmatched` rather than naming the metric it computes.
+    The server instructions and this tool's own description both tell the agent to reuse a metric's
+    declared SQL VERBATIM — and no such key was among those this returned, on the very call those
+    instructions describe. So the agent was told, in capitals, to reuse a field it never received,
+    leaving it to hand-roll SQL from the prose `calculation` instead. That also costs the receipt a
+    true match: hand-rolled SQL does not reduce to the declared binding, so the output column reads
+    `unmatched` rather than naming the metric it computes.
+
+    The key is `binding`, SINGULAR, and the instruction text has to say the same word. It first
+    shipped saying `bindings` — the MODEL's field name, and the natural thing to write — which
+    names nothing in this payload and is the identical defect one letter over. The two are pinned
+    to each other in `test_hosted_instruction_truth`, derived from this function rather than
+    spelled out, so renaming the key here fails the test rather than silently re-opening the gap.
 
     ONE binding, the one for this engine — not the whole per-dialect dict. The agent is writing for
     a single warehouse, and on an unscoped `full` call `selected` is every metric the model
@@ -1139,9 +1145,10 @@ def _table_contexts(org, table_names: list[str], L, index=None) -> dict[str, Any
     This used to return the `{name: ctx}` map alone, dropping `relationships` on the floor —
     `get_table_context` was asked for them, resolved them, and the result was discarded. That is
     what left a table-scoped `get_datasource_schema` call unable to tell a client how to join the
-    very tables it had just described. `metrics` is still dropped here on purpose: the caller
+    very tables it had just described. `metrics` is deliberately NOT asked for: the caller
     re-projects the in-scope set through `_metric_full`, because the loader's raw dump carries
-    every dialect's binding and this surface sends one.
+    every dialect's binding and this surface sends one. It WAS asked for until review — dropped on
+    return, having made `_metrics_for` walk the model once per area group for a block nobody read.
 
     Each table is resolved in ITS OWN owning area (`area_of`). A declared `area` deliberately does
     not override that: forcing a named table into the declared area returns "not found in scope"
@@ -1159,7 +1166,7 @@ def _table_contexts(org, table_names: list[str], L, index=None) -> dict[str, Any
             org,
             tbls,
             area=grp_area,
-            include=["default_filters", "relationships", "caveats", "value_transforms", "metrics"],
+            include=["default_filters", "relationships", "caveats", "value_transforms"],
             index=index,
         )
         contexts.update(ctx.get("tables", {}))
@@ -1203,7 +1210,16 @@ class Scope(NamedTuple):
 
 
 def _resolve_scope(args: dict[str, Any]) -> Scope:
-    """The scope from what the caller DECLARED — `dataset_names`, else `area`, else nothing.
+    """The scope from what the caller DECLARED.
+
+    `dataset_names` gives table scope; `area` alone gives area scope; neither gives the whole
+    datasource. Given BOTH, the level is `table` and `area` is RETAINED on the Scope rather than
+    discarded — the two are one compound declaration ("these tables, in that area"), which the
+    handler validates: a table outside the named area makes them contradict, and that is a caller
+    error. Keeping it is also what lets the scope echo report what was actually declared instead
+    of quietly dropping half of it. It deliberately does not OVERRIDE each table's own owning
+    area — that was the earlier revision the review panel rejected, because forcing a named table
+    into the declared area hid its columns while its metrics stayed advertised.
 
     `query` and `metric_names` are deliberately not consulted. They rank and select detail; they
     are not declarations. Narrowing on either would silently stop showing a caller the rest of
@@ -2722,7 +2738,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "in full detail; they do NOT narrow. `metric_index` lists every metric in the "
             "current scope, and the response reports that scope. `mode=auto` (default) picks "
             "verbosity (full/summary/index) under a char budget. Plus datasource.md / "
-            "USER_MEMORY.md context. Use metric `calculation`/`bindings` VERBATIM."
+            "USER_MEMORY.md context. Use metric `calculation`/`binding` VERBATIM (`binding` is "
+            "already this deployment's dialect)."
         ),
         "inputSchema": {
             "type": "object",
