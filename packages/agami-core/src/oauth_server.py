@@ -647,6 +647,32 @@ def _grant_refresh_token(store: Store, form: dict[str, str]) -> Response:
     )
 
 
+def revoke_refresh_tokens_for(store: Store, username: str, *, commit: bool = True) -> int:
+    """Revoke every outstanding refresh token a principal holds. Returns how many were live.
+
+    Called when that principal's password is reset by an administrator: whoever was signed in on the
+    old credential should not keep renewing on it, and a reset that left live sessions running would
+    be a reset in name only.
+
+    **It does not end sessions instantly, and the difference matters.** Access tokens are self-
+    contained JWTs — nothing reads this table to validate one — so a session already holding a valid
+    access token keeps working until it expires (`AGAMI_ACCESS_TTL`, an hour by default). What this
+    guarantees is that no NEW access token can be minted from an old refresh token, so the longest a
+    stale session can outlive the reset is one access-token lifetime. Revoking sooner than that would
+    mean checking a table on every request, which is the tradeoff the stateless bearer already made.
+
+    Rows are marked revoked rather than deleted, deliberately: presenting a revoked token is the
+    signal `_grant_refresh_token` reads to detect a stolen-token replay, and a deleted row is
+    indistinguishable from one that never existed.
+    """
+    updated = store.execute(
+        "UPDATE oauth_refresh_token SET revoked = 1 WHERE username = ? AND revoked = 0", (username,)
+    )
+    if commit:
+        store.commit()
+    return updated.rowcount
+
+
 # ---------------------------------------------------------------------------
 # OIDC social login ("Sign in with Google/Microsoft")
 #
