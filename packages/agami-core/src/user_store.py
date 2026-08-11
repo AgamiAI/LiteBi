@@ -12,6 +12,7 @@ hashed/verified via `passwords.py`.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -21,7 +22,13 @@ from passwords import hash_password, needs_rehash, verify_password
 from ports import Principal
 from store import Store
 
-_ACTIVE = "active"
+#: The status a live account holds. **Public, because two modules must agree on it**: `onboarding`
+#: refuses a reset for a switched-off account before drawing the page, and `reset_password`'s WHERE
+#: refuses the write. Those two checks exist deliberately as separate layers, and a copy of this
+#: string in each is exactly how layers drift apart — which is the defect this whole flow was fixed
+#: for once already. `_ACTIVE` stays as the in-module alias so nothing below has to change.
+ACTIVE_STATUS = "active"
+_ACTIVE = ACTIVE_STATUS
 
 # The OIDC provider keys a deploy may pin the admin to. Mirrors `oidc._PROVIDERS`, duplicated here on
 # purpose: `oidc` is the one egress module (httpx), and `user_store` must stay import-light + egress-free.
@@ -125,6 +132,82 @@ def claim_pending_password(store: Store, username: str, password: str) -> int:
     )
     store.commit()
     return cur.rowcount
+
+
+def reset_password(
+    store: Store, username: str, password: str, expected_hash: str, *, commit: bool = True
+) -> int:
+    """Set the password of an account that **already has one** — the administrator-initiated reset.
+
+    Deliberately the opposite of `claim_pending_password` above, which fires only while an account is
+    still pending. This one overwrites a live credential, so every condition that makes that safe is
+    in the WHERE rather than trusted to the caller: a guard a route forgets to apply is a guard that
+    is not there, and this UPDATE is one route away from a public page.
+
+    - `oidc_provider IS NULL` — an SSO identity never grows a password. Without it, a reset would add
+      a second way into an account whose deployment decided there is exactly one, and the person
+      whose password it is would have no idea it existed.
+    - `status = ?` (active) — a reset cannot resurrect a switched-off account. The account being off
+      is the security decision; letting a link undo it silently would make the link the stronger one.
+    - `password_hash = ?` (`expected_hash`) — **this is what actually makes a reset link single-use.**
+      Checking the credential marker in the handler and then writing is check-then-act across two
+      connections: two simultaneous posts of the same link both read the old hash, both pass, and both
+      UPDATE, so whoever commits last owns the account while the other is told they succeeded. As a
+      condition of the UPDATE the loser matches no row, gets 0, and is shown the same invalid page as
+      any other spent link. `claim_pending_password` above is single-use by exactly this shape
+      (`password_hash IS NULL`); this is that argument applied to a credential that already exists.
+
+    `commit=False` leaves the transaction open so the caller can land the revocation of that
+    principal's sessions in the same one — a password that has moved with sessions still renewing on
+    the old one is a reset in name only, and the two must not be separately committable.
+
+    Returns the row count: 0 means refused, and the caller must not report success. It cannot tell
+    you WHICH condition refused, on purpose — the page this is reached from is public and answers
+    every failure identically.
+    """
+    cur = store.execute(
+        "UPDATE users SET password_hash = ? WHERE username = ? AND password_hash = ? "
+        "AND password_hash IS NOT NULL AND oidc_provider IS NULL AND status = ?",
+        (hash_password(password), username, expected_hash, _ACTIVE),
+    )
+    if commit:
+        store.commit()
+    return cur.rowcount
+
+
+def credential_fingerprint(user: dict[str, Any]) -> str:
+    """A short, one-way marker of the credential an account holds right now.
+
+    This is what makes a reset link **single-use**, and it needs its own mechanism because the one
+    that makes a *setup* link single-use does not apply: a setup token dies because claiming flips the
+    account out of pending, and a reset leaves the account exactly as claimed as it was. So the token
+    carries this marker, the claim page re-computes it, and setting a new password changes the stored
+    hash — which retires every link minted against the old one, including the one just used.
+
+    **A hash of the hash, never the hash itself.** A setup link's payload is base64url and readable by
+    whoever holds it (`onboarding`'s module note says so), so putting `password_hash` in a token would
+    hand an argon2 digest to anyone the link is forwarded to. Truncated because this is a change
+    detector, not a credential: it needs to differ when the hash differs, and it is compared only
+    against a value re-derived from the same row.
+
+    Argon2 salts every hash, so re-setting the *same* password still produces a different digest and
+    still retires the old link. `authenticate`'s opportunistic rehash changes the stored hash too, so
+    a cost-parameter bump silently spends outstanding reset links on the owner's next sign-in — which
+    is the safe direction and worth knowing before it looks like a bug.
+
+    **Raises for an account with no password**, rather than fingerprinting the empty string. That
+    fallback would have produced `sha256("")` — one publicly computable constant, identical for every
+    passwordless row in every deployment — so the marker would have been a marker of nothing and the
+    single-use binding would have been vacuous exactly where the account is most exposed. There is no
+    legitimate caller: a reset is for an account that HAS a credential, and a pending one is the setup
+    link's job.
+    """
+    stored = user.get("password_hash")
+    if not stored:
+        raise ValueError(
+            "this account has no password to fingerprint; a reset does not apply to it"
+        )
+    return hashlib.sha256(stored.encode()).hexdigest()[:16]
 
 
 def get_user_by_email(store: Store, email: str) -> dict[str, Any] | None:
