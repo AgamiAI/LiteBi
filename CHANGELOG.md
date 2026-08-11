@@ -42,9 +42,6 @@ below corresponds to one such version.
   `claim_done_html`, which take the purpose.
 - Password hashing on `/claim` runs off the event loop. It is deliberately slow and memory-hard, and
   this is a public endpoint, so hashing inline stalled every other request in flight.
-
-### Changed
-
 - `get_datasource_schema` answers **within the scope the caller declares**, and the never-hide
   guarantee is now stated relative to that scope: within it, nothing is hidden — the scope's own
   metrics plus the cross-area bucket. A new `area` parameter narrows to one subject area
