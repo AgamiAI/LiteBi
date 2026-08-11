@@ -92,6 +92,32 @@ def _isolate_query_log(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_active_profile(tmp_path_factory, monkeypatch):
+    """Keep the developer's own `.config` out of `resolve_profile`.
+
+    Same hazard as `_isolate_query_log` above, on the read side. `tools.CONFIG_PATH` is resolved at
+    import time from the real artifacts dir and only re-resolved by `bootstrap_paths()`, so a test
+    that sets `AGAMI_ARTIFACTS_DIR` to a `tmp_path` does NOT move it — `_load_config()` still reads
+    `~/agami-artifacts/local/.config`. `resolve_profile` consults `.config.active_profile` BEFORE
+    the sole-served-datasource step, so on any machine that has run the CLI, that file's real
+    profile name short-circuits resolution and every test of the store step asserts against it
+    instead of against what the test set up.
+
+    That made the store-step tests pass in CI (no `.config` there) and fail on a contributor's
+    machine — the failure mode a test is least able to explain, since the value it reports comes
+    from a file the test never mentions. Point it at a path that does not exist, which is the state
+    `_load_config()` is written for and the one CI already had; a test that wants a `.config` sets
+    the attribute itself and this fixture is then simply overwritten."""
+    try:
+        import tools
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(tools, "CONFIG_PATH", tmp_path_factory.mktemp("cfg") / ".config")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _restore_raw_logger():
     """`execute_sql.main()` silences `_RAW_LOG` for the lifetime of the process it owns, and a test
     that calls it in-process owns the whole session instead.
