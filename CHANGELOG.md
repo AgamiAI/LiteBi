@@ -12,8 +12,36 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-08-11
+
+### Added
+
+- **An administrator can give a colleague a new password.** The setup link works exactly once —
+  claiming an account flips it out of `pending`, and every later use is refused — so an administrator
+  could create somebody's account and then never help them back into it, and with no mail path there
+  is no self-service reset either. `/claim` now carries a second purpose: `setup` still means a
+  pending account choosing its first password, and `reset` means a claimed account being given a new
+  one because an administrator asked. The two are matched against the state of the account rather
+  than trusted from the link, so neither can do the other's job.
+- A reset link is **single-use**, by a mechanism the setup link does not need: a reset leaves an
+  account exactly as claimed as it was, so nothing about it would change and the link would work
+  forever. The link is bound to the credential it was minted against, and that credential is a
+  condition of the write — so the first successful reset retires it, a password change by any other
+  route retires it, and two simultaneous uses cannot both succeed.
+- A reset **ends the sessions running on the old password** by revoking that person's refresh
+  tokens. Stated precisely because a security control believed to cover more than it does is worse
+  than a narrow one: a session already holding an access token lasts until that token expires, and
+  the `/admin` console cookie and any outstanding authorization code are untouched.
+- A reset can never give a password to an identity that signs in through a provider, and can never
+  revive a switched-off account.
+
 ### Changed
 
+- The claim page is worded for what the link is for — somebody with an account is not told to
+  "finish setting up" — and `setup_page_html` / `setup_done_html` are now `claim_page_html` /
+  `claim_done_html`, which take the purpose.
+- Password hashing on `/claim` runs off the event loop. It is deliberately slow and memory-hard, and
+  this is a public endpoint, so hashing inline stalled every other request in flight.
 - `get_datasource_schema` answers **within the scope the caller declares**, and the never-hide
   guarantee is now stated relative to that scope: within it, nothing is hidden — the scope's own
   metrics plus the cross-area bucket. A new `area` parameter narrows to one subject area
