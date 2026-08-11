@@ -2692,9 +2692,14 @@ TOOLS: dict[str, dict[str, Any]] = {
     "list_datasources": {
         "handler": tool_list_datasources,
         "description": (
-            "List the datasources this deployment serves. Each entry carries `datasource`, the "
-            "`description` its model declares, `database_type` and `table_count` — enough to "
-            "route a question without pulling a schema per candidate. "
+            "List the datasources this deployment serves. Each entry carries `datasource`, "
+            "`database_type` and `table_count`, plus the `description` its model declares WHEN it "
+            "declares one — enough to route a question without pulling a schema per candidate. "
+            # `description` is conditional on the served path and absent on the local one, so it is
+            # the one field here a client must not assume: the whole point of this tool is routing
+            # without a schema call, and an agent that treats a missing key as an error re-adds the
+            # call. `database_type` and `table_count` are unconditional on both paths.
+            "A datasource whose model declares no description still routes on its name. "
             "Call this first when the datasource is not yet known; the others accept an "
             "optional `datasource`. "
             # Both fields have always shipped and neither was described, so an agent had no reason
@@ -2732,9 +2737,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             # declared filter was first met on the receipt — after the statement it belonged in had
             # already run. Naming them here puts them in front of the agent while it writes SQL.
             "Each table in scope also carries its declared `default_filters`, `relationships`, "
-            "`caveats` and `value_transforms`. A `default_filter` is the org's own definition of "
-            "what that table means and is NOT applied to your SQL — read it HERE, while you are "
-            "writing the statement, rather than meeting it on the receipt afterwards."
+            "`caveats` and `value_transforms`. An entry in `default_filters` is the org's own "
+            "definition of what that table means and is NOT applied to your SQL — read them HERE, "
+            "while you are writing the statement, rather than meeting them on the receipt "
+            "afterwards."
         ),
         "inputSchema": {
             "type": "object",
@@ -2876,7 +2882,12 @@ TOOLS: dict[str, dict[str, Any]] = {
             "non-null marker means NOT CHECKED and an empty `items` with a null marker means "
             "checked and clean.\n"
             "`receipt.joins.items` — one entry per join the STATEMENT wrote, each "
-            "`{predicate, from_to, scope, status}` with status declared (the predicate it wrote "
+            "`{predicate, from_to, scope, status}` plus the matched declaration's `{name, "
+            "cardinality, confidence, origin, review_state, signed_off_by, signed_off_role, "
+            "signed_off_at, cross_schema, on}` — that second key set is always PRESENT and every "
+            "one of it is null unless status is 'declared', because an item that matched nothing "
+            "must assert nothing about a relationship it did not match. Status is declared (the "
+            "predicate it wrote "
             "matches the relationship named on `name`) / undeclared (it matches none, or wrote no "
             "predicate to match, AND every declaration between its two tables was one we could "
             "read) / undeclarable (an endpoint is a relation the statement bound for itself) / "

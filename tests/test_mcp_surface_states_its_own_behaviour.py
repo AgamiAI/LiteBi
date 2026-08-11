@@ -22,6 +22,7 @@ what tells you the surface still lists nine.
 
 from __future__ import annotations
 
+import ast
 import inspect
 from typing import get_args
 
@@ -31,6 +32,39 @@ pytest.importorskip("pydantic")
 
 import guardrail  # noqa: E402
 import tools  # noqa: E402
+
+
+def _emits_key(source: str, key: str) -> bool:
+    """Does `source` build a dict entry under `key`?
+
+    Quote-agnostic on purpose. Matching only `"key"` would make a no-op restyle to single quotes
+    fail a test about payload SHAPE, which is not what any of these are asserting. `ruff format`
+    would put the double quotes back, but a test that depends on the formatter to stay true is
+    testing the formatter.
+    """
+    return f'"{key}"' in source or f"'{key}'" in source
+
+
+def _signoff_keys() -> list[str]:
+    """The relationship keys every join item carries, read off the assembler's own literal.
+
+    `assemble_receipt` seeds them as `{key: None for key in (...)}` precisely so both branches
+    carry an identical key set, which makes that tuple the one true statement of the join shape.
+    Parsed rather than copied: copying it here would just create the second place to drift that
+    this whole change is about closing.
+    """
+    from semantic_model import runtime
+
+    tree = ast.parse(inspect.getsource(runtime.assemble_receipt))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.DictComp) or not isinstance(node.value, ast.Constant):
+            continue
+        if node.value.value is not None:
+            continue
+        source = node.generators[0].iter
+        if isinstance(source, ast.Tuple):
+            return [e.value for e in source.elts if isinstance(e, ast.Constant)]
+    raise AssertionError("the join sign-off key set is no longer a literal tuple — re-derive it")
 
 
 def _instruction_variants(monkeypatch) -> dict[str, str]:
@@ -93,8 +127,21 @@ def test_list_datasources_describes_the_fields_it_actually_returns():
     handler_src = inspect.getsource(tools.tool_list_datasources)
     described = tools.TOOLS["list_datasources"]["description"]
     for key in ("database_type", "table_count"):
-        assert f'"{key}"' in handler_src, f"handler no longer emits {key}; fix the description"
+        assert _emits_key(handler_src, key), f"handler no longer emits {key}; fix the description"
         assert f"`{key}`" in described, f"{key} ships on every call and is described nowhere"
+
+
+def test_the_one_conditional_field_is_described_as_conditional():
+    """`description` is the only entry here a client must not assume.
+
+    The served path emits it only when the model declares one and the local path never does, so
+    "each entry carries a description" was the same class of untruth this file exists to catch —
+    and the cost is specific: routing without a schema call is the tool's whole purpose, and an
+    agent that reads a missing key as an error re-adds the call it was meant to avoid.
+    """
+    described = tools.TOOLS["list_datasources"]["description"]
+    assert "WHEN it declares one" in described
+    assert "still routes on its name" in described
 
 
 def test_the_dialect_rule_points_at_the_field_that_carries_it(monkeypatch):
@@ -114,8 +161,25 @@ def test_the_schema_tool_names_the_table_context_it_ships():
     context_src = inspect.getsource(tools._table_contexts)
     described = tools.TOOLS["get_datasource_schema"]["description"]
     for block in ("default_filters", "relationships", "caveats", "value_transforms"):
-        assert f'"{block}"' in context_src, f"{block} is no longer requested; fix the description"
+        assert _emits_key(context_src, block), f"{block} is no longer requested; fix the wording"
         assert f"`{block}`" in described, f"{block} ships in the payload and is described nowhere"
+
+
+def test_the_join_item_shape_is_described_as_the_assembler_builds_it():
+    """The declared shape said `{predicate, from_to, scope, status}` and stopped there, while the
+    next two sentences referenced `name` and `review_state` — and the instructions tell an agent to
+    filter joins ON `review_state`. So the surface named a field in its rule that its own shape
+    said did not exist, which is the exact failure mode of the four undocumented capabilities this
+    change is about, one layer in.
+
+    Derived from `assemble_receipt`'s key tuple: add a sign-off field and this says so.
+    """
+    described = tools.TOOLS["execute_sql"]["description"]
+    missing = [key for key in _signoff_keys() if key not in described]
+    assert missing == [], f"join items carry these and the shape omits them: {', '.join(missing)}"
+    # Present-but-null is the part a consumer cannot guess, and it is what makes "review_state is
+    # null when status is not 'declared'" a readable rule rather than a contradiction.
+    assert "always PRESENT" in described
 
 
 # --- where each kind of guidance lives ---------------------------------------
