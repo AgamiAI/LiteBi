@@ -1,7 +1,7 @@
 {
   "name": "agami-core",
   "description": "The trust layer between AI and your database, so an agent's answers are defensible. Every join, metric, and named filter is confidence-scored and either FK-derived or human-approved via a review dashboard. Every answer ships a SQL receipt showing what ran and which model version it used. Works across Postgres / MySQL / Snowflake / BigQuery / Redshift / SQL Server / Oracle / Databricks / Trino / DuckDB / SQLite. Local-first: credentials, schema, results never leave your machine.",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "author": {
     "name": "Agami AI",
     "email": "skills@agami.ai",
