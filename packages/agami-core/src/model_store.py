@@ -46,6 +46,42 @@ def _est_rows(table_doc: dict[str, Any]) -> int | None:
     return ph.get("estimated_row_count") if isinstance(ph, dict) else None
 
 
+def _relationship_key(position: int, rel_doc: dict[str, Any]) -> str:
+    """The `relationship.name` for one join — unique within its subject area BY CONSTRUCTION.
+
+    `relationship` is PRIMARY KEY (org_id, datasource, area, name), and a duplicate name does not
+    lose one edge: the INSERT raises part-way through `write_datasource`, nothing commits, and the
+    deployment serves NO model at all. So the only acceptable property here is that a collision
+    cannot happen, for any model that validates.
+
+    **Hence the ordinal**, rather than a name assembled from whichever fields look discriminating.
+    That was the previous approach twice over — first the table pair alone, which collides for a
+    self-join written two ways (`manager_id` and `mentor_id` on one employee table), then the pair
+    plus columns, which still collides for two `on:`-expression joins (both columns are None there)
+    and for same-named tables in two schemas. Each fix enumerated the cases its author had in mind
+    and the next shape found the gap. A position in a list cannot repeat.
+
+    The rest is for the human reading the table, and carries no uniqueness burden: schema-qualified
+    endpoints, with the columns when the simple form is used. The `on:` expression is deliberately
+    NOT appended — it would add unbounded length to a primary key to describe an edge whose
+    definition is already in `doc`.
+
+    Nothing READS this. No query selects a relationship by name, and `load_datasource` rebuilds each
+    one from `doc` — so the format is not a contract, and a redeploy replaces a datasource's rows
+    wholesale (the DELETE in `write_datasource`), leaving nothing keyed the old way to migrate.
+    """
+
+    def endpoint(schema: Any, table: Any, column: Any) -> str:
+        qualified = f"{schema}.{table}" if schema else f"{table}"
+        return f"{qualified}.{column}" if column else qualified
+
+    frm = endpoint(
+        rel_doc.get("from_schema"), rel_doc.get("from_table"), rel_doc.get("from_column")
+    )
+    to = endpoint(rel_doc.get("to_schema"), rel_doc.get("to_table"), rel_doc.get("to_column"))
+    return f"{position}:{frm}->{to}"
+
+
 def write_datasource(
     store: Store, datasource: str, org: Datasource, org_id: str = DEFAULT_ORG
 ) -> None:
@@ -100,13 +136,12 @@ def write_datasource(
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (org_id, datasource, sa.name, e.name, edoc.get("value_pattern"), json.dumps(edoc)),
             )
-        for r in sa.relationships:
+        for position, r in enumerate(sa.relationships):
             rdoc = r.model_dump(mode="json")
-            name = f"{rdoc.get('from_table')}->{rdoc.get('to_table')}"
             store.execute(
                 "INSERT INTO relationship (org_id, datasource, area, name, doc) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (org_id, datasource, sa.name, name, json.dumps(rdoc)),
+                (org_id, datasource, sa.name, _relationship_key(position, rdoc), json.dumps(rdoc)),
             )
     store.commit()
 

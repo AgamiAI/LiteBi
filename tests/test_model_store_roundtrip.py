@@ -95,6 +95,118 @@ def test_reseed_replaces_rows():
     s.close()
 
 
+def _roundtrip_relationships(relationships):
+    """Write a subject area holding `relationships`, read it back, return what survived.
+
+    Through `load_datasource` rather than a row count, deliberately. A count of two also passes if a
+    later change folds two joins into one — the same lost edge, wearing the shape of a successful
+    load. Reading them back is what says both survived intact.
+    """
+    doc = json.loads(json.dumps(FULL_ORG))
+    doc["subject_areas"][0]["relationships"] = relationships
+    org = Datasource.model_validate(doc)
+    s = Store.connect("sqlite://")
+    s.run_migrations()
+    model_store.write_datasource(s, "main", org)
+    rebuilt = model_store.load_datasource(s, "main")
+    s.close()
+    assert rebuilt is not None
+    return rebuilt.subject_areas[0].relationships
+
+
+# Three shapes where one pair of tables is joined twice. Each one collided on
+# PRIMARY KEY (org_id, datasource, area, name) under some earlier version of the key, and a
+# collision is not a lost edge — the INSERT raises mid-write, nothing commits, and the deployment
+# serves NO model. They are listed together because the lesson is that they are the same bug: a key
+# assembled from whichever fields looked discriminating misses the shape its author did not picture.
+
+
+def test_a_table_pair_joined_on_two_column_pairs_survives_the_roundtrip():
+    """The simple form — an employee row pointing at another as its manager, and as its mentor.
+
+    Self-referencing tables make this ordinary rather than exotic. It collided when the key was the
+    table pair alone.
+    """
+    kept = _roundtrip_relationships(
+        [
+            {
+                "from_table": "employee",
+                "from_column": "manager_id",
+                "to_table": "employee",
+                "to_column": "id",
+                "relationship": "many_to_one",
+            },
+            {
+                "from_table": "employee",
+                "from_column": "mentor_id",
+                "to_table": "employee",
+                "to_column": "id",
+                "relationship": "many_to_one",
+            },
+        ]
+    )
+    assert {(r.from_column, r.to_column) for r in kept} == {
+        ("manager_id", "id"),
+        ("mentor_id", "id"),
+    }
+
+
+def test_a_table_pair_joined_by_two_on_expressions_survives_the_roundtrip():
+    """The `on:` escape hatch — where BOTH columns are None, so a column-aware key does not separate
+    them either. Two function-based joins between one pair of tables are two edges."""
+    kept = _roundtrip_relationships(
+        [
+            {
+                "from_table": "orders",
+                "to_table": "customers",
+                "on": "orders.customer_id = customers.id",
+                "relationship": "many_to_one",
+            },
+            {
+                "from_table": "orders",
+                "to_table": "customers",
+                "on": "CAST(orders.legacy_customer AS INTEGER) = customers.id",
+                "relationship": "many_to_one",
+            },
+        ]
+    )
+    assert {r.on for r in kept} == {
+        "orders.customer_id = customers.id",
+        "CAST(orders.legacy_customer AS INTEGER) = customers.id",
+    }
+
+
+def test_same_named_tables_in_two_schemas_survive_the_roundtrip():
+    """Schema-qualified endpoints exist so two schemas holding a same-named table are not conflated
+    (see `Relationship.from_schema`). A key that drops the schema conflates them again."""
+    kept = _roundtrip_relationships(
+        [
+            {
+                "from_table": "orders",
+                "from_schema": "sales",
+                "from_column": "customer_id",
+                "to_table": "customers",
+                "to_schema": "sales",
+                "to_column": "id",
+                "relationship": "many_to_one",
+            },
+            {
+                "from_table": "orders",
+                "from_schema": "archive",
+                "from_column": "customer_id",
+                "to_table": "customers",
+                "to_schema": "archive",
+                "to_column": "id",
+                "relationship": "many_to_one",
+            },
+        ]
+    )
+    assert {(r.from_schema, r.to_schema) for r in kept} == {
+        ("sales", "sales"),
+        ("archive", "archive"),
+    }
+
+
 # --- file → DB parity + tools wiring ---------------------------------------
 
 
