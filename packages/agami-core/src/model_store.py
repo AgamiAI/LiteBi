@@ -102,7 +102,21 @@ def write_datasource(
             )
         for r in sa.relationships:
             rdoc = r.model_dump(mode="json")
-            name = f"{rdoc.get('from_table')}->{rdoc.get('to_table')}"
+            # **The join columns belong in the key, not just the tables.** `relationship` is UNIQUE on
+            # (org_id, datasource, area, name), and a table pair joined two ways — an employee row
+            # pointing at another as `manager_id` and again as `mentor_id` — produced one name twice
+            # and aborted the whole load on the constraint. Self-referencing tables make that ordinary
+            # rather than exotic, and the failure was total: nothing is written, so the deployment ends
+            # up with no model at all.
+            #
+            # Safe to change the format because nothing READS it. No query selects a relationship by
+            # name, and `load_datasource` rebuilds each one from `doc`; the column exists to keep rows
+            # distinct. A redeploy also replaces a datasource's rows wholesale (the DELETE above), so
+            # models stored under the old key need no migration.
+            name = (
+                f"{rdoc.get('from_table')}.{rdoc.get('from_column')}"
+                f"->{rdoc.get('to_table')}.{rdoc.get('to_column')}"
+            )
             store.execute(
                 "INSERT INTO relationship (org_id, datasource, area, name, doc) "
                 "VALUES (?, ?, ?, ?, ?)",

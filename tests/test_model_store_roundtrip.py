@@ -95,6 +95,51 @@ def test_reseed_replaces_rows():
     s.close()
 
 
+def test_a_table_pair_joined_two_ways_survives_the_roundtrip():
+    """Two joins between the SAME pair of tables are two relationships, not one.
+
+    A self-referencing table is the ordinary case — an employee row pointing at another as its
+    manager, and again as its mentor — and any pair joined on two different column pairs is the same
+    shape. `relationship` is UNIQUE on (org_id, datasource, area, name), and the name used to be
+    built from the table names alone, so the second row collided with the first and the write raised
+    mid-load. The failure was total rather than partial: nothing is committed, so a deployment ends
+    up serving no model at all.
+
+    Asserted through `load_datasource` rather than by counting rows, deliberately. A row count also
+    passes if a future change quietly folds the two joins into one — the same lost relationship,
+    wearing the shape of a successful load. Reading the joins back is what says both survived
+    intact.
+    """
+    doc = json.loads(json.dumps(FULL_ORG))
+    doc["subject_areas"][0]["relationships"] = [
+        {
+            "from_table": "employee",
+            "from_column": "manager_id",
+            "to_table": "employee",
+            "to_column": "id",
+            "relationship": "many_to_one",
+        },
+        {
+            "from_table": "employee",
+            "from_column": "mentor_id",
+            "to_table": "employee",
+            "to_column": "id",
+            "relationship": "many_to_one",
+        },
+    ]
+    org = Datasource.model_validate(doc)
+    s = Store.connect("sqlite://")
+    s.run_migrations()
+    model_store.write_datasource(s, "main", org)
+    rebuilt = model_store.load_datasource(s, "main")
+    assert rebuilt is not None
+    joins = {(r.from_column, r.to_column) for r in rebuilt.subject_areas[0].relationships}
+    assert joins == {("manager_id", "id"), ("mentor_id", "id")}, (
+        "a table pair joined two ways lost one of its joins on the way through the database"
+    )
+    s.close()
+
+
 # --- file → DB parity + tools wiring ---------------------------------------
 
 
