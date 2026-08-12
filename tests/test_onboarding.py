@@ -144,6 +144,23 @@ def test_claim_link_is_single_use(client, env):
     s.close()
 
 
+def test_the_claim_page_says_whose_account_it_is(client, env):
+    """A link is shared out-of-band, so the person holding it may have been sent the wrong one — or
+    two. While the only link set a FIRST password that was tolerable; a reset link replaces a working
+    one, and following the wrong one locks somebody out of their own account.
+
+    Asserted on both purposes and on the re-render after a rejected password, because that last one is
+    the render most easily forgotten and the one somebody is staring at when they are confused.
+    """
+    setup = onboarding.mint_setup_token(PENDING)
+    assert PENDING in client.get("/claim", params={"token": setup}).text
+    reset = _reset_token(env, ADMIN_USER)
+    assert ADMIN_USER in client.get("/claim", params={"token": reset}).text
+    # ...and when the password is refused for being too short.
+    again = client.post("/claim", data={"token": setup, "password": "short"})
+    assert again.status_code == 400 and PENDING in again.text
+
+
 def test_claim_rejects_a_bad_token(client):
     assert client.get("/claim", params={"token": "nope"}, follow_redirects=False).status_code == 400
     assert (
@@ -157,6 +174,25 @@ def test_claim_rejects_a_short_password(client, env):
     assert r.status_code == 400 and "at least" in r.text
     s = Store.connect(env)
     assert onboarding.is_pending(user_store.get_user(s, PENDING))  # still pending — nothing set
+    s.close()
+
+
+def test_a_password_refused_for_being_too_long_says_so(client, env):
+    """The advice has to match the bound that was missed.
+
+    Both ends shared one message, so somebody who pasted three hundred characters was told to "use at
+    least 8" — guidance that makes the problem worse the more carefully it is followed, on the one
+    page they cannot get past. Raised by Copilot on PR #222.
+    """
+    token = onboarding.mint_setup_token(PENDING)
+    r = client.post("/claim", data={"token": token, "password": "x" * 300})
+    assert r.status_code == 400
+    assert "at most" in r.text and "at least" not in r.text
+    # ...and the page still names the account, so the re-render did not lose it — the whole point of
+    # the change this test file is attached to.
+    assert PENDING in r.text
+    s = Store.connect(env)
+    assert onboarding.is_pending(user_store.get_user(s, PENDING))  # nothing was written
     s.close()
 
 

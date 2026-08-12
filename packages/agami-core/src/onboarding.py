@@ -179,11 +179,26 @@ _WORDING: dict[str, dict[str, str]] = {
 }
 
 
-def claim_page_html(token: str, purpose: str = _SETUP_PURPOSE, error: str = "") -> str:
-    """The choose-a-password page reached from a valid link, worded for what the link is for."""
+def claim_page_html(
+    token: str, purpose: str = _SETUP_PURPOSE, error: str = "", username: str = ""
+) -> str:
+    """The choose-a-password page reached from a valid link, worded for what the link is for.
+
+    **It names the account.** Without that, somebody following a link is asked to choose a password
+    with no way to tell WHOSE it is — and the link is shared out-of-band, so the person holding it may
+    have been sent the wrong one, or two of them. That was tolerable while the only link set a first
+    password on an account the recipient was expecting; it is not now that a link can REPLACE a working
+    password, where following the wrong one silently locks somebody out of their own account.
+
+    It discloses nothing new: whoever holds the link already holds a token whose payload is base64url
+    and carries this same address in the clear (the module note says so). Showing it turns something
+    they could decode into something they can check.
+    """
     words = _WORDING[purpose]
     alert = f'<div class="alert error">{ui.esc(error)}</div>' if error else ""
+    whose = f'<p class="small">for <strong>{ui.esc(username)}</strong></p>' if username else ""
     body = f"""<div class="consent"><p class="who">{ui.esc(words["title"])}</p>
+{whose}
 <p class="small">{ui.esc(words["lead"])}</p></div>
 {alert}
 <form method="post" action="/claim">
@@ -300,7 +315,7 @@ async def claim(request: Request) -> Response:
         actionable = _actionable(token)
         if actionable is None:
             return HTMLResponse(setup_invalid_html(), status_code=400)
-        return HTMLResponse(claim_page_html(token, actionable[1]))
+        return HTMLResponse(claim_page_html(token, actionable[1], username=actionable[0]))
 
     form = await _form(request)
     token = form.get("token", "")
@@ -309,9 +324,23 @@ async def claim(request: Request) -> Response:
         return HTMLResponse(setup_invalid_html(), status_code=400)
     username, purpose, expected_hash = actionable
     password = form.get("password", "")
+    # Both bounds, and each says which one was missed. One message for both read "Use at least 8
+    # characters" to somebody who had just typed three hundred — advice that makes the problem worse
+    # the more carefully it is followed. Neither message names the password back, and neither is
+    # branched on anything but its length.
     if not _MIN_PASSWORD_LEN <= len(password) <= _MAX_PASSWORD_LEN:
+        too_short = len(password) < _MIN_PASSWORD_LEN
         return HTMLResponse(
-            claim_page_html(token, purpose, error=f"Use at least {_MIN_PASSWORD_LEN} characters."),
+            claim_page_html(
+                token,
+                purpose,
+                error=(
+                    f"Use at least {_MIN_PASSWORD_LEN} characters."
+                    if too_short
+                    else f"Use at most {_MAX_PASSWORD_LEN} characters."
+                ),
+                username=username,
+            ),
             status_code=400,
         )
     # Off the event loop. Argon2 is deliberately slow and memory-hard, and this handler is `async` on a
