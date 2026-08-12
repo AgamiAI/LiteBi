@@ -177,6 +177,25 @@ def test_claim_rejects_a_short_password(client, env):
     s.close()
 
 
+def test_a_password_refused_for_being_too_long_says_so(client, env):
+    """The advice has to match the bound that was missed.
+
+    Both ends shared one message, so somebody who pasted three hundred characters was told to "use at
+    least 8" — guidance that makes the problem worse the more carefully it is followed, on the one
+    page they cannot get past. Raised by Copilot on PR #222.
+    """
+    token = onboarding.mint_setup_token(PENDING)
+    r = client.post("/claim", data={"token": token, "password": "x" * 300})
+    assert r.status_code == 400
+    assert "at most" in r.text and "at least" not in r.text
+    # ...and the page still names the account, so the re-render did not lose it — the whole point of
+    # the change this test file is attached to.
+    assert PENDING in r.text
+    s = Store.connect(env)
+    assert onboarding.is_pending(user_store.get_user(s, PENDING))  # nothing was written
+    s.close()
+
+
 def test_claim_for_an_already_password_user_is_refused(client, env):
     # The admin (a password user) isn't pending; a token for them can't overwrite their password.
     token = onboarding.mint_setup_token(ADMIN_USER)

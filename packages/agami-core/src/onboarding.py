@@ -324,12 +324,21 @@ async def claim(request: Request) -> Response:
         return HTMLResponse(setup_invalid_html(), status_code=400)
     username, purpose, expected_hash = actionable
     password = form.get("password", "")
+    # Both bounds, and each says which one was missed. One message for both read "Use at least 8
+    # characters" to somebody who had just typed three hundred — advice that makes the problem worse
+    # the more carefully it is followed. Neither message names the password back, and neither is
+    # branched on anything but its length.
     if not _MIN_PASSWORD_LEN <= len(password) <= _MAX_PASSWORD_LEN:
+        too_short = len(password) < _MIN_PASSWORD_LEN
         return HTMLResponse(
             claim_page_html(
                 token,
                 purpose,
-                error=f"Use at least {_MIN_PASSWORD_LEN} characters.",
+                error=(
+                    f"Use at least {_MIN_PASSWORD_LEN} characters."
+                    if too_short
+                    else f"Use at most {_MAX_PASSWORD_LEN} characters."
+                ),
                 username=username,
             ),
             status_code=400,
