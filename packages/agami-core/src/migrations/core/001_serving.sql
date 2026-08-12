@@ -83,7 +83,7 @@ CREATE TABLE relationship (
     org_id     TEXT NOT NULL DEFAULT 'local',
     datasource TEXT NOT NULL,
     area       TEXT NOT NULL,
-    name       TEXT NOT NULL,      -- "from->to"
+    name       TEXT NOT NULL,      -- "<position>:<from>-><to>" (model_store._relationship_key)
     doc        TEXT NOT NULL,
     PRIMARY KEY (org_id, datasource, area, name)
 );
