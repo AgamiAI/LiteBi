@@ -12,6 +12,32 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-08-12
+
+### Added
+
+- **The claim page says whose account it is.** Somebody following a setup or reset link was asked to
+  choose a password with no indication of which account it belonged to. A link is shared out of band,
+  so the person holding it may have been sent the wrong one, or two of them — and now that a link can
+  REPLACE a working password rather than only set a first one, following the wrong one silently locks
+  somebody out of their own account with nothing on the page to warn them. It discloses nothing new:
+  whoever holds the link already holds a token naming that account.
+- **The MCP surface states what the server already does.** Four capabilities shipped working and
+  undocumented, and a silent feature is worse than a broken one — a broken one gets reported.
+  `execute_sql` returns three statuses and described two; the third carries the whole database-error
+  channel with a `kind` from a declared enum, which tells an agent whether a failure is repairable
+  from the schema it already holds or whether retrying is pointless. Documented, so it can be used.
+
+### Fixed
+
+- A password refused for being **too long** said "use at least 8 characters" — the same message as
+  one refused for being too short, and advice that makes the problem worse the more carefully it is
+  followed. Each bound now names itself.
+- Seven store-step tests resolved the profile from the developer's own `~/agami-artifacts` rather
+  than from the temporary directory they had set, so they compared against a value from a file the
+  test never mentions. CI has no such file, so they passed there and failed only on a machine that
+  had run the CLI.
+
 ## [0.6.3] — 2026-08-11
 
 ### Added
