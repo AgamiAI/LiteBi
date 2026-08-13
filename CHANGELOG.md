@@ -12,6 +12,27 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-08-13
+
+### Fixed
+
+- **A model whose subject area joins one pair of tables twice now loads.** It did not before: each
+  relationship row was keyed by its two table names, and that key is the table's primary key — so the
+  second join collided with the first and the INSERT raised part-way through the write. The failure
+  was total rather than partial. Nothing commits, so the deployment ends up serving **no semantic
+  model at all**, and the error names a column tuple rather than the join that collided.
+
+  Self-referencing tables make this ordinary rather than exotic: an employee row pointing at another
+  as its manager, and again as its mentor, is one pair of tables and two genuinely different joins.
+  Two `on:`-expression joins between one pair, and same-named tables living in two schemas, failed
+  the same way.
+
+  The key now carries the relationship's position within its subject area, so a collision is
+  impossible for any model that validates rather than impossible for the shapes somebody enumerated
+  — which is what the two previous versions of this key each attempted, and each missed. Nothing
+  reads the value (a relationship is rebuilt from its stored document), and a redeploy replaces a
+  datasource's rows wholesale, so models written under the old key need no migration and no backfill.
+
 ## [0.6.4] — 2026-08-12
 
 ### Added
