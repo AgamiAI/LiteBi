@@ -490,8 +490,8 @@ class DbActivitySink:
         self._store.execute(
             "INSERT INTO tool_calls (id, ts, org_id, actor, tool_name, datasource, sql, row_count, "
             "execution_ms, success, error_kind, source, user_question, agent_query, thread_id, "
-            "correlation_id, refusal_detail, refusal_remediation) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "correlation_id, refusal_detail, refusal_remediation, audit_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid4().hex,
                 record.ts,
@@ -515,6 +515,10 @@ class DbActivitySink:
                 # has them.
                 getattr(record, "refusal_detail", None),
                 getattr(record, "refusal_remediation", None),
+                # This call's execution (019), `getattr`-guarded like the two above so an embedder on
+                # an older record shape writes NULL rather than raising. NULL is ordinary here too:
+                # those are NULL on every non-refusal, this on every call that ran no statement.
+                getattr(record, "audit_id", None),
             ),
         )
         self._store.commit()

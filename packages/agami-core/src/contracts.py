@@ -293,4 +293,8 @@ class ToolCallRecord(_Contract):
     agent_query: str | None = None
     thread_id: str | None = None
     correlation_id: str | None = None  # the turn: one user question -> N agent sub-queries
+    # This call's execution, where it ran one (019) — `query_executions.id`, the same id `_emit` puts
+    # on the envelope the caller receives. `correlation_id` identifies the turn, which may run several
+    # statements; this identifies the statement. NULL wherever none ran.
+    audit_id: str | None = None
     org_id: str = "local"  # the tenant this call ran for; defaults to the single-tenant org

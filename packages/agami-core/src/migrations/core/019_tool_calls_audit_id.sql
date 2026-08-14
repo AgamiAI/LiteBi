@@ -1,0 +1,22 @@
+-- The key between the two logs. `tool_calls` records that a tool ran; `query_executions` records what
+-- the warehouse was asked and what the guard decided. Both are written for every `execute_sql` and are
+-- 1:1, and until now nothing joined them: 018's own comment records the gap — "there is no key between
+-- them (`Envelope.audit_id` is `query_executions.id`, which `tool_calls` does not carry)".
+--
+-- `correlation_id` is not that key. It identifies the TURN, and one turn may run several statements, so
+-- it cannot distinguish them.
+--
+-- The value is one the caller already received: `_emit` stamps `audit_id` onto every envelope, for
+-- `ok`, `refused` and `failed` alike, and `query_executions.id` is that same id. So this column
+-- reconciles nothing and mints nothing — it stores the id the answer carried back.
+--
+-- NULL IS THE ORDINARY CASE, not a gap. Only a tool that ran a statement has an execution: a schema
+-- read, a datasource list, or a refusal thrown before the executor has none.
+--
+-- NO FOREIGN KEY, matching this table's existing stance. The two logs are read independently and are
+-- each legible alone; a retention sweep over executions must not block or cascade into the activity
+-- log.
+--
+-- PORTABLE: one nullable TEXT column added by ALTER — the only form SQLite and Postgres both accept
+-- without a table rebuild.
+ALTER TABLE tool_calls ADD COLUMN audit_id TEXT;

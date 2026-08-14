@@ -683,3 +683,79 @@ def test_no_combination_of_outcome_arguments_can_write_a_dishonest_row(db):
                 assert r["success"] == 0, f"a stated error kind logged as a success: {case}"
     finally:
         store.close()
+
+
+# --- the execution id (019) --------------------------------------------------
+
+
+def test_record_reads_the_execution_id_off_every_envelope_status(db):
+    """`audit_id` is on the envelope for `ok`, `refused` and `failed` alike, so it is read outside the
+    status branches. Reading it only on success would leave exactly the calls an auditor most wants to
+    trace — the blocked and the broken ones — unable to reach their execution row."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text='{"status": "ok", "row_count": 1, "audit_id": "qe-ok"}',
+        execution_ms=5, actor="you@example.com",
+    )
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text='{"status": "refused", "refusal": {"rule": "table_scope"}, "audit_id": "qe-ref"}',
+        execution_ms=6, actor="you@example.com",
+    )
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text='{"status": "failed", "failure": {"kind": "syntax"}, "audit_id": "qe-fail"}',
+        execution_ms=7, actor="you@example.com",
+    )
+
+    assert [r["audit_id"] for r in _rows(db)] == ["qe-ok", "qe-ref", "qe-fail"]
+
+
+def test_a_call_that_ran_no_statement_records_no_execution_id(db):
+    """NULL is the ordinary value, not a gap: a schema read runs no query, so there is no execution
+    for it to point at. A synthetic id here would imply a statement nobody ran."""
+    tools.record_tool_call(
+        name="get_datasource_schema", arguments={"datasource": "SALES_DATA"},
+        result_text='{"tables": []}', execution_ms=2, actor="you@example.com",
+    )
+
+    (r,) = _rows(db)
+    assert r["audit_id"] is None
+
+
+def test_a_caller_with_no_body_can_still_state_the_execution_id(db):
+    """The override, for a caller that classified the outcome itself and hands over no `result_text`.
+    Without it such a caller records a row that can never be joined to its execution."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"}, result_text=None,
+        execution_ms=9, actor="you@example.com",
+        success=True, row_count=3, audit_id="qe-stated",
+    )
+
+    (r,) = _rows(db)
+    assert r["audit_id"] == "qe-stated" and r["success"] == 1 and r["row_count"] == 3
+
+
+def test_a_stated_execution_id_wins_over_the_body(db):
+    """Same precedence as the outcome overrides: the caller observed the call, the body is a
+    re-parse. Nothing here can be incoherent — an id makes no claim about how the call went."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text='{"status": "ok", "audit_id": "qe-from-body"}',
+        execution_ms=4, actor="you@example.com", audit_id="qe-stated",
+    )
+
+    (r,) = _rows(db)
+    assert r["audit_id"] == "qe-stated"
+
+
+def test_a_body_whose_execution_id_is_not_a_string_records_none(db):
+    """A body is caller-influenced, and the column is a key. A number or an object arriving here
+    would be written straight through and then never match anything on the other side of the join."""
+    tools.record_tool_call(
+        name="execute_sql", arguments={"sql": "SELECT 1"},
+        result_text='{"status": "ok", "audit_id": 17}', execution_ms=4, actor="you@example.com",
+    )
+
+    (r,) = _rows(db)
+    assert r["audit_id"] is None
