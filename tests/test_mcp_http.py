@@ -206,6 +206,21 @@ def test_http_tools_list_is_the_same_four(base_url):
     assert names == PRODUCT_TOOLS
 
 
+def test_favicon_is_served_without_a_bearer_token(base_url):
+    """An anonymous fetcher asking for the conventional icon path gets the PNG.
+
+    Before this route existed the answer was a 401 with an auth challenge, because the bearer gate
+    fires ahead of routing — so the one request a client makes to learn what a server looks like was
+    met with "authenticate first". A 404 would at least be honest; a challenge reads as a walled
+    origin.
+    """
+    with TestClient(mcp_http.build_app()) as c:
+        res = c.get("/favicon.ico")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "image/png"
+    assert res.content == mcp_http._FAVICON_FILE.read_bytes()
+
+
 def test_presence_auth_yields_no_session_id(base_url):
     """The fallback that matters most: presence auth mints no token at all, so there is no session to
     report. It must read as "no session" — never break the caller."""

@@ -41,7 +41,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from store import Store
@@ -136,6 +136,7 @@ def _org_id_from_scope(scope: dict) -> str | None:
 
 # The brand assets (logo, provider icons, favicon) served at /static — packaged alongside this module.
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+_FAVICON_FILE = _STATIC_DIR / "logo_icon.png"
 
 
 def _build_auth_provider() -> AuthProvider:
@@ -243,7 +244,7 @@ _OAUTH_PATHS = (
 
 def _is_public_path(path: str) -> bool:
     """True for the surface reachable without an MCP bearer token: the OAuth discovery routes + flow
-    endpoints, the static brand assets, the root landing, and the `/admin/*` pages. Discovery and
+    endpoints, the static brand assets, the root landing, its favicon, and the `/admin/*` pages. Discovery and
     static use boundary matching (they have suffix/sub-path routes, and a bare `startswith` would let
     `/.well-known/oauth-protected-resource-x` or `/static-x` slip through); the OAuth + admin
     endpoints are matched *exactly* (only those exact paths are routed), so a future
@@ -256,7 +257,7 @@ def _is_public_path(path: str) -> bool:
         return True
     if path == "/static" or path.startswith("/static/"):
         return True
-    if path == "/":
+    if path == "/" or path == "/favicon.ico":
         return True
     return path in _OAUTH_PATHS or path in admin.ADMIN_PATHS or path in onboarding.PUBLIC_PATHS
 
@@ -636,8 +637,19 @@ def create_app(
         """The bare base URL in a browser → a branded landing (connector URL + admin link), not a 404."""
         return HTMLResponse(admin.landing_body_html(public_base_url()))
 
+    async def _favicon(request: Request) -> Response:
+        """The conventional icon path, answered from the same PNG the pages link.
+
+        Routed because without it the path is not merely absent but *gated*: the bearer middleware
+        challenges anything off its public list before routing can 404 it, so a client asking what
+        this server looks like got a 401 and an auth prompt. That matters beyond tidiness — an MCP
+        client showing a server in a connector list has no credentials to offer for an icon, and a
+        deployment that redirects `/` elsewhere leaves this the only path left to ask on."""
+        return FileResponse(_FAVICON_FILE, media_type="image/png")
+
     routes = [
         Route("/", _root, methods=["GET"]),
+        Route("/favicon.ico", _favicon, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource", _protected_resource),
         Route("/.well-known/oauth-protected-resource/{rest:path}", _protected_resource),
         Route("/.well-known/oauth-authorization-server", _auth_server),
