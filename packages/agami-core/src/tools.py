@@ -2453,6 +2453,7 @@ def record_tool_call(
     success: bool | None = None,
     row_count: int | None = None,
     error_kind: str | None = None,
+    audit_id: str | None = None,
     org_id: str | None = None,
 ) -> None:
     """Record one MCP tool call to the activity log (the transport calls this for **every** tool). The
@@ -2484,6 +2485,10 @@ def record_tool_call(
       "succeeded" beside an error. **`raised=True` outranks all of them** — a call that threw is a
       failure whatever the caller passes, though it may still be given a more specific kind than the
       generic `"exception"`.
+    - `audit_id` replaces the execution id otherwise **read out of `result_text`** (019). Same reason
+      as the trio above and one more: a caller with no body to hand over can still record which
+      execution this call was, and unlike the trio it can state nothing incoherent, because an
+      identity makes no claim about how the call went.
     - `org_id` replaces the tenant otherwise stamped downstream from this process's context. A caller
       that read the tenant at the point which actually scoped the work states it, rather than leaving it
       to be re-read later from a context that may no longer be the same one. The fallback when that
@@ -2492,6 +2497,10 @@ def record_tool_call(
     """
     args = arguments or {}
     derived_success, derived_row_count, derived_error_kind = True, None, None
+    # This call's execution id (019), read off the same body as the trio below. Its own variable
+    # rather than one of them because it states nothing about the outcome: it is read on `ok`,
+    # `refused` and `failed` alike, and the coherence rules the trio is forced through do not apply.
+    derived_audit_id: str | None = None
     # The refusal's own two sentences, for the reader of THIS log. `error_kind` says which rule fired;
     # these say what it fired on and what to do about it — "orders_archive is not declared in the
     # model", not just `table_scope`. Without them an administrator reading a conversation can tell a
@@ -2550,6 +2559,9 @@ def record_tool_call(
                     derived_success = False
                     derived_error_kind = parsed["error"].get("kind") or "error"
                 derived_row_count = parsed.get("row_count")
+                # Outside the status branches above, because the envelope carries it on all three.
+                found = parsed.get("audit_id")
+                derived_audit_id = found if isinstance(found, str) and found else None
         except (ValueError, TypeError):
             pass
     if success is not None or row_count is not None or error_kind is not None:
@@ -2611,6 +2623,9 @@ def record_tool_call(
         "correlation_id": (  # the turn (one user question)
             correlation_id if correlation_id is not None else args.get("correlation_id")
         ),
+        # The statement, where one ran. A plain override rather than one of the coherent trio: it is
+        # an identity, so a stated value cannot contradict a derived one the way an outcome can.
+        "audit_id": audit_id if audit_id is not None else derived_audit_id,
     }
     if org_id is not None:
         # Set rather than left absent, so `_record_tool_call`'s `setdefault` keeps it instead of
