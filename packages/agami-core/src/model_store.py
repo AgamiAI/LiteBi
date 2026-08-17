@@ -13,6 +13,7 @@ collections (those are their own rows); load re-attaches them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -369,6 +370,29 @@ def _tokens(s: str | None) -> set[str]:
     return set(_WORD_RE.findall((s or "").lower()))
 
 
+def example_id(ex: dict[str, Any]) -> str:
+    """The example's identity, derived from its own content: `question` + `sql`, 12 hex characters —
+    the construction `compute_model_hash` uses (`snapshot.py::_hash_and_manifest`).
+
+    Derived rather than minted because a minted id changes on every deploy, and derived rather than
+    authored because authoring gives the id two homes that can disagree. Each part is NUL-*terminated*
+    rather than joined, so ("ab", "c") and ("a", "bc") cannot collapse onto one id.
+
+    `area` is excluded deliberately: it is not carried in the example file — the deploy injects it
+    from the subject-area directory name — so hashing it would tie the id to a value resolved outside
+    the example. Two examples sharing question and sql are the same example.
+
+    Byte-exact, no normalization: a normalizer is a second thing that can disagree between the two
+    things it exists to hold in agreement. So a reworded question or a corrected query is a different
+    example, which is the intended property; metadata edits leave the id alone.
+    """
+    h = hashlib.sha256()
+    for part in (str(ex.get("question") or ""), str(ex.get("sql") or "")):
+        h.update(part.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:12]
+
+
 def write_examples(
     store: Store, datasource: str, examples: list[dict[str, Any]], org_id: str = DEFAULT_ORG
 ) -> None:
@@ -377,10 +401,21 @@ def write_examples(
     store.execute(
         "DELETE FROM prompt_example WHERE org_id = ? AND datasource = ?", (org_id, datasource)
     )
+    # Since ids are derived from content, the same example filed under two subject areas now resolves
+    # to one id — and `area` is not in the primary key, so the second INSERT would raise and abort the
+    # deploy. First wins, which also keeps the surviving row's `area` stable across re-seeds. It also
+    # only serves the area it won under, so an example deliberately filed twice is no longer returned
+    # for the second one. Two examples carrying the *same authored* id skip here too, where they used
+    # to take the deploy down. The rows above were just deleted, so a within-this-call repeat is the
+    # only collision reachable.
+    seen: set[str] = set()
     for ex in examples:
         # Keep a stable id across re-seeds when the example carries one (so per-example identity
-        # survives a redeploy); mint one only when absent.
-        ex_id = str(ex.get("id") or uuid4().hex)
+        # survives a redeploy); derive one from its content when absent.
+        ex_id = str(ex.get("id") or example_id(ex))
+        if ex_id in seen:
+            continue
+        seen.add(ex_id)
         store.execute(
             "INSERT INTO prompt_example (org_id, datasource, area, id, question, doc) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -403,13 +438,13 @@ def select_examples(
     context. No embeddings (that tier is deploy-time + off by default)."""
     if area:
         rows = store.query(
-            "SELECT question, doc FROM prompt_example WHERE org_id = ? AND datasource = ? "
+            "SELECT id, question, doc FROM prompt_example WHERE org_id = ? AND datasource = ? "
             "AND (area = ? OR area IS NULL)",
             (org_id, datasource, area),
         )
     else:
         rows = store.query(
-            "SELECT question, doc FROM prompt_example WHERE org_id = ? AND datasource = ?",
+            "SELECT id, question, doc FROM prompt_example WHERE org_id = ? AND datasource = ?",
             (org_id, datasource),
         )
     q = _tokens(query)
@@ -418,13 +453,35 @@ def select_examples(
     out: list[dict[str, Any]] = []
     used = 0
     for r in rows[:top_k]:
-        doc = json.loads(r["doc"])
+        # The column wins over any `id` inside `doc` — they agree by construction, but the column is
+        # the identity `example_by_id` resolves. Merged before measuring, so the budget accounts for
+        # the dict actually returned.
+        doc = {**json.loads(r["doc"]), "id": r["id"]}
         size = len(json.dumps(doc))
         if out and used + size > char_budget:
             break
         out.append(doc)
         used += size
     return out
+
+
+def example_by_id(
+    store: Store, *, org_id: str = DEFAULT_ORG, datasource: str, example_id: str
+) -> dict[str, Any] | None:
+    """The one example carrying `example_id`, in the shape `select_examples` returns it, or None when
+    no such example is seeded for this org and datasource.
+
+    The derivation is one-way, so a caller holding an id has no way back to the example it names
+    without this. Scoped like every other read here: an id identifies an example *within* an org's
+    datasource, even though the same curated example imported elsewhere derives the same characters.
+    """
+    rows = store.query(
+        "SELECT id, doc FROM prompt_example WHERE org_id = ? AND datasource = ? AND id = ?",
+        (org_id, datasource, example_id),
+    )
+    if not rows:
+        return None
+    return {**json.loads(rows[0]["doc"]), "id": rows[0]["id"]}
 
 
 # ---------------------------------------------------------------------------

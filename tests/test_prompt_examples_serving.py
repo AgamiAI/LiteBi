@@ -95,6 +95,29 @@ def test_the_area_parameter_is_advertised_so_a_client_can_send_it(tmp_path):
     assert "area" in schema["properties"]
 
 
+def test_every_served_example_carries_its_id(tmp_path, monkeypatch):
+    """The id column was never selected, so it reached nobody even when it held something. A caller
+    can now name the example it used rather than quoting it back (ACE-109).
+
+    Seeded under the org the tool will resolve to rather than the write default: on a machine that
+    has a deployment record, those differ, and the read would find nothing.
+    """
+    examples = [
+        {"area": "sales", "question": f"monthly revenue trend {i}", "sql": f"SELECT {i}"}
+        for i in range(3)
+    ]
+    url = "sqlite://" + str(tmp_path / "agami.db")
+    s = Store.connect(url)
+    s.run_migrations()
+    model_store.write_examples(s, "main", examples, tools.current_org_id())
+    s.close()
+    monkeypatch.setenv("AGAMI_DB_URL", url)
+
+    out = json.loads(tools.tool_get_prompt_examples({"datasource": "main", "query": "revenue"}))
+    assert out["examples"], "expected at least one match"
+    assert all(e["id"] == model_store.example_id(e) for e in out["examples"])
+
+
 # --- the local (file) path, which had no test at all -----------------------------------------
 
 
