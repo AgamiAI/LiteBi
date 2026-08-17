@@ -12,6 +12,40 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-08-14
+
+### Added
+
+- **The activity log can name the execution it ran.** `tool_calls` records that a tool ran and
+  `query_executions` records what the warehouse was asked and what the guard decided; both are
+  written for every `execute_sql`, they are 1:1, and nothing joined them. `018`'s own comment
+  recorded the gap — *"there is no key between them (`Envelope.audit_id` is `query_executions.id`,
+  which `tool_calls` does not carry)"* — and chose to duplicate a column rather than add one.
+
+  That holds for a single sentence-shaped field. It stops holding once anything has to be attached to
+  a **statement**: `correlation_id` names the turn, one turn runs several statements, and no column
+  told them apart. A reader wanting per-statement facts had to guess, and the only material to guess
+  with was the agent's own framing text — which repeats whenever a turn retries a sub-question, so it
+  mis-attributes in silence.
+
+  `tool_calls` now carries `audit_id`, and the value is one the caller already received: `_emit`
+  stamps it onto every envelope, and `query_executions.id` is that same id. The column reconciles
+  nothing and mints nothing.
+
+  It is read off the body `record_tool_call` already parses, on `ok`, `refused` and `failed` alike —
+  a blocked or broken call is the one an auditor most wants to trace. A caller that hands over no
+  body can state it instead, like the outcome fields beside it. NULL is the ordinary case, not a gap:
+  a schema read or a datasource list runs no statement and has none.
+
+### Fixed
+
+- **A client asking what this server looks like gets the icon, not a 401.** `/favicon.ico` was not
+  merely absent, it was gated: the bearer middleware challenges anything off its public list before
+  routing can 404 it, so the one unauthenticated request a client makes to learn what a server looks
+  like came back as an auth prompt. An MCP client showing a server in a connector list has no
+  credentials to offer for an icon fetch, and a deployment that redirects `/` elsewhere leaves this
+  the only path left to ask on — so such a server drew a letter avatar beside servers that answered.
+
 ## [0.6.5] — 2026-08-13
 
 ### Fixed
