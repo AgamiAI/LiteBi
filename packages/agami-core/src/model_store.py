@@ -490,8 +490,8 @@ class DbActivitySink:
         self._store.execute(
             "INSERT INTO tool_calls (id, ts, org_id, actor, tool_name, datasource, sql, row_count, "
             "execution_ms, success, error_kind, source, user_question, agent_query, thread_id, "
-            "correlation_id, refusal_detail, refusal_remediation, audit_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "correlation_id, refusal_detail, refusal_remediation, audit_id, basis) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid4().hex,
                 record.ts,
@@ -519,6 +519,10 @@ class DbActivitySink:
                 # an older record shape writes NULL rather than raising. NULL is ordinary here too:
                 # those are NULL on every non-refusal, this on every call that ran no statement.
                 getattr(record, "audit_id", None),
+                # The agent's account of what it based the query on (020), already bounded and
+                # serialized by the writer. `getattr`-guarded like the three above, and NULL is
+                # ordinary here too: the argument is optional and most calls omit it.
+                getattr(record, "basis", None),
             ),
         )
         self._store.commit()
@@ -531,7 +535,7 @@ class DbActivitySink:
 _TOOL_CALL_COLS = (
     "id, ts, actor, tool_name, datasource, sql, row_count, execution_ms, success, error_kind, "
     "user_question, agent_query, thread_id, correlation_id, source, "
-    "refusal_detail, refusal_remediation"
+    "refusal_detail, refusal_remediation, basis"
 )
 
 

@@ -1964,6 +1964,79 @@ def _bounded_audit_sql(sql: str) -> tuple[str, bool]:
     return sql[:AUDIT_SQL_MAX_CHARS], True
 
 
+# What the agent may say it based a query on. A CLOSED set, enforced HERE and named in the tool
+# description as prose rather than declared as a schema `enum`. The MCP SDK validates arguments
+# against `inputSchema` before the handler runs, so an `enum` would not filter a bad value out of
+# the list — it would refuse the whole query over an optional note. An entry naming a kind we do not
+# know is dropped instead, and the row says the claim was not stored verbatim.
+BASIS_KINDS = frozenset(
+    {"example", "table", "join", "metric", "entity", "glossary", "filter", "date_range"}
+)
+
+# The list is caller-written and therefore caller-length. 20 is far above any honest use — a query
+# built on twenty distinct choices has more to explain than a log line can carry anyway — so this
+# bites only on a runaway, in the same spirit as `runtime._RECEIPT_MAX_REFS`.
+BASIS_MAX_ENTRIES = 20
+
+# `ref` is mostly a name — a table, a metric, an example id. But for `filter` and `date_range` it is
+# the PREDICATE, so it can carry a literal drawn from the customer's data, which is exactly the
+# disclosure `why` is bounded for. Same constraint, therefore: bounded here, and never treated as
+# safe to forward anywhere the SQL itself would not go.
+BASIS_REF_MAX_CHARS = 200
+
+# `why` is one short sentence by contract, and free text the model wrote can contain anything it
+# just read. Bounded well above a sentence, so a cut means something already went wrong.
+BASIS_WHY_MAX_CHARS = 300
+
+
+def _bounded_basis(raw: Any) -> str | None:
+    """The agent's stated basis as it will be stored, or None when it said nothing.
+
+    None rather than an empty envelope is what keeps a call that omits the argument byte-identical to
+    one made before the field existed — the column is simply NULL, as it is on every historical row.
+
+    `truncated` is ONE flag meaning "what is stored is not what was sent", set by a dropped entry, a
+    cut string and an over-cap list alike. Two flags would separate rejection from truncation, but a
+    reader only needs to know the record is not verbatim before quoting it — and a dropped entry that
+    set no flag would be a silent loss, which is the worse failure of the two.
+    """
+    if not isinstance(raw, list):
+        return None  # absent, or a caller sending something that was never a list
+    entries: list[dict[str, str]] = []
+    truncated = False
+    for item in raw:
+        if not isinstance(item, dict):
+            truncated = True  # rejected, and the row says the claim is not what was sent
+            continue
+        kind, ref, why = item.get("kind"), item.get("ref"), item.get("why")
+        # `kind` and `ref` are the entry's two required fields, so both are checked the same way and
+        # a failure of either drops the entry. The isinstance guards are not belt-and-braces: JSON
+        # gives us arbitrary types here, an array or object `kind` is UNHASHABLE, and testing it
+        # against a frozenset would raise TypeError out of the middle of building the audit record —
+        # turning a query that already succeeded into an error the caller sees.
+        if not isinstance(kind, str) or kind not in BASIS_KINDS:
+            truncated = True
+            continue
+        if not isinstance(ref, str) or not ref:
+            truncated = True
+            continue
+        if len(entries) >= BASIS_MAX_ENTRIES:
+            truncated = True
+            break  # nothing after this can change either value, so stop reading the caller's list
+        why = why if isinstance(why, str) else ""  # optional, unlike the two above
+        truncated = truncated or len(ref) > BASIS_REF_MAX_CHARS or len(why) > BASIS_WHY_MAX_CHARS
+        entries.append(
+            {
+                "kind": kind,
+                "ref": ref[:BASIS_REF_MAX_CHARS],
+                "why": why[:BASIS_WHY_MAX_CHARS],
+            }
+        )
+    if not entries and not truncated:
+        return None  # an empty list is the same claim as no list
+    return json.dumps({"entries": entries, "truncated": truncated})
+
+
 def _bounded_audit_detail(detail: str) -> str:
     """The refusal's detail as it will be stored (ACE-098).
 
@@ -2619,6 +2692,10 @@ def record_tool_call(
         "refusal_remediation": derived_refusal_remediation,
         "user_question": user_question if user_question is not None else args.get("user_question"),
         "agent_query": args.get("raw_query"),  # the existing arg is the agent's framing of the query
+        # The choices behind the query, bounded here rather than by the caller — a bound the caller
+        # applies is not a bound. Joins the two self-reported columns above: same provenance, same
+        # trust.
+        "basis": _bounded_basis(args.get("basis")),
         "thread_id": thread_id if thread_id is not None else args.get("thread_id"),
         "correlation_id": (  # the turn (one user question)
             correlation_id if correlation_id is not None else args.get("correlation_id")
@@ -2814,7 +2891,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Fetch the curated few-shot NL→SQL examples for a datasource, grouped by subject area. "
             "Use before generating SQL to ground dialect and house style; match on the question, "
-            "then reuse the tagged tables/columns/SQL."
+            "then reuse the tagged tables/columns/SQL. On a served deployment each example carries "
+            "a stable `id` — cite it as a basis ref on execute_sql to say which one you followed."
         ),
         "inputSchema": {
             "type": "object",
@@ -2941,7 +3019,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "resolve what the aggregate reads (a `COUNT(*)`, an unqualified column, a CTE the walk "
             "does not enter), so do NOT report it as clean. Its sibling `findings` is a different "
             "question — whether the arithmetic is meaningful at all — and a number can be "
-            "un-multiplied and still meaningless."
+            "un-multiplied and still meaningless.\n"
+            "OPTIONALLY send `basis` — the choices behind this query, each with why. Recorded for "
+            "the admin activity log beside the statement; never checked against your SQL."
         ),
         "inputSchema": {
             "type": "object",
@@ -2972,6 +3052,22 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "thread_id": _THREAD_ID_PROP,
                 "correlation_id": _CORRELATION_ID_PROP,
+                # Deliberately a bare array: no `items` schema, no `maxItems`. The MCP SDK validates
+                # every call against this schema BEFORE the handler runs, so any constraint here
+                # refuses the whole query rather than bounding the field — a 260-character `ref` is
+                # an ordinary IN-list predicate, and losing the user's answer over an advisory note
+                # is the opposite of what this field is for. `_bounded_basis` is the bound, which is
+                # also the only place a bound belongs: it truncates and records that it did.
+                # Validation is per-item and runs on the event loop, so an items schema also made a
+                # max-size body cost seconds of everyone else's latency.
+                "basis": {
+                    "type": "array",
+                    "description": "OPTIONAL. What you based this query on: objects of {kind, ref, "
+                    "why}. kind is one of example, table, join, metric, entity, glossary, filter, "
+                    "date_range; ref is what you chose (the example id, the table or metric name, "
+                    "the predicate); why is one short sentence, carrying no values from the data "
+                    "that the SQL does not. Over-long or unknown entries are trimmed, not refused.",
+                },
             },
             "required": ["sql"],
             "additionalProperties": False,

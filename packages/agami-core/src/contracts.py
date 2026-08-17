@@ -297,4 +297,11 @@ class ToolCallRecord(_Contract):
     # on the envelope the caller receives. `correlation_id` identifies the turn, which may run several
     # statements; this identifies the statement. NULL wherever none ran.
     audit_id: str | None = None
+    # What the agent says it based this query on (020): JSON `{"entries": [...], "truncated": bool}`,
+    # each entry a `kind` from a closed set, a `ref`, and a one-sentence `why`. Bounded by the writer
+    # (`tools.BASIS_MAX_ENTRIES` and the two length caps) — `truncated` says the stored value is not
+    # what was sent. Self-reported like `user_question`/`agent_query` above, so it is evidence of a
+    # claim and never a fact; nothing here checks `ref` against `sql`. NULL on every call that did
+    # not send one, which is the ordinary case.
+    basis: str | None = None
     org_id: str = "local"  # the tenant this call ran for; defaults to the single-tenant org

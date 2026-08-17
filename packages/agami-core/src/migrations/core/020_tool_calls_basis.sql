@@ -1,0 +1,27 @@
+-- What the agent based this query on. The activity log already records what ran — the statement, the
+-- outcome, and two self-reported columns (`user_question`, `agent_query`) carrying the caller's own
+-- framing. What it has never recorded is the reasoning between the two: which curated example was
+-- mirrored, which table was chosen over a similar one, which metric definition was used, why a
+-- filter is there. So an operator can see that a query was wrong, but not where the reasoning went
+-- wrong.
+--
+-- ONE COLUMN, HOLDING JSON, because the shape is a list rather than a value: each entry is a `kind`
+-- from a closed set, a `ref` naming what was chosen, and a `why` that is one sentence. Eight named
+-- columns would be eight ALTERs, and a ninth kind would be a ninth; this way a new kind is a new
+-- enum value on the tool schema and no schema change at all here.
+--
+-- The stored value is an OBJECT, not a bare list — `{"entries": [...], "truncated": true|false}`.
+-- The writer caps the entry count and the length of `ref` and `why`, and a record that was cut has
+-- to say so, or a reader takes a truncated list for the whole claim. 015 recorded that flag as its
+-- own column (`query_executions.sql_truncated`); one column here means it rides inside the value.
+--
+-- SELF-REPORTED, LIKE ITS NEIGHBOURS. This is the model's account of its own reasoning, not
+-- something the server observed, so it is evidence of a claim and never a fact. Nothing in core
+-- scores it or checks `ref` against the SQL — a consumer holding the receipt can do that itself.
+--
+-- NULL IS THE ORDINARY CASE. The argument is optional and absent is normal: every client that has
+-- never heard of it keeps working, and its rows are byte-identical to today's but for this column.
+--
+-- PORTABLE: one nullable TEXT column added by ALTER — the only form SQLite and Postgres both accept
+-- without a table rebuild.
+ALTER TABLE tool_calls ADD COLUMN basis TEXT;
