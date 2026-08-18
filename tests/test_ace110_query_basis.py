@@ -96,8 +96,8 @@ DECLARED_KINDS = [
 
 
 def test_every_declared_kind_is_accepted():
-    """The enum on the schema and the set enforced at the boundary have to be the same set, or a
-    compliant client sends something the boundary silently drops."""
+    """The kinds the description advertises and the set enforced at the boundary have to be the same
+    set, or a compliant client sends something the boundary silently drops."""
     entries = [{"kind": k, "ref": "x", "why": "y"} for k in DECLARED_KINDS]
     doc = _stored(tools._bounded_basis(entries))
     assert [e["kind"] for e in doc["entries"]] == DECLARED_KINDS
@@ -138,9 +138,11 @@ def test_a_payload_the_boundary_trims_is_accepted_by_the_schema():
 
 @pytest.mark.parametrize("bad", ["nonsense", "", None, "EXAMPLE", 7, True])
 def test_an_unknown_kind_is_dropped_at_the_boundary(bad):
-    """Criterion 3. The schema declares the enum, but nothing in this repo validates an incoming
-    payload against a tool's inputSchema — `enum` is honoured by the client — so a non-compliant
-    caller reaches this code path and the drop is what makes 'rejected rather than stored' true."""
+    """Criterion 3, and the drop is the whole of it. The MCP SDK validates arguments against
+    `inputSchema` before the handler runs, so a constraint declared there does not filter a bad entry
+    out of `basis` — it refuses the entire call, taking the answer with it. That is why the property
+    carries no `items` schema and the kinds are advertised as prose: enforcement belongs here, where
+    an unknown kind costs its own entry and nothing else."""
     doc = _stored(tools._bounded_basis([{"kind": bad, "ref": "x", "why": "y"}, ENTRY]))
     assert doc["entries"] == [ENTRY]
     assert doc["truncated"] is True  # dropped is not verbatim, and the row has to say so
@@ -192,7 +194,9 @@ def test_all_entries_invalid_still_records_the_attempt():
 
 
 def test_too_many_entries_are_capped_and_flagged():
-    over = [{"kind": "table", "ref": f"t{i}", "why": "w"} for i in range(tools.BASIS_MAX_ENTRIES + 3)]
+    over = [
+        {"kind": "table", "ref": f"t{i}", "why": "w"} for i in range(tools.BASIS_MAX_ENTRIES + 3)
+    ]
     doc = _stored(tools._bounded_basis(over))
     assert len(doc["entries"]) == tools.BASIS_MAX_ENTRIES
     assert doc["truncated"] is True
@@ -214,7 +218,9 @@ def test_a_long_ref_is_cut_and_flagged():
     """`ref` is bounded for the same reason `why` is: for `filter` and `date_range` it IS the
     predicate, so it can carry a literal out of the customer's data."""
     long_ref = "region = '" + "x" * (tools.BASIS_REF_MAX_CHARS + 50) + "'"
-    doc = _stored(tools._bounded_basis([{"kind": "filter", "ref": long_ref, "why": "asked for it"}]))
+    doc = _stored(
+        tools._bounded_basis([{"kind": "filter", "ref": long_ref, "why": "asked for it"}])
+    )
     assert len(doc["entries"][0]["ref"]) == tools.BASIS_REF_MAX_CHARS
     assert doc["truncated"] is True
 
@@ -319,9 +325,17 @@ def test_the_stored_basis_reaches_the_reader(db):
 
 def _card(basis_value):
     return admin._call_card(
-        {"sql": "SELECT 1", "agent_query": "count", "ts": "2026-08-17T00:00:00Z",
-         "datasource": "SALES_DATA", "execution_ms": 4, "success": 1, "row_count": 1,
-         "tool_name": "execute_sql", "basis": basis_value}
+        {
+            "sql": "SELECT 1",
+            "agent_query": "count",
+            "ts": "2026-08-17T00:00:00Z",
+            "datasource": "SALES_DATA",
+            "execution_ms": 4,
+            "success": 1,
+            "row_count": 1,
+            "tool_name": "execute_sql",
+            "basis": basis_value,
+        }
     )
 
 
@@ -338,9 +352,15 @@ def test_a_basis_lands_under_its_own_call_not_a_neighbour():
     """The criterion is 'under the RIGHT statement'. A turn runs several calls and only some carry a
     basis, so rendering one card per call is not enough — the block has to stay inside the card whose
     SQL it explains."""
-    with_basis = {"sql": "SELECT 1", "ts": "2026-08-17T00:00:00Z", "datasource": "SALES_DATA",
-                  "execution_ms": 4, "success": 1, "tool_name": "execute_sql",
-                  "basis": json.dumps({"entries": [ENTRY], "truncated": False})}
+    with_basis = {
+        "sql": "SELECT 1",
+        "ts": "2026-08-17T00:00:00Z",
+        "datasource": "SALES_DATA",
+        "execution_ms": 4,
+        "success": 1,
+        "tool_name": "execute_sql",
+        "basis": json.dumps({"entries": [ENTRY], "truncated": False}),
+    }
     without = {**with_basis, "sql": "SELECT 2", "basis": None}
     html = admin._call_card(without) + admin._call_card(with_basis)
     assert html.index("SELECT 2") < html.index("SELECT 1") < html.index("88e825e75112")
@@ -405,8 +425,16 @@ def test_the_rendered_basis_is_escaped():
     """Self-reported and attacker-influenceable, exactly like the SQL and the question beside it."""
     html = _card(
         json.dumps(
-            {"entries": [{"kind": "filter", "ref": "<script>alert(1)</script>",
-                          "why": 'a "quoted" & <b>bold</b> reason'}], "truncated": False}
+            {
+                "entries": [
+                    {
+                        "kind": "filter",
+                        "ref": "<script>alert(1)</script>",
+                        "why": 'a "quoted" & <b>bold</b> reason',
+                    }
+                ],
+                "truncated": False,
+            }
         )
     )
     assert "<script>" not in html

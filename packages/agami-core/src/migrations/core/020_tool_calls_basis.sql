@@ -8,7 +8,8 @@
 -- ONE COLUMN, HOLDING JSON, because the shape is a list rather than a value: each entry is a `kind`
 -- from a closed set, a `ref` naming what was chosen, and a `why` that is one sentence. Eight named
 -- columns would be eight ALTERs, and a ninth kind would be a ninth; this way a new kind is a new
--- enum value on the tool schema and no schema change at all here.
+-- value in the list the tool description advertises and in the set the boundary enforces, and no
+-- schema change at all here.
 --
 -- The stored value is an OBJECT, not a bare list — `{"entries": [...], "truncated": true|false}`.
 -- The writer caps the entry count and the length of `ref` and `why`, and a record that was cut has
