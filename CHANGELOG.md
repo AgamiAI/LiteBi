@@ -12,6 +12,56 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-08-18
+
+### Added
+
+- **A curated example keeps the same id across deploys, and the caller can see it.** `prompt_example`
+  has had an `id` column in its primary key since the table existed, and it was unusable three times
+  over: an example with no `id` in its YAML got a minted uuid4, nothing wrote that back, so the next
+  deploy minted a different one for the same example — and the read selected `question, doc`, never
+  the `id`, so no identity reached a caller even where one existed. Across a real deployed model of
+  16 subject areas and 46 curated examples, not one carried an id.
+
+  So nothing could name an example, count one, or say whether the one returned yesterday is the one
+  returned today. `agami-save-correction` cannot tell a correction that created an example from one
+  that should have replaced it; ranking returns a subset and which subset is unrecordable; the library
+  only grows, because no two observations of an example can be tied together.
+
+  The id is now **derived from the example's own content** — `question` and `sql`, each NUL-terminated,
+  SHA-256, twelve hex characters, the construction `compute_model_hash` already uses. Derived rather
+  than minted, because a minted id changes every deploy; derived rather than authored, because
+  authoring gives the id two homes that can disagree and needs a pass over every deployment. An
+  authored `id` in the YAML still wins, which is the escape hatch for an example deliberately filed
+  under two subject areas — those otherwise resolve to one id, and the first now wins rather than the
+  second aborting the deploy.
+
+  `select_examples` returns it, and `example_by_id` reads one back, scoped by org and datasource like
+  every other read in the module. The derivation is one-way, so a consumer holding an id needs the
+  lookup for the id to be worth having.
+
+- **An agent can say what it based a query on, and why.** The activity log records what ran and two
+  self-reported columns carrying the caller's framing of the question. What it never recorded is the
+  reasoning in between: why that table, when the model declares three that look similar; why that
+  join, when it declares no relationship between those two tables; which curated example this
+  followed, or whether there was none. An operator could see that a query was wrong and not where the
+  reasoning went wrong — and a query against the wrong table is indistinguishable, in the log, from
+  one against the right table.
+
+  `execute_sql` takes an optional `basis`: a list of `{kind, ref, why}`, recorded on `tool_calls` and
+  rendered in the activity log beneath the statement it explains. Absent is the ordinary case, the
+  field is not `required`, and a client that has never heard of it is unaffected.
+
+  **The property is declared as a bare array, and that is a correctness constraint rather than a
+  simplification.** The MCP SDK validates arguments against `inputSchema` before the handler runs, so
+  a `maxLength`, `maxItems` or `enum` there does not trim a bad entry — it refuses the whole call and
+  takes the caller's answer with it. The kinds are advertised in the description and enforced at the
+  boundary, where an over-long `ref` or an unknown `kind` costs its own entry and nothing else. The
+  stored value says when it was cut, so a reader never takes a truncated list for the whole claim.
+
+  Self-reported, like its neighbours: core records the claim and adjudicates nothing. Whoever holds
+  the receipt can check `ref` against the SQL themselves.
+
 ## [0.6.6] — 2026-08-14
 
 ### Added
