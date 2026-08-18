@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -209,6 +210,60 @@ def _utc(ts: str | None) -> str:
     return f'<time data-utc="{ui.esc(ts)}">{ui.esc(ts)}</time>'
 
 
+def _text(v: Any) -> str:
+    """A value from a self-reported JSON column as a string, or empty when it is not one.
+
+    `ui.esc` takes `str | None` and raises on anything else truthy, so this is what keeps a column
+    written by someone other than this process from reaching it."""
+    return v if isinstance(v, str) else ""
+
+
+def _basis_block(raw: Any) -> str:
+    """What the agent said it based this query on (020), rendered under the statement it explains.
+
+    Self-reported and attacker-influenceable exactly like the SQL and the question above, so every
+    part is escaped and the block says whose claim it is. A row written before the column existed, or
+    by a caller that sent nothing, renders nothing at all.
+
+    Unparseable JSON renders nothing rather than raising: this is one card in a page the operator
+    opened to read the rest of the log, and a malformed self-report is not worth losing that page.
+    """
+    if not raw:
+        return ""
+    try:
+        doc = json.loads(raw)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(doc, dict):
+        return ""
+    entries = doc.get("entries")
+    if not isinstance(entries, list):
+        return ""
+    # Every value is re-checked for str-ness rather than trusted: `ui.esc` handles None but raises on
+    # any other non-string, and one such row would cost the operator the whole page (`_session_drawer`
+    # joins every card). The writer never emits one, but `basis` is a plain TEXT column and an
+    # embedder builds `ToolCallRecord` itself — not trusting the column is the point of this guard.
+    items = "".join(
+        f'<li><span class="pill" style="background:var(--chip);color:var(--ink)">'
+        f'{ui.esc(_text(e.get("kind")))}</span> {ui.esc(_text(e.get("ref")))}'
+        + (f' — {ui.esc(_text(e["why"]))}' if _text(e.get("why")) else "")
+        + "</li>"
+        for e in entries
+        if isinstance(e, dict)
+    )
+    cut = ' <span class="muted">· truncated</span>' if doc.get("truncated") else ""
+    if not items and not cut:
+        return ""
+    # A claim that was made and wholly rejected still shows its heading: on the one surface this
+    # feature exists for, "the agent said nothing" and "everything the agent said was rejected" must
+    # not look identical.
+    body = f'<ul style="margin:4px 0 0;padding-left:18px;font-size:13px">{items}</ul>' if items else ""
+    return (
+        f'<div class="muted" style="margin-top:6px;font-size:13px">basis · agent-reported{cut}</div>'
+        f"{body}"
+    )
+
+
 def _call_card(c: dict[str, Any]) -> str:
     """One call inside a turn. A **query** call (has `sql`) shows its agent-framing + SQL; a **non-query**
     call (list_datasources, get_datasource_schema, …) has no SQL, so it shows its tool name — so every call
@@ -239,7 +294,7 @@ def _call_card(c: dict[str, Any]) -> str:
     rows_bit = f" · {c['row_count']} rows" if c.get("row_count") is not None else ""
     return (
         '<div style="border-top:1px solid var(--line);padding:9px 0 11px">'
-        f"{head}{body}"
+        f"{head}{body}{_basis_block(c.get('basis'))}"
         f'<div class="muted" style="font-size:13px;margin-top:6px">{_utc(c["ts"])} · {ds} · '
         f"{lat} {_ok_pill(c['success'])}{rows_bit}</div></div>"
     )

@@ -274,9 +274,23 @@ def test_no_notice_leaks_a_spec_id_to_a_client():
                     m.Table.model_fields["default_filters"].description):
         assert not spec_id.search(surface), surface
 
+    # Every description at any depth, not just the top-level properties: a property whose `items`
+    # carry their own object schema puts descriptions a level down, and those ship to the client
+    # exactly like the rest. Sweeping only the top level meant the guard's reach stopped short of
+    # part of the surface it exists to protect.
+    def _descriptions(node):
+        if isinstance(node, dict):
+            if isinstance(node.get("description"), str):
+                yield node["description"]
+            for v in node.values():
+                yield from _descriptions(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from _descriptions(v)
+
     for spec in tools.TOOLS.values():
-        for prop in spec["inputSchema"].get("properties", {}).values():
-            assert not spec_id.search(prop.get("description", ""))
+        for description in _descriptions(spec["inputSchema"]):
+            assert not spec_id.search(description), description
 
 
 def test_no_shipped_markdown_surface_carries_a_spec_id():
