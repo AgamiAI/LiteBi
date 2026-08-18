@@ -147,9 +147,7 @@ def write_datasource(
     store.commit()
 
 
-def load_datasource(
-    store: Store, datasource: str, org_id: str = DEFAULT_ORG
-) -> Datasource | None:
+def load_datasource(store: Store, datasource: str, org_id: str = DEFAULT_ORG) -> Datasource | None:
     """Rebuild the Datasource for `datasource` from rows, or None if it isn't seeded."""
     org_rows = store.query(
         "SELECT doc FROM datasource_model WHERE org_id = ? AND datasource = ?", (org_id, datasource)
@@ -254,8 +252,7 @@ def write_memory(
             (org_id, datasource),
         )
         store.execute(
-            "INSERT INTO memory (org_id, datasource, kind, content) "
-            "VALUES (?, ?, 'datasource', ?)",
+            "INSERT INTO memory (org_id, datasource, kind, content) VALUES (?, ?, 'datasource', ?)",
             (org_id, datasource, datasource_doc),
         )
     if user is not None:
@@ -412,7 +409,12 @@ def write_examples(
     for ex in examples:
         # Keep a stable id across re-seeds when the example carries one (so per-example identity
         # survives a redeploy); derive one from its content when absent.
-        ex_id = str(ex.get("id") or example_id(ex))
+        #
+        # Absent means absent, not falsy: an unquoted `id: 0` in YAML parses to an int, and
+        # `ex.get("id") or ...` would derive an id for an example that carries one. An empty string
+        # is treated as absent, since it names nothing.
+        authored = ex.get("id")
+        ex_id = str(authored) if authored is not None and str(authored) != "" else example_id(ex)
         if ex_id in seen:
             continue
         seen.add(ex_id)

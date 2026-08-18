@@ -65,9 +65,9 @@ def test_metadata_edits_leave_the_id_alone(key):
 
 def test_the_id_is_byte_exact_so_whitespace_is_a_difference():
     """No strip, no case-fold: a normalizer is a second thing that can disagree."""
-    assert model_store.example_id({"question": QUESTION + " ", "sql": SQL}) != model_store.example_id(
-        {"question": QUESTION, "sql": SQL}
-    )
+    assert model_store.example_id(
+        {"question": QUESTION + " ", "sql": SQL}
+    ) != model_store.example_id({"question": QUESTION, "sql": SQL})
 
 
 def test_an_example_missing_its_sql_still_derives_an_id():
@@ -118,6 +118,30 @@ def test_an_authored_id_wins_verbatim(tmp_path):
     s.close()
 
 
+def test_an_authored_id_of_zero_still_wins(tmp_path):
+    """`0` is a legal id and a falsy one. YAML parses an unquoted `id: 0` as an int, so a truthiness
+    check reads it as absent and derives over it — and a numbered library starts at exactly this
+    value. The failure is silent: the example keeps working, under an id its author did not choose."""
+    s = _store(tmp_path)
+    model_store.write_examples(
+        s, "main", [{"area": "sales", "id": 0, "question": QUESTION, "sql": SQL}]
+    )
+    assert _ids(s) == ["0"]
+    s.close()
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+def test_an_id_that_names_nothing_is_treated_as_absent(tmp_path, empty):
+    """The other half, and the reason the check is not simply `is not None`: a key present but empty
+    names no example, so derivation is the right answer rather than an id of ""."""
+    s = _store(tmp_path)
+    model_store.write_examples(
+        s, "main", [{"area": "sales", "id": empty, "question": QUESTION, "sql": SQL}]
+    )
+    assert _ids(s) == [model_store.example_id({"question": QUESTION, "sql": SQL})]
+    s.close()
+
+
 def test_one_example_in_two_areas_is_one_row_not_a_crash(tmp_path):
     """`area` is not in the primary key and is deliberately not in the hash, so the same example
     filed under two subject areas now collapses to one id. A bare INSERT would raise here and take
@@ -157,9 +181,7 @@ def test_examples_that_differ_only_by_area_are_still_two_rows(tmp_path):
 
 def test_select_examples_returns_the_id_on_every_example(tmp_path):
     s = _store(tmp_path)
-    model_store.write_examples(
-        s, "main", [{"area": "sales", "question": QUESTION, "sql": SQL}]
-    )
+    model_store.write_examples(s, "main", [{"area": "sales", "question": QUESTION, "sql": SQL}])
     out = model_store.select_examples(s, "main")
     assert out[0]["id"] == model_store.example_id({"question": QUESTION, "sql": SQL})
     assert out[0]["question"] == QUESTION  # the rest of the doc still rides along
