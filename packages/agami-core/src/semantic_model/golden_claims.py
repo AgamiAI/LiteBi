@@ -81,7 +81,13 @@ _FILTER_NODES = rt._exp_nodes("Filter")
 # carrying a time. Deliberately narrow — an engine-specific date expression is a spelling the
 # resolver does not model, and reading one it half-understands is how a partial interval gets
 # reported as a whole one.
-_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}([ T].*)?$")
+#
+# The time half is spelled OUT rather than written as a trailing `.*`, and that is this pattern's
+# second job. A bound is the one claim value that reaches the diff without passing through
+# `_echo_expr` — `_date_literal` returns the literal's own text — so what this admits IS the bound
+# on that value. A trailing `.*` admitted a quarter-megabyte literal carrying line breaks, and it
+# arrived intact in output the calling model reads as server-authored.
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?$")
 
 
 @dataclass(frozen=True)
@@ -175,7 +181,11 @@ def read_claims(sql: str, *, dialect: str) -> ClaimSet:
     conjuncts = rt._filtering_conjuncts(select)
 
     return ClaimSet(
-        tables=frozenset(rt._tkey(ref.bare) for ref in rt._table_references(select)),
+        # `_echo_name` on every identifier that becomes a claim WITHOUT passing through an
+        # expression key: a quoted name is caller-written text that the case fold leaves exactly as
+        # written, and these are the values that would otherwise arrive in the diff at whatever
+        # length and with whatever line breaks the statement gave them.
+        tables=frozenset(rt._echo_name(rt._tkey(ref.bare)) for ref in rt._table_references(select)),
         filter_predicates=frozenset(_expression_key(node, aliases) for node in conjuncts),
         filtered_columns=_constrained_columns(select),
         date_window=_resolve_date_window(conjuncts, aliases),
@@ -472,12 +482,20 @@ def _join_keys(
     Every join's ON, outer ones included: which columns two tables are matched on is the same fact
     whether or not the join keeps unmatched rows, and the join's *kind* is not one of the seven
     claims.
+
+    Both endpoints are bounded by `_echo_name`, for the same reason `tables` is: `_predicate_pairs`
+    case-folds a name and nothing more, so a quoted identifier reaches a claim as written.
     """
     pairs: set[frozenset[tuple[str, str]]] = set()
     for join in select.args.get("joins") or []:
         on = join.args.get("on")
         if on is not None:
-            pairs |= rt._predicate_pairs(on, aliases)
+            pairs |= {
+                frozenset(
+                    (rt._echo_name(table), rt._echo_name(column)) for table, column in pair
+                )
+                for pair in rt._predicate_pairs(on, aliases)
+            }
     return frozenset(pairs)
 
 
@@ -662,13 +680,25 @@ def _gates(generated: ClaimSet, golden: ClaimSet, must_filter: Sequence[str]) ->
     dataset's requirement rather than a property of the golden statement — but it stays silent when
     that statement could not be read, since "constrains it nowhere" is a claim about a statement
     nobody managed to read.
+
+    It matches a BARE column name across every `Select` in the tree, CTE bodies and scalar
+    subqueries included, so it deliberately errs toward "filtered" — which is what makes it safe to
+    fail an item on. That same looseness is why it is NOT a tenancy or row-scope check: a name
+    constrained in a subquery nothing joins to satisfies it. `must_filter` reads like such a check,
+    and it is not one.
     """
     verdicts: list[GateVerdict] = []
     if generated.unreadable is None:
+        # Deduped on the NORMALIZED name, because a dataset listing one column twice — or in two
+        # spellings of it — is asking for one thing, and two identical verdicts beside a failing
+        # item read as two problems.
+        required = dict.fromkeys(rt._bare(column).lower() for column in must_filter)
         verdicts.extend(
-            GateVerdict(kind="must_filter", column=column, reason=_MUST_FILTER_REASON)
-            for column in must_filter
-            if rt._tkey(rt._bare(column)) not in generated.filtered_columns
+            GateVerdict(
+                kind="must_filter", column=rt._echo_name(column), reason=_MUST_FILTER_REASON
+            )
+            for column in required
+            if column not in generated.filtered_columns
         )
     if _window_status(generated.date_window, golden.date_window) == DIFFERS:
         verdicts.append(GateVerdict(kind="date_window", column=None, reason=_DATE_WINDOW_REASON))
