@@ -18,6 +18,7 @@ more than one answer was defensible. Synthetic values only — nothing here name
 from __future__ import annotations
 
 import dataclasses
+import pickle
 import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -213,7 +214,7 @@ def test_an_aware_midnight_utc_matches_the_date():
 
 @pytest.mark.parametrize(
     "not_a_date",
-    ["01100170109835", "2025", "20250101", "2025-1-1", "x2025-01-01", "2025-01-01x",
+    ["00000000000042", "2025", "20250101", "2025-1-1", "x2025-01-01", "2025-01-01x",
      "2025-01-01T00:00:00Z ", "the 2025-01-01 order"],
 )
 def test_a_string_that_is_not_strictly_date_shaped_stays_text(not_a_date):
@@ -706,13 +707,14 @@ def test_partial_overlap_scores_between_zero_and_one_and_reports_both_counts():
     generated = _res(["channel", "orders"], [("web", 1), ("store", 3), ("kiosk", 2)])
     score = c.compare_result_sets(golden, generated, golden_sql=_UNORDERED)
     assert 0.0 < score.accuracy < 1.0
-    assert score.accuracy == 0.333
+    assert score.accuracy == pytest.approx(1 / 3)
     assert (score.golden_row_count, score.generated_row_count) == (3, 3)
 
 
 def test_a_near_miss_over_a_wide_result_cannot_round_up_to_a_pass():
-    # An item passes at exactly 1.0, so rounding to three places is not innocent: 4002 of 4004
-    # rows is 0.99950…, which rounds to 1.0 and would gate a result that disagreed about a row.
+    # An item passes at exactly 1.0, and 4002 of 4004 rows is 0.99950… — a result that disagreed
+    # about a row has to stay below the gate however wide it is. The score is the raw share, so
+    # there is nothing left to round it up; three-decimal presentation is the report's business.
     size = 4004
     rows = [(index, index) for index in range(size)]
     swapped = list(rows)
@@ -720,15 +722,15 @@ def test_a_near_miss_over_a_wide_result_cannot_round_up_to_a_pass():
     score = c.compare_result_sets(_res(["id", "n"], rows), _res(["id", "n"], swapped),
                                   golden_sql=_UNORDERED)
     assert score.accuracy < 1.0
-    assert score.accuracy == 0.999
+    assert score.accuracy == pytest.approx(4002 / size)
 
 
 def test_the_canonical_keys_reach_the_public_comparison():
     # Slice 1's three cases end to end: a padded decimal, a date written as text, and a
     # zero-padded identifier that must stay text rather than being read as a day.
-    golden = _res(["total", "day", "account"], [(5, date(2025, 1, 1), "01100170109835")])
+    golden = _res(["total", "day", "account"], [(5, date(2025, 1, 1), "00000000000042")])
     generated = _res(["total", "day", "account"],
-                     [(Decimal("5.00"), "2025-01-01", "01100170109835")])
+                     [(Decimal("5.00"), "2025-01-01", "00000000000042")])
     score = c.compare_result_sets(golden, generated, golden_sql=_UNORDERED)
     assert score.accuracy == 1.0
     assert score.unmatched_golden_columns == ()
@@ -775,7 +777,8 @@ def test_a_boolean_agrees_with_its_text_spelling_but_never_with_an_int():
         ("bounded", _res(["orders"], [(1,)]), _res(["orders"], [(1,), (2,), (3,), (4,), (5,)]),
          GoldenBounds(min_rows=1, max_rows=3), 0.0),
         ("nonempty", _res(["orders"], [(1,)]), _res(["orders"], [(9,)]), None, 1.0),
-        ("nonempty", _res(["orders"], [(1,)]), _res(["orders"], []), None, 0.0),
+        # The golden side is empty because a `nonempty` item has no answer key to fill it.
+        ("nonempty", _res(["orders"], []), _res(["orders"], []), None, 0.0),
     ],
 )
 def test_each_level_over_a_passing_and_a_failing_pair(level, golden, generated, bounds, expected):
@@ -843,7 +846,13 @@ def test_a_value_band_on_a_multi_cell_result_is_an_error():
     assert score.reason
 
 
-@pytest.mark.parametrize("value, expected", [(5, 1.0), (50, 0.0), (-1, 0.0)])
+@pytest.mark.parametrize(
+    "value, expected",
+    # The two edges are in here because the band is INCLUSIVE at both ends: an author writing
+    # `max_value: 10` means ten is an acceptable answer, and without these a `<` quietly becoming
+    # `<=` — or the reverse — changes every band in the suite and fails nothing.
+    [(5, 1.0), (0, 1.0), (10, 1.0), (50, 0.0), (-1, 0.0)],
+)
 def test_a_value_band_judges_the_single_generated_cell(value, expected):
     score = c.compare_result_sets(
         _res(["total"], [(7,)]), _res(["total"], [(value,)]),
@@ -956,3 +965,208 @@ def test_an_unknown_match_level_is_an_error_rather_than_a_crash():
                                   match="whatever", golden_sql=_UNORDERED)
     assert score.status == "error"
     assert score.accuracy is None
+
+
+# --- a root node that cannot carry an ordering -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A trailing comment, or a second statement, makes sqlglot wrap the whole thing in a node
+        # that carries no `order` argument of its own.
+        "SELECT n FROM t ORDER BY n;\n-- a trailing comment",
+        "SET search_path TO acme; SELECT n FROM t ORDER BY n",
+        # sqlglot has no grammar for EXPLAIN and falls back to a Command node — and it WARNS
+        # rather than raising, so the unparsed net never fires for it.
+        "EXPLAIN SELECT a FROM t ORDER BY a",
+    ],
+)
+def test_a_root_that_cannot_carry_an_order_is_assumed_ordered(sql):
+    # Asking `args['order']` of a node that has no such argument always answers None, which reads
+    # an ordered answer key as unordered and says nothing about having done so — the silent
+    # weakening this module refuses everywhere else.
+    ordered, note = c.has_top_level_order_by(sql)
+    assert ordered is True
+    assert note
+
+
+def test_a_parenthesised_statement_is_unwrapped_before_its_order_is_read():
+    # The order sits on the node inside the parentheses, or on the wrapper when the ORDER BY is
+    # written outside them; both are a total order of the rows the caller receives.
+    assert c.has_top_level_order_by("(SELECT a FROM t ORDER BY a)") == (True, None)
+    assert c.has_top_level_order_by("(SELECT a FROM t) ORDER BY a") == (True, None)
+    assert c.has_top_level_order_by("(SELECT a FROM t)") == (False, None)
+
+
+def test_an_unreadable_root_is_scored_order_sensitively_end_to_end():
+    # What the gap cost: the rows are reversed and the item scored a full 1.0 with no note.
+    golden = _res(["n"], [(1,), (2,)])
+    generated = _res(["n"], [(2,), (1,)])
+    score = c.compare_result_sets(
+        golden, generated, golden_sql="SELECT n FROM t ORDER BY n;\n-- a trailing comment"
+    )
+    assert score.order_sensitive is True
+    assert score.notes
+    assert score.accuracy == 0.0
+
+
+# --- the parser can fail in ways that are not a SqlglotError -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql, dialect",
+    [
+        ("SELECT a FROM t ORDER BY a", "zzsentineldialect"),
+        ("SELECT " + "(" * 200 + "1" + ")" * 200, None),
+    ],
+)
+def test_a_statement_that_breaks_the_parser_outright_is_still_a_score(sql, dialect):
+    # An unknown dialect raises ValueError and deep nesting raises RecursionError; neither is a
+    # SqlglotError, and this read happens outside the scoring call's own totality net.
+    ordered, note = c.has_top_level_order_by(sql, dialect=dialect)
+    assert ordered is True
+    assert note
+    score = c.compare_result_sets(
+        _res(["a"], [(1,)]), _res(["a"], [(1,)]), golden_sql=sql, dialect=dialect
+    )
+    assert score.notes
+    assert "zzsentineldialect" not in " ".join((score.reason, *score.notes))
+
+
+# --- an empty answer key is the normal shape for the keyless levels ----------------------------
+
+
+def test_nonempty_scores_zero_when_both_sides_are_empty():
+    # A `nonempty` item has no answer key by design, so its golden side is legitimately empty.
+    # Dropping the pair as unscored is exactly how an agent that returned NO ROWS — the one
+    # failure the level exists to catch — escapes the score entirely.
+    score = c.compare_result_sets(
+        _res(["orders"], []), _res(["orders"], []), match="nonempty", golden_sql=_UNORDERED
+    )
+    assert score.status == "scored"
+    assert score.accuracy == 0.0
+
+
+def test_bounded_scores_zero_when_both_sides_are_empty():
+    score = c.compare_result_sets(
+        _res(["orders"], []), _res(["orders"], []), match="bounded",
+        golden_sql=_UNORDERED, bounds=GoldenBounds(min_rows=1),
+    )
+    assert score.status == "scored"
+    assert score.accuracy == 0.0
+
+
+# --- the quantize bucket is a bucket, and says so ----------------------------------------------
+
+
+def test_quantize_does_not_bucket_two_different_integer_ids():
+    # Relatively 3.8e-9 apart, which nine significant digits rounds onto one key: every id or
+    # count above ~1e9 would compare equal to its neighbours under `values`.
+    left = c.canonical_cell(1100170109835, quantize=True)
+    right = c.canonical_cell(1100170114000, quantize=True)
+    assert left != right
+
+
+def test_quantize_leaves_a_whole_number_alone_however_it_was_spelled():
+    # The exemption is by VALUE and not by Python type: the same id arrives as an int from one
+    # driver, a Decimal from another and a float from a third, and all three have to keep keying
+    # alike or `values` would fail two identical numbers.
+    keys = {
+        c.canonical_cell(value, quantize=True)
+        for value in (1100170109835, Decimal("1100170109835"), 1100170109835.0)
+    }
+    assert len(keys) == 1
+
+
+def test_two_values_straddling_a_bucket_edge_do_not_pair():
+    # Pinned deliberately, because the name invites the wrong reading: this is a rounding BUCKET
+    # at nine significant digits, not a tolerance. These two are 8e-14 apart — four orders of
+    # magnitude inside what a 1e-9 tolerance would forgive — and they still key apart, because a
+    # bucket edge falls between them. A tolerance is not an equivalence relation and a Counter
+    # needs one, so the bucket stays; nobody should "tighten" it believing otherwise.
+    left = c.canonical_cell(Decimal("0.1234567895"), quantize=True)
+    right = c.canonical_cell(Decimal("0.12345678949999"), quantize=True)
+    assert left != right
+
+
+# --- the NaN bucket is a value, not an identity ------------------------------------------------
+
+
+def test_the_nan_bucket_survives_leaving_the_process():
+    # The sentinel is a plain string rather than a NaN, which no same-object comparison can show:
+    # a tuple holding one NaN object compares equal to ITSELF through the identity fast-path, so
+    # a `float('nan')` sentinel passes every in-process check and still opens a fresh bucket the
+    # moment the two keys are built from different objects.
+    key = c.canonical_cell(float("nan"))
+    travelled = pickle.loads(pickle.dumps(key))
+    assert travelled == key
+    counted = Counter([key, travelled])
+    assert counted.total() == 2 and len(counted) == 1
+
+
+# --- rows and columns are different complaints -------------------------------------------------
+
+
+def test_a_row_count_difference_is_reported_as_rows_and_a_missing_column_as_a_column():
+    # A column vector's length IS the row count, so when the counts differ no column can pair —
+    # and every such case used to be laundered through the missing-column branch, which is the
+    # string a person reads in the report for the most common regression there is.
+    counts = c.compare_result_sets(
+        _res(["id"], [(n,) for n in range(100)]),
+        _res(["id"], [(n,) for n in range(99)]),
+        golden_sql=_UNORDERED,
+    )
+    assert counts.accuracy == 0.0
+    assert counts.unmatched_golden_columns == ()
+    assert "column" not in counts.reason
+    assert (counts.golden_row_count, counts.generated_row_count) == (100, 99)
+    absent = c.compare_result_sets(
+        _res(["channel", "revenue"], [("web", 10), ("store", 20)]),
+        _res(["channel"], [("web",), ("store",)]),
+        golden_sql=_UNORDERED,
+    )
+    assert absent.unmatched_golden_columns == ("revenue",)
+    assert "revenue" in absent.reason
+
+
+# --- a band with two halves ---------------------------------------------------------------------
+
+
+def test_a_row_band_still_judges_a_result_the_value_band_cannot_reach():
+    # Both halves are authored and the result is not a single cell. Erroring here leaves the item
+    # permanently unjudgeable and reports a run fault, where the author wrote a perfectly good row
+    # band to judge it with.
+    bounds = GoldenBounds(min_rows=1, max_rows=5, max_value=100)
+    golden = _res(["orders"], [(1,)])
+    inside = c.compare_result_sets(
+        golden, _res(["channel", "orders"], [("web", 1), ("store", 2)]),
+        match="bounded", golden_sql=_UNORDERED, bounds=bounds,
+    )
+    assert (inside.status, inside.accuracy) == ("scored", 1.0)
+    outside = c.compare_result_sets(
+        golden, _res(["channel", "orders"], [("web", n) for n in range(6)]),
+        match="bounded", golden_sql=_UNORDERED, bounds=bounds,
+    )
+    assert (outside.status, outside.accuracy) == ("scored", 0.0)
+    assert "rows" in outside.reason
+
+
+def test_an_empty_result_under_a_value_band_scores_zero_rather_than_erroring():
+    # "The agent returned nothing" is a wrong answer and not an unjudgeable case — catching it is
+    # half of why a band is authored at all.
+    score = c.compare_result_sets(
+        _res(["total"], [(5,)]), _res(["total"], []),
+        match="bounded", golden_sql=_UNORDERED, bounds=GoldenBounds(min_value=0, max_value=10),
+    )
+    assert score.status == "scored"
+    assert score.accuracy == 0.0
+
+
+# --- the module's public surface -----------------------------------------------------------------
+
+
+def test_the_module_exports_only_its_public_surface():
+    # The scoring call and the value it hands back. Everything else is an internal these tests
+    # reach as a module attribute, and `MatchLevel`/`GoldenBounds` belong to `golden`.
+    assert set(c.__all__) == {"compare_result_sets", "ItemScore"}

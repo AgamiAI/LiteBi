@@ -50,6 +50,7 @@ from typing import Any, Literal, NamedTuple, Optional
 
 import sqlglot
 from execute_sql import ExecResult
+from sqlglot import exp
 from sqlglot.errors import ErrorLevel, SqlglotError
 
 from .golden import GoldenBounds, MatchLevel
@@ -64,8 +65,10 @@ _NAN_CELL: tuple[str, Any] = ("nan", "nan")
 # strips trailing zeros. Note that it also turns Decimal('100') into Decimal('1E+2') — a different
 # repr, but an equal value with an equal hash, which is all a key needs.
 _NORMALIZE_CTX = Context(prec=60)
-# A relative 1e-9 tolerance expressed as a hashable bucket: round to nine significant digits and
-# two numbers that agree to that precision land on the same key.
+# A rounding BUCKET at nine significant digits, and deliberately not a tolerance: two numbers land
+# on one key when they round alike, so two that straddle a bucket edge key apart however close they
+# are. That is not a defect to be tightened later — a tolerance is not an equivalence relation, and
+# a Counter needs one, so a bucket is the only form this forgiveness can take at all.
 _QUANTIZE_CTX = Context(prec=9)
 
 # What a driver or an author writes for a boolean. Postgres' text protocol emits `t`/`f`, other
@@ -114,7 +117,13 @@ def _canonical_number(value: int | float | Decimal, quantize: bool) -> tuple[str
         # An infinity is an ordinary comparable value and keeps its sign; normalising or rounding
         # it is meaningless, and quantizing it would raise.
         return ("num", dec)
-    if quantize:
+    # A whole number is never rounded, whatever it was spelled as. It carries no floating-point
+    # tail to forgive, and rounding one would put every id or count above ~1e9 in a bucket with its
+    # neighbours — two genuinely different ids would then pass `values` as the same answer. The
+    # test is on the VALUE and not on the Python type, because the same id arrives as an int from
+    # one driver and a Decimal from another, and exempting only one of them would fail two
+    # identical numbers.
+    if quantize and dec != dec.to_integral_value():
         dec = _QUANTIZE_CTX.plus(dec)
     return ("num", dec.normalize(context=_NORMALIZE_CTX))
 
@@ -156,8 +165,10 @@ def _canonical_text(value: str) -> tuple[str, Any]:
 def canonical_cell(value: Any, *, quantize: bool = False) -> tuple[str, Any]:
     """Turn one result-set cell into a hashable ``(type_tag, value)`` key.
 
-    With `quantize`, a number is additionally rounded to nine significant digits — a relative 1e-9
-    tolerance expressed as a bucket rather than as a comparison. Nothing else is affected.
+    With `quantize`, a number that is not a whole number is additionally rounded to nine
+    significant digits. That is a BUCKET and not a tolerance: two values land on one key when they
+    round alike, so two straddling a bucket edge stay apart however close they are. Nothing else is
+    affected.
     """
     if value is None:
         return ("null", None)
@@ -203,6 +214,10 @@ class RaggedRow(ValueError):
 # visible false failure is recoverable; a silent weakening is not.
 _NO_STATEMENT = "no statement was available to read, so an ordering was assumed"
 _UNPARSED = "the statement could not be parsed as SQL, so an ordering was assumed"
+_UNREADABLE = "the statement could not be read, so an ordering was assumed"
+_NOT_ONE_QUERY = (
+    "the statement is not a single query whose ordering could be read, so an ordering was assumed"
+)
 
 
 def has_top_level_order_by(
@@ -218,6 +233,13 @@ def has_top_level_order_by(
 
     The dialect is threaded through because a generic parse does not merely lose detail on a
     backtick- or bracket-quoting engine: it raises, and the case would fall to the assumed note.
+
+    Only a query node can carry a top-level order, and plenty of statements do not parse to one:
+    a trailing comment or a second statement wraps the whole thing in a `Block`, and a construct
+    sqlglot has no grammar for (EXPLAIN, say) falls back to a `Command` — with a WARNING rather
+    than an error, so the unparsed net below never fires for it. Asking `args['order']` of a node
+    that has no such argument always answers None, so every one of those would read as cleanly
+    unordered; they take the assumed-ordered path instead.
     """
     if sql is None or not sql.strip():
         return True, _NO_STATEMENT
@@ -230,6 +252,21 @@ def has_top_level_order_by(
         # ParseError and TokenError both derive from this; a `None` sql raises TypeError instead,
         # which is why it is guarded above rather than caught here.
         return True, _UNPARSED
+    except Exception:
+        # The rest of what a parse can do, and none of it is a SqlglotError: an unknown dialect
+        # raises ValueError, and a deeply nested statement a RecursionError. This function is
+        # called outside the scoring call's own totality net, so anything escaping here escapes
+        # that call's "never raises" contract too.
+        return True, _UNREADABLE
+    # A parenthesised statement parses to a `Subquery` wrapper. The ORDER BY sits on the node
+    # inside it, or on the wrapper when it was written outside the parentheses — both order the
+    # rows the caller receives, so the wrapper is asked before it is unwrapped.
+    while isinstance(tree, exp.Subquery):
+        if tree.args.get("order") is not None:
+            return True, None
+        tree = tree.this
+    if not isinstance(tree, (exp.Select, exp.SetOperation)):
+        return True, _NOT_ONE_QUERY
     return tree.args.get("order") is not None, None
 
 
@@ -382,23 +419,23 @@ class _Verdict(NamedTuple):
 
 # Deliberately NOT a pass. Two empty results agree about nothing: no value was compared, and
 # scoring that as a full match is how a statement that returns nothing at all gates like a right
-# one. Checked before the level dispatch, so `nonempty` never sees an empty pair either.
+# one. It applies only to the levels that consult the answer key — `nonempty` and `bounded` have
+# no answer key by design, so an empty golden side is their NORMAL shape, and dropping the pair
+# there would excuse the returned-nothing failure those two levels exist to catch.
 _BOTH_EMPTY = "both result sets are empty, so the comparison would check no value"
+_KEYED_LEVELS = ("exact", "values", "shape")
 
 
-def _accuracy(overlap: int, golden_count: int, generated_count: int) -> float:
-    """The share of the LARGER side the two agreed on, so extra rows cost what missing ones do.
+def _accuracy(overlap: int, row_count: int) -> float:
+    """The share of the rows the two sides agreed on.
 
-    Three decimal places because the number is read by a person and compared against 1.0; more
-    digits would only ever be the tail of a repeating division.
+    One denominator, because a row-count difference is decided before any column is paired and the
+    two sides are the same height by the time this is reached. The value is the raw share and is
+    NOT rounded: an item passes at exactly 1.0, and rounding would hand the pass mark to a near
+    miss — 4002 of 4004 rows is 0.99950…, which rounds up. Three-decimal presentation is the
+    report renderer's business, not the score's.
     """
-    widest = max(golden_count, generated_count)
-    if overlap == widest:
-        return 1.0
-    # 1.0 is the pass mark, and rounding alone would hand it to a near miss: 4002 of 4004 rows is
-    # 0.99950…, which rounds up. A result that disagreed about a row has to score below the gate
-    # however wide it is, so the rounded value is capped just short of it.
-    return min(round(overlap / widest, 3), 0.999)
+    return overlap / row_count
 
 
 def _score_values(
@@ -406,13 +443,26 @@ def _score_values(
     generated: ExecResult,
     *,
     ordered: bool,
-    quantize: bool,
-    allow_extra_columns: bool,
+    loose: bool,
 ) -> _Verdict:
-    """Pair the columns by value, then score how far the rows agree over the pairing."""
+    """Pair the columns by value, then score how far the rows agree over the pairing.
+
+    `loose` is the `values` level: it forgives a floating-point tail and an extra column the
+    question did not ask for. One flag rather than two, because no level asks for one and not the
+    other.
+    """
+    if len(golden.rows) != len(generated.rows):
+        # Before any pairing, because a column vector's LENGTH is the row count: when the counts
+        # differ no column can pair, and reporting that through the unmatched-column branch below
+        # tells a reader a column is absent when every one of them is present.
+        return _Verdict(
+            "scored", 0.0,
+            f"the answer key has {len(golden.rows)} rows and the generated result "
+            f"{len(generated.rows)}",
+        )
     pairing, unmatched = match_columns(
         golden.columns, golden.rows, generated.columns, generated.rows,
-        ordered=ordered, quantize=quantize,
+        ordered=ordered, quantize=loose,
     )
     if unmatched:
         # Not a partial answer. The question asked for that column and the result does not carry
@@ -421,15 +471,15 @@ def _score_values(
             "scored", 0.0, "no generated column carries the values of: " + ", ".join(unmatched),
             unmatched,
         )
-    if not allow_extra_columns and len(generated.columns) > len(golden.columns):
+    if not loose and len(generated.columns) > len(golden.columns):
         extra = len(generated.columns) - len(golden.columns)
         return _Verdict(
             "scored", 0.0, f"the generated result carries {extra} column(s) the answer key does not"
         )
     overlap, golden_count, generated_count = compare_rows(
-        golden.rows, generated.rows, pairing, ordered=ordered, quantize=quantize
+        golden.rows, generated.rows, pairing, ordered=ordered, quantize=loose
     )
-    accuracy = _accuracy(overlap, golden_count, generated_count)
+    accuracy = _accuracy(overlap, golden_count)
     if accuracy == 1.0:
         return _Verdict("scored", 1.0, "")
     return _Verdict(
@@ -488,10 +538,31 @@ def _score_bounds(generated: ExecResult, bounds: Optional[GoldenBounds]) -> _Ver
             "error", None,
             "a bounded item is judged against a band, and no bounds were given to judge it with",
         )
+    row_band = bounds.min_rows is not None or bounds.max_rows is not None
     if bounds.min_value is not None or bounds.max_value is not None:
-        verdict = _score_value_band(generated, bounds)
-        if verdict is not None:
-            return verdict
+        if not generated.rows:
+            # An empty result is a WRONG answer here and not an unjudgeable one: catching a
+            # statement that returned nothing is half of why a band gets authored at all.
+            return _Verdict("scored", 0.0, "the generated statement returned no rows")
+        number = _single_number(generated)
+        if number is None:
+            # The value band asks about one number and there is not one to ask about. When the
+            # author also wrote a row band, that band judges this result perfectly well, so it is
+            # preferred over reporting an item nobody can ever judge; without one, an error is all
+            # that is left — the case cannot be decided, and calling it wrong would blame the run.
+            if not row_band:
+                return _Verdict(
+                    "error", None,
+                    "a value band judges a single numeric cell, and the generated result is not "
+                    "one",
+                )
+        # Both edges are INCLUSIVE: an author writing `max_value: 10` means ten is an acceptable
+        # answer. Compared through str, because Decimal(float) expands the binary float in full
+        # and would put an edge of 0.1 a hair away from where the author wrote it.
+        elif bounds.min_value is not None and number < Decimal(str(bounds.min_value)):
+            return _Verdict("scored", 0.0, "the generated value is below the band")
+        elif bounds.max_value is not None and number > Decimal(str(bounds.max_value)):
+            return _Verdict("scored", 0.0, "the generated value is above the band")
     count = len(generated.rows)
     if bounds.min_rows is not None and count < bounds.min_rows:
         return _Verdict("scored", 0.0, f"the generated result has {count} rows, below the band")
@@ -500,25 +571,14 @@ def _score_bounds(generated: ExecResult, bounds: Optional[GoldenBounds]) -> _Ver
     return _Verdict("scored", 1.0, "")
 
 
-def _score_value_band(generated: ExecResult, bounds: GoldenBounds) -> Optional[_Verdict]:
-    """The value half of a band, or None when the result landed inside it and the row half is
-    still to run. A value band asks about one number, so anything wider is an error and not a
-    failure: the case cannot be judged at all, and reporting it as wrong would blame the run."""
+def _single_number(generated: ExecResult) -> Optional[Decimal]:
+    """The one number a result carries, or None when it does not carry exactly one."""
     if len(generated.rows) != 1 or len(generated.columns) != 1 or len(generated.rows[0]) != 1:
-        return _Verdict(
-            "error", None,
-            "a value band judges one number, and the generated result is not a single cell",
-        )
+        return None
     tag, value = canonical_cell(generated.rows[0][0])
-    if tag != "num":
-        return _Verdict("error", None, "a value band judges a number, and this cell is not one")
-    # Through str, because Decimal(float) expands the binary float in full and would put a band
-    # edge of 0.1 a hair away from where the author wrote it.
-    if bounds.min_value is not None and value < Decimal(str(bounds.min_value)):
-        return _Verdict("scored", 0.0, "the generated value is below the band")
-    if bounds.max_value is not None and value > Decimal(str(bounds.max_value)):
-        return _Verdict("scored", 0.0, "the generated value is above the band")
-    return None
+    # A NaN is tagged apart from `num`, so it never reaches a band comparison that it would answer
+    # False to in both directions.
+    return value if tag == "num" else None
 
 
 def _judge(
@@ -529,13 +589,12 @@ def _judge(
     ordered: bool,
 ) -> _Verdict:
     """Dispatch to the level the author asked for, loosening left to right."""
+    if match in _KEYED_LEVELS and not golden.rows and not generated.rows:
+        return _Verdict("unscored", None, _BOTH_EMPTY)
     if match in ("exact", "values"):
-        loose = match == "values"
         # `values` forgives a floating-point tail and an extra column the question did not ask
         # for; `exact` forgives neither, which is the only difference between the two.
-        return _score_values(
-            golden, generated, ordered=ordered, quantize=loose, allow_extra_columns=loose
-        )
+        return _score_values(golden, generated, ordered=ordered, loose=match == "values")
     if match == "shape":
         return _score_shape(golden, generated)
     if match == "bounded":
@@ -563,11 +622,6 @@ def compare_result_sets(
     the ANSWER KEY asked for, so a generated statement that drops the ORDER BY is still judged
     against it rather than excused by it.
     """
-    if not golden.rows and not generated.rows:
-        return ItemScore(
-            status="unscored", accuracy=None, reason=_BOTH_EMPTY,
-            golden_row_count=0, generated_row_count=0,
-        )
     ordered, note = has_top_level_order_by(golden_sql, dialect=dialect)
     try:
         verdict = _judge(golden, generated, match, bounds, ordered)
@@ -592,14 +646,8 @@ def compare_result_sets(
     )
 
 
-__all__ = [
-    "ItemScore",
-    "RaggedRow",
-    "canonical_cell",
-    "canonical_row",
-    "cell_type",
-    "compare_result_sets",
-    "compare_rows",
-    "has_top_level_order_by",
-    "match_columns",
-]
+# The scoring call and the value it hands back, and nothing else. The rest of this module is how
+# the two are built rather than what a caller is invited to reach for; `MatchLevel` and
+# `GoldenBounds` stay out because they belong to `golden`, which is where a caller should take them
+# from rather than through here.
+__all__ = ["ItemScore", "compare_result_sets"]
