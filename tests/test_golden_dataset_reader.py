@@ -82,7 +82,7 @@ def test_all_optional_fields_surface(tmp_path, monkeypatch):
                 "validation_notes": "Checked against the sample seed.",
             },
             "match": "values",
-            "must_filter": ["status = 'paid'"],
+            "must_filter": ["status"],
             "recorded": {"columns": ["revenue"], "rows": [[1234.56]], "at": "2026-01-01T00:00:00Z"},
             "tags": ["revenue", "smoke"],
             "confirmed_by": {"method": "reviewed by hand", "at": "2026-01-02T00:00:00Z"},
@@ -97,7 +97,7 @@ def test_all_optional_fields_surface(tmp_path, monkeypatch):
     assert item.expected.tables_used == ["orders"] and item.expected.chart_type == "bar"
     assert item.expected.data_shape == "single_value"
     assert item.expected.validation_notes == "Checked against the sample seed."
-    assert item.match == "values" and item.must_filter == ["status = 'paid'"]
+    assert item.match == "values" and item.must_filter == ["status"]
     assert item.recorded.columns == ["revenue"] and item.recorded.rows == [[1234.56]]
     assert item.recorded.at == "2026-01-01T00:00:00Z"
     assert item.tags == ["revenue", "smoke"]
@@ -126,10 +126,10 @@ def test_tags_preserved(tmp_path, monkeypatch):
 def test_must_filter_reaches_item(tmp_path, monkeypatch):
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     _write(_golden_dir(tmp_path), "orders.yaml",
-           {"test_cases": [_case(must_filter=["status = 'paid'", "region = 'north'"])]})
+           {"test_cases": [_case(must_filter=["status", "channel"])]})
     datasets, res = g.load_golden_datasets(PROFILE)
     assert res.ok
-    assert datasets[0].test_cases[0].must_filter == ["status = 'paid'", "region = 'north'"]
+    assert datasets[0].test_cases[0].must_filter == ["status", "channel"]
 
 
 def test_unconfirmed_item_reads(tmp_path, monkeypatch):
@@ -195,10 +195,45 @@ def test_unknown_match_level_rejected(tmp_path, monkeypatch):
 def test_near_miss_field_rejected(tmp_path, monkeypatch):
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     _write(_golden_dir(tmp_path), "orders.yaml",
-           {"test_cases": [_case("orders-count", must_filters=["status = 'paid'"])]})
+           {"test_cases": [_case("orders-count", must_filters=["status"])]})
     datasets, res = g.load_golden_datasets(PROFILE)
     assert [f.code for f in res.findings] == ["golden_invalid_case"]
     assert "must_filters" in res.findings[0].message
+    assert datasets[0].test_cases == []
+
+
+def test_missing_sql_confirmed_names_the_field(tmp_path, monkeypatch):
+    """The refusal has to be findable from the finding alone: a caller who only ever sees the
+    ValidationResult has to be told which key the author left out."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [{"id": "orders-count", "query": QUERY, "expected": {"sql": SQL}}]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_case"]
+    assert "sql_confirmed" in res.findings[0].message
+    assert datasets[0].test_cases == []
+
+
+def test_finding_never_echoes_the_answer_key(tmp_path, monkeypatch):
+    """A finding travels wherever the caller sends its ValidationResult. It names the field that
+    failed and why; it does not carry the SQL, the filters or the recorded rows out with it."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml", {"test_cases": [{
+        "id": "orders-count",
+        "query": QUERY,
+        "expected": _expected(),
+        "must_filter": ["status"],
+        # A mapping where the list of rows belongs — the shape a hand-edit lands on.
+        "recorded": {"columns": ["order_count"], "rows": {"order_count": 4211}},
+    }]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_case"]
+    message = res.findings[0].message
+    # The field that failed is named...
+    assert "recorded.rows" in message
+    # ...and nothing the author wrote down comes back with it.
+    assert "4211" not in message and "SELECT" not in message and SQL not in message
+    assert "input_value" not in message
     assert datasets[0].test_cases == []
 
 
@@ -329,6 +364,93 @@ def test_null_case_others_still_read(tmp_path, monkeypatch):
     assert [i.item_key for i in datasets[1].test_cases] == ["revenue-total"]
 
 
+@pytest.mark.parametrize("cases", [5, True, "hello", {"orders-count": {"query": QUERY}}])
+def test_non_list_test_cases_others_still_read(tmp_path, monkeypatch, cases):
+    """`test_cases` that is not a list costs its own file and nothing else. Iterating one either
+    raises out of the whole read (a scalar) or emits a finding per character (a string)."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    _write(d, "revenue.yaml", {"test_cases": cases})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_dataset"]
+    assert res.findings[0].locator == "revenue.yaml"
+    # The finding names what the author actually wrote, so they can see the mistake.
+    assert type(cases).__name__ in res.findings[0].message
+    assert [ds.name for ds in datasets] == ["orders"]
+
+
+@pytest.mark.parametrize("root_key", ["2024", "no"])
+def test_non_string_root_key_others_still_read(tmp_path, monkeypatch, root_key):
+    """YAML 1.1 resolves `2024:` to an int and a bare `no:` to False, and neither can be splatted
+    as a keyword argument — an unguarded splat takes the entire directory down with it."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    (d / "revenue.yaml").write_text(f"{root_key}: a stray key\ntest_cases: []\n", encoding="utf-8")
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_dataset"]
+    assert res.findings[0].locator == "revenue.yaml"
+    assert [ds.name for ds in datasets] == ["orders"]
+
+
+def test_dataset_level_unknown_field_costs_the_whole_file(tmp_path, monkeypatch):
+    """A typo at the top level is not a per-case fault: the dataset is refused and every valid
+    case in that file goes with it. That differs materially from a typo on a case, so pin it."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    _write(d, "revenue.yaml",
+           {"descriptoin": "Revenue questions.", "test_cases": [_case("revenue-total")]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_dataset"]
+    assert "descriptoin" in res.findings[0].message
+    assert [ds.name for ds in datasets] == ["orders"]
+
+
+def test_valueless_dataset_field_costs_the_whole_file(tmp_path, monkeypatch):
+    """`description:` with nothing after it is YAML null — an ordinary half-finished edit, and it
+    costs the file the same way a typo'd key does."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    (d / "revenue.yaml").write_text("description:\ntest_cases: []\n", encoding="utf-8")
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_dataset"]
+    assert "description" in res.findings[0].message
+    assert [ds.name for ds in datasets] == ["orders"]
+
+
+def test_unreadable_file_finding_carries_no_path(tmp_path, monkeypatch):
+    """`OSError.__str__` interpolates the full path, and in a hosted deployment the artifacts path
+    encodes the tenant. A finding says what went wrong, never where the file lives."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    (d / "notafile.yaml").mkdir()
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_unreadable_file"]
+    message = res.findings[0].message
+    assert str(tmp_path) not in message
+    # The filename alone still locates it inside the profile, which is what the author needs.
+    assert message.startswith("notafile.yaml: ")
+    assert [ds.name for ds in datasets] == ["orders"]
+
+
+def test_no_filesystem_path_reaches_a_record(tmp_path, monkeypatch):
+    """The second load-bearing property: a runner cannot forward a dataset location into a
+    subprocess because no returned record ever carries one."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"description": "Order-volume questions.", "test_cases": [_case()]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok
+    for model in (g.GoldenDataset, g.GoldenItem):
+        assert not any("Path" in str(f.annotation) for f in model.model_fields.values())
+    blob = datasets[0].model_dump_json()
+    assert str(tmp_path) not in blob and "golden_datasets" not in blob
+
+
 # --- the relativity lint: a question that moves against an answer key that does not ---
 
 RELATIVE_QUERY = "How many orders last quarter?"
@@ -417,6 +539,36 @@ def test_relativity_lint_silent_without_a_date_literal(tmp_path, monkeypatch):
     ]})
     datasets, res = g.load_golden_datasets(PROFILE)
     assert res.ok and len(datasets[0].test_cases) == 1
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT COUNT(*) AS order_count FROM orders LIMIT 2000",
+    "SELECT COUNT(*) AS order_count FROM orders WHERE total_amount > 1999",
+])
+def test_relativity_lint_silent_on_a_bare_integer(tmp_path, monkeypatch, sql):
+    """A four-digit number is a row limit or a money threshold far more often than it is a year,
+    and this lint is error severity: a false positive flips a correct file to not-ok."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, sql)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.findings == [] and res.ok
+    assert len(datasets[0].test_cases) == 1
+
+
+@pytest.mark.parametrize("sql", [
+    FROZEN_SQL + " -- frozen as of now",
+    "WITH today AS (SELECT 1) " + FROZEN_SQL,
+])
+def test_relativity_lint_not_suppressed_by_the_word_alone(tmp_path, monkeypatch, sql):
+    """An anchor is a call to the clock, not the letters. A comment or a CTE named `today` must
+    not buy a frozen answer key a pass — suppressing the lint is how the fault ships."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, sql)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_relative_question_frozen_sql"]
+    assert len(datasets[0].test_cases) == 1
 
 
 def test_relativity_lint_names_the_file_and_the_case(tmp_path, monkeypatch):

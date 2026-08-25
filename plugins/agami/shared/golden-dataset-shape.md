@@ -69,7 +69,7 @@ test_cases:
       data_shape: category_value
       validation_notes: Counted at order grain, so nothing joins in to fan the count out.
     match: values
-    must_filter: ["status = 'paid'"]
+    must_filter: [status]
     recorded:
       columns: [channel, order_count]
       rows:
@@ -86,8 +86,10 @@ test_cases:
 
 Each entry under `test_cases` is one question and its answer key. `id`
 (**required** — the author's own, and the key every stored result hangs off, so
-it must not be renamed casually) and `query` (**required** — the question as a
-user would ask it). `expected` is **required** and holds the answer key:
+it must not be renamed casually; an id repeated within one file is reported and
+that second case is dropped, the first kept — so copy-pasting a case means
+changing its id too) and `query` (**required** — the question as a user would
+ask it). `expected` is **required** and holds the answer key:
 `sql_confirmed` (**required**, boolean), `sql` (optional), `tables_used`,
 `chart_type`, `data_shape`, `validation_notes` (all optional).
 
@@ -103,20 +105,27 @@ Alongside `expected`, an item takes five optional fields:
   right: `exact`, `values`, `shape`, `bounded`, `nonempty`. **Defaults to
   `exact`**, so an item that says nothing is held to the strictest reading. Any
   other word is refused.
-- `must_filter` — a list of predicates the generated SQL has to carry (`status =
-  'paid'`). This is how a case gates *how* the answer was reached, not just what
-  it came to.
-- `recorded` — `columns`, `rows`, `at`: what the author saw on the day. A
-  receipt for a reviewer, **never the comparison target** — a run is judged
-  against `expected`.
+- `must_filter` — the **column names** a correct statement has to filter on
+  (`must_filter: [status]` — not the predicate, just the column). A statement
+  that does not filter on every column listed fails. This is how a case gates
+  *how* the answer was reached, not just what it came to.
+- `recorded` — `columns` (a list of names), `rows` (a list of rows, each row
+  itself a list of values in `columns` order) and `at`: what the author saw on
+  the day. A receipt for a reviewer, **never the comparison target** — a run is
+  judged against `expected`.
 - `tags` — free text. `smoke` is a **convention** for the fast subset, not a
   keyword the reader knows or treats specially.
 - `confirmed_by` — `method` (required within the block, free text) and `at`:
   who or what vouched for the answer key, and when.
 
-**An unknown field is refused, not ignored.** A typo'd `must_filters` does not
-quietly become a case with no filters that gates nothing — the reader drops that
-one case and names the field. Everything else in the file still reads.
+**An unknown field is refused, not ignored** — and what it costs depends on
+where it is. A typo'd `must_filters` **on a case** does not quietly become a
+case with no filters that gates nothing: the reader drops that one case, names
+the field, and everything else in the file still reads. A bad key at the **top
+level of the file** — a typo'd `descriptoin:`, or a `description:` left with no
+value while an edit is half-finished — is refused at the dataset, so the whole
+file is dropped and every valid case in it goes with it. Re-read after editing
+the top of a file.
 
 **A relative question over a frozen answer key is reported as a dataset error.**
 A question like *"how many orders last quarter?"* names a window that slides
