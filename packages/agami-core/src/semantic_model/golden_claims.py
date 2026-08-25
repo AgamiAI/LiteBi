@@ -191,28 +191,57 @@ def _expression_key(node: "exp.Expression", aliases: dict[str, str]) -> str:
 
     Qualifiers are resolved to the table they name, so an alias rewrite changes no key — that, and
     the case fold already applied to the tree, are the whole of what makes a re-spelling of the same
-    question produce the same claims. The result is regenerated from the tree rather than sliced out
-    of the caller's SQL, and bounded by `_echo_expr`, because a claim rides on tool output that the
-    calling model reads as server-authored.
+    question produce the same claims.
+
+    The key is NOT `node.sql()`. Regenerating SQL from a parsed tree is banned across this package,
+    and the ban is the right one here for its own reason as well: a claim rides on tool output the
+    calling model reads as server-authored, and a claim that looked like SQL would be read as SQL.
+    So the shape is deliberately not SQL — `eq(orders.region, 'EU')` — and it is bounded by
+    `_echo_expr`, whose job is exactly this: keep a caller's quoted identifier from arriving intact
+    inside something the model trusts.
     """
-    return rt._echo_expr(_resolve_qualifiers(node, aliases).sql())
+    return rt._echo_expr(_rendered(node, aliases, _MAX_KEY_DEPTH))
 
 
-def _resolve_qualifiers(node: "exp.Expression", aliases: dict[str, str]) -> "exp.Expression":
-    """A COPY of `node` with every column qualifier rewritten to the bare table it names."""
-    resolved = node.copy()
-    for column in resolved.find_all(exp.Column):
-        qualifier = column.table
+# How deep a key is rendered before it stops. sqlglot builds `a OR b OR c` LEFT-DEEP, so a wide
+# predicate is a DEEP tree, and a generator can emit one wide enough to exhaust the interpreter's
+# stack — which would raise out of `read_claims`, whose whole contract is that it does not. Past
+# this depth the key says so and stops. Two predicates differing only below it then compare equal,
+# which is a wrong answer on a claim that only reports and never gates.
+_MAX_KEY_DEPTH = 12
+_DEEPER = "…"
+
+
+def _rendered(node: "exp.Expression", aliases: dict[str, str], depth: int) -> str:
+    """The structural rendering `_expression_key` bounds — one node and, recursively, its own."""
+    if depth <= 0:
+        return _DEEPER
+    if isinstance(node, exp.Paren):
+        # A bracket is the author's readability rather than a change of meaning, so it is unwrapped
+        # WITHOUT spending depth — otherwise how deeply someone parenthesized would decide how much
+        # of their predicate survived into the key.
+        return _rendered(node.this, aliases, depth)
+    if isinstance(node, exp.Column):
+        qualifier = node.table
         if not qualifier:
-            continue
-        resolved_table = rt._tkey(rt._bare(aliases.get(qualifier, qualifier)))
-        column.set("table", exp.to_identifier(resolved_table))
-        # The schema and catalog parts go with it: `sales.orders.region` and `orders.region` name
-        # one column, and `_bare` has already stripped the schema off the resolved table name, so
-        # leaving them on would make the two spellings two different keys.
-        column.set("db", None)
-        column.set("catalog", None)
-    return resolved
+            return node.name.lower()
+        # The schema and catalog parts are dropped with the alias: `sales.orders.region` and
+        # `orders.region` name one column, and `_bare` has already stripped the schema off the
+        # resolved table, so keeping them would make the two spellings two different keys.
+        return f"{rt._tkey(rt._bare(aliases.get(qualifier, qualifier)))}.{node.name.lower()}"
+    if isinstance(node, exp.Literal):
+        # Quoted so that the string `'2025'` and the number `2025` are two different keys, which
+        # they are: on most engines they compare against different columns.
+        return f"'{node.this}'" if node.is_string else str(node.this)
+
+    operands = [_rendered(child, aliases, depth - 1) for child in node.iter_expressions()]
+    if not operands and not isinstance(node.args.get("this"), exp.Expression):
+        # A leaf sqlglot models with a plain value rather than a child node — a keyword unit
+        # (`EXTRACT(YEAR …)`), a cast's target type — which `iter_expressions` does not yield and
+        # which is the whole content of the node.
+        leaf = node.args.get("this")
+        operands = [] if leaf is None else [str(leaf).lower()]
+    return f"{type(node).__name__.lower()}({', '.join(operands)})"
 
 
 def _constrained_columns(select: "exp.Select") -> frozenset[str]:

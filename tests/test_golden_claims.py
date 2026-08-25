@@ -70,8 +70,35 @@ class TestReadingAStatement:
         assert claims.join_keys == frozenset(
             {frozenset({("orders", "customer_id"), ("customers", "id")})}
         )
-        assert "orders.status" in " ".join(claims.filter_predicates)
+        assert claims.filter_predicates == frozenset(
+            {"eq(orders.status, 'paid')", "eq(orders.customer_id, customers.id)"}
+        )
         assert {"status", "customer_id", "id"} <= claims.filtered_columns
+
+    def test_a_claim_key_is_structural_rather_than_sql(self, engine):
+        """Regenerating SQL from a parsed tree is banned across this package, and the ban is right
+        here for a second reason: a claim rides on output the calling model reads as
+        server-authored, and a claim that looked like SQL would be read as SQL. So the operator is
+        NAMED rather than spelled, and nothing in the key can be mistaken for a statement."""
+        claims = gc.read_claims(
+            "SELECT 1 FROM orders o WHERE o.order_date BETWEEN '2025-01-01' AND '2025-12-31'",
+            dialect=sqlglot_dialect(engine),
+        )
+
+        assert claims.filter_predicates == frozenset(
+            {"between(orders.order_date, '2025-01-01', '2025-12-31')"}
+        )
+
+    def test_a_predicate_deeper_than_the_key_renders_is_cut_off_rather_than_raising(self, engine):
+        """sqlglot builds a wide OR LEFT-DEEP, so a generated predicate is a tree as deep as it is
+        wide — and rendering it must not be what takes an eval run down."""
+        wide = " OR ".join(f"o.region = '{n}'" for n in range(40))
+        claims = gc.read_claims(
+            f"SELECT 1 FROM orders o WHERE {wide}", dialect=sqlglot_dialect(engine)
+        )
+
+        assert claims.unreadable is None
+        assert [key for key in claims.filter_predicates if "\u2026" in key]
 
     def test_an_alias_and_the_table_it_names_read_the_same(self, engine):
         """Criterion 1's mechanism, isolated: a qualifier is bound to the table its own SELECT
