@@ -40,7 +40,8 @@ free text, a way to group datasets), `user_context` (optional — who is asking,
 and what they assume), `test_cases` (optional; a file with no cases yet is a
 legal in-progress shape, not a fault).
 
-A complete file — one minimal case, then one exercising every optional field:
+A complete file — one minimal case, one exercising every optional field, and
+one held to a band:
 
 ```yaml
 description: Order-volume questions over the sample store database.
@@ -80,6 +81,18 @@ test_cases:
     confirmed_by:
       method: reviewed against the sample seed by hand
       at: '2026-01-14T09:00:00Z'
+
+  - id: orders-refunded-count
+    query: How many orders have been refunded?
+    expected:
+      sql: SELECT COUNT(*) AS order_count FROM orders WHERE status = 'refunded'
+      sql_confirmed: true
+    match: bounded
+    bounds:
+      min_rows: 1
+      max_rows: 1
+      min_value: 0
+      max_value: 500
 ```
 
 ## Test cases
@@ -99,12 +112,20 @@ that has to be comparable against something; with no SQL it would pass forever
 and nobody would notice. An unconfirmed case with no SQL is legal — that is the
 in-progress shape, and it simply cannot gate.
 
-Alongside `expected`, an item takes five optional fields:
+Alongside `expected`, an item takes six optional fields:
 
 - `match` — how closely the run has to match the answer key, loosening left to
   right: `exact`, `values`, `shape`, `bounded`, `nonempty`. **Defaults to
   `exact`**, so an item that says nothing is held to the strictest reading. Any
   other word is refused.
+- `bounds` — the band `match: bounded` is judged against: `min_rows` /
+  `max_rows` on the number of rows, and `min_value` / `max_value` on a
+  single-cell numeric answer. All four keys are optional but at least one has to
+  be set — a band that names nothing bounds nothing. A negative row count, or a
+  floor above its own ceiling, is refused. **`bounds` and `match: bounded` are a
+  pair, and either one alone is refused**: `bounded` with no band has nothing to
+  compare against, and a band under any other level is read by nothing. Both
+  halves would keep passing, which is why neither can be written on its own.
 - `must_filter` — the **column names** a correct statement has to filter on
   (`must_filter: [status]` — not the predicate, just the column). A statement
   that does not filter on every column listed fails. This is how a case gates

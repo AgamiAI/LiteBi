@@ -66,6 +66,45 @@ class GoldenExpected(_Base):
     validation_notes: Optional[str] = None
 
 
+class GoldenBounds(_Base):
+    """The band a `bounded` item's result has to land in.
+
+    Every edge is optional and any one of them is a band: a case that only cares the answer is not
+    zero says so with a floor, and inventing a ceiling to go with it would assert something the
+    author never checked.
+    """
+
+    min_rows: Optional[int] = None
+    max_rows: Optional[int] = None
+    # A numeric band on a single-cell answer, for an item whose result is one number.
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _band_bounds_something(self) -> "GoldenBounds":
+        # Each refusal here is a band that reads as passing while comparing nothing (all-empty) or
+        # as failing forever (a floor above its ceiling) — both look like a model fault to whoever
+        # reads the run, which is the wrong thing to be told. No message names a value: the band
+        # is authored data on a case that also carries the answer key, and a finding travels.
+        rows, values = (self.min_rows, self.max_rows), (self.min_value, self.max_value)
+        if all(edge is None for edge in rows + values):
+            raise ValueError(
+                "bounds names no bound; set at least one of min_rows, max_rows, min_value, "
+                "max_value, or drop the block and use a looser match level"
+            )
+        if any(edge is not None and edge < 0 for edge in rows):
+            raise ValueError(
+                "min_rows and max_rows count rows and cannot be negative; use 0 to mean no rows"
+            )
+        for low, high, floor, ceiling in ((*rows, "min_rows", "max_rows"),
+                                          (*values, "min_value", "max_value")):
+            if low is not None and high is not None and low > high:
+                raise ValueError(
+                    f"{floor} is above {ceiling}, so no result can land in the band; swap them"
+                )
+        return self
+
+
 class GoldenItem(_Base):
     """One question, its answer key, and how strictly to compare against it."""
 
@@ -73,6 +112,7 @@ class GoldenItem(_Base):
     query: str
     expected: GoldenExpected
     match: MatchLevel = "exact"
+    bounds: Optional[GoldenBounds] = None
     must_filter: list[str] = Field(default_factory=list)
     recorded: Optional[GoldenRecorded] = None
     tags: list[str] = Field(default_factory=list)
@@ -91,6 +131,20 @@ class GoldenItem(_Base):
         # would pass forever without anyone noticing.
         if self.expected.sql_confirmed and not self.expected.sql:
             raise ValueError("expected.sql_confirmed is true but expected.sql is missing")
+        return self
+
+    @model_validator(mode="after")
+    def _bounded_needs_a_band(self) -> "GoldenItem":
+        # `bounds` is read by one comparison and no other, so either half alone is a case that
+        # silently does not do what it says — a band nothing consults, or a level with nothing to
+        # consult. Both keep passing, which is why neither is allowed to be written.
+        if self.match == "bounded" and self.bounds is None:
+            raise ValueError(
+                "match is bounded but there is no bounds block to compare against; add one, or "
+                "pick a match level that judges the result on its own"
+            )
+        if self.bounds is not None and self.match != "bounded":
+            raise ValueError("bounds is set but match is not bounded, so nothing reads the band")
         return self
 
 
@@ -312,6 +366,7 @@ def load_golden_datasets(
 
 __all__ = [
     "MatchLevel",
+    "GoldenBounds",
     "GoldenRecorded",
     "GoldenConfirmedBy",
     "GoldenExpected",

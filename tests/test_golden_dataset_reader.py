@@ -588,6 +588,134 @@ def test_relativity_lint_names_the_file_and_the_case(tmp_path, monkeypatch):
     assert [i.item_key for i in datasets[1].test_cases] == ["revenue-recent", "revenue-total"]
 
 
+# --- the bounded band ---
+
+# A band `bounded` can actually compare against: at most a handful of rows, at a plausible total.
+BAND = {"min_rows": 1, "max_rows": 5}
+
+
+def test_bounds_reaches_item(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml", {"test_cases": [
+        _case("orders-count", match="bounded",
+              bounds={"min_rows": 1, "max_rows": 5, "min_value": 0.0, "max_value": 10000.0}),
+    ]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok
+    bounds = datasets[0].test_cases[0].bounds
+    assert bounds.min_rows == 1 and bounds.max_rows == 5
+    assert bounds.min_value == 0.0 and bounds.max_value == 10000.0
+
+
+def test_bounds_absent_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml", {"test_cases": [_case()]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok and datasets[0].test_cases[0].bounds is None
+
+
+@pytest.mark.parametrize("band", [
+    {"min_rows": 1},
+    {"max_rows": 5},
+    {"min_value": 0.0},
+    {"max_value": 10000.0},
+    {"min_rows": 0, "max_rows": 0},
+    {"min_value": 42.0, "max_value": 42.0},
+])
+def test_partial_band_is_legal(tmp_path, monkeypatch, band):
+    """Rows alone, values alone, or one edge of either still bounds something. An author who only
+    cares that the answer is not zero should not have to invent a ceiling to say so."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_case("orders-count", match="bounded", bounds=band)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok
+    assert datasets[0].test_cases[0].bounds.model_dump(exclude_none=True) == band
+
+
+def test_bounds_without_bounded_match_rejected(tmp_path, monkeypatch):
+    """A band under any other level is read by nothing — the silent hole the whole model exists to
+    close, and one an author would never see because the case keeps passing."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    _write(d, "revenue.yaml", {"test_cases": [_case("revenue-total", match="values", bounds=BAND)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_case"]
+    assert res.findings[0].locator == "revenue.yaml[revenue-total]"
+    assert "bounds" in res.findings[0].message
+    assert [ds.name for ds in datasets] == ["orders", "revenue"]
+    assert datasets[1].test_cases == []
+
+
+def test_bounds_under_the_default_match_rejected(tmp_path, monkeypatch):
+    """`match` left unwritten is `exact`, so a band with no level named is the same inert pairing —
+    and the likelier one, since the author never typed the word that would have contradicted it."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_case("orders-count", bounds=BAND)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_case"]
+    assert datasets[0].test_cases == []
+
+
+def test_bounded_without_bounds_rejected(tmp_path, monkeypatch):
+    """The other half of the same pairing: a level with nothing to compare against. It is exactly
+    the writable-but-inert combination this field exists to eliminate."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    _write(d, "revenue.yaml", {"test_cases": [_case("revenue-total", match="bounded")]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_case"]
+    assert res.findings[0].locator == "revenue.yaml[revenue-total]"
+    assert "bounds" in res.findings[0].message
+    assert [ds.name for ds in datasets] == ["orders", "revenue"]
+    assert datasets[1].test_cases == []
+
+
+def test_empty_band_rejected():
+    """Every key left out is a band that bounds nothing — accepted, it would read as `nonempty`
+    while claiming to be `bounded`."""
+    with pytest.raises(ValidationError):
+        g.GoldenBounds()
+
+
+@pytest.mark.parametrize("band", [
+    {"min_rows": 5, "max_rows": 1},
+    {"min_value": 10000.0, "max_value": 1.0},
+    {"min_rows": 1, "max_rows": 5, "min_value": 10000.0, "max_value": 1.0},
+])
+def test_inverted_band_rejected(band):
+    """A floor above its ceiling admits nothing, so every run against it fails and the case reads
+    as a model regression forever."""
+    with pytest.raises(ValidationError):
+        g.GoldenBounds(**band)
+
+
+@pytest.mark.parametrize("band",
+                         [{"min_rows": -1}, {"max_rows": -1}, {"min_rows": -5, "max_rows": 5}])
+def test_negative_row_bound_rejected(band):
+    """A result set cannot have fewer than no rows; a negative edge is a typo, not a band."""
+    with pytest.raises(ValidationError):
+        g.GoldenBounds(**band)
+
+
+def test_band_refusal_never_echoes_the_band(tmp_path, monkeypatch):
+    """The band is authored data on a case that also carries the answer key, so its refusal is
+    held to the same rule as every other finding: name the field, never the value."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml", {"test_cases": [
+        _case("orders-count", match="bounded", bounds={"min_rows": 4211, "max_rows": 12}),
+    ]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_invalid_case"]
+    message = res.findings[0].message
+    assert "bounds" in message and "min_rows" in message
+    assert "4211" not in message and "input_value" not in message and SQL not in message
+    assert datasets[0].test_cases == []
+
+
 # --- the canonical authoring reference ---
 
 SHAPE_DOC = REPO_ROOT / "plugins" / "agami" / "shared" / "golden-dataset-shape.md"
@@ -613,6 +741,13 @@ def test_shape_doc_example_parses(tmp_path, monkeypatch):
     # One minimal case and one exercising every optional field.
     assert len(datasets[0].test_cases) >= 2
     assert all(i.query and i.expected for i in datasets[0].test_cases)
+
+
+def test_shape_doc_example_shows_a_bounded_case():
+    """`bounded` is unusable without a band and a band is refused without it, so the pairing has to
+    be in the example — that is where an author copies a case from."""
+    example = _first_yaml_fence(SHAPE_DOC.read_text(encoding="utf-8"))
+    assert "match: bounded" in example and "bounds:" in example
 
 
 def test_shape_doc_carries_hard_rule():
