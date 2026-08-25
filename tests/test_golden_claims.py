@@ -410,6 +410,28 @@ class TestComparingTwoStatements:
         assert (window.golden["end"], window.golden["end_inclusive"]) == ("2026-01-01", False)
         assert [gate.kind for gate in diff.gates] == ["date_window"]
 
+    @pytest.mark.parametrize("midnight", ("{day} 00:00:00", "{day}T00:00:00"))
+    def test_two_spellings_of_midnight_are_one_bound(self, engine, midnight):
+        """A generator that wrote the same instant with a zero time-of-day, or with the ISO `T`
+        separator, wrote the golden window — and gating that would be failing a correct statement
+        on this module's own spelling preferences, which is the one thing a gate may never do."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o WHERE o.order_date >= '{}' "
+            "AND o.order_date < '{}'".format(
+                midnight.format(day="2025-01-01"), midnight.format(day="2026-01-01")
+            ),
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'",
+            engine,
+        )
+        window = _claim(diff, "date_window")
+
+        assert window.status == gc.AGREES
+        assert diff.gates == []
+        # Only the comparison folds the two spellings; the bound is still REPORTED as written, so a
+        # reader sees what the statement actually said.
+        assert window.generated["start"] == midnight.format(day="2025-01-01")
+
     def test_a_window_agrees_however_the_column_is_qualified(self, engine):
         """Agreement is decided on the four bound fields and NOT on the column, because two
         statements over one table may qualify it differently — and refusing a correct rewrite over
