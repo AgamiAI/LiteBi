@@ -136,3 +136,86 @@ class TestReadingAStatement:
         run down with it."""
         for sql in ("", "   ", "not sql at all", "SELECT 'unterminated", "DELETE FROM orders"):
             assert gc.read_claims(sql, dialect=sqlglot_dialect(engine)).unreadable
+
+
+def _window(sql: str, engine: str):
+    """The window one WHERE clause over `orders` resolves to."""
+    return gc.read_claims(
+        f"SELECT o.region FROM orders o WHERE {sql}", dialect=sqlglot_dialect(engine)
+    ).date_window
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestResolvingADateWindow:
+    """The temporal fold: three spellings in, one interval out — or nothing at all."""
+
+    def test_three_spellings_of_a_year_resolve_to_one_interval(self, engine):
+        """A calendar year written as a half-open comparison chain, as the same chain against a
+        typed date literal, and as an EXTRACT are the same question, and a golden item that failed
+        one against another would be failing on spelling."""
+        chained = _window("o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'", engine)
+        typed = _window(
+            "o.order_date >= DATE '2025-01-01' AND o.order_date < DATE '2026-01-01'", engine
+        )
+        extracted = _window("EXTRACT(YEAR FROM o.order_date) = 2025", engine)
+
+        for resolved in (chained, typed, extracted):
+            assert (resolved.start, resolved.start_inclusive) == ("2025-01-01", True)
+            assert (resolved.end, resolved.end_inclusive) == ("2026-01-01", False)
+        assert chained.column == "orders.order_date"
+
+    def test_an_inclusive_upper_bound_is_never_shifted_to_the_next_day(self, engine):
+        """Reading `BETWEEN … AND '2025-12-31'` as `< '2026-01-01'` is only sound on a DATE column,
+        and nothing this module is handed says the column is one. So the bound stays as written and
+        the two intervals are reported as the different intervals they are on a timestamp."""
+        between = _window("o.order_date BETWEEN '2025-01-01' AND '2025-12-31'", engine)
+
+        assert (between.start, between.start_inclusive) == ("2025-01-01", True)
+        assert (between.end, between.end_inclusive) == ("2025-12-31", True)
+
+    def test_a_bound_written_with_the_literal_first_reads_the_same(self, engine):
+        """`'2025-01-01' <= d` is `d >= '2025-01-01'` written the other way round, so the bound it
+        puts on the column is the mirror of the operator, not the operator itself."""
+        mirrored = _window("'2025-01-01' <= o.order_date AND '2026-01-01' > o.order_date", engine)
+
+        assert (mirrored.start, mirrored.start_inclusive) == ("2025-01-01", True)
+        assert (mirrored.end, mirrored.end_inclusive) == ("2026-01-01", False)
+
+    def test_a_spelling_the_resolver_does_not_model_resolves_to_nothing(self, engine):
+        """The resolver's incompleteness must read as `unknown`, never as an interval it guessed —
+        a guessed interval is what would fail a statement that filters correctly."""
+        assert _window("DATE_TRUNC('quarter', o.order_date) = '2025-04-01'", engine) is None
+
+    def test_a_partial_reduction_is_discarded_whole(self, engine):
+        """One conjunct over the date column reduced and the other did not, so what reduced is
+        HALF the constraint — and half an interval reported as a whole one is exactly the shape
+        that gates a correct statement."""
+        assert (
+            _window(
+                "o.order_date >= '2025-01-01' AND DATE_TRUNC('quarter', o.order_date) = "
+                "'2025-04-01'",
+                engine,
+            )
+            is None
+        )
+
+    def test_two_columns_carrying_a_window_resolve_to_nothing(self, engine):
+        """A window over two columns is a shape this module does not model, and picking one of them
+        would make the answer depend on the order the conjuncts were written in."""
+        assert (
+            _window("o.order_date >= '2025-01-01' AND o.shipped_date < '2026-01-01'", engine)
+            is None
+        )
+
+    def test_a_statement_with_no_temporal_predicate_resolves_to_nothing(self, engine):
+        assert _window("o.status = 'paid'", engine) is None
+
+    def test_a_predicate_on_another_column_does_not_disturb_the_window(self, engine):
+        """The unreduced conjuncts that matter are the ones touching the date column; a filter on
+        an unrelated column is not evidence that the window is partial."""
+        resolved = _window(
+            "o.status = 'paid' AND o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'",
+            engine,
+        )
+
+        assert (resolved.start, resolved.end) == ("2025-01-01", "2026-01-01")

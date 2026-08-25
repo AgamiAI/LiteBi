@@ -178,7 +178,7 @@ def read_claims(sql: str, *, dialect: str) -> ClaimSet:
         tables=frozenset(rt._tkey(ref.bare) for ref in rt._table_references(select)),
         filter_predicates=frozenset(_expression_key(node, aliases) for node in conjuncts),
         filtered_columns=_constrained_columns(select),
-        date_window=None,
+        date_window=_resolve_date_window(conjuncts, aliases),
         group_keys=_group_keys(select, aliases),
         join_keys=_join_keys(select, aliases),
         ordering=_ordering(select, aliases),
@@ -235,6 +235,151 @@ def _constrained_columns(select: "exp.Select") -> frozenset[str]:
         if where is not None:
             columns |= rt._predicate_columns(where)
     return frozenset(columns)
+
+
+# ---------------------------------------------------------------------------
+# The temporal fold
+#
+# Three spellings of the same interval reach this module — a half-open comparison chain, a year
+# pulled out with EXTRACT, and a BETWEEN — and a golden item that failed one of them against
+# another would be failing on spelling rather than on meaning. Everything else resolves to nothing,
+# and "nothing" is a real answer here: this is one of the two claims allowed to gate, so the cost
+# of guessing an interval the statement did not write is a correct statement failed.
+# ---------------------------------------------------------------------------
+
+# Which bound each comparison puts on the column standing on its LEFT, and whether that bound
+# includes the value. Written out rather than derived, because the mirrored form (`'2025-01-01' <=
+# d`) is handled by swapping the side rather than by a second table.
+_COMPARISON_BOUNDS: dict[type, tuple[str, bool]] = {
+    exp.GTE: ("start", True),
+    exp.GT: ("start", False),
+    exp.LTE: ("end", True),
+    exp.LT: ("end", False),
+}
+
+
+def _resolve_date_window(
+    conjuncts: list["exp.Expression"], aliases: dict[str, str]
+) -> Optional[DateWindow]:
+    """Fold this statement's filtering conjuncts into the one interval they constrain, or None.
+
+    None is returned wherever the fold would be a claim this module cannot stand behind: no
+    temporal predicate at all, two columns carrying one (picking either would make the answer
+    depend on the order the conjuncts were written in), a conjunct over the temporal column that
+    did not reduce, or two bounds on the same side that disagree.
+
+    A PARTIAL reduction is discarded whole, mirroring `runtime._reduced_on`. Half of a constraint
+    reported as the whole of one is not a weaker fact than no fact — it is a false one, and it is
+    the shape that fails a statement which filters correctly.
+    """
+    bounds: dict[str, list[tuple[str, str, bool]]] = {}
+    written_as: dict[str, str] = {}
+    unreduced: set[str] = set()
+    for conjunct in conjuncts:
+        found = _temporal_bounds(conjunct)
+        if found is None:
+            unreduced |= rt._predicate_columns(conjunct)
+            continue
+        column, pieces = found
+        key = column.name.lower()
+        bounds.setdefault(key, []).extend(pieces)
+        written_as.setdefault(key, _expression_key(column, aliases))
+
+    if len(bounds) != 1:
+        return None
+    key, pieces = next(iter(bounds.items()))
+    if key in unreduced:
+        return None
+
+    edges: dict[str, tuple[Optional[str], bool]] = {"start": (None, False), "end": (None, False)}
+    for side, value, inclusive in pieces:
+        settled = edges[side]
+        if settled[0] is not None and settled != (value, inclusive):
+            return None
+        edges[side] = (value, inclusive)
+    return DateWindow(
+        column=written_as[key],
+        start=edges["start"][0],
+        start_inclusive=edges["start"][1],
+        end=edges["end"][0],
+        end_inclusive=edges["end"][1],
+    )
+
+
+def _temporal_bounds(
+    node: "exp.Expression",
+) -> "tuple[exp.Column, list[tuple[str, str, bool]]] | None":
+    """One conjunct as (the column it constrains, the bounds it puts on it), or None if this module
+    does not model the shape it was written in."""
+    if isinstance(node, exp.Between):
+        column = node.this
+        low = _date_literal(node.args.get("low"))
+        high = _date_literal(node.args.get("high"))
+        if isinstance(column, exp.Column) and low is not None and high is not None:
+            # BETWEEN is inclusive at BOTH ends, and the upper one stays where it was written —
+            # shifting it to the next day is only sound on a DATE column, and no column type
+            # reaches this module.
+            return column, [("start", low, True), ("end", high, True)]
+        return None
+    if isinstance(node, exp.EQ):
+        extracted = _extracted_year(node)
+        if extracted is None:
+            return None
+        column, year = extracted
+        # A calendar year IS a half-open interval, so this folds to exactly the chain form and the
+        # two spellings compare equal.
+        return column, [("start", f"{year}-01-01", True), ("end", f"{year + 1}-01-01", False)]
+
+    bound = _COMPARISON_BOUNDS.get(type(node))
+    if bound is None:
+        return None
+    side, inclusive = bound
+    if isinstance(node.this, exp.Column):
+        column, value = node.this, _date_literal(node.expression)
+    elif isinstance(node.expression, exp.Column):
+        # `'2025-01-01' <= d` is `d >= '2025-01-01'` written the other way round, so the bound it
+        # puts on the column is the mirror of the operator rather than the operator itself.
+        column, value = node.expression, _date_literal(node.this)
+        side = "end" if side == "start" else "start"
+    else:
+        return None
+    if value is None:
+        return None
+    return column, [(side, value, inclusive)]
+
+
+def _date_literal(node: "exp.Expression | None") -> Optional[str]:
+    """The ISO date a node spells, as written — None when it spells anything else.
+
+    A typed literal (`DATE '2025-01-01'`) parses as a cast over the string, so the cast is unwrapped
+    and the two spellings resolve to one bound. Nothing is reformatted: the bound a report names has
+    to be the bound the statement wrote.
+    """
+    if isinstance(node, exp.Cast):
+        node = node.this
+    if isinstance(node, exp.Literal) and node.is_string and _ISO_DATE.match(node.this):
+        return node.this
+    return None
+
+
+def _extracted_year(node: "exp.EQ") -> "tuple[exp.Column, int] | None":
+    """`EXTRACT(YEAR FROM col) = 2025` as (col, 2025), from either operand order.
+
+    Only YEAR, and only against an integer literal. A quarter or a month extracted the same way is
+    a real interval too, but it is one this module has no test corpus for, and an interval derived
+    from a rule nobody has exercised is the kind that gates a correct statement.
+    """
+    for extract, other in ((node.this, node.expression), (node.expression, node.this)):
+        if not isinstance(extract, exp.Extract):
+            continue
+        # The unit is a bare keyword rather than an identifier, so the tree-wide case fold does not
+        # reach it and it is compared case-insensitively here.
+        if (extract.this.name or "").upper() != "YEAR":
+            continue
+        column, value = extract.expression, other
+        if isinstance(column, exp.Column) and isinstance(value, exp.Literal) and not value.is_string:
+            return column, int(value.this)
+    return None
 
 
 def _group_keys(select: "exp.Select", aliases: dict[str, str]) -> tuple[str, ...]:
