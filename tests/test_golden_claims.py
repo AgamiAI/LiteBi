@@ -100,6 +100,30 @@ class TestReadingAStatement:
         assert claims.unreadable is None
         assert [key for key in claims.filter_predicates if "\u2026" in key]
 
+    def test_a_bracketed_predicate_reads_as_the_predicate_inside_it(self, engine):
+        """A bracket is the author's readability rather than a change of meaning, so two statements
+        that differ only in their brackets must produce one key — at the top of a conjunct, where
+        the AND flattener unwraps it, and nested inside one, where this module does."""
+        dialect = sqlglot_dialect(engine)
+        for bracketed, plain in (
+            ("(o.status = 'paid')", "o.status = 'paid'"),
+            ("o.amount > (100)", "o.amount > 100"),
+        ):
+            read = [
+                gc.read_claims(f"SELECT 1 FROM orders o WHERE {sql}", dialect=dialect)
+                for sql in (bracketed, plain)
+            ]
+            assert read[0].filter_predicates == read[1].filter_predicates
+
+    def test_a_limit_that_is_not_a_plain_integer_reads_as_no_limit(self, engine):
+        """A computed row cap is not a number two statements can be compared on, so it reads as
+        absent rather than as some wrong count."""
+        claims = gc.read_claims(
+            "SELECT 1 FROM orders o LIMIT 1 + 1", dialect=sqlglot_dialect(engine)
+        )
+
+        assert claims.limit is None
+
     def test_an_alias_and_the_table_it_names_read_the_same(self, engine):
         """Criterion 1's mechanism, isolated: a qualifier is bound to the table its own SELECT
         reads, so a rewrite that renames the alias changes no claim."""
@@ -234,6 +258,33 @@ class TestResolvingADateWindow:
             _window("o.order_date >= '2025-01-01' AND o.shipped_date < '2026-01-01'", engine)
             is None
         )
+
+    def test_two_bounds_on_one_side_that_disagree_resolve_to_nothing(self, engine):
+        """Two lower bounds are two claims about where the interval starts, and picking the wider
+        or the narrower would be this module deciding which one the author meant."""
+        assert (
+            _window("o.order_date >= '2025-01-01' AND o.order_date >= '2025-02-01'", engine) is None
+        )
+
+    def test_a_range_over_something_that_is_not_a_date_is_not_a_window(self, engine):
+        """A BETWEEN and a comparison are temporal only when what they compare against is a date;
+        reading a money range as an interval would invent a window the statement never wrote."""
+        assert _window("o.amount BETWEEN 1 AND 10", engine) is None
+        assert _window("o.amount > 100", engine) is None
+
+    def test_a_comparison_between_two_literals_is_not_a_bound(self, engine):
+        """Neither side names a column, so there is nothing for the comparison to bound — and it
+        must not disturb the window the rest of the WHERE does resolve."""
+        resolved = _window("1 < 2 AND o.order_date >= '2025-01-01'", engine)
+
+        assert (resolved.start, resolved.start_inclusive) == ("2025-01-01", True)
+
+    def test_only_a_year_is_read_out_of_an_extract(self, engine):
+        """A month or a quarter pulled out the same way is a real interval too, but one no corpus
+        here exercises — and an interval derived from an unexercised rule is the kind that gates a
+        correct statement. An extracted year compared against a column is not a bound either."""
+        assert _window("EXTRACT(MONTH FROM o.order_date) = 4", engine) is None
+        assert _window("EXTRACT(YEAR FROM o.order_date) = o.fiscal_year", engine) is None
 
     def test_a_statement_with_no_temporal_predicate_resolves_to_nothing(self, engine):
         assert _window("o.status = 'paid'", engine) is None
