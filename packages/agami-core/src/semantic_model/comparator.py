@@ -27,6 +27,14 @@ one, and how far the rows agree once the columns are paired. Column identity is 
 and never by name or position — a generated statement is free to alias a total and to select it
 second — and rows are compared as a multiset unless the author ordered them, because duplicates
 are signal and order usually is not.
+
+``compare_result_sets`` is the one way in. It is TOTAL: a malformed result, an unreadable
+statement or a band that cannot be applied all come back as a score with an error status, never as
+an exception, so one bad item costs that item and not the run — the same posture
+``execute_guarded`` takes and the same one ``golden.py`` takes when it reads a dataset. And what
+it hands back carries verdicts, counts and column NAMES only. Never a cell, and never the answer
+key's SQL: the payload being judged here is result data, and a score travels further than the run
+that produced it.
 """
 
 from __future__ import annotations
@@ -35,12 +43,16 @@ import math
 import re
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Context, Decimal
-from typing import Any, Optional
+from typing import Any, Literal, NamedTuple, Optional
 
 import sqlglot
+from execute_sql import ExecResult
 from sqlglot.errors import ErrorLevel, SqlglotError
+
+from .golden import GoldenBounds, MatchLevel
 
 # Every NaN is one bucket. The value is a plain string rather than a NaN, because a Decimal or
 # float NaN as a dict key compares unequal to itself and would open a fresh bucket per cell.
@@ -255,26 +267,6 @@ def _column_vectors(
     return vectors
 
 
-def _augment(
-    golden: int, candidates: Sequence[Sequence[int]], taken: dict[int, int], seen: set[int]
-) -> bool:
-    """Kuhn's augmenting step: place `golden`, displacing an earlier pairing that can move aside.
-
-    Two columns carrying identical values are interchangeable, so pairing them in whatever order
-    they happen to appear can strand a later column whose only candidate is already spoken for;
-    the augmenting path undoes the earlier choice instead of failing. Column counts are single
-    digits, so this loop is the right algorithm and Hopcroft–Karp would buy nothing.
-    """
-    for generated in candidates[golden]:
-        if generated in seen:
-            continue
-        seen.add(generated)
-        if generated not in taken or _augment(taken[generated], candidates, taken, seen):
-            taken[generated] = golden
-            return True
-    return False
-
-
 def match_columns(
     golden_columns: Sequence[str],
     golden_rows: Sequence[Sequence[Any]],
@@ -297,14 +289,20 @@ def match_columns(
     generated_vectors = _column_vectors(
         generated_columns, generated_rows, ordered=ordered, quantize=quantize
     )
-    candidates = [
-        [index for index, other in enumerate(generated_vectors) if other == vector]
-        for vector in golden_vectors
-    ]
-    taken: dict[int, int] = {}
-    for golden in range(len(golden_vectors)):
-        _augment(golden, candidates, taken, set())
-    pairing = {golden: generated for generated, golden in taken.items()}
+    # Greedy, and deliberately NOT a maximum-matching algorithm. A golden column pairs with a
+    # generated one only when their value vectors are equal, and equality is transitive: the
+    # candidate sets are equivalence classes, so two golden columns either compete for exactly the
+    # same partners or for none of the same. Partners inside one class are interchangeable, so
+    # taking the first unclaimed one can never strand a later column that had an option of its own
+    # — there is no augmenting path to find, and adding one back would be dead weight.
+    unclaimed: dict[tuple[tuple[str, Any], ...], list[int]] = {}
+    for index, vector in enumerate(generated_vectors):
+        unclaimed.setdefault(vector, []).append(index)
+    pairing: dict[int, int] = {}
+    for index, vector in enumerate(golden_vectors):
+        partners = unclaimed.get(vector)
+        if partners:
+            pairing[index] = partners.pop(0)
     unmatched = tuple(name for index, name in enumerate(golden_columns) if index not in pairing)
     return pairing, unmatched
 
@@ -346,11 +344,261 @@ def compare_rows(
     return overlap, len(golden_rows), len(generated_rows)
 
 
+@dataclass(frozen=True)
+class ItemScore:
+    """One item's verdict: how it was judged and how far the two sides agreed.
+
+    A returned value and never an authored file, so a frozen dataclass like ``ExecResult`` and
+    ``Envelope`` rather than a pydantic model — ``golden.py``'s models are the other case, parsing
+    what a person wrote down.
+
+    ``accuracy`` is None exactly when nothing was scored. 0.0 is a score an item can legitimately
+    earn — a comparison that ran and found no agreement — and collapsing the two would report a
+    wrong answer and an unrunnable case as the same thing.
+
+    An item passes at exactly 1.0, and there is no second threshold: the match level already says
+    how loose the comparison is, and a fractional pass mark on top of it would loosen every level
+    again, invisibly.
+    """
+
+    status: Literal["scored", "unscored", "error"]
+    accuracy: Optional[float]
+    reason: str
+    unmatched_golden_columns: tuple[str, ...] = ()
+    golden_row_count: Optional[int] = None
+    generated_row_count: Optional[int] = None
+    order_sensitive: Optional[bool] = None
+    notes: tuple[str, ...] = ()
+
+
+class _Verdict(NamedTuple):
+    """What one level decided, before the counts and ordering every score carries are attached."""
+
+    status: Literal["scored", "unscored", "error"]
+    accuracy: Optional[float]
+    reason: str
+    unmatched: tuple[str, ...] = ()
+
+
+# Deliberately NOT a pass. Two empty results agree about nothing: no value was compared, and
+# scoring that as a full match is how a statement that returns nothing at all gates like a right
+# one. Checked before the level dispatch, so `nonempty` never sees an empty pair either.
+_BOTH_EMPTY = "both result sets are empty, so the comparison would check no value"
+
+
+def _accuracy(overlap: int, golden_count: int, generated_count: int) -> float:
+    """The share of the LARGER side the two agreed on, so extra rows cost what missing ones do.
+
+    Three decimal places because the number is read by a person and compared against 1.0; more
+    digits would only ever be the tail of a repeating division.
+    """
+    widest = max(golden_count, generated_count)
+    if overlap == widest:
+        return 1.0
+    # 1.0 is the pass mark, and rounding alone would hand it to a near miss: 4002 of 4004 rows is
+    # 0.99950…, which rounds up. A result that disagreed about a row has to score below the gate
+    # however wide it is, so the rounded value is capped just short of it.
+    return min(round(overlap / widest, 3), 0.999)
+
+
+def _score_values(
+    golden: ExecResult,
+    generated: ExecResult,
+    *,
+    ordered: bool,
+    quantize: bool,
+    allow_extra_columns: bool,
+) -> _Verdict:
+    """Pair the columns by value, then score how far the rows agree over the pairing."""
+    pairing, unmatched = match_columns(
+        golden.columns, golden.rows, generated.columns, generated.rows,
+        ordered=ordered, quantize=quantize,
+    )
+    if unmatched:
+        # Not a partial answer. The question asked for that column and the result does not carry
+        # it, so how well the remaining columns overlap says nothing about whether it is right.
+        return _Verdict(
+            "scored", 0.0, "no generated column carries the values of: " + ", ".join(unmatched),
+            unmatched,
+        )
+    if not allow_extra_columns and len(generated.columns) > len(golden.columns):
+        extra = len(generated.columns) - len(golden.columns)
+        return _Verdict(
+            "scored", 0.0, f"the generated result carries {extra} column(s) the answer key does not"
+        )
+    overlap, golden_count, generated_count = compare_rows(
+        golden.rows, generated.rows, pairing, ordered=ordered, quantize=quantize
+    )
+    accuracy = _accuracy(overlap, golden_count, generated_count)
+    if accuracy == 1.0:
+        return _Verdict("scored", 1.0, "")
+    return _Verdict(
+        "scored", accuracy,
+        f"{overlap} of the answer key's {golden_count} rows matched, "
+        f"out of {generated_count} the generated statement returned",
+    )
+
+
+def _column_types(columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> list[frozenset[str]]:
+    """The coarse types present in each column. Reuses the vector build so a ragged row is caught
+    here too, and orders the cells because a set of types does not care."""
+    vectors = _column_vectors(columns, rows, ordered=True, quantize=False)
+    return [
+        frozenset(tag for tag in (cell_type(cell) for cell in vector) if tag is not None)
+        for vector in vectors
+    ]
+
+
+def _score_shape(golden: ExecResult, generated: ExecResult) -> _Verdict:
+    """Counts and the coarse type lattice, never a value.
+
+    Columns are compared POSITIONALLY here, which the value levels never do — with the values off
+    limits there is nothing to pair them on, and pairing by type would call any two text columns
+    interchangeable.
+    """
+    if len(golden.rows) != len(generated.rows):
+        return _Verdict(
+            "scored", 0.0,
+            f"the answer key has {len(golden.rows)} rows and the generated result "
+            f"{len(generated.rows)}",
+        )
+    if len(golden.columns) != len(generated.columns):
+        return _Verdict(
+            "scored", 0.0,
+            f"the answer key has {len(golden.columns)} columns and the generated result "
+            f"{len(generated.columns)}",
+        )
+    pairs = zip(golden.columns, _column_types(golden.columns, golden.rows),
+                _column_types(generated.columns, generated.rows))
+    for name, golden_types, generated_types in pairs:
+        # An empty set is an all-NULL column, or a result with no rows at all, and it constrains
+        # nothing: a NULL is the absence of a value, not a value of some type.
+        if golden_types and generated_types and golden_types != generated_types:
+            return _Verdict(
+                "scored", 0.0, f"column {name!r} does not carry the type the answer key does"
+            )
+    return _Verdict("scored", 1.0, "")
+
+
+def _score_bounds(generated: ExecResult, bounds: Optional[GoldenBounds]) -> _Verdict:
+    """Judge the generated result against the authored band. Row bounds count the GENERATED rows —
+    a bounded item has no answer key to count against, which is why it is bounded."""
+    if bounds is None:
+        return _Verdict(
+            "error", None,
+            "a bounded item is judged against a band, and no bounds were given to judge it with",
+        )
+    if bounds.min_value is not None or bounds.max_value is not None:
+        verdict = _score_value_band(generated, bounds)
+        if verdict is not None:
+            return verdict
+    count = len(generated.rows)
+    if bounds.min_rows is not None and count < bounds.min_rows:
+        return _Verdict("scored", 0.0, f"the generated result has {count} rows, below the band")
+    if bounds.max_rows is not None and count > bounds.max_rows:
+        return _Verdict("scored", 0.0, f"the generated result has {count} rows, above the band")
+    return _Verdict("scored", 1.0, "")
+
+
+def _score_value_band(generated: ExecResult, bounds: GoldenBounds) -> Optional[_Verdict]:
+    """The value half of a band, or None when the result landed inside it and the row half is
+    still to run. A value band asks about one number, so anything wider is an error and not a
+    failure: the case cannot be judged at all, and reporting it as wrong would blame the run."""
+    if len(generated.rows) != 1 or len(generated.columns) != 1 or len(generated.rows[0]) != 1:
+        return _Verdict(
+            "error", None,
+            "a value band judges one number, and the generated result is not a single cell",
+        )
+    tag, value = canonical_cell(generated.rows[0][0])
+    if tag != "num":
+        return _Verdict("error", None, "a value band judges a number, and this cell is not one")
+    # Through str, because Decimal(float) expands the binary float in full and would put a band
+    # edge of 0.1 a hair away from where the author wrote it.
+    if bounds.min_value is not None and value < Decimal(str(bounds.min_value)):
+        return _Verdict("scored", 0.0, "the generated value is below the band")
+    if bounds.max_value is not None and value > Decimal(str(bounds.max_value)):
+        return _Verdict("scored", 0.0, "the generated value is above the band")
+    return None
+
+
+def _judge(
+    golden: ExecResult,
+    generated: ExecResult,
+    match: MatchLevel,
+    bounds: Optional[GoldenBounds],
+    ordered: bool,
+) -> _Verdict:
+    """Dispatch to the level the author asked for, loosening left to right."""
+    if match in ("exact", "values"):
+        loose = match == "values"
+        # `values` forgives a floating-point tail and an extra column the question did not ask
+        # for; `exact` forgives neither, which is the only difference between the two.
+        return _score_values(
+            golden, generated, ordered=ordered, quantize=loose, allow_extra_columns=loose
+        )
+    if match == "shape":
+        return _score_shape(golden, generated)
+    if match == "bounded":
+        return _score_bounds(generated, bounds)
+    if match == "nonempty":
+        if generated.rows:
+            return _Verdict("scored", 1.0, "")
+        return _Verdict("scored", 0.0, "the generated statement returned no rows")
+    return _Verdict("error", None, f"{match!r} is not a match level this comparison knows")
+
+
+def compare_result_sets(
+    golden: ExecResult,
+    generated: ExecResult,
+    *,
+    match: MatchLevel = "exact",
+    golden_sql: Optional[str] = None,
+    bounds: Optional[GoldenBounds] = None,
+    dialect: Optional[str] = None,
+) -> ItemScore:
+    """Score one generated result against its answer key. Never raises.
+
+    `golden_sql` is read for one thing only — whether the author ordered the rows — and the
+    generated statement is deliberately not a parameter: the ordering that has to hold is the one
+    the ANSWER KEY asked for, so a generated statement that drops the ORDER BY is still judged
+    against it rather than excused by it.
+    """
+    if not golden.rows and not generated.rows:
+        return ItemScore(
+            status="unscored", accuracy=None, reason=_BOTH_EMPTY,
+            golden_row_count=0, generated_row_count=0,
+        )
+    ordered, note = has_top_level_order_by(golden_sql, dialect=dialect)
+    try:
+        verdict = _judge(golden, generated, match, bounds, ordered)
+    except RaggedRow as exc:
+        # Its message counts cells and names no value, so it can be reported as it stands.
+        verdict = _Verdict("error", None, str(exc))
+    except Exception as exc:
+        # The totality net. The exception TYPE only and never its message: an arbitrary error
+        # quotes the value that broke it, and this score travels.
+        verdict = _Verdict(
+            "error", None, f"the comparison failed with an unexpected {type(exc).__name__}"
+        )
+    return ItemScore(
+        status=verdict.status,
+        accuracy=verdict.accuracy,
+        reason=verdict.reason,
+        unmatched_golden_columns=verdict.unmatched,
+        golden_row_count=len(golden.rows),
+        generated_row_count=len(generated.rows),
+        order_sensitive=ordered,
+        notes=(note,) if note else (),
+    )
+
+
 __all__ = [
+    "ItemScore",
     "RaggedRow",
     "canonical_cell",
     "canonical_row",
     "cell_type",
+    "compare_result_sets",
     "compare_rows",
     "has_top_level_order_by",
     "match_columns",
