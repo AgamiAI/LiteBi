@@ -621,11 +621,38 @@ def _windows_agree(generated: DateWindow, golden: DateWindow) -> bool:
     can say so; it just does not decide.
     """
     return (
-        generated.start,
+        _canonical_bound(generated.start),
         generated.start_inclusive,
-        generated.end,
+        _canonical_bound(generated.end),
         generated.end_inclusive,
-    ) == (golden.start, golden.start_inclusive, golden.end, golden.end_inclusive)
+    ) == (
+        _canonical_bound(golden.start),
+        golden.start_inclusive,
+        _canonical_bound(golden.end),
+        golden.end_inclusive,
+    )
+
+
+# A time-of-day that names midnight, in every precision this module's own date pattern admits.
+_MIDNIGHT = re.compile(r"[ T]00:00(?::00(?:\.0+)?)?$")
+
+
+def _canonical_bound(value: Optional[str]) -> Optional[str]:
+    """One bound in the single spelling two of them are COMPARED in — never the one they are
+    reported in, which stays exactly as the statement wrote it.
+
+    A generated statement writing `'2025-01-01 00:00:00'` against a golden `'2025-01-01'` named the
+    same instant, and gating a correct statement on which of the two spellings it chose is the
+    outcome the two gates were selected to make impossible.
+
+    This fold is sound where the inclusive-upper-bound shift the module refuses is not, and the
+    difference is the column type. Dropping a zero time-of-day names the same instant whether the
+    column is a DATE or a TIMESTAMP; moving `'2025-12-31'` inclusive to `'2026-01-01'` exclusive is
+    true only on a DATE, and nothing here carries a column type. So this must not grow into that.
+    """
+    if value is None:
+        return None
+    return _MIDNIGHT.sub("", value).replace("T", " ")
 
 
 def _gates(generated: ClaimSet, golden: ClaimSet, must_filter: Sequence[str]) -> list[GateVerdict]:
