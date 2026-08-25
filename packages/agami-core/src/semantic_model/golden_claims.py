@@ -68,10 +68,7 @@ CLAIM_NAMES = (
 
 # Why a statement's claims were not read. Sentences rather than codes because they are printed
 # beside a failing item, and value-free because the statement that produced them is the caller's.
-_UNREADABLE_UNKNOWN = "the statement could not be read"
-_UNREADABLE_NOT_ONE_SELECT = (
-    "the statement is not a single SELECT, so its claims belong to its arms rather than to it"
-)
+_UNREADABLE_NOT_ONE_SELECT = "the statement is not a single SELECT"
 
 # An aggregate's own row filter (`SUM(x) FILTER (WHERE …)`) — resolved by name because the package
 # pins only `sqlglot>=20`, and a class this build does not declare is a shape it cannot parse.
@@ -163,9 +160,7 @@ def read_claims(sql: str, *, dialect: str) -> ClaimSet:
     comes back as a `ClaimSet` whose `unreadable` says so."""
     tree, why = rt._parse_reporting(sql, dialect=dialect)
     if tree is None:
-        # `_parse_reporting` reports None for both a parse failure and a build without sqlglot;
-        # only the first carries a sentence, and the caller is owed one either way.
-        return ClaimSet(unreadable=why or _UNREADABLE_UNKNOWN)
+        return ClaimSet(unreadable=why)
     if not isinstance(tree, exp.Select):
         return ClaimSet(unreadable=_UNREADABLE_NOT_ONE_SELECT)
 
@@ -245,7 +240,7 @@ def _rendered(node: "exp.Expression", aliases: dict[str, str], depth: int) -> st
         return f"'{node.this}'" if node.is_string else str(node.this)
 
     operands = [_rendered(child, aliases, depth - 1) for child in node.iter_expressions()]
-    if not operands and not isinstance(node.args.get("this"), exp.Expression):
+    if not operands:
         # A leaf sqlglot models with a plain value rather than a child node — a keyword unit
         # (`EXTRACT(YEAR …)`), a cast's target type — which `iter_expressions` does not yield and
         # which is the whole content of the node.
