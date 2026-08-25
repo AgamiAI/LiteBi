@@ -186,8 +186,22 @@ class TestReadingAStatement:
     def test_reading_a_statement_never_raises(self, engine):
         """Every input below is something a generator can emit; none of them may take the eval
         run down with it."""
+        dialect = sqlglot_dialect(engine)
         for sql in ("", "   ", "not sql at all", "SELECT 'unterminated", "DELETE FROM orders"):
-            assert gc.read_claims(sql, dialect=sqlglot_dialect(engine)).unreadable
+            assert gc.read_claims(sql, dialect=dialect).unreadable
+
+        # The three below PARSE, and reading one used to raise anyway: a numeric literal SQL
+        # accepts happily but `int()` does not. A number this module cannot compare is a claim it
+        # declines to make, which is the same None as any other shape it does not model.
+        assert gc.read_claims("SELECT 1 FROM orders o LIMIT 1.5", dialect=dialect).limit is None
+        assert gc.read_claims("SELECT 1 FROM orders o LIMIT 1e3", dialect=dialect).limit is None
+        assert (
+            gc.read_claims(
+                "SELECT 1 FROM orders o WHERE EXTRACT(YEAR FROM o.order_date) = 2025.5",
+                dialect=dialect,
+            ).date_window
+            is None
+        )
 
 
 def _window(sql: str, engine: str):
