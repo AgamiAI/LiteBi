@@ -125,6 +125,9 @@ class ClaimSet:
     # and a different question from the one above: *is this column constrained anywhere* rather
     # than *do these two statements constrain the same way*. Derived on the same walk, because the
     # parse-exactly-once discipline is why `_parse_reporting` exists.
+    # Held as the statement spelled it, because `_gates` looks a required column up in this set by
+    # its normalized spelling and a bounded key would stop matching. The bound is applied when the
+    # set is rendered instead — see `as_dict`.
     filtered_columns: frozenset[str] = frozenset()
     date_window: Optional[DateWindow] = None
     group_keys: tuple[str, ...] = ()
@@ -139,7 +142,10 @@ class ClaimSet:
         return {
             "tables": sorted(self.tables),
             "filter_predicates": sorted(self.filter_predicates),
-            "filtered_columns": sorted(self.filtered_columns),
+            # Bounded here rather than at the source: a quoted identifier is written by whoever
+            # wrote the statement, and this is the one claim value that is held raw so the gate can
+            # match on it.
+            "filtered_columns": sorted(rt._echo_name(name) for name in self.filtered_columns),
             "date_window": self.date_window.as_dict() if self.date_window else None,
             "group_keys": list(self.group_keys),
             "join_keys": _join_keys_as_list(self.join_keys),

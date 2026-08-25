@@ -702,6 +702,21 @@ class TestWhatTheDiffIsAllowedToCarry:
         assert len(diff.gates[0].column) == rt._ECHO_MAX_NAME_CHARS + 1
         assert "!" not in diff.gates[0].column
 
+    def test_a_constrained_column_is_bounded_when_a_claim_set_is_rendered(self, engine):
+        """`filtered_columns` is the one value held as the statement spelled it, because the gate
+        matches a required column against it. So the bound belongs on the render rather than on the
+        set, and a caller who reads a claim set directly is owed it just as much as one who reads a
+        diff."""
+        injected = "reg\nion" + "c" * 100
+        claims = gc.read_claims(
+            f'SELECT 1 FROM orders o WHERE o."{injected}" = 1', dialect=sqlglot_dialect(engine)
+        )
+
+        assert injected.lower() in claims.filtered_columns, "the gate must still match the spelling"
+        for value in claims.as_dict()["filtered_columns"]:
+            assert len(value) <= rt._ECHO_MAX_NAME_CHARS + 1, value
+            assert re.search(r"[\x00-\x1f\x7f]", value) is None, value
+
 
 def test_the_two_engines_are_two_different_grammars():
     """Guard against a matrix that re-asserts every criterion twice in one grammar, which would
