@@ -434,3 +434,46 @@ def test_relativity_lint_names_the_file_and_the_case(tmp_path, monkeypatch):
     # The lint reports; the file and every case in it, flagged or not, still read.
     assert [ds.name for ds in datasets] == ["orders", "revenue"]
     assert [i.item_key for i in datasets[1].test_cases] == ["revenue-recent", "revenue-total"]
+
+
+# --- the canonical authoring reference ---
+
+SHAPE_DOC = REPO_ROOT / "plugins" / "agami" / "shared" / "golden-dataset-shape.md"
+FORMAT_SPEC = REPO_ROOT / "docs" / "format-spec.md"
+
+
+def _first_yaml_fence(text):
+    """The doc's first ```yaml block, which is the complete example dataset. Only the first is
+    parsed: a later fence would be an excerpt, not a file anyone could copy whole."""
+    body = text.split("```yaml", 1)[1]
+    return body.split("```", 1)[0]
+
+
+def test_shape_doc_example_parses(tmp_path, monkeypatch):
+    """The reference has to be a file the real reader accepts, or it teaches a shape that is
+    refused the moment someone copies it."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    example = _first_yaml_fence(SHAPE_DOC.read_text(encoding="utf-8"))
+    (_golden_dir(tmp_path) / "orders.yaml").write_text(example, encoding="utf-8")
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.findings == [] and res.ok
+    assert [ds.name for ds in datasets] == ["orders"]
+    # One minimal case and one exercising every optional field.
+    assert len(datasets[0].test_cases) >= 2
+    assert all(i.query and i.expected for i in datasets[0].test_cases)
+
+
+def test_shape_doc_carries_hard_rule():
+    """The rule that binds hardest here: a golden dataset is the questions and the answer key in
+    one file, so globbing a sibling profile reads another tenant's data."""
+    text = SHAPE_DOC.read_text(encoding="utf-8")
+    assert "> **HARD RULE — never read another profile to learn a shape.**" in text
+    assert "tenant-data leak" in text
+
+
+def test_format_spec_lists_golden_datasets():
+    lines = FORMAT_SPEC.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("## `<artifacts_dir>/` — sharable"))
+    end = next(i for i, ln in enumerate(lines[start + 1:], start + 1) if ln.startswith("## "))
+    rows = [ln for ln in lines[start:end] if "golden_datasets/<name>.yaml" in ln]
+    assert len(rows) == 1 and "User-authored" in rows[0]
