@@ -68,8 +68,8 @@ CLAIM_NAMES = (
 
 # Why a statement's claims were not read. Sentences rather than codes because they are printed
 # beside a failing item, and value-free because the statement that produced them is the caller's.
-UNREADABLE_UNKNOWN = "the statement could not be read"
-UNREADABLE_NOT_ONE_SELECT = (
+_UNREADABLE_UNKNOWN = "the statement could not be read"
+_UNREADABLE_NOT_ONE_SELECT = (
     "the statement is not a single SELECT, so its claims belong to its arms rather than to it"
 )
 
@@ -159,9 +159,9 @@ def read_claims(sql: str, *, dialect: str) -> ClaimSet:
     if tree is None:
         # `_parse_reporting` reports None for both a parse failure and a build without sqlglot;
         # only the first carries a sentence, and the caller is owed one either way.
-        return ClaimSet(unreadable=why or UNREADABLE_UNKNOWN)
+        return ClaimSet(unreadable=why or _UNREADABLE_UNKNOWN)
     if not isinstance(tree, exp.Select):
-        return ClaimSet(unreadable=UNREADABLE_NOT_ONE_SELECT)
+        return ClaimSet(unreadable=_UNREADABLE_NOT_ONE_SELECT)
 
     # Folded ONCE, into a copy, and every claim below is derived from that copy. Unquoted
     # identifiers fold case in SQL, so `O.REGION` and `o.region` are one column; a quoted one does
@@ -443,11 +443,11 @@ def _join_keys(
 # The two gate reasons, value-free so a caller may print either one verbatim beside a failing item.
 # The offending column is a FIELD rather than part of the sentence, so a renderer decides how to
 # show it and the sentence itself never carries anything the caller's statement wrote.
-MUST_FILTER_REASON = (
+_MUST_FILTER_REASON = (
     "the dataset requires this column to be filtered, and the generated statement constrains it in "
     "none of the predicates it writes"
 )
-DATE_WINDOW_REASON = "the two statements resolve their date filters to different intervals"
+_DATE_WINDOW_REASON = "the two statements resolve their date filters to different intervals"
 
 
 @dataclass
@@ -594,21 +594,19 @@ def _gates(generated: ClaimSet, golden: ClaimSet, must_filter: Sequence[str]) ->
     verdicts: list[GateVerdict] = []
     if generated.unreadable is None:
         verdicts.extend(
-            GateVerdict(kind="must_filter", column=column, reason=MUST_FILTER_REASON)
+            GateVerdict(kind="must_filter", column=column, reason=_MUST_FILTER_REASON)
             for column in must_filter
             if rt._tkey(rt._bare(column)) not in generated.filtered_columns
         )
     if _window_status(generated.date_window, golden.date_window) == DIFFERS:
-        verdicts.append(GateVerdict(kind="date_window", column=None, reason=DATE_WINDOW_REASON))
+        verdicts.append(GateVerdict(kind="date_window", column=None, reason=_DATE_WINDOW_REASON))
     return verdicts
 
 
 __all__ = [
     "AGREES",
     "CLAIM_NAMES",
-    "DATE_WINDOW_REASON",
     "DIFFERS",
-    "MUST_FILTER_REASON",
     "UNKNOWN",
     "Claim",
     "ClaimDiff",
