@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlglot import expressions as exp
 
@@ -377,7 +377,9 @@ def _extracted_year(node: "exp.EQ") -> "tuple[exp.Column, int] | None":
         if (extract.this.name or "").upper() != "YEAR":
             continue
         column, value = extract.expression, other
-        if isinstance(column, exp.Column) and isinstance(value, exp.Literal) and not value.is_string:
+        if not (isinstance(column, exp.Column) and isinstance(value, exp.Literal)):
+            continue
+        if not value.is_string:
             return column, int(value.this)
     return None
 
@@ -434,12 +436,186 @@ def _join_keys(
     return frozenset(pairs)
 
 
+# ---------------------------------------------------------------------------
+# The comparison, and the two gates
+# ---------------------------------------------------------------------------
+
+# The two gate reasons, value-free so a caller may print either one verbatim beside a failing item.
+# The offending column is a FIELD rather than part of the sentence, so a renderer decides how to
+# show it and the sentence itself never carries anything the caller's statement wrote.
+MUST_FILTER_REASON = (
+    "the dataset requires this column to be filtered, and the generated statement constrains it in "
+    "none of the predicates it writes"
+)
+DATE_WINDOW_REASON = "the two statements resolve their date filters to different intervals"
+
+
+@dataclass
+class Claim:
+    """One of the seven claims, and whether the two statements agree on it.
+
+    `generated` and `golden` are the claim's own value on each side, in the JSON-able form
+    `ClaimSet.as_dict` renders it — identifiers, bounds and counts, never a statement.
+    """
+
+    name: str
+    status: str  # AGREES | DIFFERS | UNKNOWN
+    generated: Any
+    golden: Any
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "generated": self.generated,
+            "golden": self.golden,
+        }
+
+
+@dataclass
+class GateVerdict:
+    """One of the two differences a golden item is allowed to FAIL on, rather than merely report."""
+
+    kind: str  # "must_filter" | "date_window"
+    column: Optional[str]  # the required column filtered nowhere; None for a window verdict
+    reason: str  # value-free, safe to print beside a failure
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "column": self.column, "reason": self.reason}
+
+
+@dataclass
+class ClaimDiff:
+    """What two statements say about each other: seven claims, and whatever gated."""
+
+    claims: list[Claim]  # exactly seven, in CLAIM_NAMES order
+    gates: list[GateVerdict]  # empty when nothing gates
+
+    @property
+    def gated(self) -> bool:
+        return bool(self.gates)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "claims": [claim.as_dict() for claim in self.claims],
+            "gates": [gate.as_dict() for gate in self.gates],
+            "gated": self.gated,
+        }
+
+
+def compare_statements(
+    generated_sql: str,
+    golden_sql: str,
+    *,
+    must_filter: Sequence[str] = (),
+    dialect: str,
+) -> ClaimDiff:
+    """Read both statements and compare them — the whole module in one call."""
+    return diff_claims(
+        read_claims(generated_sql, dialect=dialect),
+        read_claims(golden_sql, dialect=dialect),
+        must_filter=must_filter,
+    )
+
+
+def diff_claims(
+    generated: ClaimSet, golden: ClaimSet, *, must_filter: Sequence[str] = ()
+) -> ClaimDiff:
+    """Compare two already-read claim sets.
+
+    A statement that could not be read makes every claim `unknown` rather than `differs`: `differs`
+    is a definite comparison, and there is nothing on one side to have compared.
+    """
+    unreadable = generated.unreadable is not None or golden.unreadable is not None
+    generated_values, golden_values = generated.as_dict(), golden.as_dict()
+    window = _window_status(generated.date_window, golden.date_window)
+
+    claims: list[Claim] = []
+    for name in CLAIM_NAMES:
+        if unreadable:
+            claims.append(Claim(name=name, status=UNKNOWN, generated=None, golden=None))
+            continue
+        # Six of the seven are decided on the RENDERED value, which `as_dict` has already sorted —
+        # so every claim that is a set underneath compares order-insensitively for free, and the
+        # value a reader is shown is the same value the status was decided from. The window is the
+        # exception, because its own rule ignores one of its fields.
+        status = (
+            window
+            if name == "date_window"
+            else (AGREES if generated_values[name] == golden_values[name] else DIFFERS)
+        )
+        claims.append(
+            Claim(
+                name=name,
+                status=status,
+                generated=generated_values[name],
+                golden=golden_values[name],
+            )
+        )
+    return ClaimDiff(claims=claims, gates=_gates(generated, golden, must_filter))
+
+
+def _window_status(generated: Optional[DateWindow], golden: Optional[DateWindow]) -> str:
+    """`unknown` unless BOTH statements resolved a window.
+
+    One side unresolved is not evidence of disagreement — it is this module declining to model a
+    spelling — and reporting it as `differs` would hand the gate below a difference that the
+    statements may not have.
+    """
+    if generated is None or golden is None:
+        return UNKNOWN
+    return AGREES if _windows_agree(generated, golden) else DIFFERS
+
+
+def _windows_agree(generated: DateWindow, golden: DateWindow) -> bool:
+    """Two windows agree iff their four BOUND fields are equal — the column is not compared.
+
+    Two statements over one table may qualify the same column differently, or one may qualify it
+    and the other not, and a gate that read those as two different windows would fail a correct
+    rewrite on a qualifier. Which column each side constrains still rides on the claim, so a report
+    can say so; it just does not decide.
+    """
+    return (
+        generated.start,
+        generated.start_inclusive,
+        generated.end,
+        generated.end_inclusive,
+    ) == (golden.start, golden.start_inclusive, golden.end, golden.end_inclusive)
+
+
+def _gates(generated: ClaimSet, golden: ClaimSet, must_filter: Sequence[str]) -> list[GateVerdict]:
+    """The two differences that may fail an item, and nothing else.
+
+    The required-column gate reads only the GENERATED statement, because `must_filter` is the
+    dataset's requirement rather than a property of the golden statement — but it stays silent when
+    that statement could not be read, since "constrains it nowhere" is a claim about a statement
+    nobody managed to read.
+    """
+    verdicts: list[GateVerdict] = []
+    if generated.unreadable is None:
+        verdicts.extend(
+            GateVerdict(kind="must_filter", column=column, reason=MUST_FILTER_REASON)
+            for column in must_filter
+            if rt._tkey(rt._bare(column)) not in generated.filtered_columns
+        )
+    if _window_status(generated.date_window, golden.date_window) == DIFFERS:
+        verdicts.append(GateVerdict(kind="date_window", column=None, reason=DATE_WINDOW_REASON))
+    return verdicts
+
+
 __all__ = [
     "AGREES",
     "CLAIM_NAMES",
+    "DATE_WINDOW_REASON",
     "DIFFERS",
+    "MUST_FILTER_REASON",
     "UNKNOWN",
+    "Claim",
+    "ClaimDiff",
     "ClaimSet",
     "DateWindow",
+    "GateVerdict",
+    "compare_statements",
+    "diff_claims",
     "read_claims",
 ]

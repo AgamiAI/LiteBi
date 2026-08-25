@@ -219,3 +219,186 @@ class TestResolvingADateWindow:
         )
 
         assert (resolved.start, resolved.end) == ("2025-01-01", "2026-01-01")
+
+
+def _diff(generated_sql: str, golden_sql: str, engine: str, must_filter=()):
+    return gc.compare_statements(
+        generated_sql, golden_sql, must_filter=must_filter, dialect=sqlglot_dialect(engine)
+    )
+
+
+def _claim(diff, name: str):
+    return next(claim for claim in diff.claims if claim.name == name)
+
+
+# The statement a golden item would carry: a filtered, windowed, joined, grouped, ordered, capped
+# aggregate over the demo shop. Every one of the seven claims is present in it, which is what lets
+# the rewrite below assert that all seven AGREE rather than that none of them differs.
+GOLDEN_SHAPE = (
+    "SELECT o.region, SUM(o.amount) AS revenue "
+    "FROM orders o JOIN customers c ON o.customer_id = c.id "
+    "WHERE o.status = 'paid' AND o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01' "
+    "GROUP BY o.region ORDER BY revenue DESC LIMIT 10"
+)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestComparingTwoStatements:
+    """Seven claims out, and exactly two of them allowed to decide anything."""
+
+    def test_the_claim_set_is_exactly_seven_claims(self, engine):
+        """Seven is the contract, not an implementation detail: an eighth claim changes what a
+        golden item is allowed to assert about a statement."""
+        diff = _diff(GOLDEN_SHAPE, GOLDEN_SHAPE, engine)
+
+        assert gc.CLAIM_NAMES == (
+            "tables",
+            "filter_predicates",
+            "date_window",
+            "group_keys",
+            "join_keys",
+            "ordering",
+            "limit",
+        )
+        assert len(diff.claims) == 7
+        assert tuple(claim.name for claim in diff.claims) == gc.CLAIM_NAMES
+
+    def test_an_aliased_reordered_rewrite_agrees_on_every_claim(self, engine):
+        """The property the whole module rests on: two spellings of one question produce identical
+        claims. If this ever reports a difference, every difference the module reports is
+        suspect."""
+        rewritten = (
+            "SELECT SUM(ord.amount) AS revenue, ord.region "
+            "FROM orders ord JOIN customers cust ON ord.customer_id = cust.id "
+            "WHERE ord.order_date < '2026-01-01' AND ord.status = 'paid' "
+            "AND ord.order_date >= '2025-01-01' "
+            "GROUP BY ord.region ORDER BY revenue DESC LIMIT 10"
+        )
+        diff = _diff(rewritten, GOLDEN_SHAPE, engine)
+
+        assert [claim.status for claim in diff.claims] == [gc.AGREES] * 7
+        assert diff.gates == []
+        assert diff.gated is False
+
+    def test_a_window_shifted_by_a_quarter_differs_and_names_both(self, engine):
+        """The failure this module exists to explain: same tables, same grouping, same everything
+        except the interval — which a row count cannot tell apart from a different question."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE o.order_date >= '2025-04-01' AND o.order_date < '2025-07-01'",
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE o.order_date >= '2025-01-01' AND o.order_date < '2025-04-01'",
+            engine,
+        )
+        window = _claim(diff, "date_window")
+
+        assert window.status == gc.DIFFERS
+        assert window.generated["start"] == "2025-04-01"
+        assert window.golden["start"] == "2025-01-01"
+        assert window.generated["column"] == window.golden["column"] == "orders.order_date"
+        assert [gate.kind for gate in diff.gates] == ["date_window"]
+        assert diff.gated is True
+
+    def test_a_between_upper_bound_does_not_agree_with_the_half_open_year(self, engine):
+        """The two intervals differ at the upper bound and nowhere else, and the claim carries both
+        bounds so a reader can see which one moved."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE o.order_date BETWEEN '2025-01-01' AND '2025-12-31'",
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'",
+            engine,
+        )
+        window = _claim(diff, "date_window")
+
+        assert window.status == gc.DIFFERS
+        assert window.generated["start"] == window.golden["start"] == "2025-01-01"
+        assert (window.generated["end"], window.generated["end_inclusive"]) == ("2025-12-31", True)
+        assert (window.golden["end"], window.golden["end_inclusive"]) == ("2026-01-01", False)
+        assert [gate.kind for gate in diff.gates] == ["date_window"]
+
+    def test_a_window_agrees_however_the_column_is_qualified(self, engine):
+        """Agreement is decided on the four bound fields and NOT on the column, because two
+        statements over one table may qualify it differently — and refusing a correct rewrite over
+        a qualifier is exactly the false gate the two gates were selected to avoid."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o WHERE o.order_date >= '2025-01-01'",
+            "SELECT SUM(amount) FROM orders WHERE order_date >= '2025-01-01'",
+            engine,
+        )
+
+        assert _claim(diff, "date_window").status == gc.AGREES
+        assert diff.gates == []
+
+    def test_an_omitted_must_filter_column_gates_and_names_the_column(self, engine):
+        """The other gate: the dataset says this column must be constrained, and the statement
+        constrains it nowhere. The verdict names the column, and its reason carries no statement
+        text, so it is printable beside a failing item."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o WHERE o.status = 'paid'",
+            "SELECT SUM(o.amount) FROM orders o WHERE o.status = 'paid' AND o.region = 'EU'",
+            engine,
+            must_filter=["region"],
+        )
+
+        assert [(gate.kind, gate.column) for gate in diff.gates] == [("must_filter", "region")]
+        assert diff.gated is True
+        assert "region" not in diff.gates[0].reason
+        assert "SELECT" not in diff.gates[0].reason
+
+    def test_a_join_on_predicate_counts_as_filtering(self, engine):
+        """A required column constrained in a join's ON is constrained. A gate that only read the
+        WHERE would fail a statement that filters correctly, which is the one thing these two gates
+        may never do."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o "
+            "JOIN customers c ON o.customer_id = c.id AND c.region = 'EU'",
+            "SELECT SUM(o.amount) FROM orders o JOIN customers c ON o.customer_id = c.id "
+            "WHERE c.region = 'EU'",
+            engine,
+            must_filter=["region"],
+        )
+
+        assert diff.gates == []
+        assert diff.gated is False
+
+    def test_a_predicate_moved_into_the_aggregate_differs_without_gating(self, engine):
+        """`SUM(x) FILTER (WHERE …)` filters the aggregate rather than the row set, so the two
+        statements really do differ on their filtering predicates — and the column is still plainly
+        constrained, so the difference is REPORTED and nothing gates."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FILTER (WHERE o.region = 'EU') FROM orders o",
+            "SELECT SUM(o.amount) FROM orders o WHERE o.region = 'EU'",
+            engine,
+            must_filter=["region"],
+        )
+
+        assert _claim(diff, "filter_predicates").status == gc.DIFFERS
+        assert diff.gates == []
+        assert diff.gated is False
+
+    def test_a_predicate_the_resolver_cannot_fold_gates_nothing(self, engine):
+        """A window this module does not model reads `unknown`, and `unknown` never gates. The
+        column is still mentioned in a predicate, so the required-filter gate stays quiet too."""
+        diff = _diff(
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE DATE_TRUNC('quarter', o.order_date) = '2025-04-01'",
+            "SELECT SUM(o.amount) FROM orders o "
+            "WHERE o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'",
+            engine,
+            must_filter=["order_date"],
+        )
+
+        assert _claim(diff, "date_window").status == gc.UNKNOWN
+        assert diff.gates == []
+        assert diff.gated is False
+
+    def test_an_unparseable_statement_reports_unknown_rather_than_raising(self, engine):
+        """A generator can emit anything. Every claim reads `unknown` — not `differs`, which would
+        be a definite comparison against a statement that was never read — and nothing gates, for
+        the same reason."""
+        diff = _diff("SELECT FROM WHERE ,", GOLDEN_SHAPE, engine, must_filter=["region"])
+
+        assert [claim.status for claim in diff.claims] == [gc.UNKNOWN] * 7
+        assert diff.gates == []
+        assert diff.gated is False
