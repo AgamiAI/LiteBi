@@ -391,6 +391,20 @@ def _date_literal(node: "exp.Expression | None") -> Optional[str]:
     return None
 
 
+def _integral(literal: "exp.Literal") -> Optional[int]:
+    """A numeric literal's whole-number value, or None when it does not have one.
+
+    sqlglot hands a number back as the TEXT the statement wrote, so `1.5` and `1e3` arrive here as
+    readily as `10` does and `int()` raises on both — out of a module whose whole contract is that
+    reading a statement never raises. A number that is not an integer is a shape this module does
+    not compare, which is the same None every other unmodelled shape reads as.
+    """
+    try:
+        return int(literal.this)
+    except (TypeError, ValueError):
+        return None
+
+
 def _extracted_year(node: "exp.EQ") -> "tuple[exp.Column, int] | None":
     """`EXTRACT(YEAR FROM col) = 2025` as (col, 2025), from either operand order.
 
@@ -409,7 +423,9 @@ def _extracted_year(node: "exp.EQ") -> "tuple[exp.Column, int] | None":
         if not (isinstance(column, exp.Column) and isinstance(value, exp.Literal)):
             continue
         if not value.is_string:
-            return column, int(value.this)
+            year = _integral(value)
+            if year is not None:
+                return column, year
     return None
 
 
@@ -436,15 +452,15 @@ def _ordering(select: "exp.Select", aliases: dict[str, str]) -> tuple[tuple[str,
 
 
 def _limit(select: "exp.Select") -> Optional[int]:
-    """The row limit, when the statement writes one as a plain integer. A computed or parameterized
-    limit is not a number this module can compare, so it reads as no limit rather than as a wrong
-    one."""
+    """The row limit, when the statement writes one as a plain integer. A computed, parameterized
+    or non-integral limit is not a number this module can compare, so it reads as no limit rather
+    than as a wrong one."""
     limit = select.args.get("limit")
     if limit is None:
         return None
     value = limit.expression
     if isinstance(value, exp.Literal) and not value.is_string:
-        return int(value.this)
+        return _integral(value)
     return None
 
 
