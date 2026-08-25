@@ -26,6 +26,7 @@ Synthetic fixtures throughout: a `demo` shop over `orders` and `customers`.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -402,3 +403,73 @@ class TestComparingTwoStatements:
         assert [claim.status for claim in diff.claims] == [gc.UNKNOWN] * 7
         assert diff.gates == []
         assert diff.gated is False
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestWhatTheDiffIsAllowedToCarry:
+    """The output contract: JSON-able, deterministic, and never a statement."""
+
+    def test_the_diff_survives_a_json_round_trip(self, engine):
+        """The diff is handed to a stdlib-only renderer that reads JSON, so every set in it has to
+        have become a sorted list on the way out — and sorted rather than merely listed, because a
+        report has to read the same way twice for the same pair of statements."""
+        diff = _diff(GOLDEN_SHAPE, GOLDEN_SHAPE, engine, must_filter=["region"])
+
+        rendered = diff.as_dict()
+        assert json.loads(json.dumps(rendered)) == rendered
+
+        claims = gc.read_claims(GOLDEN_SHAPE, dialect=sqlglot_dialect(engine)).as_dict()
+        assert json.loads(json.dumps(claims)) == claims
+
+    def test_two_runs_over_one_pair_render_identically(self, engine):
+        """Frozensets iterate in an order that is stable within a process and not across them, so
+        anything derived from one has to be sorted before it is rendered."""
+        first = json.dumps(_diff(GOLDEN_SHAPE, GOLDEN_SHAPE, engine).as_dict())
+        second = json.dumps(_diff(GOLDEN_SHAPE, GOLDEN_SHAPE, engine).as_dict())
+
+        assert first == second
+
+    def test_the_diff_never_echoes_a_statement(self, engine):
+        """The diff rides on output the calling model reads as server-authored, so it carries
+        identifiers, bounds and counts — never a clause of the SQL it was derived from. Asserted
+        three ways: the statement does not appear whole, no clause keyword appears among the values
+        the diff carries (the schema's own field names are ours, so they are not scanned), and no
+        three-word span of the statement survives into the JSON."""
+        diff = _diff(GOLDEN_SHAPE, GOLDEN_SHAPE, engine, must_filter=["region"])
+        rendered = json.dumps(diff.as_dict())
+        carried = json.dumps(
+            [[claim.generated, claim.golden] for claim in diff.claims]
+            + [gate.reason for gate in diff.gates]
+        ).upper()
+
+        assert GOLDEN_SHAPE not in rendered
+        for keyword in ("SELECT", "FROM", "JOIN", "GROUP BY", "ORDER BY", "WHERE", "UNION"):
+            assert keyword not in carried, keyword
+        words = GOLDEN_SHAPE.split()
+        spans = {" ".join(words[i : i + 3]) for i in range(len(words) - 2)}
+        assert [span for span in spans if span in rendered] == []
+        # ...and it is not vacuous: the claims that ARE carried name the model's own objects.
+        assert "orders" in rendered and "2026-01-01" in rendered
+
+
+def test_the_two_engines_are_two_different_grammars():
+    """Guard against a matrix that re-asserts every criterion twice in one grammar, which would
+    look identical from the outside and prove half as much."""
+    dialects = {sqlglot_dialect(engine) for engine in ENGINES}
+
+    assert len(dialects) == len(ENGINES)
+
+
+def test_the_module_imports_no_client():
+    """No model call and no network egress: the comparison is deterministic in code, which is what
+    lets one eval run be compared against another."""
+    source = (PKG_SRC / "semantic_model" / "golden_claims.py").read_text()
+
+    for forbidden in ("requests", "httpx", "urllib", "socket", "http.client", "openai"):
+        assert forbidden not in source, forbidden
+
+
+def test_the_module_exposes_no_score():
+    """One implementation per eval mode: the deterministic scorer folds these claims in, and a
+    second scoring surface living here would be a second answer to one question."""
+    assert [name for name in dir(gc) if "score" in name.lower()] == []
