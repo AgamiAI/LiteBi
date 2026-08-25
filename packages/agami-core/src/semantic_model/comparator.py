@@ -1,4 +1,6 @@
-"""Canonical keys for the cells of a result set, so two result sets can be compared at all.
+"""Deciding whether two result sets say the same thing.
+
+Canonical keys for the cells first, so two result sets can be compared at all.
 
 A comparison asks whether the answer key's rows and the rows a generated statement produced say
 the same thing. Doing that on the raw cells does not work, because the Python objects a driver
@@ -18,16 +20,27 @@ canonicalised only where two spellings genuinely mean one thing — a padded dec
 as text, a driver's ``'t'`` for true. Text itself is left exactly as it came: stripping or
 case-folding would hide a real difference between two result sets, which is the one thing a
 comparator must never do.
+
+On top of those keys sits the comparison itself, in three steps that are deliberately separate:
+whether the answer key asked for an ordering at all, which generated column answers which golden
+one, and how far the rows agree once the columns are paired. Column identity is decided by VALUES
+and never by name or position — a generated statement is free to alias a total and to select it
+second — and rows are compared as a multiset unless the author ordered them, because duplicates
+are signal and order usually is not.
 """
 
 from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from collections.abc import Sequence
 from datetime import date, datetime, timezone
 from decimal import Context, Decimal
 from typing import Any, Optional
+
+import sqlglot
+from sqlglot.errors import ErrorLevel, SqlglotError
 
 # Every NaN is one bucket. The value is a plain string rather than a NaN, because a Decimal or
 # float NaN as a dict key compares unequal to itself and would open a fresh bucket per cell.
@@ -162,4 +175,183 @@ def cell_type(canon: tuple[str, Any]) -> Optional[str]:
     return _CELL_TYPES[canon[0]]
 
 
-__all__ = ["canonical_cell", "canonical_row", "cell_type"]
+class RaggedRow(ValueError):
+    """A row whose width disagrees with the columns it arrived with.
+
+    ``ExecResult`` does not check that every row is as wide as its column list — that is
+    convention, not a validated invariant — so a comparison can be handed a short row. It is
+    raised as this module's own type so the caller can report the case as an error: an
+    ``IndexError`` escaping a projection says nothing about which side was malformed.
+    """
+
+
+# Why an unreadable statement is read as ORDERED. The permissive reading is the dangerous one:
+# assuming unordered would silently stop checking an ordering the author asked for, and every case
+# whose statement did not parse would quietly pass a weaker test than the one it declares. A
+# visible false failure is recoverable; a silent weakening is not.
+_NO_STATEMENT = "no statement was available to read, so an ordering was assumed"
+_UNPARSED = "the statement could not be parsed as SQL, so an ordering was assumed"
+
+
+def has_top_level_order_by(
+    sql: Optional[str], *, dialect: Optional[str] = None
+) -> tuple[bool, Optional[str]]:
+    """Whether `sql` orders the rows it returns, and why the answer had to be assumed if it was.
+
+    Read off the top-level node's own `order` argument, NOT with a search for an `Order` anywhere
+    in the tree: a subquery's ORDER BY, a CTE's, an `OVER (ORDER BY …)` and an `array_agg(x ORDER
+    BY x)` all order something other than the result, and a search finds every one of them. Asking
+    the top node keeps the union cases right in both directions too — an ORDER BY after a UNION
+    hangs off the `Union` node and is a total order, one inside a single arm is not.
+
+    The dialect is threaded through because a generic parse does not merely lose detail on a
+    backtick- or bracket-quoting engine: it raises, and the case would fall to the assumed note.
+    """
+    if sql is None or not sql.strip():
+        return True, _NO_STATEMENT
+    try:
+        # ErrorLevel.RAISE as the enum, never the string: sqlglot compares the level against enum
+        # members, so a string matches no branch, every error is dropped and the tree is silently
+        # truncated — which here would read a broken statement as cleanly unordered.
+        tree = sqlglot.parse_one(sql, dialect=dialect, error_level=ErrorLevel.RAISE)
+    except SqlglotError:
+        # ParseError and TokenError both derive from this; a `None` sql raises TypeError instead,
+        # which is why it is guarded above rather than caught here.
+        return True, _UNPARSED
+    return tree.args.get("order") is not None, None
+
+
+def _sort_key(canon: tuple[str, Any]) -> tuple[str, str]:
+    """Order canonical cells for an unordered comparison — never the raw values.
+
+    Sorting raw cells raises: a naive datetime does not compare with an aware one, and a Decimal
+    does not compare with a string. The tag leads so the type classes never interleave, and the
+    value is ordered as its text, which is injective within a tag — two cells share this key only
+    when they are the same cell, so the sort is total and the result deterministic.
+    """
+    return (canon[0], str(canon[1]))
+
+
+def _column_vectors(
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    *,
+    ordered: bool,
+    quantize: bool,
+) -> list[tuple[tuple[str, Any], ...]]:
+    """One comparable vector per column: its cells in row order, or sorted when order is not part
+    of the answer."""
+    canonical = []
+    for row in rows:
+        if len(row) != len(columns):
+            raise RaggedRow(f"a row of {len(row)} cells arrived with {len(columns)} columns")
+        canonical.append(canonical_row(row, quantize=quantize))
+    vectors = []
+    for index in range(len(columns)):
+        cells = [row[index] for row in canonical]
+        if not ordered:
+            cells.sort(key=_sort_key)
+        vectors.append(tuple(cells))
+    return vectors
+
+
+def _augment(
+    golden: int, candidates: Sequence[Sequence[int]], taken: dict[int, int], seen: set[int]
+) -> bool:
+    """Kuhn's augmenting step: place `golden`, displacing an earlier pairing that can move aside.
+
+    Two columns carrying identical values are interchangeable, so pairing them in whatever order
+    they happen to appear can strand a later column whose only candidate is already spoken for;
+    the augmenting path undoes the earlier choice instead of failing. Column counts are single
+    digits, so this loop is the right algorithm and Hopcroft–Karp would buy nothing.
+    """
+    for generated in candidates[golden]:
+        if generated in seen:
+            continue
+        seen.add(generated)
+        if generated not in taken or _augment(taken[generated], candidates, taken, seen):
+            taken[generated] = golden
+            return True
+    return False
+
+
+def match_columns(
+    golden_columns: Sequence[str],
+    golden_rows: Sequence[Sequence[Any]],
+    generated_columns: Sequence[str],
+    generated_rows: Sequence[Sequence[Any]],
+    *,
+    ordered: bool,
+    quantize: bool = False,
+) -> tuple[dict[int, int], tuple[str, ...]]:
+    """Pair golden columns with the generated columns carrying the same values.
+
+    Returns the golden-index → generated-index pairing and the golden column names that found no
+    partner. Neither a column's NAME nor its position is ever consulted: a generated statement
+    that aliases the total and selects it second still answered the question, and a statement that
+    reused the golden name for a different value did not.
+    """
+    golden_vectors = _column_vectors(
+        golden_columns, golden_rows, ordered=ordered, quantize=quantize
+    )
+    generated_vectors = _column_vectors(
+        generated_columns, generated_rows, ordered=ordered, quantize=quantize
+    )
+    candidates = [
+        [index for index, other in enumerate(generated_vectors) if other == vector]
+        for vector in golden_vectors
+    ]
+    taken: dict[int, int] = {}
+    for golden in range(len(golden_vectors)):
+        _augment(golden, candidates, taken, set())
+    pairing = {golden: generated for generated, golden in taken.items()}
+    unmatched = tuple(name for index, name in enumerate(golden_columns) if index not in pairing)
+    return pairing, unmatched
+
+
+def _project(
+    row: Sequence[Any], indices: Sequence[int], quantize: bool
+) -> tuple[tuple[str, Any], ...]:
+    """The paired cells of one row, canonicalised, in golden column order."""
+    try:
+        cells = [row[index] for index in indices]
+    except IndexError:
+        raise RaggedRow(f"a row of {len(row)} cells is too short for the matched columns") from None
+    return canonical_row(cells, quantize=quantize)
+
+
+def compare_rows(
+    golden_rows: Sequence[Sequence[Any]],
+    generated_rows: Sequence[Sequence[Any]],
+    pairing: dict[int, int],
+    *,
+    ordered: bool,
+    quantize: bool = False,
+) -> tuple[int, int, int]:
+    """How far the two sides agree over their paired columns, as (overlap, golden, generated).
+
+    Ordered results are compared position by position, because the ordering is part of what the
+    author asked for. Unordered ones are compared as multisets and not as sets: a row returned
+    twice where the answer key has it once is a different answer, usually a join that fanned out,
+    and a set comparison is exactly the one that hides it.
+    """
+    golden_indices = sorted(pairing)
+    generated_indices = [pairing[index] for index in golden_indices]
+    golden = [_project(row, golden_indices, quantize) for row in golden_rows]
+    generated = [_project(row, generated_indices, quantize) for row in generated_rows]
+    if ordered:
+        overlap = sum(1 for left, right in zip(golden, generated) if left == right)
+    else:
+        overlap = sum((Counter(golden) & Counter(generated)).values())
+    return overlap, len(golden_rows), len(generated_rows)
+
+
+__all__ = [
+    "RaggedRow",
+    "canonical_cell",
+    "canonical_row",
+    "cell_type",
+    "compare_rows",
+    "has_top_level_order_by",
+    "match_columns",
+]

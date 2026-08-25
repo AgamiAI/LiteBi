@@ -301,3 +301,280 @@ def test_every_canonical_cell_is_hashable(value):
     assert isinstance(key, tuple) and len(key) == 2
     hash(key)
     assert Counter([key])[key] == 1
+
+
+# --- is the result ordered? ------------------------------------------------------------------
+
+
+def test_a_top_level_order_by_is_ordered():
+    assert c.has_top_level_order_by("SELECT a FROM t ORDER BY a") == (True, None)
+
+
+def test_a_subquery_order_by_is_not_ordered():
+    # The inner ORDER BY orders the input to the outer SELECT, which is then free to return its
+    # rows in any order. `find(exp.Order)` would read this as ordered; `args["order"]` does not.
+    ordered, note = c.has_top_level_order_by("SELECT a FROM (SELECT a FROM t ORDER BY a) x")
+    assert (ordered, note) == (False, None)
+
+
+def test_a_window_order_by_is_not_ordered():
+    sql = "SELECT a, ROW_NUMBER() OVER (ORDER BY a) FROM t"
+    assert c.has_top_level_order_by(sql) == (False, None)
+
+
+def test_a_cte_order_by_is_not_ordered():
+    sql = "WITH c AS (SELECT a FROM t ORDER BY a) SELECT a FROM c"
+    assert c.has_top_level_order_by(sql) == (False, None)
+
+
+def test_an_aggregate_order_by_is_not_ordered():
+    # `array_agg(a ORDER BY a)` orders what goes INTO one cell, not the rows that come out.
+    assert c.has_top_level_order_by("SELECT array_agg(a ORDER BY a) FROM t") == (False, None)
+
+
+def test_order_by_with_a_limit_is_ordered():
+    assert c.has_top_level_order_by("SELECT a FROM t ORDER BY a LIMIT 10") == (True, None)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["SELECT a FROM t ORDER BY a;", "-- the answer key\nSELECT a FROM t ORDER BY a",
+     "   \n\tSELECT a FROM t ORDER BY a", "select a from t order by a"],
+)
+def test_incidental_spelling_does_not_hide_the_ordering(sql):
+    assert c.has_top_level_order_by(sql) == (True, None)
+
+
+def test_a_union_ordered_as_a_whole_is_ordered():
+    # The ORDER BY hangs off the Union node here, which `args["order"]` reads because it is asked
+    # of whatever the top-level node turned out to be rather than of a Select.
+    sql = "SELECT a FROM t UNION SELECT b FROM u ORDER BY 1"
+    assert c.has_top_level_order_by(sql) == (True, None)
+
+
+def test_a_union_arm_ordered_alone_is_not_ordered():
+    # Ordering one arm is not a total order of the result the caller receives.
+    sql = "SELECT a FROM t ORDER BY a UNION SELECT b FROM u"
+    assert c.has_top_level_order_by(sql) == (False, None)
+
+
+@pytest.mark.parametrize("sql", ["not sql at all", "SELECT FROM", "SELECT 'unterminated"])
+def test_an_unreadable_statement_is_assumed_ordered(sql):
+    # Deliberate: assuming UNORDERED would silently stop checking an ordering the author asked
+    # for, and a visible false failure is recoverable where a silent weakening is not.
+    ordered, note = c.has_top_level_order_by(sql)
+    assert ordered is True
+    assert note
+
+
+@pytest.mark.parametrize("sql", [None, "", "   \n\t "])
+def test_a_missing_statement_is_assumed_ordered(sql):
+    # None is guarded separately from the parse: sqlglot raises TypeError on it, not a
+    # SqlglotError, so it would escape the except clause.
+    ordered, note = c.has_top_level_order_by(sql)
+    assert ordered is True
+    assert note
+
+
+def test_a_backtick_statement_needs_its_dialect():
+    # The dialect earns its place here: read with the generic grammar the same statement does not
+    # parse at all, and the case would silently fall to the assumed-ordered note.
+    sql = "SELECT `a` FROM `t` ORDER BY `a`"
+    generic_ordered, generic_note = c.has_top_level_order_by(sql)
+    assert generic_ordered is True
+    assert generic_note
+    assert c.has_top_level_order_by(sql, dialect="mysql") == (True, None)
+
+
+def test_a_dialect_parse_still_reads_an_unordered_statement():
+    # ...and the dialect path is not just returning True for everything.
+    sql = "SELECT `a` FROM `t`"
+    assert c.has_top_level_order_by(sql, dialect="mysql") == (False, None)
+
+
+# --- matching columns by their values --------------------------------------------------------
+
+
+def test_columns_in_a_different_order_match():
+    pairing, unmatched = c.match_columns(
+        ["channel", "orders"], [("web", 1), ("store", 2)],
+        ["orders", "channel"], [(1, "web"), (2, "store")],
+        ordered=True,
+    )
+    assert pairing == {0: 1, 1: 0}
+    assert unmatched == ()
+
+
+def test_columns_with_different_names_match():
+    # A generated statement is free to alias the total; it still answered the question.
+    pairing, unmatched = c.match_columns(
+        ["orders"], [(1,), (2,)], ["order_count"], [(1,), (2,)], ordered=True
+    )
+    assert pairing == {0: 0}
+    assert unmatched == ()
+
+
+def test_a_golden_column_with_no_partner_is_named():
+    pairing, unmatched = c.match_columns(
+        ["channel", "revenue"], [("web", 10), ("store", 20)],
+        ["channel"], [("web",), ("store",)],
+        ordered=True,
+    )
+    assert pairing == {0: 0}
+    assert unmatched == ("revenue",)
+
+
+def test_identical_value_vectors_do_not_collapse_onto_one_partner():
+    # The case a careless pairing gets wrong: two golden columns carrying the same values must
+    # take two DIFFERENT partners, and the complete matching has to be found even though the
+    # duplicate generated columns are not the first candidates encountered.
+    golden_rows = [(1, "web", 1), (2, "store", 2)]
+    generated_rows = [("web", 1, 1), ("store", 2, 2)]
+    pairing, unmatched = c.match_columns(
+        ["first", "channel", "second"], golden_rows,
+        ["channel", "left", "right"], generated_rows,
+        ordered=True,
+    )
+    assert unmatched == ()
+    assert len(pairing) == 3
+    # ...and no generated column was handed to two golden columns.
+    assert len(set(pairing.values())) == 3
+    assert pairing[1] == 0
+
+
+def test_a_duplicated_golden_column_leaves_one_unmatched():
+    # Two golden columns of the same values against one generated column: exactly one pairs, and
+    # the other is named rather than quietly sharing the partner.
+    pairing, unmatched = c.match_columns(
+        ["a", "b"], [(1, 1), (2, 2)], ["only"], [(1,), (2,)], ordered=True
+    )
+    assert len(pairing) == 1
+    assert len(unmatched) == 1
+    assert unmatched[0] in ("a", "b")
+
+
+def test_a_bool_column_does_not_match_an_int_column():
+    # Slice 1's tags exist for this: `is_active` as a real boolean against the 0/1 SQLite stores
+    # is a different answer, and raw equality would have called it a match.
+    pairing, unmatched = c.match_columns(
+        ["is_active"], [(True,), (False,)], ["is_active"], [(1,), (0,)], ordered=True
+    )
+    assert pairing == {}
+    assert unmatched == ("is_active",)
+
+
+def test_column_values_in_a_different_row_order_match_when_unordered():
+    pairing, unmatched = c.match_columns(
+        ["channel"], [("web",), ("store",)], ["channel"], [("store",), ("web",)], ordered=False
+    )
+    assert pairing == {0: 0}
+    assert unmatched == ()
+
+
+def test_column_values_in_a_different_row_order_do_not_match_when_ordered():
+    pairing, unmatched = c.match_columns(
+        ["channel"], [("web",), ("store",)], ["channel"], [("store",), ("web",)], ordered=True
+    )
+    assert pairing == {}
+    assert unmatched == ("channel",)
+
+
+def test_a_mixed_type_column_sorts_without_raising_when_unordered():
+    # Sorting the raw cells here raises: a naive datetime does not compare with an aware one, and
+    # a Decimal does not compare with a string. The sort key is derived from the canonical form.
+    left = [(datetime(2025, 1, 1, 9, 30),), (None,), ("web",), (5,)]
+    right = [(5,), ("web",), (datetime(2025, 1, 1, 9, 30, tzinfo=timezone.utc),), (None,)]
+    pairing, unmatched = c.match_columns(["mixed"], left, ["mixed"], right, ordered=False)
+    assert pairing == {0: 0}
+    assert unmatched == ()
+
+
+def test_matching_forwards_quantize():
+    golden_rows = [(Decimal("1.00000000001"),)]
+    generated_rows = [(Decimal("1.0"),)]
+    assert c.match_columns(["v"], golden_rows, ["v"], generated_rows, ordered=True)[0] == {}
+    pairing, _ = c.match_columns(
+        ["v"], golden_rows, ["v"], generated_rows, ordered=True, quantize=True
+    )
+    assert pairing == {0: 0}
+
+
+def test_matching_a_ragged_row_is_surfaced_as_this_module_s_error():
+    with pytest.raises(c.RaggedRow):
+        c.match_columns(["a", "b"], [(1,)], ["a", "b"], [(1, 2)], ordered=True)
+
+
+# --- comparing the rows ----------------------------------------------------------------------
+
+
+def test_rows_are_projected_onto_the_pairing():
+    # The generated side carries an extra column and the matched one sits elsewhere; only the
+    # paired columns are compared, in golden column order.
+    golden_rows = [("web", 1), ("store", 2)]
+    generated_rows = [(99, 1, "web"), (99, 2, "store")]
+    assert c.compare_rows(golden_rows, generated_rows, {0: 2, 1: 1}, ordered=True) == (2, 2, 2)
+
+
+def test_row_order_is_irrelevant_when_unordered():
+    golden_rows = [("web", 1), ("store", 2)]
+    generated_rows = [("store", 2), ("web", 1)]
+    pairing = {0: 0, 1: 1}
+    assert c.compare_rows(golden_rows, generated_rows, pairing, ordered=False) == (2, 2, 2)
+
+
+def test_row_order_is_decisive_when_ordered():
+    golden_rows = [("web", 1), ("store", 2)]
+    generated_rows = [("store", 2), ("web", 1)]
+    pairing = {0: 0, 1: 1}
+    assert c.compare_rows(golden_rows, generated_rows, pairing, ordered=True) == (0, 2, 2)
+
+
+def test_duplicate_rows_count_as_a_multiset_not_a_set():
+    # A set would say these two agree once; they agree twice, and the duplicate is signal.
+    pairing = {0: 0}
+    assert c.compare_rows([("web",), ("web",)], [("web",), ("web",)], pairing, ordered=False) == (
+        2, 2, 2,
+    )
+
+
+def test_a_duplicate_on_one_side_only_reduces_the_overlap():
+    pairing = {0: 0}
+    assert c.compare_rows([("web",), ("web",)], [("web",)], pairing, ordered=False) == (1, 2, 1)
+    assert c.compare_rows([("web",)], [("web",), ("web",)], pairing, ordered=False) == (1, 1, 2)
+
+
+def test_partial_overlap_returns_both_counts():
+    golden_rows = [("web",), ("store",), ("kiosk",)]
+    generated_rows = [("kiosk",), ("web",), ("phone",)]
+    assert c.compare_rows(golden_rows, generated_rows, {0: 0}, ordered=False) == (2, 3, 3)
+
+
+def test_a_shorter_generated_side_matches_only_where_it_reaches_when_ordered():
+    golden_rows = [("web",), ("store",), ("kiosk",)]
+    assert c.compare_rows(golden_rows, [("web",), ("store",)], {0: 0}, ordered=True) == (2, 3, 2)
+
+
+def test_nan_rows_count_deterministically():
+    # Two independently-produced NaNs are unequal and would never meet in a raw comparison; the
+    # canonical bucket makes the count depend on the values rather than on object identity.
+    golden_rows = [(float("nan"),), (float("nan"),)]
+    generated_rows = [(float("nan"),), (float("nan"),)]
+    assert c.compare_rows(golden_rows, generated_rows, {0: 0}, ordered=False) == (2, 2, 2)
+    assert c.compare_rows(golden_rows, [(float("nan"),)], {0: 0}, ordered=False) == (1, 2, 1)
+
+
+def test_comparing_forwards_quantize():
+    golden_rows = [(Decimal("1.00000000001"),)]
+    generated_rows = [(Decimal("1.0"),)]
+    assert c.compare_rows(golden_rows, generated_rows, {0: 0}, ordered=False) == (0, 1, 1)
+    assert c.compare_rows(
+        golden_rows, generated_rows, {0: 0}, ordered=False, quantize=True
+    ) == (1, 1, 1)
+
+
+def test_comparing_a_ragged_row_is_surfaced_as_this_module_s_error():
+    # `ExecResult` does not validate that a row is as wide as its column list, so a short row can
+    # reach here; it must arrive as this module's own error rather than an IndexError from a
+    # projection, which would say nothing about which side was malformed.
+    with pytest.raises(c.RaggedRow):
+        c.compare_rows([("web", 1)], [("web",)], {0: 0, 1: 1}, ordered=False)
