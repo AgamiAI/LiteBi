@@ -17,6 +17,7 @@ Two properties are load-bearing:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -105,6 +106,56 @@ class GoldenDataset(_Base):
     test_cases: list[GoldenItem] = Field(default_factory=list)
 
 
+# A question phrased against the day it is asked: the window it names slides forward on its own.
+_RELATIVE_QUESTION_RE = re.compile(
+    r"\b(?:last|past|previous|this|current|trailing|rolling)\s+(?:\d+\s+)?"
+    r"(?:day|week|month|quarter|year|hour|minute)s?\b"
+    r"|\b(?:today|yesterday|ytd|mtd|year[- ]to[- ]date|month[- ]to[- ]date)\b"
+    r"|\bso far this\b|\brecent(?:ly)?\b",
+    re.IGNORECASE,
+)
+
+# Deliberately only the "what is now" functions, and deliberately NOT INTERVAL, DATEADD, DATE_SUB
+# or DATE_TRUNC. Those are date arithmetic, and arithmetic is relative only when its own anchor is
+# — `CURRENT_DATE - INTERVAL '90 days'` already matches here on `CURRENT_DATE`, so adding INTERVAL
+# would buy nothing. DATE_TRUNC would actively break the lint: it is how the frozen case this
+# exists to catch is usually written (`DATE_TRUNC('quarter', placed_at) = '2024-01-01'`), so
+# treating it as an anchor would suppress the report on exactly the statement it should fire on.
+_NOW_ANCHOR_RE = re.compile(
+    r"\b(?:CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|LOCALTIMESTAMP|"
+    r"SYSDATE|NOW|GETDATE|CURDATE|TODAY)\b|'now'",
+    re.IGNORECASE,
+)
+
+# A day pinned in the text: a quoted ISO date (with an optional time) or a bare four-digit year.
+_FROZEN_DATE_RE = re.compile(r"'\d{4}-\d{2}-\d{2}(?:[ T][\d:.]+)?'|\b(?:19|20)\d{2}\b")
+
+
+def _lint_relativity(item: GoldenItem, stem: str, res: ValidationResult) -> None:
+    """Report an item whose question moves with time while its answer key does not.
+
+    Unlike the refusals above this does not drop the item: the case is broken, not the model, so a
+    runner that scored it as a failure would blame the wrong thing. It stays in the dataset and the
+    fault is carried by a finding instead.
+
+    An item with no `expected.sql` is skipped in silence — there is nothing to inspect, and an
+    unconfirmed case with no answer key is a legal, in-progress shape.
+    """
+    sql = item.expected.sql
+    if not sql or not _RELATIVE_QUESTION_RE.search(item.query):
+        return
+    if not _FROZEN_DATE_RE.search(sql) or _NOW_ANCHOR_RE.search(sql):
+        return
+    locator = f"{stem}.yaml[{item.id}]"
+    res.error(
+        "golden_relative_question_frozen_sql",
+        f"{locator}: the question is asked relative to today but the answer key is pinned to fixed "
+        "dates, so the question moves with time and the answer key does not; anchor the SQL to the "
+        "current date or rewrite the question to name the window",
+        locator=locator,
+    )
+
+
 def load_golden_datasets(
     profile: str, art: Path | None = None
 ) -> tuple[list[GoldenDataset], ValidationResult]:
@@ -179,6 +230,7 @@ def load_golden_datasets(
                 )
                 continue
             seen.add(item.item_key)
+            _lint_relativity(item, path.stem, res)
             items.append(item)
 
         try:

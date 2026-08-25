@@ -327,3 +327,110 @@ def test_null_case_others_still_read(tmp_path, monkeypatch):
     assert res.findings[0].locator == "revenue.yaml[0]"
     assert [ds.name for ds in datasets] == ["orders", "revenue"]
     assert [i.item_key for i in datasets[1].test_cases] == ["revenue-total"]
+
+
+# --- the relativity lint: a question that moves against an answer key that does not ---
+
+RELATIVE_QUERY = "How many orders last quarter?"
+STATIC_QUERY = "How many orders were placed in 2024?"
+FROZEN_SQL = (
+    "SELECT COUNT(*) AS order_count FROM orders "
+    "WHERE placed_at >= '2024-01-01' AND placed_at < '2024-04-01'"
+)
+
+
+def _window_case(query, sql, item_id="orders-window"):
+    """A case whose question and answer key are both under the lint's nose.
+
+    `sql` may be None, which is the unconfirmed shape: no answer key to inspect.
+    """
+    expected = {"sql": sql, "sql_confirmed": True} if sql else {"sql_confirmed": False}
+    return {"id": item_id, "query": query, "expected": expected}
+
+
+def test_relativity_lint_fires(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, FROZEN_SQL)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_relative_question_frozen_sql"]
+    assert [f.severity for f in res.findings] == ["error"]
+    assert res.findings[0].locator == "orders.yaml[orders-window]"
+    # Reported, never dropped: the item is broken, so the run has to see it as a dataset fault
+    # rather than as a model that failed.
+    assert [ds.name for ds in datasets] == ["orders"]
+    assert [i.item_key for i in datasets[0].test_cases] == ["orders-window"]
+
+
+def test_relativity_lint_clean_when_anchored(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    # Carries a frozen literal too, so only the anchor can be what keeps the lint quiet.
+    anchored = (
+        "SELECT COUNT(*) AS order_count FROM orders "
+        "WHERE placed_at >= CURRENT_DATE - INTERVAL '90 days' AND placed_at >= '2020-01-01'"
+    )
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, anchored)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok and len(datasets[0].test_cases) == 1
+
+
+@pytest.mark.parametrize("predicate", [
+    "placed_at >= NOW() - INTERVAL '90 days'",
+    "placed_at >= date('now', '-90 days')",
+    "placed_at >= DATEADD(day, -90, GETDATE())",
+    "placed_at >= SYSDATE - 90",
+])
+def test_relativity_lint_reads_every_anchor_spelling(tmp_path, monkeypatch, predicate):
+    """The lint is not Postgres-only: each dialect's word for "now" has to count as an anchor."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    sql = f"SELECT COUNT(*) FROM orders WHERE {predicate} AND placed_at >= '2020-01-01'"
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, sql)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok and len(datasets[0].test_cases) == 1
+
+
+def test_relativity_lint_silent_on_a_static_question(tmp_path, monkeypatch):
+    """Frozen literals are the normal shape of a golden case; only a moving question rots them."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(STATIC_QUERY, FROZEN_SQL)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok and len(datasets[0].test_cases) == 1
+
+
+def test_relativity_lint_silent_without_an_answer_key(tmp_path, monkeypatch):
+    """An unconfirmed case has no SQL to inspect, which is legal and not something to report."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, None)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok and datasets[0].test_cases[0].expected.sql is None
+
+
+def test_relativity_lint_silent_without_a_date_literal(tmp_path, monkeypatch):
+    """No frozen literal means nothing has been pinned to a day, so there is nothing to rot."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    _write(_golden_dir(tmp_path), "orders.yaml", {"test_cases": [
+        _window_case(RELATIVE_QUERY, "SELECT COUNT(*) AS order_count FROM orders"),
+    ]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert res.ok and len(datasets[0].test_cases) == 1
+
+
+def test_relativity_lint_names_the_file_and_the_case(tmp_path, monkeypatch):
+    """The message, not just the locator, has to be enough to find the case in the tree."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    d = _golden_dir(tmp_path)
+    _good_file(d)
+    _write(d, "revenue.yaml", {"test_cases": [
+        _window_case("What did we bill in the past 30 days?", FROZEN_SQL, "revenue-recent"),
+        _case("revenue-total"),
+    ]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_relative_question_frozen_sql"]
+    assert "revenue.yaml" in res.findings[0].message and "revenue-recent" in res.findings[0].message
+    # The lint reports; the file and every case in it, flagged or not, still read.
+    assert [ds.name for ds in datasets] == ["orders", "revenue"]
+    assert [i.item_key for i in datasets[1].test_cases] == ["revenue-recent", "revenue-total"]
