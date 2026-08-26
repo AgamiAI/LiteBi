@@ -151,7 +151,10 @@ def profile(tmp_path, monkeypatch, warehouse):
     (golden / "orders.yaml").write_text(yaml.safe_dump(DATASET), encoding="utf-8")
 
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
-    monkeypatch.setenv("DATASOURCE_URL__AGAMI_EXAMPLE", f"sqlite:///{warehouse}")
+    # The ORG-SCOPED variable, because the run names a tenant. The org-less `DATASOURCE_URL__…`
+    # forms are offered to the single-tenant `local` org alone, so a named tenant that relied on
+    # one would be a fixture proving the opposite of what this file exists to prove.
+    monkeypatch.setenv(f"{ORG.upper()}_DATASOURCE_URL__AGAMI_EXAMPLE", f"sqlite:///{warehouse}")
     for var in ("AGAMI_DB_URL", "APP_DATABASE_URL", "AGAMI_ORG_ID", "AGAMI_SQL_TIMEOUT_S"):
         monkeypatch.delenv(var, raising=False)
     return artifacts

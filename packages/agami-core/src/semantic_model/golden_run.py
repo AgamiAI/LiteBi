@@ -235,6 +235,11 @@ def run_golden_dataset(
 ) -> GoldenRunResult:
     """Run every case in `dataset`, in order, and hand back the scored run.
 
+    `org` is BOTH things it looks like, and that is why it is one parameter: the tenant the question
+    is asked about, which the generator is told, and the tenant whose warehouse both statements are
+    executed against, which the chokepoint resolves credentials for. Splitting them would let a run
+    score one tenant's dataset against another's rows.
+
     `findings` are the reader's — what it dropped getting this dataset together. They are carried
     rather than swallowed: a run over a dataset that lost three cases to a typo is not the same run
     as one over a whole dataset, and nothing else downstream can tell the difference.
@@ -252,7 +257,9 @@ def run_golden_dataset(
             completed = False
             break
         outcomes.append(
-            _run_item(item, generated, profile=profile, executor=executor, dialect=dialect)
+            _run_item(
+                item, generated, profile=profile, org=org, executor=executor, dialect=dialect
+            )
         )
     return GoldenRunResult(
         run_id=run_id,
@@ -269,6 +276,7 @@ def _run_item(
     generated: GeneratedSql,
     *,
     profile: str,
+    org: str,
     executor: "Executor",
     dialect: str,
 ) -> ItemOutcome:
@@ -287,7 +295,7 @@ def _run_item(
         )
 
     golden_sql = item.expected.sql or ""
-    score = _score(item, generated.sql, golden_sql, profile=profile, executor=executor,
+    score = _score(item, generated.sql, golden_sql, profile=profile, org=org, executor=executor,
                    dialect=dialect)
     # After the score, and only when there are two statements to read. The diff is what turns "the
     # rows disagree" into a reason, so it is worth having on a failing item as much as on a passing
@@ -329,10 +337,16 @@ def _score(
     golden_sql: str,
     *,
     profile: str,
+    org: str,
     executor: "Executor",
     dialect: str,
 ) -> ItemScore:
     """Run both statements through the chokepoint and score what came back.
+
+    `org` reaches the chokepoint because that is where a tenant's warehouse is chosen. The org-less
+    credential names are offered to the single-tenant `local` org and to no other, so a named tenant
+    arriving here without its own id would resolve the shared warehouse instead of failing closed —
+    and the run would score that tenant's dataset against somebody else's rows.
 
     The MATCH LEVEL is read before either statement runs, because it decides whether there are two.
     A level that judges the generated result on its own terms never looks at the answer key, so an
@@ -347,14 +361,14 @@ def _score(
     if item.match in _SELF_JUDGING_LEVELS:
         golden_result = ExecResult(columns=[], rows=[])
     elif golden_sql:
-        envelope = execute_guarded(golden_sql, profile, None, executor=executor)
+        envelope = execute_guarded(golden_sql, profile, None, executor=executor, org_id=org)
         if envelope.status != "ok":
             return _not_ok(envelope, answer_key=True)
         golden_result = envelope.data
     else:
         return ItemScore(status="unscored", accuracy=None, reason=_NO_ANSWER_KEY)
 
-    envelope = execute_guarded(generated_sql, profile, None, executor=executor)
+    envelope = execute_guarded(generated_sql, profile, None, executor=executor, org_id=org)
     if envelope.status != "ok":
         return _not_ok(envelope, answer_key=False)
     return compare_result_sets(

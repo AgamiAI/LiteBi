@@ -138,6 +138,49 @@ def test_both_statements_execute_through_the_injected_executor(chokepoint):
     assert result.completed and len(result.outcomes) == 1
 
 
+def test_both_statements_resolve_credentials_for_the_org_the_run_names(monkeypatch):
+    """The org the run was asked about is the org whose warehouse both statements run against.
+
+    The chokepoint resolves credentials per `(org, profile)`, and the run's `org` reached only the
+    generator's prompt — so every item was scored against whatever the org-less default resolved
+    to. The two notions were one word, and this pins them apart at the only place it shows.
+    """
+    resolved_for: list[str] = []
+
+    def _credentials(profile, org_id="local"):
+        resolved_for.append(org_id)
+        return {"type": "sqlite", "path": ":memory:"}
+
+    monkeypatch.setattr(execute_sql, "_load_credentials", _credentials)
+    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, None))
+
+    result = _run(_dataset(_item()), _StubGenerator(), _SpyExecutor())
+
+    assert resolved_for == [ORG, ORG]  # the answer key and the generated statement, both
+    assert result.completed and result.outcomes[0].passed
+
+
+def test_a_named_org_is_not_scored_against_the_shared_warehouse(monkeypatch, tmp_path):
+    """The concrete failure the org above prevents, at the credential channel rather than the seam.
+
+    `DATASOURCE_URL` and `DATASOURCE_URL__<PROFILE>` are the single-tenant forms, and the
+    chokepoint offers them to org `local` alone: a named tenant whose own variable is unset must
+    fail closed rather than quietly score its dataset against whatever warehouse the host has.
+    """
+    monkeypatch.setattr(execute_sql, "_model_safety", lambda s, p, a: (s, None))
+    monkeypatch.setattr(execute_sql, "CREDENTIALS_PATH", tmp_path / "no-credentials-file")
+    monkeypatch.setenv("DATASOURCE_URL", "sqlite:///shared-warehouse.db")
+    monkeypatch.setenv("DATASOURCE_URL__ACME", "sqlite:///shared-warehouse.db")
+    for var in (f"{ORG.upper()}_DATASOURCE_URL", f"{ORG.upper()}_DATASOURCE_URL__ACME"):
+        monkeypatch.delenv(var, raising=False)
+    spy = _SpyExecutor()
+
+    result = _run(_dataset(_item()), _StubGenerator(), spy)
+
+    assert result.outcomes[0].score.status == "error"
+    assert spy.calls == []  # nothing ran, which is the whole of failing closed
+
+
 def test_a_refused_golden_statement_is_unscored_and_the_run_finishes(chokepoint, monkeypatch):
     """Criterion 5. The answer key itself being refused says nothing about the generated statement,
     so the item is unscored and carries the gate's own sentence — and the next item still runs."""
