@@ -251,7 +251,7 @@ def test_the_run_summary_counts_every_outcome(chokepoint, monkeypatch):
 
     assert (result.passed, result.failed, result.unscored, result.errored) == (1, 1, 1, 1)
     assert result.passed + result.failed + result.unscored + result.errored == len(result.outcomes)
-    # And the whole run survives the trip AH-110/AH-104 take it on.
+    # And the whole run survives the trip whatever persists and renders it takes it on.
     assert json.loads(json.dumps(result.as_dict()))["summary"]["passed"] == 1
 
 
