@@ -6,6 +6,11 @@ and no command of its own, so this is the wiring that lets a person — or a ski
 does three things nothing upstream does: it chooses the dataset, it renders the tables and columns
 the generator is given, and it decides what a verdict looks like on a terminal.
 
+**The exit code is the contract a pipeline gates on**: `0` every confirmed case passed, `1` a
+confirmed case failed, `2` no verdict could be produced — the preflight refused, the run stopped
+partway, or every generation errored. `2` reads as "go look at the harness", never as "the model
+regressed". See `_verdict`, whose ordering is the whole of that distinction.
+
 **Stdout carries verdicts and never SQL.** Neither the answer key nor the generated statement
 appears in the printed payload — nor the answer key's own column names, which two of the
 comparator's reasons are built out of — so a terminal that gets pasted into a chat window carries
@@ -74,10 +79,16 @@ except ImportError as exc:
 # the same order, so the two cannot disagree about what a run looks like.
 _SECTION_ORDER = ("failure", "error", "unscored", "unconfirmed", "pass")
 
-# Where a run's exit code is decided is a later slice's problem. This one exits 0 for any run that
-# reached the end of its wiring — a run with failures in it is a run that worked — and non-zero
-# only when it could not start.
+# What a run's exit code means, and the whole of what CI reads. `_CANNOT_START` is both "the
+# preflight refused" and "the run produced no verdict": to a pipeline those are the same event —
+# nothing was judged — and a second code for it would only be a second thing to configure.
+_FAILED = 1
 _CANNOT_START = 2
+
+# Marks the lines a caller is meant to strip — the refusals and the warnings, this helper talking
+# about itself. The run's own summary line carries no prefix, because that one is the thing to
+# keep.
+_PREFIX = "agami-eval:"
 
 
 def _section(outcome: Any) -> str:
@@ -482,8 +493,18 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
 
 
 def _stop(reason: str) -> None:
-    """Say why the run cannot start. One prefix everywhere, so a caller can strip it."""
-    print(f"agami-eval: {reason}", file=sys.stderr)
+    """Say why the run cannot start."""
+    print(f"{_PREFIX} {reason}", file=sys.stderr)
+
+
+def _warn(reason: str) -> None:
+    """Say something about a run that still finished.
+
+    Same stream and same prefix as `_stop`, and a separate name for one reason: `_stop` is called
+    at six sites that all return `_CANNOT_START`, so a call reading `_stop(...)` where nothing
+    stops would misdescribe the control flow at every one of them.
+    """
+    print(f"{_PREFIX} {reason}", file=sys.stderr)
 
 
 def _section_counts(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -583,6 +604,50 @@ def _run_payload(result: GoldenRunResult, questions: dict[str, str]) -> dict[str
     }
 
 
+def _verdict(result: GoldenRunResult) -> int:
+    """The run's exit code, so a pipeline can gate on it.
+
+    The ORDER of these checks is the substance, not an implementation detail. A broken pipeline
+    outranks a regression, so a run that stopped partway AND carries gating failures reports
+    `_CANNOT_START` rather than `_FAILED`: sending somebody to debug a model change against a run
+    that never happened is the expensive mistake this ordering exists to prevent.
+
+    A run in which EVERY generation errored is `_CANNOT_START` for the same reason — nothing was
+    scored, so it is neither a regression nor a passing suite. That rule is CATEGORICAL and not
+    proportional on purpose: any fraction here would be a pass-rate threshold, which a verdict
+    built on a confirmed answer key deliberately does not have.
+
+    `gating_failures` and never `failed`. `failed` counts every scored miss including the
+    unconfirmed ones, whose answer keys nobody has reviewed and which can therefore never gate;
+    resting the exit code on it would fail CI on an item no human has agreed to. Confirmed-only is
+    the contract's invariant, and this is the surface it is observable at.
+    """
+    if not result.completed:
+        return _CANNOT_START
+    if result.outcomes and result.errored == len(result.outcomes):
+        return _CANNOT_START
+    if result.gating_failures:
+        return _FAILED
+    return 0
+
+
+def _summary_line(result: GoldenRunResult, summary: dict[str, Any]) -> str:
+    """The one line a person reads a pipeline log against.
+
+    Built from `sections` rather than the runner's counters, for the reason `_section_counts`
+    gives: these are the rows that were printed, and `failed` is a different number. Word for word
+    the sentence the skill renders from the same payload, so a CI log and a chat report describe
+    one run in one wording instead of two.
+    """
+    sections = summary["sections"]
+    return (
+        f"Ran {result.dataset} on {result.profile}: "
+        f"{sections['failure']} failed, {sections['error']} errored, "
+        f"{sections['unscored']} unscored, {sections['unconfirmed']} unconfirmed, "
+        f"{sections['pass']} passed — run completed: {'yes' if summary['completed'] else 'no'}."
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Run a golden dataset and score every case.")
     parser.add_argument("--profile", required=True, help="the semantic-model profile to run")
@@ -675,7 +740,23 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"({exc.__class__.__name__}: {exc.strerror or 'cannot be written'})"
         )
     print(json.dumps(payload, indent=2))
-    return 0
+
+    # Everything below prints AFTER the payload, and the exit code is computed last: a run costs a
+    # model call and up to two warehouse queries per case, so a verdict must never cost the
+    # verdicts. The summary goes to stderr because stdout is a JSON document — a human sentence
+    # there would break every caller that parses it — and stderr already carries the refusals, so a
+    # log has one place to look. It is unprefixed because it is the thing to keep rather than the
+    # thing to strip.
+    print(_summary_line(result, payload["summary"]), file=sys.stderr)
+    if not any(outcome.confirmed for outcome in result.outcomes):
+        # A green run that verified nothing is the one most easily mistaken for evidence, so it
+        # says so out loud. The exit code stays 0: the run worked, there was simply nothing in it
+        # that could gate.
+        _warn(
+            "this run gated on nothing — no case in it has a confirmed answer key, so a green "
+            "exit says only that the run worked"
+        )
+    return _verdict(result)
 
 
 if __name__ == "__main__":
