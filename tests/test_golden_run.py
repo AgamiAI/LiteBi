@@ -328,6 +328,47 @@ def test_a_generator_that_breaks_stops_the_run_rather_than_scoring_the_rest(chok
     assert result.outcomes == ()
 
 
+def test_a_generator_that_breaks_says_why_in_the_runs_findings(chokepoint):
+    """A stopped run is otherwise a run with no items and no reason, which reads as a dataset that
+    was empty. The exception's TYPE is relayed and its message is not — the message is somebody
+    else's text, and a run's result travels."""
+
+    class _Breaks:
+        def generate(self, question, org, datasource):
+            raise RuntimeError("cannot reach warehouse-marker.example with the key it was given")
+
+    result = _run(_dataset(_item("a"), _item("b")), _Breaks(), _SpyExecutor())
+
+    assert result.completed is False
+    assert [finding["code"] for finding in result.findings] == ["golden_generator_failed"]
+    assert "RuntimeError" in result.findings[0]["message"]
+    assert "warehouse-marker.example" not in json.dumps(result.as_dict())
+
+
+def test_a_run_that_stops_partway_keeps_the_items_it_already_scored(chokepoint):
+    """A run that stopped after two of forty is the case `completed` exists for, and the two are
+    worth as much as they were before the third item broke — so they are kept rather than
+    discarded with the run."""
+
+    class _BreaksOnTheThird:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, question, org, datasource):
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("the adapter is misconfigured")
+            return gr.GeneratedSql(sql=GENERATED_SQL, error=None)
+
+    dataset = _dataset(_item("a"), _item("b"), _item("c"), _item("d"))
+
+    result = _run(dataset, _BreaksOnTheThird(), _SpyExecutor())
+
+    assert result.completed is False
+    assert [outcome.item_key for outcome in result.outcomes] == ["a", "b"]
+    assert result.passed == 2
+
+
 # --- the statement diff, and the two things it may decide ---------------------------------------
 
 
@@ -369,10 +410,39 @@ def test_a_case_with_no_answer_key_is_judged_on_its_own_only_where_the_level_all
 
     result = _run(_dataset(graded, keyed), _StubGenerator(), spy)
 
-    assert result.outcomes[0].passed and result.outcomes[0].claims is None
+    assert result.outcomes[0].passed
+    # There is no second statement to compare against, so every claim reads `unknown` — which is
+    # the shape that says "nothing was compared" rather than "the two agreed".
+    claims = result.outcomes[0].claims
+    assert {claim["status"] for claim in claims["claims"]} == {"unknown"}
+    assert claims["gated"] is False
     assert result.outcomes[1].score.status == "unscored"
     # One statement ran in total: neither case has an answer key, and the second never got that far.
     assert [call[0] for call in spy.calls] == [GENERATED_SQL]
+
+
+def test_a_required_filter_is_checked_on_an_item_that_has_no_answer_key(chokepoint):
+    """`must_filter` is the DATASET's requirement, not a property of the golden statement.
+
+    A keyless case is exactly the shape that used to declare one and never be checked for it: the
+    diff was guarded on there being two statements, so the item passed on its band alone while the
+    column it was required to constrain went unfiltered.
+    """
+    item = _item(
+        "banded-scoped",
+        match="bounded",
+        bounds={"min_rows": 1, "max_rows": 10},
+        must_filter=["region"],
+        expected={"sql": None, "sql_confirmed": False},
+    )
+
+    result = _run(_dataset(item), _StubGenerator(), _SpyExecutor())
+
+    outcome = result.outcomes[0]
+    assert outcome.score.accuracy == 1.0  # the band the author wrote is satisfied
+    assert outcome.gated is True and outcome.passed is False
+    assert [gate["kind"] for gate in outcome.claims["gates"]] == ["must_filter"]
+    assert [gate["column"] for gate in outcome.claims["gates"]] == ["region"]
 
 
 def test_a_self_judging_level_does_not_run_the_answer_key_it_happens_to_have(chokepoint):
@@ -685,3 +755,25 @@ def test_the_pass_mark_is_the_comparators_alone(chokepoint):
 
     assert result.outcomes[0].score.accuracy == pytest.approx(1 / 3)
     assert result.outcomes[0].passed is False and result.failed == 1
+
+
+def test_a_near_miss_is_a_fail_at_every_decimal_place(chokepoint):
+    """The pass mark is the raw 1.0, and a two-thirds-wrong answer does not discriminate that from
+    any threshold a reader might reach for instead.
+
+    So this is the comparator's own near miss: 4002 of 4004 rows is 0.99950…, which rounds up at
+    three decimals and clears any threshold below it. Both sides carry the same values in both
+    columns, so the columns pair and only the pairing of the two together moved.
+    """
+    golden_rows = [(index, index) for index in range(4004)]
+    # Two rows have their second cell swapped with each other, so each column's values are
+    # untouched and exactly two rows no longer say what the answer key says.
+    generated_rows = [(0, 1), (1, 0), *golden_rows[2:]]
+    spy = _SpyExecutor({GOLDEN_SQL: golden_rows, GENERATED_SQL: generated_rows})
+
+    result = _run(_dataset(_item()), _StubGenerator(), spy)
+
+    accuracy = result.outcomes[0].score.accuracy
+    assert accuracy == pytest.approx(4002 / 4004)
+    assert round(accuracy, 3) == 1.0  # which is why the pass mark reads the unrounded value
+    assert result.outcomes[0].passed is False and result.gating_failures == 1

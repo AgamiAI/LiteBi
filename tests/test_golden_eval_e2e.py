@@ -215,7 +215,10 @@ def test_a_case_with_a_band_and_no_answer_key_is_judged_on_its_own(profile):
     outcome = _by_key(_run(profile))["orders-roughly"]
 
     assert outcome.passed and outcome.confirmed is False
-    assert outcome.claims is None  # there is no second statement to compare against
+    # The diff still runs — `must_filter` is the dataset's requirement and would be checked here
+    # too — but there is no second statement, so every claim reads `unknown` and nothing gates.
+    assert {claim["status"] for claim in outcome.claims["claims"]} == {"unknown"}
+    assert outcome.claims["gates"] == []
 
 
 def test_an_unanswered_question_errors_without_costing_the_rest_of_the_run(profile):

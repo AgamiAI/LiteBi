@@ -85,6 +85,16 @@ _NO_ANSWER_KEY = (
 _MAX_RELAYED_ERROR = 200
 _ERROR_TRUNCATED = "…"
 
+# What a run says when its generator raised. `completed=False` is the fact and not the reason, and
+# a forty-item run that broke on the first item is otherwise indistinguishable from a run over an
+# empty dataset. The exception's TYPE is relayed and its message is not: a message quotes whatever
+# broke — a host, a key, a row — and this module's whole posture is that such text does not travel.
+_GENERATOR_RAISED_CODE = "golden_generator_failed"
+_GENERATOR_RAISED = (
+    "the generator raised {exception} on this item, so the run stopped rather than scoring the "
+    "cases after it"
+)
+
 
 @dataclass(frozen=True)
 class GeneratedSql:
@@ -195,6 +205,11 @@ class GoldenRunResult:
 
         A case whose answer key nobody has confirmed cannot fail a run — it would be gating on an
         answer that is itself unreviewed — so it reports its score and stops there.
+
+        This counts items that were SCORED, so it is not a verdict on its own and must not be read
+        as one. A run in which every confirmed item's generation errored — a model writing prose
+        where a statement was asked for — has zero gating failures and is not a green run. A caller
+        deciding a verdict reads `completed`, `gating_failures` AND `errored`, all three.
         """
         return sum(
             1
@@ -243,18 +258,36 @@ def run_golden_dataset(
     `findings` are the reader's — what it dropped getting this dataset together. They are carried
     rather than swallowed: a run over a dataset that lost three cases to a typo is not the same run
     as one over a whole dataset, and nothing else downstream can tell the difference.
+
+    **A verdict is not `gating_failures == 0`.** That counter is over items that were SCORED, so a
+    run whose every generation came back unreadable reports zero of them. Whoever decides a run
+    passed reads three values: `completed` (the loop got through the dataset), `gating_failures`
+    (no confirmed item was scored a miss) and `errored` (no item failed to produce a statement).
     """
     run_id = uuid.uuid4().hex
     outcomes: list[ItemOutcome] = []
+    run_findings = [asdict(finding) for finding in findings]
     completed = True
     for item in dataset.test_cases:
         try:
             generated = generator.generate(item.query, org, datasource)
-        except Exception:
+        except Exception as exc:
             # The generator is the one injected seam in this loop that is allowed to raise, and an
             # adapter that raises is not answering. Its message is dropped rather than reported:
-            # this is somebody else's exception text, and a run's result travels.
+            # this is somebody else's exception text, and a run's result travels. The TYPE is not
+            # the message, and a stopped run that says nothing about why is one nobody can act on,
+            # so it goes where the run already carries what it could not do — the findings.
             completed = False
+            run_findings.append(
+                asdict(
+                    Finding(
+                        severity="error",
+                        code=_GENERATOR_RAISED_CODE,
+                        message=_GENERATOR_RAISED.format(exception=type(exc).__name__),
+                        locator=item.item_key,
+                    )
+                )
+            )
             break
         outcomes.append(
             _run_item(
@@ -266,7 +299,7 @@ def run_golden_dataset(
         profile=profile,
         dataset=dataset.name,
         outcomes=tuple(outcomes),
-        findings=tuple(asdict(finding) for finding in findings),
+        findings=tuple(run_findings),
         completed=completed,
     )
 
@@ -297,22 +330,22 @@ def _run_item(
     golden_sql = item.expected.sql or ""
     score = _score(item, generated.sql, golden_sql, profile=profile, org=org, executor=executor,
                    dialect=dialect)
-    # After the score, and only when there are two statements to read. The diff is what turns "the
-    # rows disagree" into a reason, so it is worth having on a failing item as much as on a passing
-    # one; what it decides is narrower than what it describes — two gates out of seven claims.
-    diff = (
-        compare_statements(
-            generated.sql, golden_sql, must_filter=item.must_filter, dialect=dialect
-        )
-        if golden_sql
-        else None
+    # After the score, and on EVERY item that produced a statement — an answer key is not the
+    # condition. The diff is what turns "the rows disagree" into a reason, and one of its two gates
+    # reads the generated statement alone: `must_filter` is the DATASET's requirement rather than a
+    # property of the golden statement, so a keyless case that declares one still has it to meet.
+    # Skipping the diff for want of an answer key is how such a case passed on its band while
+    # filtering nothing. An empty golden side reads as unreadable, which makes every claim
+    # `unknown` — the shape that says nothing was compared, rather than that the two agreed.
+    diff = compare_statements(
+        generated.sql, golden_sql, must_filter=item.must_filter, dialect=dialect
     )
     return ItemOutcome(
         item_key=item.item_key,
         score=score,
         generated_sql=generated.sql,
-        claims=diff.as_dict() if diff is not None else None,
-        gated=diff.gated if diff is not None else False,
+        claims=diff.as_dict(),
+        gated=diff.gated,
         confirmed=confirmed,
     )
 
@@ -535,6 +568,11 @@ class ClaudeCliGenerator:
     built this generator — inlining it is what makes the no-tools invocation above sufficient.
     `timeout_s` is `subprocess.run`'s own bound, so a client that hangs is killed rather than waited
     on. Execution has no timer of its own here: its bound is the deployment's, at the chokepoint.
+
+    That bound is THIS generator's and not the runner's, and the difference matters to whoever
+    injects another one. `SqlGenerator.generate` has no parameter that could carry a timeout — the
+    argument list is the isolation, so widening it is a contract change — which means an injected
+    generator that hangs hangs the run, with nothing above it to cut the call off.
     """
 
     def __init__(self, schema: str, *, timeout_s: float) -> None:
