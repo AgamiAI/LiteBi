@@ -39,6 +39,9 @@ value-free sentence.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -348,7 +351,153 @@ def _not_ok(envelope: Envelope, *, answer_key: bool) -> ItemScore:
     return ItemScore(status="error", accuracy=None, reason=envelope.failure.message)
 
 
+# ---------------------------------------------------------------------------
+# The shipped generator: the operator's own client, as a child process
+# ---------------------------------------------------------------------------
+
+# The child's argument list, in full. `-p` is print mode — read a prompt, write an answer, exit.
+# There is deliberately nothing else: no MCP configuration, no tool allowlist and no permission
+# mode. A client with no tools has no path to the warehouse at all, so "the generating model never
+# read a row, and never saw the answer key" is a property of the SHAPE of this invocation rather
+# than of an allowlist somebody has to keep correct. What the model needs to write a statement —
+# the tables and columns — is inlined in the prompt instead, by whoever built this generator.
+_CLIENT_ARGV = ("claude", "-p")
+
+# The child's whole environment, by name. An ALLOWLIST and not a filter, and that is the decision:
+# `subprocess.run` passes the parent's environment through by default, and the parent's carries the
+# dataset's own root (`AGAMI_ARTIFACTS_DIR`) and the warehouse DSN (`DATASOURCE_URL…`). A filter is
+# a list of things somebody has to remember to add to; an allowlist is one nobody can forget.
+#
+# `ANTHROPIC_API_KEY` is here because it is the one credential the child EXISTS to use — the
+# operator's own key for their own client, in a process whose only job is to answer a question. It
+# is not a datasource credential, and no datasource credential has a name that could reach this
+# tuple.
+_CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "ANTHROPIC_API_KEY")
+
+# Why a generation produced no statement. Fixed sentences, and the fixedness is the point: a client
+# can echo the whole prompt on stderr, and this text is rendered beside the item and persisted with
+# the run. Nothing the child wrote — stdout, stderr, exit code, the command line — reaches any of
+# them.
+_GENERATION_UNAVAILABLE = "the generator command could not be started on this machine"
+_GENERATION_TIMED_OUT = "the generator did not answer within the time this run allows"
+_GENERATION_EXITED = "the generator exited without answering"
+_GENERATION_UNREADABLE = "the generator's answer did not carry a statement this run could read"
+
+_PROMPT = """\
+Write one SQL statement that answers a question about a database.
+
+Organization: {org}
+Datasource: {datasource}
+
+The tables and columns you may use:
+{schema}
+
+The question:
+{question}
+
+Reply with a single JSON object and no other text: {{"sql": "<one SELECT statement>"}}
+Write one read-only SELECT over the tables above. You have no tools here and nothing you write is
+executed by you, so do not try to run it, verify it, or read any data.
+"""
+
+
+def _generation_prompt(question: str, org: str, datasource: Optional[str], schema: str) -> str:
+    """The whole of what the child is asked. Every value in it came from the question's own side of
+    the run — never from `expected`, and never from a result set."""
+    return _PROMPT.format(
+        org=org, datasource=datasource or "(unnamed)", schema=schema, question=question
+    )
+
+
+def _first_json_object(text: str) -> Optional[dict[str, Any]]:
+    """The first complete JSON object in `text`, or None when there is not one.
+
+    Scanning for a balanced pair of braces rather than reaching for the whole string is what makes
+    this fence-tolerant for free: a model that wrapped its answer in prose or a ```json fence has
+    put the object somewhere inside, and an item lost to a code fence is a wrong number in the run
+    rather than a wrong answer by the model. Strings are tracked so a brace inside a SQL literal
+    does not close the object early.
+    """
+    depth, start, in_string, escaped = 0, -1, False, False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start : index + 1])
+                except ValueError:
+                    return None
+                return value if isinstance(value, dict) else None
+    return None
+
+
+def _child_env() -> dict[str, str]:
+    """The environment the child is given: the allowlist, and only the names that are actually set."""
+    return {key: os.environ[key] for key in _CHILD_ENV_KEYS if key in os.environ}
+
+
+class ClaudeCliGenerator:
+    """Answer a question by spawning the operator's own client, once, with no tools.
+
+    `schema` is the tables and columns the model may write against, already rendered by whoever
+    built this generator — inlining it is what makes the no-tools invocation above sufficient.
+    `timeout_s` is `subprocess.run`'s own bound, so a client that hangs is killed rather than waited
+    on. Execution has no timer of its own here: its bound is the deployment's, at the chokepoint.
+    """
+
+    def __init__(self, schema: str, *, timeout_s: float) -> None:
+        self.schema = schema
+        self.timeout_s = timeout_s
+
+    def generate(self, question: str, org: str, datasource: Optional[str]) -> GeneratedSql:
+        """One question in, one statement out — or a fixed sentence saying why there is not one."""
+        prompt = _generation_prompt(question, org, datasource, self.schema)
+        try:
+            # The prompt goes on STDIN rather than in the argument list: a schema is long, an
+            # argument list is bounded, and a process list is readable by other users on most
+            # systems.
+            completed = subprocess.run(
+                list(_CLIENT_ARGV),
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+                env=_child_env(),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            # `TimeoutExpired` carries the command and whatever output was captured before the kill.
+            # None of it is read.
+            return GeneratedSql(sql="", error=_GENERATION_TIMED_OUT)
+        except OSError:
+            # No client installed, or nothing executable at that name. `OSError.__str__`
+            # interpolates the path it tried, which is why the exception is not relayed.
+            return GeneratedSql(sql="", error=_GENERATION_UNAVAILABLE)
+        if completed.returncode != 0:
+            return GeneratedSql(sql="", error=_GENERATION_EXITED)
+        answer = _first_json_object(completed.stdout)
+        sql = answer.get("sql") if answer else None
+        if not isinstance(sql, str) or not sql.strip():
+            return GeneratedSql(sql="", error=_GENERATION_UNREADABLE)
+        return GeneratedSql(sql=sql.strip(), error=None)
+
+
 __all__ = [
+    "ClaudeCliGenerator",
     "GeneratedSql",
     "GoldenRunResult",
     "ItemOutcome",

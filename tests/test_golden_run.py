@@ -19,6 +19,7 @@ fixtures are synthetic throughout — an `acme` profile over `orders`, fabricate
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -326,6 +327,186 @@ def test_a_case_with_no_answer_key_is_judged_on_its_own_only_where_the_level_all
     assert result.outcomes[1].score.status == "unscored"
     # One statement ran in total: neither case has an answer key, and the second never got that far.
     assert [call[0] for call in spy.calls] == [GENERATED_SQL]
+
+
+# --- the shipped generator: what the child process is, and is not, given ------------------------
+
+SCHEMA = "orders(id INTEGER, customer_id INTEGER, region TEXT, total NUMERIC)"
+# A distinctive answer key and a distinctive row value, so a substring search over everything the
+# child was handed is a real check rather than a coincidence.
+ANSWER_KEY = "SELECT COUNT(*) AS orders_placed_marker FROM orders"
+ANSWER = '{"sql": "SELECT COUNT(order_id) AS n FROM orders"}'
+
+
+class _RecordedSpawn:
+    """Stands in for the client process, keeping everything it was invoked with.
+
+    The whole of criteria 1-3 is asserted against these recordings — the argv, the prompt on stdin
+    and the environment ACTUALLY PASSED, never `os.environ`, which is exactly what the child would
+    have inherited had the allowlist not been built.
+    """
+
+    def __init__(self, stdout: str = ANSWER, returncode: int = 0, stderr: str = "",
+                 raises: BaseException | None = None) -> None:
+        self.invocations: list[tuple[list[str], dict]] = []
+        self._stdout, self._returncode, self._stderr = stdout, returncode, stderr
+        self._raises = raises
+
+    def __call__(self, args, **kwargs):
+        self.invocations.append((list(args), kwargs))
+        if self._raises is not None:
+            raise self._raises
+        return subprocess.CompletedProcess(args, self._returncode, self._stdout, self._stderr)
+
+    def everything_given(self) -> str:
+        """Every string the child could read: its arguments, its stdin, and its environment."""
+        parts: list[str] = []
+        for args, kwargs in self.invocations:
+            parts += args
+            parts.append(kwargs.get("input") or "")
+            parts += [f"{key}={value}" for key, value in (kwargs.get("env") or {}).items()]
+        return "\n".join(parts)
+
+
+@pytest.fixture()
+def spawn(monkeypatch):
+    recorder = _RecordedSpawn()
+    monkeypatch.setattr(gr.subprocess, "run", recorder)
+    return recorder
+
+
+def _cli_generator() -> gr.ClaudeCliGenerator:
+    return gr.ClaudeCliGenerator(SCHEMA, timeout_s=30.0)
+
+
+def test_the_generator_is_invoked_with_no_tools(spawn):
+    """The child gets print mode and nothing else.
+
+    No `--mcp-config`, no `--allowedTools`, no `--permission-mode`. A client with no tools has no
+    path to the warehouse at all, so 'the generating model never read a row' holds structurally
+    rather than by an allowlist staying correct. The schema is inlined in the prompt instead.
+    """
+    generated = _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    args, kwargs = spawn.invocations[0]
+    assert args == ["claude", "-p"]
+    assert not [arg for arg in args if arg.startswith("--")]
+    assert SCHEMA in kwargs["input"] and QUESTION in kwargs["input"]
+    assert kwargs["timeout"] == 30.0
+    assert generated.sql == "SELECT COUNT(order_id) AS n FROM orders" and generated.error is None
+
+
+def test_the_answer_key_is_in_nothing_the_generator_was_given(chokepoint, spawn):
+    """Criterion 1. A model that can see `expected.sql` is grading itself, and no assertion over
+    the scores would reveal it — so the assertion is over what the child was handed."""
+    item = _item("keyed", expected={"sql": ANSWER_KEY, "sql_confirmed": True})
+
+    _run(_dataset(item, _item("keyed-2", expected={"sql": ANSWER_KEY, "sql_confirmed": True})),
+         _cli_generator(), _SpyExecutor())
+
+    given = spawn.everything_given()
+    assert len(spawn.invocations) == 2
+    assert ANSWER_KEY not in given
+    assert "orders_placed_marker" not in given
+
+
+def test_no_result_row_is_in_anything_the_generator_was_given(chokepoint, spawn):
+    """Criterion 3. The second item is generated AFTER the first item's rows exist, which is the
+    only ordering under which this could have failed."""
+    _run(_dataset(_item("a"), _item("b")), _cli_generator(), _SpyExecutor())
+
+    assert len(spawn.invocations) == 2
+    assert str(ROW_VALUE) not in spawn.everything_given()
+
+
+def test_the_dataset_path_is_in_no_argument_and_no_environment_value(
+    chokepoint, spawn, monkeypatch, tmp_path
+):
+    """Criterion 2. The child's environment is built, not inherited.
+
+    `subprocess.run` passes the parent's environment through by default, and the parent's carries
+    the dataset's own root and the warehouse DSN. Every argument-level assertion would still pass
+    while the path was one `os.environ` read away inside the child.
+    """
+    artifacts = tmp_path / "artifacts-marker"
+    artifacts.mkdir()
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(artifacts))
+    monkeypatch.setenv("DATASOURCE_URL__ACME", "sqlite:///warehouse-marker.db")
+
+    _run(_dataset(_item()), _cli_generator(), _SpyExecutor())
+
+    args, kwargs = spawn.invocations[0]
+    passed = kwargs["env"]
+    assert [key for key in passed if key.startswith("AGAMI_")] == []
+    assert [key for key in passed if "DATASOURCE" in key] == []
+    given = spawn.everything_given()
+    assert str(artifacts) not in given and "artifacts-marker" not in given
+    assert "warehouse-marker" not in given
+
+
+def test_a_failed_generation_reports_a_fixed_sentence_rather_than_stderr(monkeypatch):
+    """A client can echo the prompt on stderr, and a score is rendered and persisted further on.
+    So a failed generation reports a fixed sentence and the child's output is dropped."""
+    echoed = "the whole prompt, echoed back, including " + ANSWER_KEY
+    monkeypatch.setattr(
+        gr.subprocess, "run", _RecordedSpawn(stdout="", returncode=1, stderr=echoed)
+    )
+
+    generated = _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    assert generated.sql == ""
+    assert generated.error and echoed not in generated.error
+    assert ANSWER_KEY not in generated.error and "stderr" not in generated.error
+
+
+def test_an_unreadable_answer_is_an_error_rather_than_a_statement(monkeypatch):
+    """Whatever a model wrote is not SQL until it parses as the object we asked for."""
+    monkeypatch.setattr(gr.subprocess, "run", _RecordedSpawn(stdout="I could not work that out."))
+
+    generated = _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    assert generated.sql == "" and generated.error
+
+
+def test_a_fenced_answer_is_still_read(monkeypatch):
+    """Models fence their JSON as often as not, and an item lost to a code fence is a wrong number
+    in the run rather than a wrong answer by the model."""
+    fenced = "Here you go:\n```json\n" + ANSWER + "\n```\nHope that helps.\n"
+    monkeypatch.setattr(gr.subprocess, "run", _RecordedSpawn(stdout=fenced))
+
+    assert _cli_generator().generate(QUESTION, ORG, DATASOURCE).sql.startswith("SELECT COUNT")
+
+
+def test_a_generation_that_hangs_is_cut_off_and_the_run_returns(chokepoint, monkeypatch):
+    """Criterion 8. The bound is `subprocess.run`'s own, so the child is killed rather than waited
+    on, and the item it belonged to is an error like any other."""
+    hangs = _RecordedSpawn(raises=subprocess.TimeoutExpired(cmd=["claude", "-p"], timeout=30.0))
+    monkeypatch.setattr(gr.subprocess, "run", hangs)
+
+    result = _run(_dataset(_item("a"), _item("b")), _cli_generator(), _SpyExecutor())
+
+    assert hangs.invocations[0][1]["timeout"] == 30.0
+    assert [outcome.score.status for outcome in result.outcomes] == ["error", "error"]
+    assert result.completed and result.errored == 2
+
+
+def test_the_runner_makes_no_model_call_of_its_own(chokepoint, monkeypatch):
+    """Criterion 16. The injected generator is the only thing that may reach a model.
+
+    Pinned by making the module's own spawn fatal: a run driven by a stub generator completes
+    without it being touched, so there is no second, unasserted egress in the scoring path.
+    """
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the runner spawned a process of its own")
+
+    monkeypatch.setattr(gr.subprocess, "run", _forbidden)
+    generator = _StubGenerator()
+
+    result = _run(_dataset(_item("a"), _item("b")), generator, _SpyExecutor())
+
+    assert result.completed and len(result.outcomes) == 2
+    assert [call[0] for call in generator.calls] == [QUESTION, QUESTION]
 
 
 def test_the_pass_mark_is_the_comparators_alone(chokepoint):
