@@ -51,6 +51,12 @@ Q_PASS = "How many orders have been placed?"
 Q_FAIL = "How many customers are on file?"
 Q_ERROR = "How many products are listed?"
 Q_UNCONFIRMED = "How many payments have been taken?"
+Q_UNSCORED = "How many orders are in a status nobody uses?"
+
+# A predicate the seed matches nothing on, so both sides come back empty and the comparator has
+# nothing to compare. Both statements are the same one: the point is an item nobody can judge, not
+# a disagreement.
+EMPTY_SQL = "SELECT id FROM orders WHERE status = 'no-such-status'"
 
 GENERATED = {
     Q_PASS: f"SELECT COUNT(id) AS {GENERATED_SENTINEL} FROM orders",
@@ -58,6 +64,7 @@ GENERATED = {
     # rather than an accident of which table happens to be larger.
     Q_FAIL: "SELECT COUNT(DISTINCT country) AS n FROM customers",
     Q_UNCONFIRMED: "SELECT COUNT(*) AS n FROM refunds",
+    Q_UNSCORED: EMPTY_SQL,
     # Q_ERROR is deliberately absent: the scripted generator answers nothing for it.
 }
 
@@ -92,6 +99,21 @@ MIXED_DATASET: dict[str, Any] = {
             "expected": {"sql": "SELECT COUNT(*) AS n FROM customers", "sql_confirmed": True},
         },
     ],
+}
+
+# Confirmed, so nothing about its answer key excuses it — and still not a failure, because nothing
+# was compared.
+UNSCORED_CASE: dict[str, Any] = {
+    "id": "unused-status",
+    "query": Q_UNSCORED,
+    "expected": {"sql": EMPTY_SQL, "sql_confirmed": True},
+}
+
+# The mixed dataset plus the case nothing can be judged for, so one run exercises all five
+# sections. Kept apart from MIXED_DATASET because the counts asserted against that one are its own,
+# and its unscored case is written last so the ordering assertion has something to reorder.
+ALL_SECTIONS_DATASET: dict[str, Any] = {
+    "test_cases": [*MIXED_DATASET["test_cases"], UNSCORED_CASE],
 }
 
 PASSING_DATASET: dict[str, Any] = {
@@ -233,11 +255,30 @@ def test_a_run_reports_every_item_and_the_summary_counts_them(artifacts, scripte
 def test_the_sections_are_emitted_failures_first(artifacts, scripted, capsys):
     """The ordering criterion, asserted on the sequence alone. The dataset lists its cases
     pass-first, so a run that simply echoed the file's order fails here."""
-    _write(artifacts, "mixed", MIXED_DATASET)
+    _write(artifacts, "all-five", ALL_SECTIONS_DATASET)
 
-    _, payload, _ = _run(capsys, "--dataset", "mixed")
+    _, payload, _ = _run(capsys, "--dataset", "all-five")
 
-    assert _sections(payload) == ["failure", "error", "unconfirmed", "pass"]
+    assert _sections(payload) == ["failure", "error", "unscored", "unconfirmed", "pass"]
+
+
+def test_the_section_counts_describe_the_rows_that_were_printed(artifacts, scripted, capsys):
+    """The summary's own headline counts, so what is claimed and what is rendered cannot disagree.
+
+    They are not the runner's counters and this run shows why: the unconfirmed miss counts in
+    `failed` while its row sits under `unconfirmed`, and the unscored item counts in neither
+    `failed` nor `gating_failures` while still occupying a row."""
+    _write(artifacts, "all-five", ALL_SECTIONS_DATASET)
+
+    _, payload, _ = _run(capsys, "--dataset", "all-five")
+
+    sections = _sections(payload)
+    assert payload["summary"]["sections"] == {
+        section: sections.count(section)
+        for section in ("failure", "error", "unscored", "unconfirmed", "pass")
+    }
+    assert sum(payload["summary"]["sections"].values()) == payload["summary"]["total"] == 5
+    assert payload["summary"]["failed"] == 2 and payload["summary"]["sections"]["failure"] == 1
 
 
 def test_an_all_passing_run_still_emits_a_full_payload(artifacts, scripted, capsys):
@@ -284,22 +325,21 @@ def test_an_item_that_could_not_be_scored_is_counted_rather_than_dropped(
 ):
     """Two empty result sets agree about nothing, so the comparator scores neither side. The item
     still has to appear, and `unscored` has to say so — otherwise a dataset of such cases reads as
-    a run with nothing wrong in it."""
-    question = "How many orders are in a status nobody uses?"
-    empty = "SELECT id FROM orders WHERE status = 'no-such-status'"
-    _write(artifacts, "empty", {"test_cases": [
-        {"id": "both-empty", "query": question,
-         "expected": {"sql": empty, "sql_confirmed": True}},
-    ]})
-    GENERATED[question] = empty
-    try:
-        _, payload, _ = _run(capsys, "--dataset", "empty")
-    finally:
-        del GENERATED[question]
+    a run with nothing wrong in it.
+
+    It is confirmed and it did not pass, and it is still not a failure: nothing was compared, so it
+    is its own category. A run that filed it under failures would report `failed: 0` above a list
+    with a row in it."""
+    _write(artifacts, "empty", {"test_cases": [UNSCORED_CASE]})
+
+    _, payload, _ = _run(capsys, "--dataset", "empty")
 
     assert payload["summary"]["unscored"] == 1
-    assert [item["item_key"] for item in payload["items"]] == ["both-empty"]
+    assert [item["item_key"] for item in payload["items"]] == ["unused-status"]
     assert payload["items"][0]["status"] == "unscored"
+    assert payload["items"][0]["confirmed"] is True and payload["items"][0]["passed"] is False
+    assert _sections(payload) == ["unscored"]
+    assert payload["summary"]["failed"] == 0 and payload["summary"]["gating_failures"] == 0
 
 
 # ---------------------------------------------------------------------------

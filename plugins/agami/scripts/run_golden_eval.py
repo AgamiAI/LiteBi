@@ -56,10 +56,11 @@ except ImportError as exc:
     )
     raise SystemExit(2) from exc
 
-# Presentation order. What went wrong comes first because that is what a reader acts on, and the
-# passes come last because they are the part that needs no action. The report slice reads the same
-# order, so the two cannot disagree about what a run looks like.
-_SECTION_ORDER = ("failure", "error", "unconfirmed", "pass")
+# Presentation order: failures first because they are the actionable thing, errors next because the
+# run itself broke, unscored next because nothing could be judged, unconfirmed after that because
+# those ran but can never gate, and passes last because they need no action. The report slice reads
+# the same order, so the two cannot disagree about what a run looks like.
+_SECTION_ORDER = ("failure", "error", "unscored", "unconfirmed", "pass")
 
 # Where a run's exit code is decided is a later slice's problem. This one exits 0 for any run that
 # reached the end of its wiring — a run with failures in it is a run that worked — and non-zero
@@ -73,11 +74,18 @@ def _section(outcome: Any) -> str:
     Order matters here and not only in the output: an item whose generation errored is an error
     whether or not anybody confirmed its answer key, and an unconfirmed item is never a failure
     because it can never gate a run.
+
+    An unscored item is not a failure either, and the check for it has to come before `passed`:
+    nothing was compared, so `passed` is False for a reason that has nothing to do with the answer.
+    It counts in `unscored` and in neither `failed` nor `gating_failures`, so filing it under
+    failures would print a failure list above a summary saying there were none.
     """
     if outcome.score.status == "error":
         return "error"
     if not outcome.confirmed:
         return "unconfirmed"
+    if outcome.score.status == "unscored":
+        return "unscored"
     return "pass" if outcome.passed else "failure"
 
 
@@ -182,14 +190,33 @@ def _summary(result: GoldenRunResult) -> dict[str, Any]:
     return {**result.as_dict()["summary"], "completed": result.completed}
 
 
+def _section_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+    """How many rows are printed under each heading, counted from the rows themselves.
+
+    These and the runner's counters answer different questions, and both are printed: this is what
+    is on screen, and `failed` / `gating_failures` / `errored` are what a verdict rests on. The two
+    do not line up — an unscored item is in neither `failed` nor `gating_failures` and still takes a
+    row, an unconfirmed miss counts in `failed` and is rendered somewhere else — so the rendered
+    counts are derived from the rendered items rather than recomputed from the run.
+    """
+    return {
+        section: sum(1 for item in items if item["section"] == section)
+        for section in _SECTION_ORDER
+    }
+
+
 def _write_artifact(
-    result: GoldenRunResult, questions: dict[str, str], keys: dict[str, str]
+    result: GoldenRunResult,
+    questions: dict[str, str],
+    keys: dict[str, str],
+    summary: dict[str, Any],
 ) -> Path:
     """Join the run to the dataset it ran and persist both statements.
 
     `GoldenRunResult` carries neither the question nor the answer key, so this is the only place
     that holds all three — and the report slice renders the two statements side by side, which is
-    why they are kept rather than dropped with stdout's.
+    why they are kept rather than dropped with stdout's. The summary is handed in rather than built
+    again here, so the file and the terminal describe the run with one set of numbers.
 
     This lands under `local/`, which is gitignored per-user state, and the answer key it repeats is
     already on disk in the dataset file the run just read, so it adds no exposure.
@@ -198,7 +225,7 @@ def _write_artifact(
         "run_id": result.run_id,
         "profile": result.profile,
         "dataset": result.dataset,
-        "summary": _summary(result),
+        "summary": summary,
         "items": [
             {
                 "item_key": outcome.item_key,
@@ -221,9 +248,7 @@ def _write_artifact(
     return path
 
 
-def _run_payload(
-    result: GoldenRunResult, questions: dict[str, str], artifact: Path
-) -> dict[str, Any]:
+def _run_payload(result: GoldenRunResult, questions: dict[str, str]) -> dict[str, Any]:
     """The verdicts, in presentation order, with no statement anywhere in them."""
     items = [
         {
@@ -245,10 +270,9 @@ def _run_payload(
     # Stable within a section, so items keep the order their author wrote them in.
     items.sort(key=lambda item: _SECTION_ORDER.index(item["section"]))
     return {
-        "summary": _summary(result),
+        "summary": {**_summary(result), "sections": _section_counts(items)},
         "items": items,
         "findings": _finding_lines(list(result.findings)),
-        "artifact": str(artifact),
     }
 
 
@@ -297,8 +321,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     questions = {item.item_key: item.query for item in dataset.test_cases}
     keys = {item.item_key: item.expected.sql or "" for item in dataset.test_cases}
-    artifact = _write_artifact(result, questions, keys)
-    print(json.dumps(_run_payload(result, questions, artifact), indent=2))
+    payload = _run_payload(result, questions)
+    payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"]))
+    print(json.dumps(payload, indent=2))
     return 0
 
 
