@@ -53,6 +53,7 @@ Q_FAIL = "How many customers are on file?"
 Q_ERROR = "How many products are listed?"
 Q_UNCONFIRMED = "How many payments have been taken?"
 Q_UNSCORED = "How many orders are in a status nobody uses?"
+Q_TYPED = "What does the first order carry in the column the answer key picked?"
 
 # A predicate the seed matches nothing on, so both sides come back empty and the comparator has
 # nothing to compare. Both statements are the same one: the point is an item nobody can judge, not
@@ -66,6 +67,9 @@ GENERATED = {
     Q_FAIL: "SELECT COUNT(DISTINCT country) AS n FROM customers",
     Q_UNCONFIRMED: "SELECT COUNT(*) AS n FROM refunds",
     Q_UNSCORED: EMPTY_SQL,
+    # A text column where the answer key selected a numeric one, which is the one disagreement the
+    # `shape` level can see — and the only reason it builds that names a column.
+    Q_TYPED: "SELECT status FROM orders LIMIT 1",
     # Q_ERROR is deliberately absent: the scripted generator answers nothing for it.
 }
 
@@ -131,6 +135,77 @@ PASSING_DATASET: dict[str, Any] = {
 }
 
 
+# The three datasets whose answer keys alias a column with the sentinel AND then miss, so the
+# comparator builds a reason out of that alias. A passing case cannot expose this: the reasons that
+# name a column are only ever built on a disagreement.
+ONE_UNMATCHED_DATASET: dict[str, Any] = {
+    "test_cases": [
+        {
+            "id": "customers-count",
+            "query": Q_FAIL,
+            "expected": {
+                "sql": f"SELECT COUNT(*) AS {GOLDEN_SENTINEL} FROM customers",
+                "sql_confirmed": True,
+            },
+        },
+    ],
+}
+
+TWO_UNMATCHED_DATASET: dict[str, Any] = {
+    "test_cases": [
+        {
+            "id": "customers-count",
+            "query": Q_FAIL,
+            "expected": {
+                "sql": (
+                    f"SELECT COUNT(*) AS {GOLDEN_SENTINEL}, "
+                    f"COUNT(DISTINCT id) AS {GOLDEN_SENTINEL}2 FROM customers"
+                ),
+                "sql_confirmed": True,
+            },
+        },
+    ],
+}
+
+TYPE_MISMATCH_DATASET: dict[str, Any] = {
+    "test_cases": [
+        {
+            "id": "first-order",
+            "query": Q_TYPED,
+            "match": "shape",
+            "expected": {
+                "sql": f"SELECT id AS {GOLDEN_SENTINEL} FROM orders LIMIT 1",
+                "sql_confirmed": True,
+            },
+        },
+    ],
+}
+
+# Right rows, missing filter. The only shape in which an item scores 1.0 and still does not pass,
+# and the only one that puts anything in `gates`.
+GATED_DATASET: dict[str, Any] = {
+    "test_cases": [
+        {
+            "id": "orders-count",
+            "query": Q_PASS,
+            "must_filter": ["status"],
+            "expected": {"sql": "SELECT COUNT(*) AS n FROM orders", "sql_confirmed": True},
+        },
+    ],
+}
+
+# A `sql:` value carrying an unquoted `: `, which YAML reads as a nested mapping and refuses —
+# and PyYAML quotes the offending source line back inside the error it raises. Written as text
+# rather than dumped, because a dumper would quote it and there would be no error.
+UNPARSEABLE_TEXT = f"""test_cases:
+  - id: broken
+    query: How many orders were placed?
+    expected:
+      sql: SELECT COUNT(*) AS {GOLDEN_SENTINEL} FROM orders WHERE note: 'x'
+      sql_confirmed: true
+"""
+
+
 class _Scripted:
     """The shipped generator's stand-in, constructed the same way the script constructs the real
     one — so a change to that call site fails here rather than silently bypassing the schema."""
@@ -177,9 +252,15 @@ def scripted(monkeypatch) -> None:
 
 
 def _write(art: Path, name: str, dataset: dict[str, Any]) -> None:
+    _write_text(art, name, yaml.safe_dump(dataset))
+
+
+def _write_text(art: Path, name: str, text: str) -> None:
+    """The same, for a file that has to reach the reader exactly as written — a dumper would quote
+    its way out of the syntax error the test is about."""
     golden = art / PROFILE / "golden_datasets"
     golden.mkdir(exist_ok=True)
-    (golden / f"{name}.yaml").write_text(yaml.safe_dump(dataset), encoding="utf-8")
+    (golden / f"{name}.yaml").write_text(text, encoding="utf-8")
 
 
 def _run(capsys, *argv: str) -> tuple[int, dict[str, Any], str]:
@@ -359,6 +440,80 @@ def test_stdout_carries_neither_statement(artifacts, scripted, capsys):
     assert GENERATED_SENTINEL not in rendered
 
 
+def test_a_mismatch_counts_the_answer_keys_columns_rather_than_naming_them(
+    artifacts, scripted, capsys
+):
+    """`reason` is the one field that reaches the chat table, and the comparator builds this one
+    out of the aliases the author wrote in `expected.sql`. A count says the same thing — the answer
+    key asked for something the result does not carry — and carries no identifier with it.
+
+    The names are not lost: the artifact keeps the score whole, which is where a drill-down reads
+    them from."""
+    _write(artifacts, "one-unmatched", ONE_UNMATCHED_DATASET)
+    _write(artifacts, "two-unmatched", TWO_UNMATCHED_DATASET)
+
+    _, one, _ = _run(capsys, "--dataset", "one-unmatched")
+    _, two, _ = _run(capsys, "--dataset", "two-unmatched")
+
+    assert GOLDEN_SENTINEL not in json.dumps(one) + json.dumps(two)
+    assert one["items"][0]["section"] == "failure"
+    assert one["items"][0]["reason"] == (
+        "1 of the answer key's columns has no counterpart in the generated result"
+    )
+    assert two["items"][0]["reason"] == (
+        "2 of the answer key's columns have no counterpart in the generated result"
+    )
+    joined = json.loads(Path(one["artifact"]).read_text(encoding="utf-8"))
+    assert joined["items"][0]["score"]["unmatched_golden_columns"] == [GOLDEN_SENTINEL]
+
+
+def test_a_type_mismatch_does_not_name_the_answer_keys_column(artifacts, scripted, capsys):
+    """The `shape` level's own reason is the second one built from an alias. Same rule, and the
+    same surface — nothing about `shape` makes a name safer to print than `exact` does."""
+    _write(artifacts, "typed", TYPE_MISMATCH_DATASET)
+
+    _, payload, _ = _run(capsys, "--dataset", "typed")
+
+    assert GOLDEN_SENTINEL not in json.dumps(payload)
+    assert payload["items"][0]["section"] == "failure"
+    assert payload["items"][0]["reason"] == (
+        "a column does not carry the type the answer key does"
+    )
+
+
+def test_a_dataset_that_does_not_parse_does_not_relay_the_offending_line(artifacts, capsys):
+    """PyYAML quotes ~75 characters of the source line back inside its error, so a `sql:` value
+    with an unquoted colon in it puts a fragment of the answer key on a surface that promises no
+    SQL. Only the first line of a finding is relayed; `code` and `locator` stay whole, because
+    those are what tells a dataset breakage apart from a scored failure."""
+    _write_text(artifacts, "broken", UNPARSEABLE_TEXT)
+
+    _, payload, _ = _run(capsys, "--list")
+
+    assert GOLDEN_SENTINEL not in json.dumps(payload)
+    finding = payload["findings"][0]
+    assert finding["code"] == "golden_unreadable_file"
+    assert finding["locator"] == "broken.yaml"
+    assert "\n" not in finding["message"] and "broken.yaml" in finding["message"]
+
+
+def test_a_required_filter_the_statement_never_wrote_fails_a_perfect_score(
+    artifacts, scripted, capsys
+):
+    """`gates` is the only nested structure another module puts on this payload, and this is the
+    only shape that fills it: the rows are right, the required filter is absent, and the item does
+    not pass at an accuracy of 1.0."""
+    _write(artifacts, "gated", GATED_DATASET)
+
+    _, payload, _ = _run(capsys, "--dataset", "gated")
+
+    item = payload["items"][0]
+    assert item["section"] == "failure"
+    assert item["accuracy"] == 1.0 and item["passed"] is False and item["gated"] is True
+    assert [gate["kind"] for gate in item["gates"]] == ["must_filter"]
+    assert item["gates"][0]["column"] == "status"
+
+
 def test_the_artifact_lands_in_the_eval_dashboard_dir_with_both_statements(
     artifacts, scripted, capsys
 ):
@@ -508,9 +663,61 @@ def test_a_run_where_every_item_errors_is_not_green(artifacts, monkeypatch, caps
 # The one raise on the run path
 # ---------------------------------------------------------------------------
 
+def test_the_artifact_write_failing_does_not_discard_the_run(artifacts, scripted, capsys):
+    """A run costs a model call and two warehouse queries per case. A directory it cannot write to
+    loses the drill-down and nothing else — the verdicts still print, the exit code still says the
+    run reached the end of its wiring, and the path is not relayed onto stderr."""
+    _write(artifacts, "green", PASSING_DATASET)
+    out = agami_paths.dashboard_dir("eval", PROFILE, artifacts)
+    out.mkdir(parents=True)
+    out.chmod(0o500)
+    try:
+        code, payload, err = _run(capsys, "--dataset", "green")
+    finally:
+        out.chmod(0o700)
+
+    assert code == 0
+    assert _sections(payload) == ["pass"] and payload["summary"]["passed"] == 1
+    assert payload["artifact"] == ""
+    assert err.startswith("agami-eval:") and "Traceback" not in err
+    assert str(artifacts) not in err
+
+
+def test_a_profile_whose_model_cannot_be_read_stops_without_a_traceback(
+    artifacts, scripted, capsys
+):
+    """The model load sits on the run path too, and a profile that was never connected raises
+    straight through it — printing the absolute artifacts path, which every other refusal on this
+    path withholds."""
+    _write(artifacts, "green", PASSING_DATASET)
+    (artifacts / PROFILE / "datasource.yaml").unlink()
+
+    code, payload, err = _run(capsys, "--dataset", "green")
+
+    assert code != 0 and payload == {}
+    assert err.startswith("agami-eval:") and "Traceback" not in err
+    assert str(artifacts) not in err
+
+
+def test_a_model_that_does_not_parse_stops_without_a_traceback(artifacts, scripted, capsys):
+    """The second way the load fails, and the one whose exception text quotes the offending value
+    back — so the count of problems is relayed and the values are not."""
+    _write(artifacts, "green", PASSING_DATASET)
+    path = artifacts / PROFILE / "datasource.yaml"
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    doc["description"] = 5
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    code, payload, err = _run(capsys, "--dataset", "green")
+
+    assert code != 0 and payload == {}
+    assert err.startswith("agami-eval:") and "Traceback" not in err
+    assert "input_value" not in err
+
+
 def test_a_datasource_with_no_storage_connection_fails_preflight(artifacts, scripted, capsys):
-    """`resolve_datasource_dialect` is the only unguarded raise the run path reaches, so it is
-    reported as a preflight failure rather than as a traceback."""
+    """`resolve_datasource_dialect` is one of three raises the run path reaches, so it is reported
+    as a preflight failure rather than as a traceback."""
     _write(artifacts, "green", PASSING_DATASET)
     path = artifacts / PROFILE / "datasource.yaml"
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -541,9 +748,50 @@ def test_the_generator_is_handed_the_tables_and_the_timeout(artifacts, monkeypat
 
     assert seen["timeout_s"] == 7.0
     lines = seen["schema"].splitlines()
-    # Every table in the sample store, once each, rendered as `name(col TYPE, …)`.
+    # Every table in the sample store, once each, rendered as `schema.name(col TYPE, …)`.
     assert len(lines) == len(set(lines)) == 11
-    assert any(line.startswith("orders(") and "status string" in line for line in lines)
+    assert any(line.startswith("main.orders(") and "status string" in line for line in lines)
+
+
+def test_the_schema_qualifies_every_table_that_declares_one(monkeypatch):
+    """The rendered schema is the entire vocabulary the generator gets, so a table rendered bare is
+    a statement written bare — which on a profile whose schema is not on the connection's search
+    path errors on every item and reads as a model regression. The sqlite sample cannot show it,
+    so this is asserted over the rendering alone.
+
+    Qualifying also fixes the dedup: two same-named tables in two schemas are two tables, and a
+    key on the bare name silently kept one of them."""
+    bundles = {
+        "billing": {"tables": {"invoices": {
+            "name": "invoices", "schema": "billing",
+            "columns": [{"name": "id", "type": "integer"}],
+        }}},
+        "reporting": {"tables": {"invoices": {
+            "name": "invoices", "schema": "reporting",
+            "columns": [{"name": "id", "type": "integer"}],
+        }}},
+        # A model that declares no schema — the repo's convention renders the bare name.
+        "staging": {"tables": {"drafts": {
+            "name": "drafts", "schema": None,
+            "columns": [{"name": "id", "type": "integer"}],
+        }}},
+    }
+    monkeypatch.setattr(
+        run_golden_eval.runtime, "list_subject_areas", lambda org: [
+            {"name": name} for name in bundles
+        ]
+    )
+    monkeypatch.setattr(
+        run_golden_eval.loader, "get_subject_area_bundle", lambda org, area: bundles[area]
+    )
+
+    lines = run_golden_eval._schema_text(object()).splitlines()
+
+    assert lines == [
+        "billing.invoices(id integer)",
+        "reporting.invoices(id integer)",
+        "drafts(id integer)",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -587,16 +835,40 @@ def test_the_skill_routes_authoring_to_the_shared_shape():
 
 
 def test_the_summary_names_the_unscored_count():
-    """A dataset whose relative windows have outrun its data must not read as a clean run."""
-    assert "unscored" in SKILL
-    assert "Unscored" in SKILL  # its own section, not just a number in the summary line
+    """A dataset whose relative windows have outrun its data must not read as a clean run.
+
+    Asserted on the summary TEMPLATE rather than on the file, because the criterion is that the
+    count appears beside the failure count. Deleting it from the template left the word elsewhere
+    in the file and a check for the word alone stayed green."""
+    summary_line = next(
+        line for line in SKILL.splitlines() if line.startswith("Ran <dataset> on <profile>:")
+    )
+
+    assert "unscored" in summary_line
+    assert "Unscored" in SKILL  # …and its own section, not only a number in the summary line
 
 
 def test_the_skill_separates_the_unconfirmed_from_the_failures():
     """They ran and they reported and they can never gate, so a reader who scans the failures must
-    not find one of these in the list."""
+    not find one of these in the list.
+
+    "Visibly apart" is an ORDERING claim, so the assertion is on the order: a 3e that had been
+    moved above the failures section still contained every phrase a presence check looked for."""
     assert "can never gate" in SKILL
-    assert "### 3e" in SKILL  # a section of their own, visibly after the ones that can
+    assert SKILL.index("### 3e") > SKILL.index("### 3b")
+
+
+def test_the_skill_says_a_dataset_with_nothing_confirmed_gates_on_nothing():
+    """The state most profiles are actually in. The run is worth having and its verdict rests on
+    nothing, and only the skill can say so — the payload's counts do not say it by themselves."""
+    assert "has no confirmed cases" in SKILL
+    assert "rests on nothing" in SKILL
+
+
+def test_the_skill_says_what_to_do_when_the_model_cannot_be_read():
+    """One of the three ways the run path refuses before anything runs, so the cheat sheet carries
+    it beside the other two."""
+    assert "cannot read the semantic model" in SKILL
 
 
 def test_the_skill_forbids_pasting_sql():
@@ -637,6 +909,17 @@ def test_invocation_conventions_lists_the_skill():
     reachable only by someone who already knows the name."""
     assert "| agami-eval |" in CONVENTIONS
     assert "`/agami-eval`" in CONVENTIONS
+
+
+def test_the_routing_triggers_are_the_skills_own():
+    """The table header says the triggers come from `when_to_use`, so a phrase in the row that the
+    frontmatter does not carry routes nothing — it reads as a trigger and is not one."""
+    row = next(line for line in CONVENTIONS.splitlines() if line.startswith("| agami-eval |"))
+    quoted = re.findall(r'"([^"]+)"', row)
+
+    assert quoted, "the agami-eval row no longer quotes any trigger phrase"
+    for phrase in quoted:
+        assert phrase in FRONTMATTER
 
 
 def test_invocation_conventions_count_matches_the_directory():

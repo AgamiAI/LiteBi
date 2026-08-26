@@ -77,10 +77,10 @@ A run costs one model call plus one query per case, so tell the user what they a
 ### 3a — Summary line first
 
 ```
-Ran <dataset> on <profile>: <F> failed, <E> errored, <U> unscored, <C> unconfirmed, <P> passed — run completed: <yes | no>.
+Ran <dataset> on <profile>: <sections.failure> failed, <sections.error> errored, <sections.unscored> unscored, <sections.unconfirmed> unconfirmed, <sections.pass> passed — run completed: <yes | no>.
 ```
 
-`<F>`…`<P>` are `summary.sections`; `completed` is `summary.completed`. **A verdict is not "zero failures".** `gating_failures` counts items that were *scored*, so a run in which every generation errored has zero of them and is not green — and a run that stopped partway reports only the cases it reached. Read `completed`, `gating_failures` and `errored` together, and if `completed` is false say so on this line and again below: *"The run stopped partway — `<N>` cases were never attempted, so this is not a clean result."*
+Each placeholder names its own key under `summary.sections`; `completed` is `summary.completed`. The keys are spelled out because the payload also carries top-level `summary.failed` and `summary.errored` and **they are different numbers** — an unconfirmed miss counts in `failed` and is rendered under 3e, so a run can report `failed: 2` beside one failure row. **A verdict is not "zero failures".** `gating_failures` counts items that were *scored*, so a run in which every generation errored has zero of them and is not green — and a run that stopped partway reports only the cases it reached. Read `completed`, `gating_failures` and `errored` together, and if `completed` is false say so on this line and again below: *"The run stopped partway — `<N>` cases were never attempted, so this is not a clean result."*
 
 ### 3b — Failures (lead with what did not pass)
 
@@ -143,7 +143,9 @@ Two different things, and they must not share a table.
 | payments-count | did not match the answer key (accuracy 0.00) |
 ```
 
-These ran and were scored, and **they can never gate a run** — nobody has confirmed their answer key, so failing a run on one would be gating on an unreviewed answer. Keep them under their own heading, after the failures, so a reader scanning for what broke never picks one up.
+These ran and **they can never gate a run** — nobody has confirmed their answer key, so failing a run on one would be gating on an unreviewed answer. Keep them under their own heading, after the failures, so a reader scanning for what broke never picks one up.
+
+Most of them were also scored, but not all: an unconfirmed item can come back `unscored` like any other (both sides empty, say), and then `accuracy` is `null` rather than a number. Read `status` before you render a score — write *"nothing could be compared"* rather than the `(accuracy 0.00)` the template shows.
 
 ### 3f — Passes, then the drill-down
 
@@ -182,6 +184,8 @@ End the turn.
 | `--list` returns no datasets | One line: "This profile has no golden datasets yet — the first one goes in `<datasets_dir>/<name>.yaml`." Point at `shared/golden-dataset-shape.md` and stop. Don't write one. |
 | The dataset has 0 confirmed items | Say the verdict will rest on nothing (Phase 1), then run if they want. Every case reports; none can gate. |
 | `agami-eval: cannot run this profile — …no storage connection…` | The preflight stop: the model declares no storage connection, so no dialect can be resolved and nothing can execute. Route to `/agami-connect` to finish the profile. Nothing ran; this is not a failing eval. |
+| `agami-eval: cannot read the semantic model…` / `…does not parse…` | The model is missing or broken, so the generator has no tables to write against. Route to `/agami-connect` to build or rebuild it. Nothing ran; this is not a failing eval, and don't try to repair the YAML from here. |
+| `agami-eval: the verdicts are below, but…could not be written` | The run finished and its JSON artifact did not land — usually a permissions problem on `<artifacts_dir>/local/eval/<profile>/`. Report the verdicts normally, and say there is no drill-down file for this run rather than pointing at an empty `artifact`. |
 | Every item says *"the generator command could not be started on this machine"* | The generator is the `claude` client and it is not on this PATH (or not on the PATH of whatever shell ran the script). Nothing was scored — report it as a broken run, not a red one. |
 | `completed: false` | The run stopped partway: the cases after the stop were never attempted and are absent from `items`. Say so on the summary line, and don't compare the counts to a previous run. |
 | Credentials missing | The run fails at execution, not generation, so items come back scored-as-errors in bulk. Check `<artifacts_dir>/local/credentials` per Phase 0.2 and re-invoke `/agami-connect` if it's absent. |

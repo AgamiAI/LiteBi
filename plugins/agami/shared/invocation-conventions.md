@@ -9,7 +9,7 @@ agami ships eight skills, all prefixed `agami-` to avoid colliding with Claude C
 | agami-model | `/agami-model` | "open the model explorer", "show me the model", "exclude a table", "remove this column" — AND review/sign-off: "open the review dashboard", "review my model", "sign off the metrics", "approve N", "walk the review queue" (its Review tab absorbed the former `/agami-review`) |
 | agami-save-correction | `/agami-save-correction` | "save this as a correction", "remember this", "use this SQL next time" |
 | agami-reconcile | `/agami-reconcile` | "reconcile against my dashboard", "verify these numbers against agami" |
-| agami-eval | `/agami-eval` | "run the evals", "run the golden set", "run the golden dataset", "did anything regress?", "how accurate is agami on my data?" |
+| agami-eval | `/agami-eval` | "run the evals", "run the golden dataset", "score the model against my golden questions", "did anything regress?", "how accurate is agami on my data?" |
 | agami-serve | `/agami-serve` | "set up agami for Claude Desktop", "use agami in the Claude app", "hook up the MCP server", "let me test what my end users would see" |
 | agami-deploy | `/agami-deploy` | "deploy agami", "self-host agami", "set up the agami server for my team", "host agami on a VM" (early access — in testing) |
 

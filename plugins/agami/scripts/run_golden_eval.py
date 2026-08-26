@@ -7,8 +7,10 @@ does three things nothing upstream does: it chooses the dataset, it renders the 
 the generator is given, and it decides what a verdict looks like on a terminal.
 
 **Stdout carries verdicts and never SQL.** Neither the answer key nor the generated statement
-appears in the printed payload, so a terminal that gets pasted into a chat window carries no
-statement with it. Both are written to a JSON artifact instead, beside the run's other output.
+appears in the printed payload — nor the answer key's own column names, which two of the
+comparator's reasons are built out of — so a terminal that gets pasted into a chat window carries
+no statement with it. All of it is written to a JSON artifact instead, beside the run's other
+output.
 
 Unlike the stdlib-only helpers beside it, this one imports the agami-core package: the runner, the
 reader, the chokepoint and the model loader all live there, and re-implementing any of them here
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -41,7 +44,9 @@ try:
     import agami_paths
     import execute_sql
     import tools
+    from pydantic import ValidationError
     from semantic_model import loader, runtime
+    from semantic_model.comparator import ItemScore
     from semantic_model.golden import GoldenDataset, load_golden_datasets
     from semantic_model.golden_run import ClaudeCliGenerator, GoldenRunResult, run_golden_dataset
     from semantic_model.models import Datasource
@@ -97,13 +102,22 @@ def _schema_text(org: Datasource) -> str:
     off disk. Built in-process rather than by shelling out to the `sm` CLI, whose `areas` and
     `bundle` subcommands are two-line wrappers over exactly these two calls.
 
-    A table that belongs to more than one subject area is rendered once: the generator is being
-    given a vocabulary, and the same table twice reads as two of them.
+    Every table is named the way the rest of the repo names one — `schema.table` where the model
+    declares a schema, the bare name where it does not. This string is the whole of the vocabulary
+    the generator is given, so a bare name here is an unqualified statement there: on a profile
+    whose schema is not on the connection's search path every item would error, and the run would
+    read as a model regression rather than as a wiring bug.
+
+    A table that belongs to more than one subject area is rendered once, keyed on that qualified
+    name: the generator is being given a vocabulary, the same table twice reads as two of them, and
+    two same-named tables in two schemas really are two.
     """
     tables: dict[str, str] = {}
     for area in runtime.list_subject_areas(org):
         bundle = loader.get_subject_area_bundle(org, area["name"])
-        for name, table in bundle["tables"].items():
+        for table in bundle["tables"].values():
+            schema = table.get("schema")
+            name = f"{schema}.{table['name']}" if schema else table["name"]
             if name in tables:
                 continue
             columns = ", ".join(
@@ -114,13 +128,57 @@ def _schema_text(org: Datasource) -> str:
     return "\n".join(tables.values())
 
 
+# The second reason built from an answer-key column name, and the one that carries no structured
+# field to rebuild it from: `shape` pairs columns positionally and quotes the golden side's name.
+# Matched rather than reconstructed, because the name belongs in the artifact and it is only this
+# surface that refuses it.
+_TYPED_COLUMN_REASON = re.compile(r"^column .+ does not carry the type the answer key does$")
+_TYPED_COLUMN_SAFE = "a column does not carry the type the answer key does"
+
+
+def _safe_reason(score: ItemScore) -> str:
+    """One item's `reason`, with the answer key's column names taken out of it.
+
+    Two of the comparator's reasons are built from the aliases the author wrote in `expected.sql`,
+    and this payload is read straight into a chat table — so a mismatch would put the answer key's
+    vocabulary in a transcript that is promised no SQL. A count says the same actionable thing:
+    the answer key asked for something the generated result does not carry. The artifact keeps the
+    score whole, names included, which is where a drill-down reads them from.
+    """
+    unmatched = score.unmatched_golden_columns
+    if unmatched:
+        verb = "has" if len(unmatched) == 1 else "have"
+        return (
+            f"{len(unmatched)} of the answer key's columns {verb} no counterpart in the "
+            "generated result"
+        )
+    return _TYPED_COLUMN_SAFE if _TYPED_COLUMN_REASON.match(score.reason) else score.reason
+
+
 def _finding_lines(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The three fields a reader acts on. `severity` and `suggestion` belong to the validator's own
-    surfaces, and repeating them here would make this payload a second rendering of a finding."""
+    """The three fields a reader acts on, the message cut to its first line.
+
+    `severity` and `suggestion` belong to the validator's own surfaces, and repeating them here
+    would make this payload a second rendering of a finding.
+
+    The first line only, because a YAML parse error carries the offending source line back inside
+    its own text — and on a golden dataset that line is the answer key. `code` and `locator` are
+    what tells a dataset breakage apart from a scored failure, so both stay whole.
+    """
     return [
-        {"code": finding["code"], "message": finding["message"], "locator": finding["locator"]}
+        {
+            "code": finding["code"],
+            "message": finding["message"].split("\n", 1)[0],
+            "locator": finding["locator"],
+        }
         for finding in findings
     ]
+
+
+def _datasets_dir(profile: str) -> Path:
+    """Where a profile's datasets live. Named in both refusals a caller can hit, so it is composed
+    once — two spellings of this path would be two answers to "where do I put one"."""
+    return agami_paths.profile_dir(profile) / "golden_datasets"
 
 
 def _list_payload(profile: str) -> dict[str, Any]:
@@ -133,7 +191,7 @@ def _list_payload(profile: str) -> dict[str, Any]:
     datasets, findings = load_golden_datasets(profile)
     return {
         "profile": profile,
-        "datasets_dir": str(agami_paths.profile_dir(profile) / "golden_datasets"),
+        "datasets_dir": str(_datasets_dir(profile)),
         "datasets": [
             {
                 "name": dataset.name,
@@ -151,13 +209,16 @@ def _list_payload(profile: str) -> dict[str, Any]:
     }
 
 
-def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[GoldenDataset]:
+def _pick(
+    datasets: list[GoldenDataset], wanted: Optional[str], datasets_dir: Path
+) -> Optional[GoldenDataset]:
     """The dataset to run, or None having said on stderr why there is not one.
 
     A bare invocation against a single dataset is the common case and needs no argument. Against
     several it stops: choosing for the person would run the wrong dataset silently, and asking them
     which one is the skill's job rather than this helper's. Every refusal names what is present,
-    because a name is what the next invocation needs.
+    because a name is what the next invocation needs — and when nothing is present, the directory
+    to create instead, which is the only thing a caller can act on from there.
     """
     names = ", ".join(dataset.name for dataset in datasets)
     if wanted is not None:
@@ -166,7 +227,10 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
                 return dataset
         _stop(f"no golden dataset named {wanted!r}. Datasets present: {names or 'none'}")
     elif not datasets:
-        _stop("this profile has no golden datasets to run")
+        _stop(
+            "this profile has no golden datasets to run. The first one goes in "
+            f"{datasets_dir}/<name>.yaml"
+        )
     elif len(datasets) > 1:
         _stop(f"name a dataset with --dataset. Datasets present: {names}")
     else:
@@ -177,17 +241,6 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
 def _stop(reason: str) -> None:
     """Say why the run cannot start. One prefix everywhere, so a caller can strip it."""
     print(f"agami-eval: {reason}", file=sys.stderr)
-
-
-def _summary(result: GoldenRunResult) -> dict[str, Any]:
-    """The runner's own counters plus `completed`, which is not derivable from them.
-
-    All three of the values a verdict rests on are here — `completed`, `gating_failures` and
-    `errored` — because the runner's docstring says a caller reads all three: a generator that
-    raised truncates the outcomes, so the items after it are absent and the counts alone would
-    read as a clean run.
-    """
-    return {**result.as_dict()["summary"], "completed": result.completed}
 
 
 def _section_counts(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -229,8 +282,11 @@ def _write_artifact(
         "items": [
             {
                 "item_key": outcome.item_key,
-                "question": questions.get(outcome.item_key, ""),
-                "expected_sql": keys.get(outcome.item_key, ""),
+                # Indexed rather than defaulted: both dicts are built from the same `test_cases`
+                # the run was handed, and a key that stopped resolving should say so rather than
+                # write an artifact with an empty question in it.
+                "question": questions[outcome.item_key],
+                "expected_sql": keys[outcome.item_key],
                 "generated_sql": outcome.generated_sql,
                 "score": outcome.as_dict()["score"],
             }
@@ -249,18 +305,18 @@ def _write_artifact(
 
 
 def _run_payload(result: GoldenRunResult, questions: dict[str, str]) -> dict[str, Any]:
-    """The verdicts, in presentation order, with no statement anywhere in them."""
+    """The verdicts, in presentation order, with no statement and no column of one in them."""
     items = [
         {
             "section": _section(outcome),
             "item_key": outcome.item_key,
-            "question": questions.get(outcome.item_key, ""),
+            "question": questions[outcome.item_key],
             "confirmed": outcome.confirmed,
             "passed": outcome.passed,
             "gated": outcome.gated,
             "status": outcome.score.status,
             "accuracy": outcome.score.accuracy,
-            "reason": outcome.score.reason,
+            "reason": _safe_reason(outcome.score),
             "golden_row_count": outcome.score.golden_row_count,
             "generated_row_count": outcome.score.generated_row_count,
             "gates": outcome.claims["gates"] if outcome.claims else [],
@@ -270,7 +326,15 @@ def _run_payload(result: GoldenRunResult, questions: dict[str, str]) -> dict[str
     # Stable within a section, so items keep the order their author wrote them in.
     items.sort(key=lambda item: _SECTION_ORDER.index(item["section"]))
     return {
-        "summary": {**_summary(result), "sections": _section_counts(items)},
+        "summary": {
+            # The runner's own counters, plus `completed`, which is not derivable from them: a
+            # generator that raised truncates the outcomes, so the items after it are absent and
+            # the counts alone would read as a clean run. All three of the values a verdict rests
+            # on — `completed`, `gating_failures` and `errored` — are therefore here.
+            **result.as_dict()["summary"],
+            "completed": result.completed,
+            "sections": _section_counts(items),
+        },
         "items": items,
         "findings": _finding_lines(list(result.findings)),
     }
@@ -293,16 +357,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     datasets, findings = load_golden_datasets(args.profile)
-    dataset = _pick(datasets, args.dataset)
+    dataset = _pick(datasets, args.dataset, _datasets_dir(args.profile))
     if dataset is None:
         return _CANNOT_START
 
-    org_model = loader.load_datasource(agami_paths.profile_dir(args.profile))
+    # Reading the model and resolving its dialect are the three raises this path reaches, and
+    # everything below them is total. None of them is relayed as a stack: a traceback prints the
+    # absolute artifacts path, which encodes the tenant in a hosted deployment and which every
+    # other refusal here withholds.
     try:
+        org_model = loader.load_datasource(agami_paths.profile_dir(args.profile))
         dialect = resolve_datasource_dialect(org_model)
+    except FileNotFoundError:
+        _stop(
+            f"cannot read the semantic model for profile {args.profile!r} — "
+            "run agami-connect to build one"
+        )
+        return _CANNOT_START
+    except ValidationError as exc:
+        # The count and not the text: pydantic's own message quotes the value that failed back,
+        # and here that value is a piece of the tenant's model.
+        _stop(
+            f"the semantic model for profile {args.profile!r} does not parse "
+            f"({exc.error_count()} problem(s)) — agami-connect can rebuild it"
+        )
+        return _CANNOT_START
     except DialectUnresolved as exc:
-        # The one unguarded raise on this path: everything below it is total. Its message is
-        # value-free by contract, so it is relayed as the preflight reason rather than as a stack.
+        # This one's message is value-free by contract, so it is relayed as the preflight reason.
         _stop(f"cannot run this profile — {exc}")
         return _CANNOT_START
 
@@ -322,7 +403,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     questions = {item.item_key: item.query for item in dataset.test_cases}
     keys = {item.item_key: item.expected.sql or "" for item in dataset.test_cases}
     payload = _run_payload(result, questions)
-    payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"]))
+    try:
+        payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"]))
+    except OSError as exc:
+        # The run is already paid for — a model call and up to two warehouse queries per case — so
+        # a directory it cannot write to costs the drill-down and nothing else. The verdicts print
+        # either way. The path is not relayed, for the reason the preflight guards give.
+        payload["artifact"] = ""
+        _stop(
+            "the verdicts are below, but this run's artifact could not be written "
+            f"({exc.__class__.__name__}: {exc.strerror or 'cannot be written'})"
+        )
     print(json.dumps(payload, indent=2))
     return 0
 
