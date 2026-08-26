@@ -329,7 +329,7 @@
 
     function renderCounts() {
       const counts = document.getElementById("counts");
-      const s = RUN.summary || {};
+      const s = RUN.summary;
       // Straight from the run's own summary. Nothing here recounts the items: the run decides
       // what it did, and this page only shows it.
       [
@@ -349,7 +349,7 @@
 
     function renderBanners() {
       const banners = document.getElementById("banners");
-      const s = RUN.summary || {};
+      const s = RUN.summary;
       if (!s.verified) {
         banners.appendChild(el("div", { class: "banner" }, [
           el("strong", { text: "This run verified nothing. " }),

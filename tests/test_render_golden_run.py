@@ -35,6 +35,16 @@ from render_golden_run import render  # noqa: E402
 PLACEHOLDER_RE = re.compile(r"\{\{[A-Z_]+\}\}")
 RENDERER = REPO_ROOT / "plugins" / "agami" / "scripts" / "render_golden_run.py"
 
+# The template's own source. Several assertions below are over this text rather than over a rendered
+# DOM, and that is the ceiling of what this repository tests rather than laziness: the page builds
+# every element in JavaScript, there is no browser in this suite, and adding one to assert a heading
+# exists would be a dependency out of all proportion to the claim. So the drawing code is pinned by
+# its markup — that the call site is there, and in the right order — which is what a mutation of the
+# renderer would take out. The sibling `test_render_examples_validation.py` has the same ceiling.
+TEMPLATE = (REPO_ROOT / "plugins" / "agami" / "shared" / "golden-run-template.html").read_text(
+    encoding="utf-8"
+)
+
 # Planted in the two statements so "both statements are rendered" is an assertion rather than an
 # inspection, the way the eval helper's own tests plant them to assert the opposite about stdout.
 GOLDEN_SENTINEL = "goldensentinelzzq"
@@ -149,6 +159,14 @@ def _mixed() -> list[dict[str, Any]]:
             question="How many payments have been taken?",
             score={"status": "scored", "accuracy": 0.0, "reason": "no row matched"},
         ),
+        # The one case where the score and the verdict disagree on purpose: every row agreed, and
+        # the statement still did not answer the question the dataset requires. It is the only path
+        # on which a genuine 1.000 is printed beside "Did not reproduce the answer key".
+        _item(
+            item_key="orders-by-status-scoped", section="failure", passed=False, gated=True,
+            question="How many orders are there, by status?",
+            score={"status": "scored", "accuracy": 1.0, "reason": "every row matched"},
+        ),
         _item(),
     ]
 
@@ -254,7 +272,12 @@ def test_the_header_reports_the_runs_own_counts():
 
     assert summary["passed"] == 41 and summary["failed"] == 42
     assert summary["unscored"] == 43 and summary["errored"] == 44
-    assert summary["total"] == 5
+    assert summary["total"] == 6
+    # Exactly what the header draws, plus the two things no count says. A whitelist that carried a
+    # name nothing on the page reads would not be doing the job the projection exists for.
+    assert set(summary) == {
+        "total", "passed", "failed", "unscored", "errored", "completed", "sections", "verified",
+    }
 
 
 def test_a_run_that_confirmed_nothing_does_not_read_as_a_clean_pass():
@@ -268,8 +291,11 @@ def test_a_run_that_confirmed_nothing_does_not_read_as_a_clean_pass():
 
     assert _payload(drafted)["summary"]["verified"] is False
     assert _payload(render(title="x", profile="demo", run=signed_off))["summary"]["verified"] is True
-    # …and the page says what that means, in the words the skill already uses for it.
-    assert "rests on nothing" in drafted
+    # …and the page says what that means, in the words the skill already uses for it. Asserted over
+    # the template rather than over the rendered file, because the banner's words are in the file
+    # whether or not the banner is drawn: what is worth pinning is that the flag draws it.
+    assert "if (!s.verified)" in TEMPLATE
+    assert "rests on nothing" in TEMPLATE
 
 
 def test_a_run_that_stopped_partway_says_so():
@@ -278,7 +304,9 @@ def test_a_run_that_stopped_partway_says_so():
     stopped = render(title="x", profile="demo", run=_run([_item()], completed=False))
 
     assert _payload(stopped)["summary"]["completed"] is False
-    assert "stopped" in stopped
+    # Over the template, for the reason the banner above gives: the sentence ships in every report.
+    assert "if (!s.completed)" in TEMPLATE
+    assert "The run stopped partway. " in TEMPLATE
 
 
 # --- Per item -------------------------------------------------------------
@@ -288,7 +316,7 @@ def test_every_item_carries_its_question_and_verdict():
     html = render(title="x", profile="demo", run=_run(_mixed()))
 
     items = _payload(html)["items"]
-    assert len(items) == 5
+    assert len(items) == 6
     for item in items:
         assert item["question"] and item["status"] and item["reason"]
         assert item["section"] in SECTIONS
@@ -374,6 +402,42 @@ def test_the_table_set_delta_is_rendered_above_the_statements():
     assert items["products-count"]["tables"] is None
 
 
+def test_a_claim_that_is_not_a_list_of_names_cannot_reach_the_page():
+    """Each side of the claim is joined into a sentence by the page. A bare string arriving where a
+    list was promised makes that join undefined, throws, and — since the whole body is built by that
+    script — leaves the report blank with no error on it. Nothing on this side of the handoff
+    enforces the comparator's shape, so the projection coerces instead of trusting it."""
+    run = _run([_item(claims={"claims": [{
+        "name": "tables", "status": "differs",
+        "generated": ["orders", ["nested", "list"], {"a": 1}, None, 7],
+        "golden": "customers",
+    }]})])
+
+    tables = _payload(render(title="x", profile="demo", run=run))["items"][0]["tables"]
+
+    assert tables["generated"] == ["orders", "7"]
+    assert tables["golden"] == []
+    assert "nested" not in json.dumps(tables)
+
+
+def test_a_gated_item_shows_a_perfect_score_beside_a_failing_verdict():
+    """The one case where the score and the verdict disagree, and the reason the page never derives
+    one from the other: every row agreed, so the accuracy really is 1.0, and the statement still did
+    not write the filter the dataset requires. A renderer that recomputed `passed` from the accuracy
+    would turn this run's only real failure into a pass."""
+    items = {
+        item["item_key"]: item
+        for item in _payload(render(title="x", profile="demo", run=_run(_mixed())))["items"]
+    }
+
+    gated = items["orders-by-status-scoped"]
+    assert gated["accuracy"] == 1.0 and gated["passed"] is False
+    assert gated["gated"] is True and gated["section"] == "failure"
+    # …and the page says which of the two it is, rather than leaving a reader to reconcile them.
+    assert "if (item.gated)" in TEMPLATE
+    assert "the dataset requires a filter this statement does not write" in TEMPLATE
+
+
 def test_the_sections_keep_the_order_the_run_wrote_them_in():
     """The run and the skill share one presentation order, and its own comment says the report
     reads the same one so the two cannot disagree. So the renderer takes the order from the run
@@ -387,6 +451,21 @@ def test_the_sections_keep_the_order_the_run_wrote_them_in():
     assert list(payload["summary"]["sections"]) == [
         "pass", "failure", "error", "unscored", "unconfirmed"
     ]
+
+
+def test_a_case_under_a_section_the_summary_never_listed_still_reaches_the_page():
+    """A report that silently described fewer cases than ran would be worse than a fallback nobody
+    reaches. The runner's own summary always names every section, so this cannot come from it — but
+    `--items-file` is a public argument taking JSON somebody else wrote, and a hand-edited run is a
+    real input."""
+    run = _run([_item(item_key="hand-edited", section="rewritten-by-hand")])
+    run["summary"]["sections"] = {"pass": 1}
+
+    payload = _payload(render(title="x", profile="demo", run=run))
+
+    assert payload["items"][0]["section"] == "rewritten-by-hand"
+    # And the page draws it under a heading of its own rather than filtering it away.
+    assert 'el("h2", { text: "Other" })' in TEMPLATE
 
 
 # --- The two sizes --------------------------------------------------------
@@ -421,11 +500,15 @@ def test_a_run_with_no_items_still_renders():
 # --- The substitutions ----------------------------------------------------
 
 def test_the_title_the_profile_and_the_dataset_reach_the_page():
+    """The profile is drawn from its own placeholder, so it is asserted there and carried in the
+    payload nowhere — a second copy of it would be a value the page never reads."""
     html = render(title="Golden run · orders · demo", profile="demo", run=_run([_item()]))
 
     assert "Golden run · orders · demo" in html
+    assert "profile <code>demo</code>" in html
     payload = _payload(html)
-    assert payload["profile"] == "demo" and payload["dataset"] == "orders"
+    assert payload["dataset"] == "orders"
+    assert "profile" not in payload
 
 
 def test_a_placeholder_written_into_a_question_is_not_substituted_into():
@@ -451,3 +534,58 @@ def test_a_run_that_is_not_an_object_is_refused():
     a renderer that half-read one would produce a page describing nothing."""
     with pytest.raises(ValueError, match="run"):
         render(title="x", profile="demo", run=[_item()])  # type: ignore[arg-type]
+
+
+# --- What the template actually draws -------------------------------------
+#
+# Everything above reads the payload the page is built from. That is most of what there is to
+# assert in a repository with no browser in its test suite — but on its own it is a ceiling worth
+# naming: a template that drew an empty div would satisfy every one of those assertions, because
+# the payload would still be embedded in the file. So the drawing code is pinned by its own markup:
+# that each call site is present, and that the ones whose order carries meaning are in that order.
+# It is not a substitute for a rendered DOM; it is the check that fails when the drawing is gutted.
+
+def _css_rule(selector: str) -> str:
+    """One CSS rule's declarations, by exact selector."""
+    match = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", TEMPLATE)
+    assert match, f"{selector} is no longer a rule in the template"
+    return match.group(1).strip()
+
+
+def test_the_template_draws_both_statements_on_every_case():
+    """The two statements side by side are the whole reason the page exists, and they are drawn in
+    one place — a case built without them would still carry them in the payload and show neither."""
+    assert 'statement("Answer key", item.expected_sql' in TEMPLATE
+    assert 'statement("Generated", item.generated_sql' in TEMPLATE
+    assert 'class: "statements"' in TEMPLATE
+
+
+def test_the_template_draws_the_question_the_verdict_and_the_delta_for_a_case():
+    """One case is a question, what the run decided about it, the table-set difference and the two
+    statements. The delta is between the verdict and the statements on purpose: "generated read one
+    table and the answer key read another" is usually the whole finding, so it is read before them
+    rather than spotted inside them."""
+    assert 'class: "question", text: item.question' in TEMPLATE
+    assert 'text: SECTION_LABEL[item.section] || item.section' in TEMPLATE
+
+    verdict = TEMPLATE.index("verdictLine(item),")
+    delta = TEMPLATE.index("deltaLine(item),")
+    statements = TEMPLATE.index('el("div", { class: "statements" }')
+    assert verdict < delta < statements
+
+
+def test_the_page_draws_its_banners_its_counts_and_its_sections():
+    """The three calls that put anything on the page at all. Without them the file still parses,
+    still carries the whole run, and renders an empty box."""
+    for call in ("renderBanners();", "renderCounts();", "renderSections();"):
+        assert call in TEMPLATE
+
+
+def test_an_unscored_case_and_an_errored_case_do_not_look_alike():
+    """They are told apart in the payload above; this is the half of that claim a reader sees. Both
+    carry a null accuracy and neither is a failure, so if their pills were styled the same the page
+    would show one thing where the run recorded two."""
+    unscored, errored = _css_rule(".pill.unscored"), _css_rule(".pill.error")
+
+    assert unscored and errored
+    assert unscored != errored

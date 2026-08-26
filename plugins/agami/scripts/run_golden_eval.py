@@ -67,8 +67,7 @@ import _agami_lib  # noqa: E402
 _agami_lib.ensure_importable()
 
 # The report renderer is a sibling script and stdlib-only, so it is imported plainly: it has none
-# of the dependencies the guard below exists for, and a run that could not render is a run that
-# still has its verdicts.
+# of the dependencies the guard below exists for.
 import render_golden_run
 
 try:
@@ -744,7 +743,9 @@ def _write_report(joined: dict[str, Any], stamp: str) -> Path:
 
     Rendered here rather than left to a later, manual step, because the closing line of a run is
     what points at it — an unrendered report is one nobody finds. The renderer is a sibling script
-    and stdlib-only; what it can show is what this artifact wrote down.
+    and stdlib-only; what it can show is what this artifact wrote down. And a run that could not
+    render is a run that still has its verdicts, which is why the caller catches the failure here
+    rather than letting it end the run.
     """
     path = _run_dir(joined["profile"]) / f"{stamp}.html"
     path.write_text(

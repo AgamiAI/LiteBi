@@ -255,9 +255,13 @@ def test_a_real_run_writes_a_report_with_both_statements_and_no_rows(
     report behind — in the profile's own eval directory, carrying the confirmed answer key beside
     the generated statement, which is the pair a failure is read from.
 
-    And the rule that goes with it: the rows both statements returned are not on the page. Asserted
-    against the values the sample store really holds rather than against a fixture, because a
-    projection that quietly started passing an item through would show them here.
+    And the rule that goes with it: what the comparator read off the two result sets is not on the
+    page. The rows themselves never reach a `GoldenRunResult` — the comparator reduces them where
+    they are read — so asserting their absence here would assert nothing;
+    `test_no_result_row_reaches_the_report` in the renderer's own suite is that guard. What a real
+    run does carry is the row counts and the column names the comparator wrote down, and the
+    report's projection drops those too, so a projection that quietly started passing an item
+    through shows up here.
     """
     # Imported here rather than at the top of the file: every other test in it drives the runner
     # directly, and the helper is the one thing this test adds.
@@ -283,10 +287,11 @@ def test_a_real_run_writes_a_report_with_both_statements_and_no_rows(
     assert "SELECT COUNT(id) AS n FROM orders" in html            # what the model wrote
     assert COUNT_QUESTION in html
     with sqlite3.connect(warehouse) as db:
-        statuses = [row[0] for row in db.execute("SELECT DISTINCT status FROM orders")]
-    assert statuses, "the sample store no longer has statuses to check against"
-    for status in statuses:
-        assert status not in html
+        (statuses,) = db.execute("SELECT COUNT(DISTINCT status) FROM orders").fetchone()
+    artifact = json.loads(Path(payload["artifact"]).read_text(encoding="utf-8"))
+    scored = {item["item_key"]: item for item in artifact["items"]}
+    assert scored["orders-by-status"]["score"]["golden_row_count"] == statuses
+    assert "golden_row_count" not in html and "unmatched_golden_columns" not in html
 
 
 def test_the_run_is_json_and_carries_no_filesystem_path(profile, tmp_path):

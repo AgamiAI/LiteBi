@@ -59,7 +59,13 @@ _NEARLY_ONE = 1.0 - 10.0 ** -_ACCURACY_DECIMALS
 
 # The counts the header reads. Taken from the run's own summary and never recounted from the
 # items: a report that recomputed one would be a second place that decides what a run looks like.
-_SUMMARY_COUNTS = ("total", "passed", "failed", "unscored", "errored", "gating_failures")
+# Exactly the five tiles the page draws — a name here that nothing reads is a value reaching the
+# file for no reason, which is the opposite of what a whitelist is for.
+_SUMMARY_COUNTS = ("total", "passed", "failed", "unscored", "errored")
+
+# What one side of the table-set claim may carry through. The page joins these into a sentence with
+# `Array.join`, so anything else is a broken page rather than a wrong word.
+_SCALAR = (str, int, float)
 
 
 def _shown(accuracy: float) -> float:
@@ -72,6 +78,20 @@ def _shown(accuracy: float) -> float:
     if accuracy >= 1.0:
         return round(accuracy, _ACCURACY_DECIMALS)
     return min(round(accuracy, _ACCURACY_DECIMALS), _NEARLY_ONE)
+
+
+def _names(value: Any) -> list[str]:
+    """One side of the table-set claim, flattened to the strings the page prints.
+
+    The claim is written by the statement comparator and its shape is promised by a docstring, not
+    by anything on this side of the handoff. The page joins the list into a sentence, so a bare
+    string arriving where a list was promised makes `.join` undefined, throws, and leaves the whole
+    page blank — the same silent failure a broken payload causes. Anything that is not a scalar is
+    dropped rather than rendered, because a nested structure would print its own punctuation.
+    """
+    if not isinstance(value, list):
+        return []
+    return [str(name) for name in value if isinstance(name, _SCALAR)]
 
 
 def _tables_claim(item: dict) -> Optional[dict[str, Any]]:
@@ -92,8 +112,8 @@ def _tables_claim(item: dict) -> Optional[dict[str, Any]]:
         # calling something else "tables".
         "name": claim.get("name", ""),
         "status": claim.get("status", ""),
-        "generated": claim.get("generated"),
-        "golden": claim.get("golden"),
+        "generated": _names(claim.get("generated")),
+        "golden": _names(claim.get("golden")),
     }
 
 
@@ -165,7 +185,6 @@ def render(
 
     payload = {
         "run_id": run.get("run_id", ""),
-        "profile": run.get("profile", ""),
         "dataset": run.get("dataset", ""),
         "summary": _summary(run, items),
         "items": [_item(item) for item in items],
