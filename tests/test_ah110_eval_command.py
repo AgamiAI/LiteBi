@@ -93,6 +93,24 @@ ONE_FAILURE: dict[str, Any] = {"test_cases": [FAILING_ITEM, PASSING_ITEM]}
 ONLY_UNCONFIRMED: dict[str, Any] = {"test_cases": [UNCONFIRMED_ITEM]}
 
 
+def _tagged(item: dict[str, Any], *tags: str) -> dict[str, Any]:
+    """The same case, carrying tags. A copy, so the untagged datasets above stay untagged."""
+    return {**item, "tags": list(tags)}
+
+
+# The tags overlap on purpose: `smoke` and `revenue` both name the failing case, so a selection of
+# the two has a different size under OR (two cases) than under AND (one) — which is the only way a
+# test can tell the two readings apart. `draft` names the unconfirmed case alone, the selection
+# that runs correctly and can gate on nothing.
+TAGGED: dict[str, Any] = {
+    "test_cases": [
+        _tagged(PASSING_ITEM, "smoke"),
+        _tagged(FAILING_ITEM, "smoke", "revenue"),
+        _tagged(UNCONFIRMED_ITEM, "draft"),
+    ]
+}
+
+
 class _Scripted:
     """The shipped generator's stand-in, constructed the way the script constructs the real one."""
 
@@ -357,3 +375,104 @@ def test_a_failing_run_still_carries_neither_statement(artifacts, scripted, caps
     assert GENERATED_SENTINEL not in rendered
     # …and the stderr the same pipeline log carries is held to the same rule.
     assert GOLDEN_SENTINEL not in err and GENERATED_SENTINEL not in err
+
+
+# ---------------------------------------------------------------------------
+# Selecting a slice of a dataset by tag
+# ---------------------------------------------------------------------------
+
+def test_a_tag_runs_only_the_cases_carrying_it(artifacts, scripted, capsys):
+    """The selection is asserted on what the run actually contains rather than on a printed count:
+    a filter that narrowed nothing and a filter that narrowed correctly say the same thing in a
+    summary line, and differ only in which cases have verdicts."""
+    _write(artifacts, "suite", TAGGED)
+
+    _, payload, _ = _run(capsys, "--dataset", "suite", "--tag", "smoke")
+
+    assert len(payload["items"]) == 2
+    assert {item["item_key"] for item in payload["items"]} == {"orders-count", "customers-count"}
+
+
+def test_two_tags_run_their_union_and_not_their_intersection(artifacts, scripted, capsys):
+    """OR across tags: a suite is the union of the slices asked for. `smoke` and `revenue` overlap
+    on the failing case, so AND would run that one case alone — the count is what separates the two
+    readings, and the intersection is spelled out here so a future change to OR fails loudly."""
+    _write(artifacts, "suite", TAGGED)
+
+    _, payload, _ = _run(capsys, "--dataset", "suite", "--tag", "smoke", "--tag", "revenue")
+
+    keys = {item["item_key"] for item in payload["items"]}
+    assert keys == {"orders-count", "customers-count"}
+    # The case both tags name. Under AND this would be the whole run.
+    assert keys != {"customers-count"}
+
+
+def test_a_tag_no_case_carries_refuses_and_names_the_tags_that_exist(artifacts, scripted, capsys):
+    """A tag nothing carries is a wrong selector, not an empty result, so it is `2` and not a green
+    run over zero cases — a typo in CI would otherwise pass forever. The refusal names the tags the
+    dataset does have, because that list is the whole of what the next invocation needs."""
+    _write(artifacts, "suite", TAGGED)
+
+    code, payload, err = _run(capsys, "--dataset", "suite", "--tag", "smoek")
+
+    assert code == 2
+    assert payload == {}
+    assert "draft" in err and "revenue" in err and "smoke" in err
+
+
+def test_tag_matching_is_case_sensitive(artifacts, scripted, capsys):
+    """Tags are free text the dataset's author wrote, and nothing else that reads them folds case.
+    Matching loosely here would invent a vocabulary the file itself does not have."""
+    _write(artifacts, "suite", TAGGED)
+
+    code, _, _ = _run(capsys, "--dataset", "suite", "--tag", "Smoke")
+
+    assert code == 2
+
+
+def test_a_tag_selecting_only_unconfirmed_cases_is_green_and_says_it_gated_on_nothing(
+    artifacts, scripted, capsys
+):
+    """The confusing pair with the refusal above, and the reason it is tested next to it: this
+    selector was right and the run was fine — there was simply nothing in the slice that could
+    gate. A `2` here would tell CI the harness is broken when nothing is."""
+    _write(artifacts, "suite", TAGGED)
+
+    code, payload, err = _run(capsys, "--dataset", "suite", "--tag", "draft")
+
+    assert code == 0
+    assert [item["item_key"] for item in payload["items"]] == ["payments-count"]
+    assert "gated on nothing" in err
+
+
+def test_a_tag_selecting_a_confirmed_failure_still_exits_one(artifacts, scripted, capsys):
+    """Selecting a slice narrows what runs and changes nothing about how a verdict is reached."""
+    _write(artifacts, "suite", TAGGED)
+
+    code, payload, _ = _run(capsys, "--dataset", "suite", "--tag", "revenue")
+
+    assert code == 1
+    assert [item["item_key"] for item in payload["items"]] == ["customers-count"]
+
+
+def test_no_tag_runs_every_case(artifacts, scripted, capsys):
+    """The default is unchanged: a dataset whose cases carry tags runs whole when none is named."""
+    _write(artifacts, "suite", TAGGED)
+
+    _, payload, _ = _run(capsys, "--dataset", "suite")
+
+    assert len(payload["items"]) == 3
+
+
+def test_a_tag_against_a_dataset_with_no_tags_says_so(artifacts, scripted, capsys):
+    """The state every dataset starts in. There is no list of tags to name, so the refusal says
+    that in words rather than printing an empty one — "Tags present:" followed by nothing reads as
+    a broken message and tells the reader nothing about what to do next."""
+    _write(artifacts, "plain", ONE_FAILURE)
+
+    code, _, err = _run(capsys, "--dataset", "plain", "--tag", "smoke")
+
+    assert code == 2
+    assert "carries a tag at all" in err
+    # The list-shaped half of the refusal is the thing that would have rendered empty.
+    assert "Tags present" not in err

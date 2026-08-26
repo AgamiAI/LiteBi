@@ -25,6 +25,7 @@ Usage:
 
     python3 run_golden_eval.py --profile main --list
     python3 run_golden_eval.py --profile main --dataset orders --timeout-s 120
+    python3 run_golden_eval.py --profile main --dataset orders --tag smoke --tag revenue
 """
 
 from __future__ import annotations
@@ -492,6 +493,40 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
     return None
 
 
+def _select(dataset: GoldenDataset, tags: Optional[list[str]]) -> Optional[GoldenDataset]:
+    """The dataset narrowed to the cases carrying one of `tags`, or None having said why not.
+
+    OR and never AND: a tag names a slice its author wrote, so a suite is the union of the slices
+    asked for. Intersecting them would make every extra `--tag` narrow the run, which is the
+    opposite of what naming a second suite means.
+
+    Matching is CASE-SENSITIVE. `tags` is free text with no vocabulary and no normalization
+    anywhere it is read, so folding case here would invent one that no other reader of the dataset
+    applies — `Smoke` and `smoke` would select the same cases from this helper and different ones
+    from anything else looking at the same file.
+
+    A tag no case carries is a wrong selector rather than an empty result, so it refuses instead of
+    running zero cases green: a typo in a pipeline's arguments would otherwise pass forever. The
+    refusal names the tags that do exist, because that list is what the next invocation needs.
+    """
+    if not tags:
+        return dataset
+    wanted = set(tags)
+    selected = [item for item in dataset.test_cases if wanted.intersection(item.tags)]
+    if not selected:
+        present = sorted({tag for item in dataset.test_cases for tag in item.tags})
+        names = (
+            f"Tags present: {', '.join(present)}"
+            if present
+            else "No case in this dataset carries a tag at all."
+        )
+        _stop(f"no case in {dataset.name!r} carries any of: {', '.join(tags)}. {names}")
+        return None
+    # A copy and not a mutation: the model forbids unknown fields and the caller's dataset is what
+    # the reader handed back, so narrowing in place would edit the record every other reader sees.
+    return dataset.model_copy(update={"test_cases": selected})
+
+
 def _stop(reason: str) -> None:
     """Say why the run cannot start."""
     print(f"{_PREFIX} {reason}", file=sys.stderr)
@@ -656,6 +691,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--list", action="store_true", help="describe the profile's datasets and run nothing"
     )
     parser.add_argument(
+        "--tag",
+        action="append",
+        help="run only the cases carrying this tag; repeatable, and a case carrying any of the "
+        "tags given runs",
+    )
+    parser.add_argument(
         "--timeout-s", type=float, default=120.0, help="how long one generation may take"
     )
     parser.add_argument(
@@ -672,6 +713,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     datasets, findings = load_golden_datasets(args.profile)
     dataset = _pick(datasets, args.dataset)
+    if dataset is None:
+        return _CANNOT_START
+
+    # Before the model is read and long before the generator is reached, so a wrong selector costs
+    # nothing. The selection is applied to the dataset here rather than threaded into the run:
+    # `run_golden_dataset` takes a dataset, an environment and a generator, and widening that
+    # signature with a notion of which cases to skip would make every caller of it carry one.
+    dataset = _select(dataset, args.tag)
     if dataset is None:
         return _CANNOT_START
 
