@@ -10,6 +10,8 @@ But agami works *through* an AI assistant — Claude Code, or Claude Desktop / c
 
 When you use agami locally — the skill scripts plus the on-machine library (the SQL executor and the stdio MCP server) — there is no outbound network call of any kind: no telemetry, no analytics, no install ping. `tests/test_privacy_no_network.py` enforces this: it scans every shipped skill script and the local library modules and fails the build if one gains a `curl` / `requests.post` / socket call. (It deliberately excludes the two **server** modules, `mcp_http` and `oidc` — the self-hosted team server *is* a network service by design; that's the opt-in deploy covered below, not the local path.)
 
+One command sits outside that sentence, and it is worth naming rather than burying: running a **golden-dataset eval** starts your own already-installed AI client as a child process, once per question, to produce the SQL being graded. It is your client, your account and your existing trust decision — agami opens no connection itself, holds no key of its own, and the child is started with no tools, no MCP configuration, and an explicit short list of environment variables that excludes every `AGAMI_*` name and every warehouse credential. Nothing in the query path does this; it happens only when you ask for an eval.
+
 So none of this is ever collected, transmitted, or logged by the local agami path:
 
 - Your credentials, database hostnames, IPs, ports, tokens
@@ -88,4 +90,4 @@ If you [deploy the team server](../deploy/README.md) so your org can share one m
 
 ## No telemetry
 
-agami has **no telemetry** — no usage counts, no events, no install ping, no opt-in or opt-out. Earlier 0.x builds kept a vestigial (never-deployed, never-invoked) telemetry sample client + endpoint in the repo as historical artifacts; those were removed entirely. There is no network call anywhere in agami's codebase, and `tests/test_privacy_no_network.py` fails the build if any script introduces one. If a future version ever added telemetry, it would be opt-in with a full privacy doc — never a silent re-enable.
+agami has **no telemetry** — no usage counts, no events, no install ping, no opt-in or opt-out. Earlier 0.x builds kept a vestigial (never-deployed, never-invoked) telemetry sample client + endpoint in the repo as historical artifacts; those were removed entirely. There is no network **client** anywhere in agami's codebase — nothing it ships opens a socket, and `tests/test_privacy_no_network.py` fails the build if any script introduces one. (The one thing that reaches outward is the golden-dataset eval described above, and it does so by starting *your* AI client as a child process, not by calling anything itself.) If a future version ever added telemetry, it would be opt-in with a full privacy doc — never a silent re-enable.
