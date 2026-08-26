@@ -181,16 +181,22 @@ def render(
     # renderers, because the payload IS SQL.
     run_json = json.dumps(payload).replace("</", "<\\/")
 
+    # The run's JSON goes in LAST, after every other placeholder. The order matters here in a way it
+    # does not in the sibling renderers, and it is deliberate rather than incidental: this payload is
+    # somebody's question and somebody's SQL, so a case asking "how many {{THEME_CSS}} orders?" would
+    # otherwise have the stylesheet spliced into the object literal by a later replace. The JSON then
+    # stops parsing, the script throws at load, and — because the whole body is built by that script
+    # — the report renders blank with nothing anywhere saying why.
     return (
         template
         .replace("{{REPORT_TITLE}}", title)
         .replace("{{GENERATED_AT}}",
                  datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
-        .replace("{{RUN_JSON}}", run_json)
         .replace("{{PROFILE}}", profile or "")
         .replace("{{AGAMI_LOGO_DARK_TEXT}}", logo_dark_svg)
         .replace("{{AGAMI_LOGO_LIGHT_TEXT}}", logo_light_svg)
         .replace("{{THEME_CSS}}", theme_css)
+        .replace("{{RUN_JSON}}", run_json)
     )
 
 

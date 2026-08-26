@@ -428,6 +428,24 @@ def test_the_title_the_profile_and_the_dataset_reach_the_page():
     assert payload["profile"] == "demo" and payload["dataset"] == "orders"
 
 
+def test_a_placeholder_written_into_a_question_is_not_substituted_into():
+    """A question is free text and a statement is somebody's SQL, so either may contain the literal
+    text of another placeholder. The run's JSON is substituted last for exactly this: substituted
+    earlier, a later replace splices a stylesheet into the object literal, the JSON stops parsing,
+    the script throws at load and the report renders blank with nothing on it saying why."""
+    html = render(title="x", profile="demo", run=_run([_item(
+        question="How many {{THEME_CSS}} orders?",
+        generated_sql="SELECT COUNT(*) FROM orders -- {{PROFILE}}",
+    )]))
+
+    # The assertion is that this parses at all; the values are checked so it cannot pass by having
+    # eaten the placeholders instead.
+    item = _payload(html)["items"][0]
+    assert item["question"] == "How many {{THEME_CSS}} orders?"
+    assert item["generated_sql"] == "SELECT COUNT(*) FROM orders -- {{PROFILE}}"
+    assert "profile <code>demo</code>" in html
+
+
 def test_a_run_that_is_not_an_object_is_refused():
     """The `--items-file` handoff is JSON somebody else wrote, and a list is the sibling's shape —
     a renderer that half-read one would produce a page describing nothing."""
