@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<!--
+  agami · golden run report (standalone, read-only)
+
+  Rendered by scripts/render_golden_run.py from one run's JSON artifact. It shows
+  what a run decided, per case: the question, the verdict, the table-set delta,
+  and the confirmed answer key beside the generated statement.
+
+  Two rules this page keeps, both asserted by tests/test_render_golden_run.py:
+    * BOTH statements are shown. Reading them against each other is the whole
+      point; the rule that keeps an answer key off a terminal is about stdout
+      and about what a model's context holds, not about a file on disk.
+    * NO result row is shown. The comparator already reduced them to a score,
+      and a self-contained file full of rows gets pasted into chat threads.
+
+  There is no back-channel and nothing to submit: a run is finished the moment
+  it is rendered, so unlike the model explorer and the examples queue this page
+  writes nothing back.
+
+  Renderer fills (names bare on purpose — a real "{{...}}" token in this comment
+  would catch the blanket replace and, if the substituted JSON carried an HTML
+  comment-close sequence, close the comment early and leak JSON):
+    REPORT_TITLE          — "Golden run · <dataset> · <profile>"
+    GENERATED_AT          — ISO8601 UTC timestamp
+    RUN_JSON              — the run payload (see render_golden_run.py::render)
+    PROFILE               — the active profile name
+    AGAMI_LOGO_DARK_TEXT  — full SVG content of agami-logo-dark.svg
+    AGAMI_LOGO_LIGHT_TEXT — full SVG content of agami-logo-light.svg
+    THEME_CSS             — shared/theme.css, the one palette
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{REPORT_TITLE}} — agami</title>
+  <style>
+{{THEME_CSS}}
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px 32px 48px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--fg); line-height: 1.5;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; }
+
+    header.dashboard-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 24px; margin-bottom: 12px;
+    }
+    .logo a { display: inline-block; line-height: 0; text-decoration: none; }
+    .logo svg { display: block; height: 26px; width: auto; }
+    .logo-light-mode { display: inline-block; }
+    .logo-dark-mode { display: none; }
+    @media (prefers-color-scheme: dark) {
+      .logo-light-mode { display: none; }
+      .logo-dark-mode { display: inline-block; }
+    }
+    h1.dashboard-title { font-size: 20px; font-weight: 600; margin: 0; flex: 1; text-align: right; }
+    .meta { font-size: 12px; color: var(--muted); margin-bottom: 18px;
+            display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .meta code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+    /* Banners — the two things no count says */
+    .banner {
+      border-radius: 10px; padding: 12px 16px; margin-bottom: 12px; font-size: 13px;
+      background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg);
+    }
+    .banner strong { font-weight: 600; }
+
+    /* The header's counts */
+    .counts { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 24px; }
+    .count-tile {
+      border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elev);
+      padding: 12px 18px; min-width: 116px;
+    }
+    .count-tile .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .count-tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.04em; }
+    .count-tile.failure .n { color: var(--bad-fg); }
+    .count-tile.pass .n { color: var(--ok-fg); }
+
+    /* Sections */
+    .section { margin-bottom: 30px; }
+    .section-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 6px; }
+    .section-head h2 { font-size: 15px; margin: 0; font-weight: 600; }
+    .section-head .n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .section-note { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+
+    /* One case */
+    .case {
+      border: 1px solid var(--border); border-left-width: 4px; border-radius: 12px;
+      background: var(--bg-elev); margin-bottom: 14px; padding: 16px 18px;
+    }
+    .case.failure { border-left-color: var(--bad-border); }
+    .case.error { border-left-color: var(--warn-fg); }
+    .case.unscored { border-left-color: var(--muted); }
+    .case.unconfirmed { border-left-color: var(--info-border); }
+    .case.pass { border-left-color: var(--ok-border); }
+
+    .case-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .question { font-size: 15px; font-weight: 600; flex: 1; min-width: 260px; }
+    .item-key { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px; color: var(--muted); }
+    .pill {
+      font-size: 10px; padding: 2px 9px; border-radius: 999px; letter-spacing: 0.04em;
+      text-transform: uppercase; font-weight: 600; white-space: nowrap;
+    }
+    .pill.failure { background: var(--bad-bg); color: var(--bad-fg); border: 1px solid var(--bad-border); }
+    .pill.error { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg); }
+    .pill.unscored { background: var(--code-bg); color: var(--muted); border: 1px solid var(--border); }
+    .pill.unconfirmed { background: var(--info-bg); color: var(--accent); border: 1px solid var(--info-border); }
+    .pill.pass { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid var(--ok-border); }
+
+    .verdict { font-size: 13px; color: var(--fg); margin-top: 8px; }
+    .verdict .score { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .delta {
+      font-size: 12px; margin-top: 10px; padding: 7px 12px; border-radius: 8px;
+      background: var(--code-bg); color: var(--fg);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .delta.differs { background: var(--bad-bg); color: var(--bad-fg); }
+
+    /* The two statements, side by side */
+    .statements { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+    @media (max-width: 900px) { .statements { grid-template-columns: 1fr; } }
+    .statement { border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      background: var(--bg); min-width: 0; }
+    .statement .label {
+      font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 7px 12px; border-bottom: 1px solid var(--border); background: var(--bg-elev);
+    }
+    .statement pre {
+      margin: 0; padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.5;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .statement pre.absent { color: var(--muted); font-style: italic; }
+
+    .empty { color: var(--muted); padding: 48px; text-align: center; }
+    footer.page-footer {
+      margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
+      font-size: 12px; color: var(--muted);
+    }
+    footer.page-footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="dashboard-header">
+      <div class="logo">
+        <a href="https://agami.ai" target="_blank" rel="noopener">
+          <span class="logo-light-mode">{{AGAMI_LOGO_DARK_TEXT}}</span>
+          <span class="logo-dark-mode">{{AGAMI_LOGO_LIGHT_TEXT}}</span>
+        </a>
+      </div>
+      <h1 class="dashboard-title">{{REPORT_TITLE}}</h1>
+    </header>
+    <div class="meta">
+      <span>Run <span id="generated-at">{{GENERATED_AT}}</span></span>
+      <span>· profile <code>{{PROFILE}}</code></span>
+      <span>· dataset <code id="dataset-name"></code></span>
+      <span>· run <code id="run-id"></code></span>
+    </div>
+
+    <div id="banners"></div>
+    <div class="counts" id="counts"></div>
+    <main id="sections"></main>
+
+    <footer class="page-footer">
+      Scored by agami. This report is written under your artifacts directory and is not committed —
+      it carries both statements, and no result rows.
+      <a href="https://agami.ai" target="_blank" rel="noopener">agami.ai</a>
+    </footer>
+  </div>
+
+  <script>
+    "use strict";
+    const RUN = {{RUN_JSON}};
+
+    // What each section is called and why a reader should care. The ORDER is the run's own —
+    // RUN.summary.sections is written in it — so nothing here re-sorts anything.
+    const SECTION_LABEL = {
+      failure: "Failed",
+      error: "Errored",
+      unscored: "Unscored",
+      unconfirmed: "Unconfirmed",
+      pass: "Passed",
+    };
+    const SECTION_NOTE = {
+      failure: "Scored against a confirmed answer key and did not reproduce it.",
+      error: "No statement was produced, so there was nothing to run.",
+      unscored: "Both sides ran and the comparison had no value to check.",
+      unconfirmed: "Scored and reported in full — and unable to fail a run, because nobody has confirmed the answer key.",
+      pass: "Reproduced the confirmed answer key.",
+    };
+
+    // Every value from the run is written with textContent. innerHTML appears nowhere in this
+    // file: the payload is somebody's question and somebody's SQL.
+    const el = (tag, attrs, kids) => {
+      const n = document.createElement(tag);
+      if (attrs) for (const k in attrs) {
+        if (k === "class") n.className = attrs[k];
+        else if (k === "text") n.textContent = attrs[k];
+        else n.setAttribute(k, attrs[k]);
+      }
+      (kids || []).forEach(c => c && n.appendChild(c));
+      return n;
+    };
+
+    const names = list => (list && list.length ? list.join(", ") : "none");
+
+    // Already rounded by the renderer; this only pads it to a fixed width so a column of scores
+    // lines up. A null accuracy is a comparison that never ran, and never a zero.
+    const score = a => (a === null || a === undefined) ? "—" : Number(a).toFixed(3);
+
+    function verdictLine(item) {
+      const line = el("div", { class: "verdict" });
+      if (item.status === "error") {
+        line.appendChild(el("span", { text: "Nothing was scored — " + item.reason }));
+        return line;
+      }
+      if (item.status === "unscored") {
+        line.appendChild(el("span", { text: "Nothing could be compared — " + item.reason }));
+        return line;
+      }
+      const verdict = item.passed ? "Reproduced the answer key" : "Did not reproduce the answer key";
+      line.appendChild(el("span", { text: verdict + " · accuracy " }));
+      line.appendChild(el("span", { class: "score", text: score(item.accuracy) }));
+      if (item.reason) line.appendChild(el("span", { text: " — " + item.reason }));
+      if (item.gated) {
+        line.appendChild(el("span", {
+          text: " · the dataset requires a filter this statement does not write",
+        }));
+      }
+      if (!item.confirmed) {
+        line.appendChild(el("span", { text: " · unconfirmed, so it cannot fail the run" }));
+      }
+      return line;
+    }
+
+    function deltaLine(item) {
+      const claim = item.tables;
+      if (!claim) {
+        return el("div", {
+          class: "delta",
+          text: "tables: no statement was read, so there was nothing to compare",
+        });
+      }
+      if (claim.status === "unknown") {
+        return el("div", {
+          class: "delta",
+          text: claim.name + ": one of the statements could not be read",
+        });
+      }
+      if (claim.status === "differs") {
+        return el("div", {
+          class: "delta differs",
+          text: claim.name + ": generated read " + names(claim.generated)
+            + " · the answer key read " + names(claim.golden),
+        });
+      }
+      return el("div", {
+        class: "delta",
+        text: claim.name + ": both read " + names(claim.golden),
+      });
+    }
+
+    function statement(label, sql, absentText) {
+      const body = sql
+        ? el("pre", { text: sql })
+        : el("pre", { class: "absent", text: absentText });
+      return el("div", { class: "statement" }, [
+        el("div", { class: "label", text: label }),
+        body,
+      ]);
+    }
+
+    function renderCase(item) {
+      return el("div", { class: "case " + item.section }, [
+        el("div", { class: "case-head" }, [
+          el("div", { class: "question", text: item.question }),
+          el("span", { class: "item-key", text: item.item_key }),
+          el("span", { class: "pill " + item.section, text: SECTION_LABEL[item.section] || item.section }),
+        ]),
+        verdictLine(item),
+        // One line above the statements, because "generated read one table and the answer key
+        // read another" is usually the whole finding.
+        deltaLine(item),
+        el("div", { class: "statements" }, [
+          statement("Answer key", item.expected_sql, "this case has no answer key"),
+          statement("Generated", item.generated_sql, "no statement was generated"),
+        ]),
+      ]);
+    }
+
+    function renderSections() {
+      const main = document.getElementById("sections");
+      const order = Object.keys(RUN.summary.sections || {});
+      let drawn = 0;
+      order.forEach(name => {
+        const cases = (RUN.items || []).filter(item => item.section === name);
+        if (!cases.length) return;
+        drawn += cases.length;
+        const section = el("div", { class: "section" }, [
+          el("div", { class: "section-head" }, [
+            el("h2", { text: SECTION_LABEL[name] || name }),
+            el("span", { class: "n", text: cases.length + (cases.length === 1 ? " case" : " cases") }),
+          ]),
+          el("p", { class: "section-note", text: SECTION_NOTE[name] || "" }),
+        ]);
+        cases.forEach(item => section.appendChild(renderCase(item)));
+        main.appendChild(section);
+      });
+      // A run can carry an item under a section the summary does not list, and dropping it
+      // silently would be a report that describes fewer cases than ran.
+      const rest = (RUN.items || []).filter(item => order.indexOf(item.section) === -1);
+      if (rest.length) {
+        const section = el("div", { class: "section" }, [
+          el("div", { class: "section-head" }, [el("h2", { text: "Other" })]),
+        ]);
+        rest.forEach(item => section.appendChild(renderCase(item)));
+        main.appendChild(section);
+        drawn += rest.length;
+      }
+      if (!drawn) {
+        main.appendChild(el("div", { class: "empty", text: "This run scored no cases." }));
+      }
+    }
+
+    function renderCounts() {
+      const counts = document.getElementById("counts");
+      const s = RUN.summary || {};
+      // Straight from the run's own summary. Nothing here recounts the items: the run decides
+      // what it did, and this page only shows it.
+      [
+        ["total", "Cases", ""],
+        ["passed", "Passed", "pass"],
+        ["failed", "Did not match", "failure"],
+        ["unscored", "Unscored", ""],
+        ["errored", "Errored", ""],
+      ].forEach(([key, label, cls]) => {
+        const n = s[key];
+        counts.appendChild(el("div", { class: "count-tile " + cls }, [
+          el("div", { class: "n", text: (n === null || n === undefined) ? "—" : String(n) }),
+          el("div", { class: "label", text: label }),
+        ]));
+      });
+    }
+
+    function renderBanners() {
+      const banners = document.getElementById("banners");
+      const s = RUN.summary || {};
+      if (!s.verified) {
+        banners.appendChild(el("div", { class: "banner" }, [
+          el("strong", { text: "This run verified nothing. " }),
+          el("span", {
+            text: "No case in it has a confirmed answer key, so it reports scores and its verdict "
+              + "rests on nothing. Confirm the answer keys you trust and run it again.",
+          }),
+        ]));
+      }
+      if (!s.completed) {
+        banners.appendChild(el("div", { class: "banner" }, [
+          el("strong", { text: "The run stopped partway. " }),
+          el("span", {
+            text: "The generator failed, so the cases after the stop were never attempted and are "
+              + "absent below. Do not read these counts as a whole run.",
+          }),
+        ]));
+      }
+    }
+
+    document.getElementById("dataset-name").textContent = RUN.dataset || "";
+    document.getElementById("run-id").textContent = RUN.run_id || "";
+    renderBanners();
+    renderCounts();
+    renderSections();
+  </script>
+</body>
+</html>
