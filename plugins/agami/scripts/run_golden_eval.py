@@ -66,6 +66,11 @@ import _agami_lib  # noqa: E402
 
 _agami_lib.ensure_importable()
 
+# The report renderer is a sibling script and stdlib-only, so it is imported plainly: it has none
+# of the dependencies the guard below exists for, and a run that could not render is a run that
+# still has its verdicts.
+import render_golden_run
+
 try:
     import agami_paths
     import execute_sql
@@ -653,29 +658,31 @@ def _section_counts(items: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-def _write_artifact(
+def _joined(
     result: GoldenRunResult,
     questions: dict[str, str],
     keys: dict[str, str],
     summary: dict[str, Any],
     selection: Optional[str],
-) -> Path:
-    """Join the run to the dataset it ran and persist both statements.
+) -> dict[str, Any]:
+    """Join the run to the dataset it ran and keep both statements.
 
     `GoldenRunResult` carries neither the question nor the answer key, so this is the only place
     that holds all three — and the report slice renders the two statements side by side, which is
     why they are kept rather than dropped with stdout's. The summary is handed in rather than built
     again here, so the file and the terminal describe the run with one set of numbers.
 
-    This lands under `local/`, which is gitignored per-user state, and the answer key it repeats is
-    already on disk in the dataset file the run just read, so it adds no exposure.
+    Both files this run leaves behind are built from this one value, so the JSON a person greps and
+    the report they open can never describe the run differently. What they hold lands under
+    `local/`, which is gitignored per-user state, and the answer key it repeats is already on disk
+    in the dataset file the run just read, so it adds no exposure.
 
     The verdict fields are here because the score alone cannot say which cases failed: `passed`
     folds `gated` into itself, so a gated-but-accurate case reads exactly like a pass, and a re-run
     of the failures would silently skip it. Widening this record is additive on purpose — the report
-    slice reads the same file, so a field may be added but none may be reshaped or dropped.
+    slice reads the same value, so a field may be added but none may be reshaped or dropped.
     """
-    joined = {
+    return {
         "run_id": result.run_id,
         "profile": result.profile,
         "dataset": result.dataset,
@@ -710,13 +717,44 @@ def _write_artifact(
         ],
         "findings": list(result.findings),
     }
-    out = agami_paths.dashboard_dir("eval", result.profile)
+
+
+def _run_dir(profile: str) -> Path:
+    """Where a run's two files land. The caller owns this path, as it does for every other rendered
+    surface — the renderer beside this one just takes an `--out`."""
+    out = agami_paths.dashboard_dir("eval", profile)
     out.mkdir(parents=True, exist_ok=True)
-    # Microseconds because a person sorts these by name and two runs a second apart must not land
-    # on the same one — an overwritten run is a report that silently describes something else.
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = out / f"{stamp}.json"
+    return out
+
+
+def _write_artifact(joined: dict[str, Any], stamp: str) -> Path:
+    """The run, whole, as JSON.
+
+    This lands under `local/`, which is gitignored per-user state, and the answer key it repeats is
+    already on disk in the dataset file the run just read, so it adds no exposure.
+    """
+    path = _run_dir(joined["profile"]) / f"{stamp}.json"
     path.write_text(json.dumps(joined, indent=2), encoding="utf-8")
+    return path
+
+
+def _write_report(joined: dict[str, Any], stamp: str) -> Path:
+    """The same run as a page a person opens: every case's question, its verdict, and the confirmed
+    answer key beside the generated statement.
+
+    Rendered here rather than left to a later, manual step, because the closing line of a run is
+    what points at it — an unrendered report is one nobody finds. The renderer is a sibling script
+    and stdlib-only; what it can show is what this artifact wrote down.
+    """
+    path = _run_dir(joined["profile"]) / f"{stamp}.html"
+    path.write_text(
+        render_golden_run.render(
+            title=f"Golden run · {joined['dataset']} · {joined['profile']}",
+            profile=joined["profile"],
+            run=joined,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -927,17 +965,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     questions = {item.item_key: item.query for item in dataset.test_cases}
     keys = {item.item_key: item.expected.sql or "" for item in dataset.test_cases}
     payload = _run_payload(result, questions)
+    joined = _joined(result, questions, keys, payload["summary"], selection)
+    # Microseconds because a person sorts these by name and two runs a second apart must not land
+    # on the same one — an overwritten run is a report that silently describes something else. One
+    # stamp for the pair, so the JSON and the page beside it are visibly the same run.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    # The run is already paid for — a model call and up to two warehouse queries per case — so a
+    # directory it cannot write to costs the drill-down and nothing else. The verdicts print either
+    # way, and each file is lost on its own. Neither path is relayed, for the reason the preflight
+    # guards give.
     try:
-        payload["artifact"] = str(
-            _write_artifact(result, questions, keys, payload["summary"], selection)
-        )
+        payload["artifact"] = str(_write_artifact(joined, stamp))
     except OSError as exc:
-        # The run is already paid for — a model call and up to two warehouse queries per case — so
-        # a directory it cannot write to costs the drill-down and nothing else. The verdicts print
-        # either way. The path is not relayed, for the reason the preflight guards give.
         payload["artifact"] = ""
         _warn(
             "the verdicts are below, but this run's artifact could not be written "
+            f"({exc.__class__.__name__}: {exc.strerror or 'cannot be written'})"
+        )
+    try:
+        payload["report"] = str(_write_report(joined, stamp))
+    except OSError as exc:
+        payload["report"] = ""
+        _stop(
+            "the verdicts are below, but this run's report could not be written "
             f"({exc.__class__.__name__}: {exc.strerror or 'cannot be written'})"
         )
     print(json.dumps(payload, indent=2))

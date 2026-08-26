@@ -628,6 +628,27 @@ def test_the_artifact_lands_in_the_eval_dashboard_dir_with_both_statements(
     assert by_key["orders-count"]["score"]["accuracy"] == 1.0
 
 
+def test_the_report_lands_beside_the_artifact_and_carries_both_statements(
+    artifacts, scripted, capsys
+):
+    """The drill-down a person actually opens. It is written by the run rather than rendered later
+    by hand, because the skill's closing line points at it — and the caller owns the path here, as
+    it does for every other rendered surface, so this is where the path is asserted.
+
+    One stamp for the pair, so the JSON and the HTML are visibly the same run."""
+    _write(artifacts, "mixed", MIXED_DATASET)
+
+    _, payload, _ = _run(capsys, "--dataset", "mixed")
+
+    report = Path(payload["report"])
+    assert report.parent == agami_paths.dashboard_dir("eval", PROFILE, artifacts)
+    assert report.suffix == ".html"
+    assert report.stem == Path(payload["artifact"]).stem
+    html = report.read_text(encoding="utf-8")
+    assert GOLDEN_SENTINEL in html and GENERATED_SENTINEL in html
+    assert Q_PASS in html
+
+
 def test_the_artifact_carries_what_the_report_renders(artifacts, scripted, capsys):
     """The verdict fields and the claim difference, per item.
 
@@ -812,7 +833,10 @@ def test_the_artifact_write_failing_does_not_discard_the_run(artifacts, scripted
     """A run costs a model call and two warehouse queries per case. A directory it cannot write to
     loses the drill-down and nothing else — the verdicts still print, the exit code is still the
     dataset's own (`0` here: one confirmed case, and it passed), and the path is not relayed onto
-    stderr. A missing artifact is not a broken run, so it does not become a `2`."""
+    stderr. A missing artifact is not a broken run, so it does not become a `2`.
+
+    The report is written to the same directory and takes the same posture: neither file is worth
+    discarding a paid-for run over."""
     _write(artifacts, "green", PASSING_DATASET)
     out = agami_paths.dashboard_dir("eval", PROFILE, artifacts)
     out.mkdir(parents=True)
@@ -824,7 +848,7 @@ def test_the_artifact_write_failing_does_not_discard_the_run(artifacts, scripted
 
     assert code == 0
     assert _sections(payload) == ["pass"] and payload["summary"]["passed"] == 1
-    assert payload["artifact"] == ""
+    assert payload["artifact"] == "" and payload["report"] == ""
     assert err.startswith("agami-eval:") and "Traceback" not in err
     assert str(artifacts) not in err
 
@@ -1104,6 +1128,13 @@ def test_the_skill_says_what_to_do_when_the_model_cannot_be_read():
     """One of the three ways the run path refuses before anything runs, so the cheat sheet carries
     it beside the other two."""
     assert "cannot read the semantic model" in SKILL
+
+
+def test_the_skill_hands_over_the_report_and_not_only_the_json():
+    """The report exists to be opened, and the only route to it is the line the skill prints. A
+    render nobody is pointed at is a file nobody finds."""
+    assert "`report`" in SKILL
+    assert ".html" in SKILL
 
 
 def test_the_skill_forbids_pasting_sql():

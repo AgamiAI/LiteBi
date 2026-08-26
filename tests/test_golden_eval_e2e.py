@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -243,6 +244,49 @@ def test_the_run_summary_is_the_same_on_a_second_run(profile):
         "total": 4, "passed": 3, "failed": 1, "unscored": 0, "errored": 0, "gating_failures": 1,
     }
     assert first.run_id != second.run_id
+
+
+def test_a_real_run_writes_a_report_with_both_statements_and_no_rows(
+    profile, warehouse, monkeypatch, capsys
+):
+    """The last step of the path, driven through the command a person actually runs.
+
+    Everything before it is already asserted above; what this adds is that a finished run leaves a
+    report behind — in the profile's own eval directory, carrying the confirmed answer key beside
+    the generated statement, which is the pair a failure is read from.
+
+    And the rule that goes with it: the rows both statements returned are not on the page. Asserted
+    against the values the sample store really holds rather than against a fixture, because a
+    projection that quietly started passing an item through would show them here.
+    """
+    # Imported here rather than at the top of the file: every other test in it drives the runner
+    # directly, and the helper is the one thing this test adds.
+    import agami_paths
+    import run_golden_eval
+
+    class _Helper(_ScriptedGenerator):
+        def __init__(self, schema: str, *, timeout_s: float) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Helper)
+    # The helper resolves the single-operator org, so it reads the org-less form of the DSN.
+    monkeypatch.setenv("DATASOURCE_URL__AGAMI_EXAMPLE", f"sqlite:///{warehouse}")
+
+    code = run_golden_eval.main(["--profile", PROFILE, "--dataset", "orders"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    report = Path(payload["report"])
+    assert report.parent == agami_paths.dashboard_dir("eval", PROFILE, profile)
+    html = report.read_text(encoding="utf-8")
+    assert "SELECT COUNT(*) AS order_count FROM orders" in html   # the answer key
+    assert "SELECT COUNT(id) AS n FROM orders" in html            # what the model wrote
+    assert COUNT_QUESTION in html
+    with sqlite3.connect(warehouse) as db:
+        statuses = [row[0] for row in db.execute("SELECT DISTINCT status FROM orders")]
+    assert statuses, "the sample store no longer has statuses to check against"
+    for status in statuses:
+        assert status not in html
 
 
 def test_the_run_is_json_and_carries_no_filesystem_path(profile, tmp_path):
