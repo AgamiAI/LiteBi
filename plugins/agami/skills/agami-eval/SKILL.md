@@ -68,6 +68,10 @@ A run costs one model call plus one query per case, so tell the user what they a
 
 `--timeout-s` bounds a single generation (default 120). Raise it only if items are coming back with *"the generator did not answer within the time this run allows"*.
 
+Two flags narrow the run, and naming both is refused because they are two ways of selecting from the same dataset. `--tag <name>` is repeatable and runs the cases carrying **any** of the tags given, matched exactly — `Smoke` and `smoke` are different tags. `--rerun-failures` runs only what this dataset's last run recorded under failures. Both are for the non-interactive path; reach for them here only if the user asks for a slice or a re-run by name.
+
+**The exit code is the contract, and you should read it before the payload.** `0` every confirmed case passed · `1` a confirmed case failed · `2` no verdict could be produced. A `2` is never a model regression — report it as a broken harness and do not open the failures table.
+
 **The script emits `items` already ordered** — failures, errors, unscored, unconfirmed, passes — and `summary.sections` counts the rows in each. Render them in the order received and use those counts; do not re-sort, re-group or recount.
 
 ---
@@ -187,5 +191,8 @@ End the turn.
 | `agami-eval: cannot read the semantic model…` / `…does not parse…` | The model is missing or broken, so the generator has no tables to write against. Route to `/agami-connect` to build or rebuild it. Nothing ran; this is not a failing eval, and don't try to repair the YAML from here. |
 | `agami-eval: the verdicts are below, but…could not be written` | The run finished and its JSON artifact did not land — usually a permissions problem on `<artifacts_dir>/local/eval/<profile>/`. Report the verdicts normally, and say there is no drill-down file for this run rather than pointing at an empty `artifact`. |
 | Every item says *"the generator command could not be started on this machine"* | The generator is the `claude` client and it is not on this PATH (or not on the PATH of whatever shell ran the script). Nothing was scored — report it as a broken run, not a red one. |
-| `completed: false` | The run stopped partway: the cases after the stop were never attempted and are absent from `items`. Say so on the summary line, and don't compare the counts to a previous run. |
+| `completed: false` | The run stopped partway: the cases after the stop were never attempted and are absent from `items`. Say so on the summary line, and don't compare the counts to a previous run. Exit code is `2`. |
+| `agami-eval: no previous run of … to re-read` | `--rerun-failures` with nothing to re-read. Run the dataset once first; it deliberately does not fall back to running everything. |
+| `agami-eval: the last run … recorded no failures` | Nothing to re-run, which is a clean `0`. Say the previous run was green rather than reporting an empty run as a result. |
+| `agami-eval: … no longer in <dataset> and were skipped` | Cases were edited out between the two runs. Report how many were skipped so the smaller count is explained. |
 | Credentials missing | The run fails at execution, not generation, so items come back scored-as-errors in bulk. Check `<artifacts_dir>/local/credentials` per Phase 0.2 and re-invoke `/agami-connect` if it's absent. |

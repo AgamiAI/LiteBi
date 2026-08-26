@@ -26,6 +26,15 @@ Usage:
     python3 run_golden_eval.py --profile main --list
     python3 run_golden_eval.py --profile main --dataset orders --timeout-s 120
     python3 run_golden_eval.py --profile main --dataset orders --tag smoke --tag revenue
+    python3 run_golden_eval.py --profile main --dataset orders --rerun-failures
+
+**What a run sends outbound.** Generating a statement spawns the operator's own client with every
+tool switched off, and hands it the question, the organization, the datasource name and the tables
+and columns of the semantic model. It is handed neither the answer key, nor the dataset's location,
+nor any result row — generation finishes before anything is executed, so no row exists yet. That
+egress is the operator's own model provider and nothing else. It matters most in CI, where the
+model's vocabulary leaves a shared runner rather than one person's machine, and where the
+credential is whatever the environment supplies to the client.
 """
 
 from __future__ import annotations
@@ -493,6 +502,68 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
     return None
 
 
+def _last_failures(profile: str, dataset_name: str) -> Optional[list[str]]:
+    """The item keys the most recent run of this dataset recorded as failures, or None if none ran.
+
+    Artifacts are keyed on the profile, not the dataset, so the newest file in the directory may
+    describe something else entirely — matching on the recorded `dataset` is what stops a re-run
+    executing another dataset's failures and reporting confidently about it. `*.json` and not `*`
+    because the report slice writes its HTML into this same directory.
+
+    An unreadable or unrecognisable artifact is skipped rather than fatal. These accumulate over
+    months and one truncated file, from a full disk or an interrupted write, must not make the
+    feature unusable for every run after it.
+    """
+    out = agami_paths.dashboard_dir("eval", profile)
+    if not out.is_dir():
+        return None
+    for path in sorted(out.glob("*.json"), reverse=True):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record["dataset"] != dataset_name:
+                continue
+            return [
+                item["item_key"] for item in record["items"] if item["section"] == "failure"
+            ]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def _reselect(dataset: GoldenDataset, profile: str) -> Optional[GoldenDataset]:
+    """The dataset narrowed to what its last run failed, or None having said why not.
+
+    No previous run refuses rather than falling back to running everything: someone re-running a
+    failure list is asking a narrow question, and answering a wider one costs a model call per case
+    and buries the answer they wanted.
+    """
+    failures = _last_failures(profile, dataset.name)
+    if failures is None:
+        _stop(
+            f"no previous run of {dataset.name!r} to re-read on this profile — "
+            "run it once before re-running its failures"
+        )
+        return None
+    by_key = {item.item_key: item for item in dataset.test_cases}
+    selected = [by_key[key] for key in failures if key in by_key]
+    missing = len(failures) - len(selected)
+    if missing:
+        # Editing a case away between runs is ordinary; running fewer than the last run reported
+        # without saying so is not.
+        _warn(
+            f"{missing} of the last run's failures are no longer in {dataset.name!r} and were "
+            "skipped"
+        )
+    if not selected:
+        # Not a wrong selector — the last run genuinely had nothing to re-run — so this is a clean
+        # exit, and the sentence says which of the two it was so a reader is not left guessing.
+        _warn(
+            f"the last run of {dataset.name!r} recorded no failures, so this re-run had nothing "
+            "to do"
+        )
+    return dataset.model_copy(update={"test_cases": selected})
+
+
 def _select(dataset: GoldenDataset, tags: Optional[list[str]]) -> Optional[GoldenDataset]:
     """The dataset narrowed to the cases carrying one of `tags`, or None having said why not.
 
@@ -572,6 +643,11 @@ def _write_artifact(
 
     This lands under `local/`, which is gitignored per-user state, and the answer key it repeats is
     already on disk in the dataset file the run just read, so it adds no exposure.
+
+    The verdict fields are here because the score alone cannot say which cases failed: `passed`
+    folds `gated` into itself, so a gated-but-accurate case reads exactly like a pass, and a re-run
+    of the failures would silently skip it. Widening this record is additive on purpose — the report
+    slice reads the same file, so a field may be added but none may be reshaped or dropped.
     """
     joined = {
         "run_id": result.run_id,
@@ -588,6 +664,12 @@ def _write_artifact(
                 "expected_sql": keys[outcome.item_key],
                 "generated_sql": outcome.generated_sql,
                 "score": outcome.as_dict()["score"],
+                "confirmed": outcome.confirmed,
+                "passed": outcome.passed,
+                "gated": outcome.gated,
+                # The same classifier the terminal printed, so "re-run the failures" runs what a
+                # reader actually saw under that heading rather than a second opinion about it.
+                "section": _section(outcome),
             }
             for outcome in result.outcomes
         ],
@@ -690,11 +772,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--list", action="store_true", help="describe the profile's datasets and run nothing"
     )
-    parser.add_argument(
+    # Two ways of narrowing the same dataset, so naming both is a question with no answer rather
+    # than a combination worth defining.
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--tag",
         action="append",
         help="run only the cases carrying this tag; repeatable, and a case carrying any of the "
         "tags given runs",
+    )
+    selection.add_argument(
+        "--rerun-failures",
+        action="store_true",
+        help="run only the cases the last run of this dataset recorded as failures",
     )
     parser.add_argument(
         "--timeout-s", type=float, default=120.0, help="how long one generation may take"
@@ -720,7 +810,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     # nothing. The selection is applied to the dataset here rather than threaded into the run:
     # `run_golden_dataset` takes a dataset, an environment and a generator, and widening that
     # signature with a notion of which cases to skip would make every caller of it carry one.
-    dataset = _select(dataset, args.tag)
+    dataset = (
+        _reselect(dataset, args.profile) if args.rerun_failures else _select(dataset, args.tag)
+    )
     if dataset is None:
         return _CANNOT_START
 

@@ -476,3 +476,178 @@ def test_a_tag_against_a_dataset_with_no_tags_says_so(artifacts, scripted, capsy
     assert "carries a tag at all" in err
     # The list-shaped half of the refusal is the thing that would have rendered empty.
     assert "Tags present" not in err
+
+
+# ---------------------------------------------------------------------------
+# The artifact, and re-running what failed
+# ---------------------------------------------------------------------------
+
+def _artifacts_in(art: Path) -> list[Path]:
+    return sorted((art / "local" / "eval" / PROFILE).glob("*.json"))
+
+
+def _artifact(art: Path) -> dict[str, Any]:
+    return json.loads(_artifacts_in(art)[-1].read_text(encoding="utf-8"))
+
+
+def test_the_artifact_records_the_verdict_and_still_records_the_statements(
+    artifacts, scripted, capsys
+):
+    """The four verdict fields are what makes a failure list recoverable, and they are ADDITIVE:
+    the report slice reads this same file, so nothing that was here before may go."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+
+    _run(capsys, "--dataset", "mixed")
+
+    item = _artifact(artifacts)["items"][0]
+    assert {"confirmed", "passed", "gated", "section"} <= set(item)
+    # Everything the record carried before the widening is still here.
+    assert {"item_key", "question", "expected_sql", "generated_sql", "score"} <= set(item)
+
+
+def test_the_recorded_section_is_the_one_the_terminal_printed(artifacts, scripted, capsys):
+    """A re-run selects on `section`, so the file and the screen must classify identically —
+    otherwise "re-run the failures" runs something the reader never saw under that heading."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+
+    _, payload, _ = _run(capsys, "--dataset", "mixed")
+
+    on_screen = {item["item_key"]: item["section"] for item in payload["items"]}
+    on_disk = {item["item_key"]: item["section"] for item in _artifact(artifacts)["items"]}
+    assert on_screen == on_disk
+
+
+def test_a_rerun_runs_exactly_what_the_last_run_recorded_as_failures(artifacts, scripted, capsys):
+    """Asserted against the artifact rather than a hard-coded list, so the test cannot agree with
+    a bug that mis-records and then mis-selects the same way."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    first, _, _ = _run(capsys, "--dataset", "mixed")
+    assert first == 1
+    failed = [i["item_key"] for i in _artifact(artifacts)["items"] if i["section"] == "failure"]
+    assert failed, "the first run must have failed something for this to mean anything"
+
+    code, payload, _ = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert [item["item_key"] for item in payload["items"]] == failed
+    assert code == 1
+
+
+def test_a_rerun_with_no_previous_run_refuses(artifacts, scripted, capsys):
+    """It must not fall back to running everything: a narrow question answered widely costs a
+    model call per case and buries the answer that was asked for."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+
+    code, payload, err = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert code == 2
+    assert payload == {}
+    assert "no previous run" in err
+
+
+def test_a_rerun_after_a_clean_run_does_nothing_and_says_so(artifacts, scripted, capsys):
+    """Nothing to re-run is not a wrong selector, so it is a clean exit — but a silent one would
+    read exactly like a re-run that fixed everything."""
+    _write(artifacts, "clean", {"test_cases": [PASSING_ITEM]})
+    assert _run(capsys, "--dataset", "clean")[0] == 0
+
+    code, payload, err = _run(capsys, "--dataset", "clean", "--rerun-failures")
+
+    assert code == 0
+    assert payload["items"] == []
+    assert "recorded no failures" in err
+
+
+def test_a_rerun_reads_its_own_datasets_artifact_and_not_the_newest_one(
+    artifacts, scripted, capsys
+):
+    """The directory is keyed on the profile, so the newest file may describe another dataset.
+    Matching on the recorded name is what stops a re-run executing the wrong cases."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    _run(capsys, "--dataset", "mixed")
+    mixed_failed = [
+        i["item_key"] for i in _artifact(artifacts)["items"] if i["section"] == "failure"
+    ]
+    # A later run of a different dataset, which is now the newest file in the directory.
+    _write(artifacts, "clean", {"test_cases": [PASSING_ITEM]})
+    _run(capsys, "--dataset", "clean")
+    assert _artifact(artifacts)["dataset"] == "clean"
+
+    _, payload, _ = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert [item["item_key"] for item in payload["items"]] == mixed_failed
+
+
+def test_a_rerun_ignores_a_report_beside_the_artifacts(artifacts, scripted, capsys):
+    """The report slice writes its HTML into this directory. Globbing `*` rather than `*.json`
+    would try to read one as a run and refuse."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    _run(capsys, "--dataset", "mixed")
+    (artifacts / "local" / "eval" / PROFILE / "99999999T999999999999Z.html").write_text(
+        "<html>a report</html>", encoding="utf-8"
+    )
+
+    code, payload, _ = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert code == 1
+    assert payload["items"]
+
+
+def test_a_rerun_skips_an_artifact_it_cannot_read(artifacts, scripted, capsys):
+    """These accumulate for months; one truncated file from a full disk must not make the feature
+    unusable for every run after it."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    _run(capsys, "--dataset", "mixed")
+    failed = [i["item_key"] for i in _artifact(artifacts)["items"] if i["section"] == "failure"]
+    (artifacts / "local" / "eval" / PROFILE / "99999999T999999999999Z.json").write_text(
+        "{ this is not json", encoding="utf-8"
+    )
+
+    code, payload, _ = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert code == 1
+    assert [item["item_key"] for item in payload["items"]] == failed
+
+
+def test_a_rerun_skips_a_failure_the_dataset_no_longer_has_and_says_how_many(
+    artifacts, scripted, capsys
+):
+    """Editing a case away between runs is ordinary. Running fewer cases than the last run
+    reported without saying so is not."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    _run(capsys, "--dataset", "mixed")
+    # The failing case is edited out; only the passing one remains.
+    _write(artifacts, "mixed", {"test_cases": [PASSING_ITEM]})
+
+    code, payload, err = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert code == 0
+    assert payload["items"] == []
+    assert "no longer in" in err
+
+
+def test_naming_both_selections_is_refused(artifacts, scripted, capsys):
+    """Two ways of narrowing the same dataset — asking for both is a question with no answer."""
+    _write(artifacts, "tagged", TAGGED)
+
+    with pytest.raises(SystemExit) as raised:
+        run_golden_eval.main(
+            ["--profile", PROFILE, "--dataset", "tagged", "--tag", "smoke", "--rerun-failures"]
+        )
+
+    assert raised.value.code != 0
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_a_rerun_carries_no_statement_on_stdout(artifacts, scripted, capsys):
+    """The no-SQL rule holds on the re-run path too, asserted on a FAILING re-run: a passing
+    case's reason is empty and would prove nothing."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    _run(capsys, "--dataset", "mixed")
+
+    _, payload, err = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    rendered = json.dumps(payload)
+    assert GOLDEN_SENTINEL not in rendered
+    assert GENERATED_SENTINEL not in rendered
+    assert GOLDEN_SENTINEL not in err
+    assert GENERATED_SENTINEL not in err
