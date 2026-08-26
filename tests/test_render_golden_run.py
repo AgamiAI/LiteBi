@@ -340,6 +340,22 @@ def test_the_accuracy_is_shown_to_three_decimals():
     assert "0.99875" not in json.dumps(payload)
 
 
+def test_a_near_miss_is_never_shown_as_a_perfect_score():
+    """4002 of 4004 rows rounds to 1.000 at three decimals, and an item passes at exactly 1.0. So
+    rounding alone would print a perfect-looking score beside the sentence saying the statement did
+    not reproduce the answer key — the one confusion this report exists to remove. Only a real 1.0
+    may read as 1.000."""
+    near_miss = _item(passed=False, section="failure",
+                      score={"status": "scored", "accuracy": 4002 / 4004})
+    perfect = _item(passed=True, section="pass",
+                    score={"status": "scored", "accuracy": 1.0})
+
+    payload = _payload(render(title="x", profile="demo", run=_run([near_miss, perfect])))
+
+    assert payload["items"][0]["accuracy"] == 0.999, "a near miss must not reach the pass mark"
+    assert payload["items"][1]["accuracy"] == 1.0, "a real pass still shows as one"
+
+
 def test_the_table_set_delta_is_rendered_above_the_statements():
     """"Generated read `orders`, the answer key read `customers`" is usually the whole finding, so
     it is one line above the two statements rather than something to be spotted in them."""

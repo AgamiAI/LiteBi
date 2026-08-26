@@ -51,9 +51,27 @@ LOGO_LIGHT_PATH = SHARED_DIR / "agami-logo-light.svg"
 # rounding happens here instead, where it is presentation and no verdict rests on it.
 _ACCURACY_DECIMALS = 3
 
+# The largest accuracy that may be shown for an item that did not score exactly 1.0. Rounding alone
+# is not enough: 4002/4004 rounds to 1.000, so a near miss would read as a perfect score printed
+# beside the sentence saying it did not reproduce the answer key. That is the one confusion this
+# report exists to remove, so a score short of the mark is shown short of the mark.
+_NEARLY_ONE = 1.0 - 10.0 ** -_ACCURACY_DECIMALS
+
 # The counts the header reads. Taken from the run's own summary and never recounted from the
 # items: a report that recomputed one would be a second place that decides what a run looks like.
 _SUMMARY_COUNTS = ("total", "passed", "failed", "unscored", "errored", "gating_failures")
+
+
+def _shown(accuracy: float) -> float:
+    """One accuracy at the precision the page prints it, never rounded up to the pass mark.
+
+    Only an accuracy of exactly 1.0 may be shown as 1.000, because that is the only value that
+    passes. Anything short of it is held below, so the number beside a failure never looks like
+    the number beside a pass.
+    """
+    if accuracy >= 1.0:
+        return round(accuracy, _ACCURACY_DECIMALS)
+    return min(round(accuracy, _ACCURACY_DECIMALS), _NEARLY_ONE)
 
 
 def _tables_claim(item: dict) -> Optional[dict[str, Any]]:
@@ -99,7 +117,7 @@ def _item(item: dict) -> dict[str, Any]:
         "status": score.get("status", ""),
         # None means nothing was scored and 0.0 is a score an item earned, so the two are kept
         # apart here as carefully as they are where they were decided.
-        "accuracy": None if accuracy is None else round(accuracy, _ACCURACY_DECIMALS),
+        "accuracy": None if accuracy is None else _shown(accuracy),
         "reason": score.get("reason", ""),
         "expected_sql": item.get("expected_sql", ""),
         "generated_sql": item.get("generated_sql", ""),
