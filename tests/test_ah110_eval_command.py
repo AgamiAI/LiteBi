@@ -48,13 +48,21 @@ GENERATED_SENTINEL = "generatedsentinelzzq"
 
 Q_PASS = "How many orders have been placed?"
 Q_FAIL = "How many customers are on file?"
+Q_FAIL_TOO = "How many products are listed?"
 Q_UNCONFIRMED = "How many payments have been taken?"
+# Deliberately absent from `GENERATED` below, which is what makes its case error.
+Q_ERRORS = "How many invoices were issued?"
+
+# The statement that makes the confirmed case miss, kept as a name so a test can put it back after
+# monkeypatching a passing answer over it.
+GENERATED_FAILING = f"SELECT COUNT(DISTINCT country) AS {GENERATED_SENTINEL} FROM customers"
 
 GENERATED = {
     Q_PASS: "SELECT COUNT(id) AS n FROM orders",
     # A different number off the same table, so the miss is a real disagreement about rows rather
     # than an accident of which table is larger.
-    Q_FAIL: f"SELECT COUNT(DISTINCT country) AS {GENERATED_SENTINEL} FROM customers",
+    Q_FAIL: GENERATED_FAILING,
+    Q_FAIL_TOO: "SELECT COUNT(DISTINCT category_id) AS n FROM products",
     Q_UNCONFIRMED: "SELECT COUNT(*) AS n FROM refunds",
 }
 
@@ -73,6 +81,22 @@ FAILING_ITEM: dict[str, Any] = {
         "sql": f"SELECT COUNT(*) AS {GOLDEN_SENTINEL} FROM customers",
         "sql_confirmed": True,
     },
+}
+
+# A second confirmed miss, so a run can record a failure LIST rather than a single failure — which
+# is the only shape in which "the list narrowed" is observable.
+SECOND_FAILING_ITEM: dict[str, Any] = {
+    "id": "products-count",
+    "query": Q_FAIL_TOO,
+    "expected": {"sql": "SELECT COUNT(*) AS n FROM products", "sql_confirmed": True},
+}
+
+# Confirmed, and its generation produces no statement at all. It is `passed: false` like a failure
+# and it is not one — nothing was scored.
+ERRORING_ITEM: dict[str, Any] = {
+    "id": "invoices-count",
+    "query": Q_ERRORS,
+    "expected": {"sql": "SELECT COUNT(*) AS n FROM invoices", "sql_confirmed": True},
 }
 
 # Scores a miss and can never gate: nobody has confirmed its answer key.
@@ -550,11 +574,15 @@ def test_a_rerun_after_a_clean_run_does_nothing_and_says_so(artifacts, scripted,
     _write(artifacts, "clean", {"test_cases": [PASSING_ITEM]})
     assert _run(capsys, "--dataset", "clean")[0] == 0
 
+    before = len(_artifacts_in(artifacts))
     code, payload, err = _run(capsys, "--dataset", "clean", "--rerun-failures")
 
     assert code == 0
-    assert payload["items"] == []
     assert "recorded no failures" in err
+    # Nothing ran, so nothing printed and nothing was written: a 0-case artifact would become this
+    # dataset's newest record and shadow the real one a later re-run needs.
+    assert payload == {}
+    assert len(_artifacts_in(artifacts)) == before
 
 
 def test_a_rerun_reads_its_own_datasets_artifact_and_not_the_newest_one(
@@ -621,8 +649,11 @@ def test_a_rerun_skips_a_failure_the_dataset_no_longer_has_and_says_how_many(
     code, payload, err = _run(capsys, "--dataset", "mixed", "--rerun-failures")
 
     assert code == 0
-    assert payload["items"] == []
+    assert payload == {}
     assert "no longer in" in err
+    # And it must NOT also claim the last run was clean — it recorded a failure, which was deleted.
+    # A skill reads that sentence back to the user as "the previous run was green".
+    assert "recorded no failures" not in err
 
 
 def test_naming_both_selections_is_refused(artifacts, scripted, capsys):
@@ -651,3 +682,116 @@ def test_a_rerun_carries_no_statement_on_stdout(artifacts, scripted, capsys):
     assert GENERATED_SENTINEL not in rendered
     assert GOLDEN_SENTINEL not in err
     assert GENERATED_SENTINEL not in err
+
+
+# ---------------------------------------------------------------------------
+# A re-run may only trust a whole, concluded run
+# ---------------------------------------------------------------------------
+
+ERRORING_ITEM: dict[str, Any] = {
+    "id": "unscripted-count",
+    "query": "A question no generator has an answer for",
+    "expected": {"sql": "SELECT COUNT(*) AS n FROM products", "sql_confirmed": True},
+}
+
+# One of each section a re-run must tell apart: a confirmed miss, an unconfirmed miss that can
+# never gate, and a case whose generation produced nothing at all.
+ONE_OF_EACH: dict[str, Any] = {
+    "test_cases": [FAILING_ITEM, UNCONFIRMED_ITEM, ERRORING_ITEM]
+}
+
+
+def test_a_tagged_slice_does_not_become_the_datasets_failure_record(
+    artifacts, scripted, capsys, monkeypatch
+):
+    """The false green this refusal exists for. A slice describes some of the dataset, so its
+    failure list is narrower than the truth — and inheriting it exits 0 over a live regression."""
+    _write(artifacts, "tagged", TAGGED)
+    assert _run(capsys, "--dataset", "tagged")[0] == 1
+    # The tagged case now passes, so a slice over it alone records no failures at all.
+    monkeypatch.setitem(GENERATED, Q_FAIL, "SELECT COUNT(*) AS n FROM customers")
+    assert _run(capsys, "--dataset", "tagged", "--tag", "revenue")[0] == 0
+    monkeypatch.setitem(GENERATED, Q_FAIL, GENERATED_FAILING)
+
+    code, payload, err = _run(capsys, "--dataset", "tagged", "--rerun-failures")
+
+    assert "recorded no failures" not in err
+    assert [item["item_key"] for item in payload["items"]] == ["customers-count"]
+    assert code == 1
+
+
+def test_a_run_that_produced_no_verdict_is_not_read_as_a_clean_one(artifacts, capsys, monkeypatch):
+    """An all-errored run records no failures because it scored nothing, not because nothing was
+    wrong. Trusting its empty list arrives at exactly the green the `2` branch refuses."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+
+    class _Silent(_Scripted):
+        def generate(self, question, org, datasource):
+            return gr.GeneratedSql(sql="", error="the generator did not answer")
+
+    monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Silent)
+    assert _run(capsys, "--dataset", "mixed")[0] == 2
+
+    monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Scripted)
+    code, payload, err = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    # No usable record exists, so it refuses rather than reporting a clean re-run.
+    assert code == 2
+    assert payload == {}
+    assert "no previous run" in err
+
+
+def test_an_incomplete_run_is_not_read_as_a_failure_record(artifacts, capsys, monkeypatch):
+    """Same rule for a run that stopped partway: its truncated list would narrow every re-run
+    after it."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+
+    class _Raises(_Scripted):
+        def __init__(self, schema, *, timeout_s):
+            super().__init__(schema, timeout_s=timeout_s)
+            self.asked = 0
+
+        def generate(self, question, org, datasource):
+            self.asked += 1
+            if self.asked > 1:
+                raise RuntimeError("the client fell over")
+            return super().generate(question, org, datasource)
+
+    monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Raises)
+    assert _run(capsys, "--dataset", "mixed")[0] == 2
+
+    monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Scripted)
+    code, _, err = _run(capsys, "--dataset", "mixed", "--rerun-failures")
+
+    assert code == 2
+    assert "no previous run" in err
+
+
+def test_a_rerun_selects_the_failures_and_not_merely_what_did_not_pass(
+    artifacts, scripted, capsys
+):
+    """`section` and not `passed`. An errored case did not pass and an unconfirmed miss did not
+    pass, and neither is a failure — selecting on `passed` would re-run the whole dataset."""
+    _write(artifacts, "each", ONE_OF_EACH)
+    first, payload, _ = _run(capsys, "--dataset", "each")
+    assert first == 1
+    sections = {item["section"] for item in payload["items"]}
+    assert {"failure", "error", "unconfirmed"} <= sections, sections
+
+    _, payload, _ = _run(capsys, "--dataset", "each", "--rerun-failures")
+
+    assert [item["item_key"] for item in payload["items"]] == ["customers-count"]
+
+
+def test_an_unreachable_datasource_cannot_produce_a_verdict(
+    artifacts, scripted, capsys, monkeypatch
+):
+    """The criterion this contract exists for. It reaches `2` by a different route than a
+    generation failure does — the statements are written, and then nothing can execute them."""
+    _write(artifacts, "mixed", ONE_FAILURE)
+    monkeypatch.delenv("DATASOURCE_URL__AGAMI_EXAMPLE")
+
+    code, payload, _ = _run(capsys, "--dataset", "mixed")
+
+    assert code == 2
+    assert payload["summary"]["errored"] == payload["summary"]["total"]

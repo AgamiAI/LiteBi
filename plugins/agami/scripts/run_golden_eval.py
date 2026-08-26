@@ -30,8 +30,11 @@ Usage:
 
 **What a run sends outbound.** Generating a statement spawns the operator's own client with every
 tool switched off, and hands it the question, the organization, the datasource name and the tables
-and columns of the semantic model. It is handed neither the answer key, nor the dataset's location,
-nor any result row — generation finishes before anything is executed, so no row exists yet. That
+and columns of the semantic model. It is handed neither the answer key nor any result row —
+generation finishes before anything is executed, so no row exists yet. It is not told where the
+dataset lives either, though that withholds a name rather than a capability: the child keeps `HOME`
+and is given the profile's name, and what actually stops it reading the answer key off disk is that
+it is started with no tools to read one with. That
 egress is the operator's own model provider and nothing else. It matters most in CI, where the
 model's vocabulary leaves a shared runner rather than one person's machine, and where the
 credential is whatever the environment supplies to the client.
@@ -503,16 +506,24 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
 
 
 def _last_failures(profile: str, dataset_name: str) -> Optional[list[str]]:
-    """The item keys the most recent run of this dataset recorded as failures, or None if none ran.
+    """The item keys the most recent WHOLE, CONCLUDED run of this dataset recorded as failures.
+
+    Three things disqualify a record, and each of them was a false green before it did:
+
+    * **A run that produced no verdict.** An all-errored or half-finished run records no failures
+      because it scored nothing, not because nothing was wrong. Trusting its empty list makes the
+      next re-run exit `0` over a dataset with live regressions in it — the exact reading the `2`
+      branch exists to prevent, arrived at two invocations later.
+    * **A run that was itself a selection.** A `--tag` slice or an earlier re-run describes some of
+      the dataset, so its failure list is silently narrower than the truth and every re-run after it
+      inherits the narrowing.
+    * **A record this version cannot read**, including one written before the verdict fields were
+      added.
 
     Artifacts are keyed on the profile, not the dataset, so the newest file in the directory may
     describe something else entirely — matching on the recorded `dataset` is what stops a re-run
     executing another dataset's failures and reporting confidently about it. `*.json` and not `*`
     because the report slice writes its HTML into this same directory.
-
-    An unreadable or unrecognisable artifact is skipped rather than fatal. These accumulate over
-    months and one truncated file, from a full disk or an interrupted write, must not make the
-    feature unusable for every run after it.
     """
     out = agami_paths.dashboard_dir("eval", profile)
     if not out.is_dir():
@@ -521,6 +532,16 @@ def _last_failures(profile: str, dataset_name: str) -> Optional[list[str]]:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             if record["dataset"] != dataset_name:
+                continue
+            if record["selection"] is not None:
+                continue
+            summary = record["summary"]
+            if _verdict_of(
+                completed=summary["completed"],
+                total=summary["total"],
+                errored=summary["errored"],
+                gating_failures=summary["gating_failures"],
+            ) == _CANNOT_START:
                 continue
             return [
                 item["item_key"] for item in record["items"] if item["section"] == "failure"
@@ -554,9 +575,11 @@ def _reselect(dataset: GoldenDataset, profile: str) -> Optional[GoldenDataset]:
             f"{missing} of the last run's failures are no longer in {dataset.name!r} and were "
             "skipped"
         )
-    if not selected:
+    if not selected and not missing:
         # Not a wrong selector — the last run genuinely had nothing to re-run — so this is a clean
-        # exit, and the sentence says which of the two it was so a reader is not left guessing.
+        # exit. Only claimed when nothing was skipped: saying "recorded no failures" right after
+        # saying some were skipped contradicts it, and a skill reads this sentence back as "the
+        # previous run was green".
         _warn(
             f"the last run of {dataset.name!r} recorded no failures, so this re-run had nothing "
             "to do"
@@ -586,12 +609,13 @@ def _select(dataset: GoldenDataset, tags: Optional[list[str]]) -> Optional[Golde
     selected = [item for item in dataset.test_cases if wanted.intersection(item.tags)]
     if not selected:
         present = sorted({tag for item in dataset.test_cases for tag in item.tags})
+        tags_shown = ", ".join(repr(tag) for tag in tags)
         names = (
             f"Tags present: {', '.join(present)}"
             if present
             else "No case in this dataset carries a tag at all."
         )
-        _stop(f"no case in {dataset.name!r} carries any of: {', '.join(tags)}. {names}")
+        _stop(f"no case in {dataset.name!r} carries any of: {tags_shown}. {names}")
         return None
     # A copy and not a mutation: the model forbids unknown fields and the caller's dataset is what
     # the reader handed back, so narrowing in place would edit the record every other reader sees.
@@ -633,6 +657,7 @@ def _write_artifact(
     questions: dict[str, str],
     keys: dict[str, str],
     summary: dict[str, Any],
+    selection: Optional[str],
 ) -> Path:
     """Join the run to the dataset it ran and persist both statements.
 
@@ -653,6 +678,10 @@ def _write_artifact(
         "run_id": result.run_id,
         "profile": result.profile,
         "dataset": result.dataset,
+        # What narrowed this run, or None for a whole one. A later re-run reads only whole runs:
+        # a slice's failure list is silently narrower than the truth, and inheriting it narrows
+        # every re-run after it.
+        "selection": selection,
         "summary": summary,
         "items": [
             {
@@ -662,11 +691,11 @@ def _write_artifact(
                 # write an artifact with an empty question in it.
                 "question": questions[outcome.item_key],
                 "expected_sql": keys[outcome.item_key],
+                # The runner's own record, rather than three of its keys re-spelled here: it
+                # already carries `confirmed`, `passed`, `gated` and the claim difference the
+                # report renders beside the two statements.
+                **outcome.as_dict(),
                 "generated_sql": outcome.generated_sql,
-                "score": outcome.as_dict()["score"],
-                "confirmed": outcome.confirmed,
-                "passed": outcome.passed,
-                "gated": outcome.gated,
                 # The same classifier the terminal printed, so "re-run the failures" runs what a
                 # reader actually saw under that heading rather than a second opinion about it.
                 "section": _section(outcome),
@@ -739,11 +768,27 @@ def _verdict(result: GoldenRunResult) -> int:
     resting the exit code on it would fail CI on an item no human has agreed to. Confirmed-only is
     the contract's invariant, and this is the surface it is observable at.
     """
-    if not result.completed:
+    return _verdict_of(
+        completed=result.completed,
+        total=len(result.outcomes),
+        errored=result.errored,
+        gating_failures=result.gating_failures,
+    )
+
+
+def _verdict_of(*, completed: bool, total: int, errored: int, gating_failures: int) -> int:
+    """The rule itself, over four numbers rather than a run.
+
+    A recorded run has to be judged by the same rule as a live one — `_last_failures` must know
+    whether the artifact it is about to trust produced a verdict at all — and an artifact carries
+    these four values and not a `GoldenRunResult`. One spelling, so the two can never drift into
+    disagreeing about what a green run was.
+    """
+    if not completed:
         return _CANNOT_START
-    if result.outcomes and result.errored == len(result.outcomes):
+    if total and errored == total:
         return _CANNOT_START
-    if result.gating_failures:
+    if gating_failures:
         return _FAILED
     return 0
 
@@ -815,6 +860,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     if dataset is None:
         return _CANNOT_START
+    if args.rerun_failures and not dataset.test_cases:
+        # Nothing to re-run is a clean exit, and it stops here rather than running: an empty run
+        # would write a 0-case artifact that becomes this dataset's newest record and shadows the
+        # real one, so the evidence a later re-run needs would be gone.
+        return 0
+
+    selection = (
+        "rerun" if args.rerun_failures else (",".join(args.tag) if args.tag else None)
+    )
 
     # Reading the model and resolving its dialect are the three raises this path reaches, and
     # everything below them is total. None of them is relayed as a stack: a traceback prints the
@@ -870,13 +924,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     keys = {item.item_key: item.expected.sql or "" for item in dataset.test_cases}
     payload = _run_payload(result, questions)
     try:
-        payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"]))
+        payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"], selection))
     except OSError as exc:
         # The run is already paid for — a model call and up to two warehouse queries per case — so
         # a directory it cannot write to costs the drill-down and nothing else. The verdicts print
         # either way. The path is not relayed, for the reason the preflight guards give.
         payload["artifact"] = ""
-        _stop(
+        _warn(
             "the verdicts are below, but this run's artifact could not be written "
             f"({exc.__class__.__name__}: {exc.strerror or 'cannot be written'})"
         )
