@@ -628,6 +628,34 @@ def test_the_artifact_lands_in_the_eval_dashboard_dir_with_both_statements(
     assert by_key["orders-count"]["score"]["accuracy"] == 1.0
 
 
+def test_the_artifact_carries_what_the_report_renders(artifacts, scripted, capsys):
+    """The verdict fields and the claim difference, per item.
+
+    The report renderer is stdlib-only — it cannot parse a statement — so the table-set delta it
+    prints above the two statements has no input unless the run writes the difference down here.
+    The same goes for `confirmed` / `passed` / `gated` / `section`: they are the verdict, and
+    re-deriving any of them at render time would be a second definition of one."""
+    _write(artifacts, "mixed", MIXED_DATASET)
+
+    _, payload, _ = _run(capsys, "--dataset", "mixed")
+
+    joined = json.loads(Path(payload["artifact"]).read_text(encoding="utf-8"))
+    by_key = {item["item_key"]: item for item in joined["items"]}
+    passing = by_key["orders-count"]
+    assert passing["section"] == "pass"
+    assert passing["confirmed"] is True and passing["passed"] is True and passing["gated"] is False
+    # The tables claim is the first of the seven, and it is the one the report renders.
+    assert passing["claims"]["claims"][0] == {
+        "name": "tables", "status": "agrees", "generated": ["orders"], "golden": ["orders"],
+    }
+    # A run that never got a statement has no claim difference at all, so the report has to render
+    # the absence rather than assume the key is there.
+    assert by_key["products-count"]["section"] == "error"
+    assert by_key["products-count"]["claims"] is None
+    assert by_key["payments-count"]["section"] == "unconfirmed"
+    assert by_key["customers-count"]["section"] == "failure"
+
+
 def test_what_the_reader_dropped_reaches_the_findings(artifacts, scripted, capsys):
     """A case too broken to read costs that case, and the run says so — otherwise the dataset
     quietly shrinks and the summary looks the same."""

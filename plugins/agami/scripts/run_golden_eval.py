@@ -692,12 +692,18 @@ def _write_artifact(
                 "question": questions[outcome.item_key],
                 "expected_sql": keys[outcome.item_key],
                 # The runner's own record, whole. It already carries `item_key`, `generated_sql`,
-                # `confirmed`, `passed`, `gated` and the claim difference the report renders beside
-                # the two statements — re-spelling any of them here is a second source of truth for
-                # a value that has one, and the copy is what goes stale.
+                # `confirmed`, `passed`, `gated`, the score and the claim difference — re-spelling
+                # any of them here is a second source of truth for a value that has one, and the
+                # copy is what goes stale.
+                #
+                # The claim difference is why the whole record goes in rather than a chosen few:
+                # the report renderer is stdlib-only and cannot parse a statement, so a difference
+                # it is not handed is one it cannot show.
                 **outcome.as_dict(),
                 # The same classifier the terminal printed, so "re-run the failures" runs what a
-                # reader actually saw under that heading rather than a second opinion about it.
+                # reader actually saw under that heading rather than a second opinion about it —
+                # and the renderer does not re-derive it, which would be a second place deciding
+                # what a run looks like.
                 "section": _section(outcome),
             }
             for outcome in result.outcomes
