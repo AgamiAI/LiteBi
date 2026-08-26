@@ -9,8 +9,10 @@ primitive.
 This docstring used to say "NO shipped script makes a network call", and that is
 no longer the posture. `semantic_model/golden_run.py` starts the operator's OWN
 AI client as a CHILD PROCESS to generate the SQL a golden-dataset eval grades —
-their client, their account, an explicit command, and a child given no tools, no
-MCP configuration and an allowlisted environment. Being out of process, it matches
+their client, their account, an explicit command, and a child whose every tool,
+MCP server and setting source is switched off BY A FLAG (`--tools ""`,
+`--strict-mcp-config`, `--setting-sources ""`), started in an empty directory,
+with an allowlisted environment. Being out of process, it matches
 none of the primitives below, so nothing here went red when it landed. That is
 exactly why the wording is corrected deliberately: a doc that keeps promising what
 the code stopped doing is worse than one that never promised it. What the scan

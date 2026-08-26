@@ -19,6 +19,7 @@ fixtures are synthetic throughout — an `acme` profile over `orders`, fabricate
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -349,11 +350,16 @@ class _RecordedSpawn:
     def __init__(self, stdout: str = ANSWER, returncode: int = 0, stderr: str = "",
                  raises: BaseException | None = None) -> None:
         self.invocations: list[tuple[list[str], dict]] = []
+        self.working_dirs: list[tuple[str | None, list[str] | None]] = []
         self._stdout, self._returncode, self._stderr = stdout, returncode, stderr
         self._raises = raises
 
     def __call__(self, args, **kwargs):
         self.invocations.append((list(args), kwargs))
+        # The working directory is read HERE and not by the test: it is a temporary directory that
+        # exists only for the duration of the call, so its contents are unknowable afterwards.
+        cwd = kwargs.get("cwd")
+        self.working_dirs.append((cwd, sorted(os.listdir(cwd)) if cwd else None))
         if self._raises is not None:
             raise self._raises
         return subprocess.CompletedProcess(args, self._returncode, self._stdout, self._stderr)
@@ -379,21 +385,75 @@ def _cli_generator() -> gr.ClaudeCliGenerator:
     return gr.ClaudeCliGenerator(SCHEMA, timeout_s=30.0)
 
 
-def test_the_generator_is_invoked_with_no_tools(spawn):
-    """The child gets print mode and nothing else.
+def _flag_value(args: list[str], flag: str) -> str | None:
+    """The value that follows `flag` in an argument list, or None when the flag is not there."""
+    return args[args.index(flag) + 1] if flag in args else None
 
-    No `--mcp-config`, no `--allowedTools`, no `--permission-mode`. A client with no tools has no
-    path to the warehouse at all, so 'the generating model never read a row' holds structurally
-    rather than by an allowlist staying correct. The schema is inlined in the prompt instead.
+
+def test_the_generator_is_invoked_with_every_tool_and_mcp_source_switched_off(spawn):
+    """The tools, the MCP servers and the setting sources are closed by NAME, one flag each.
+
+    This test used to assert the opposite shape — that the argument list was `claude -p` and
+    carried no `--` argument at all. That is not a security property in this client: an omitted
+    `--tools` means every built-in tool, an omitted `--strict-mcp-config` loads the operator's own
+    MCP servers, and omitted `--setting-sources` reads the launch directory's project settings.
+    Absence of a flag was the bug, so what is pinned here is the PRESENCE of the three that close
+    each default, plus the empty working directory the child is started in.
     """
     generated = _cli_generator().generate(QUESTION, ORG, DATASOURCE)
 
     args, kwargs = spawn.invocations[0]
-    assert args == ["claude", "-p"]
-    assert not [arg for arg in args if arg.startswith("--")]
+    assert args[:2] == ["claude", "-p"]
+    assert _flag_value(args, "--tools") == ""  # "" is this client's spelling of "no tools"
+    assert "--strict-mcp-config" in args  # and no --mcp-config, so: no MCP servers
+    assert _flag_value(args, "--setting-sources") == ""  # no user / project / local settings
+    workdir, contents = spawn.working_dirs[0]
+    assert workdir and workdir != os.getcwd()
+    assert contents == []  # nothing to read even if a setting source were loaded
     assert SCHEMA in kwargs["input"] and QUESTION in kwargs["input"]
     assert kwargs["timeout"] == 30.0
     assert generated.sql == "SELECT COUNT(order_id) AS n FROM orders" and generated.error is None
+
+
+def test_the_working_directory_is_not_left_behind_after_the_generation(spawn):
+    """The directory exists for the call and no longer. An eval runs once per question, and a
+    generator that littered a temporary directory per item would be a slow leak on a long run."""
+    _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    workdir, _ = spawn.working_dirs[0]
+    assert not os.path.exists(workdir)
+
+
+def test_the_child_is_given_no_way_to_read_the_answer_key_off_disk(spawn, monkeypatch):
+    """`HOME` is on the environment allowlist, and that is the whole of the route to the key.
+
+    From `HOME` a child with a file-reading tool reaches `~/.config/agami/path`, which NAMES the
+    artifacts directory; the dataset under it carries `expected.sql` and the rows a previous run
+    recorded, and the warehouse credentials file sits beside it. Withholding `AGAMI_ARTIFACTS_DIR`
+    hides the name of that path, not the root it is computed from — so the three flags are what
+    make the `HOME` in this environment inert, rather than decoration on the argument list.
+    """
+    monkeypatch.setenv("HOME", "/home/example")
+
+    _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    args, kwargs = spawn.invocations[0]
+    assert kwargs["env"]["HOME"] == "/home/example"
+    assert _flag_value(args, "--tools") == ""
+    assert "--strict-mcp-config" in args and "--mcp-config" not in args
+    assert _flag_value(args, "--setting-sources") == ""
+
+
+def test_the_invocation_is_the_same_on_every_call(spawn):
+    """One tuple, no branch: a flag that some runs get and others do not is a flag that will be
+    missing on the run that mattered. The module-level constant is what makes that unrepresentable,
+    so a second generation is asserted to be argument-for-argument the first."""
+    generator = _cli_generator()
+    generator.generate(QUESTION, ORG, DATASOURCE)
+    generator.generate("How many customers are there?", ORG, None)
+
+    assert spawn.invocations[0][0] == spawn.invocations[1][0]
+    assert isinstance(gr._CLIENT_ARGV, tuple)
 
 
 def test_the_answer_key_is_in_nothing_the_generator_was_given(chokepoint, spawn):

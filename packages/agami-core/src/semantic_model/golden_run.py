@@ -29,12 +29,17 @@ remaining items against something that is not working.
 
 The one shipped generator, `ClaudeCliGenerator`, spawns the operator's own client as a child
 process. Three decisions about that child are load-bearing and are pinned by tests rather than by
-this docstring: it is given **no tools and no MCP configuration** (the schema is inlined in the
-prompt instead, so there is no path from the generating model to the warehouse to police), its
-environment is an explicit **allowlist** rather than the inherited one (the parent's environment
-carries the dataset's own root and the warehouse credentials), and its **stderr is never
-surfaced** — a client can echo the prompt there, and a failed generation is reported as a fixed,
-value-free sentence.
+this docstring: **every tool and every MCP server is switched off by an explicit flag** and the
+child starts in an empty directory, so the schema inlined in its prompt is the only thing it can
+read; its environment is an explicit **allowlist** rather than the inherited one (the parent's
+environment carries the dataset's own root and the warehouse credentials); and its **stderr is
+never surfaced** — a client can echo the prompt there, and a failed generation is reported as a
+fixed, value-free sentence.
+
+The flags are the load-bearing half of that first decision, and it is worth saying why here too:
+in this client the ABSENCE of a tool flag means every built-in tool, not none of them. A child left
+at its defaults could read files, glob and run commands, and `HOME` is on the allowlist — which is
+the whole of the route to the artifacts pointer, the dataset and the answer key inside it.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -355,13 +361,36 @@ def _not_ok(envelope: Envelope, *, answer_key: bool) -> ItemScore:
 # The shipped generator: the operator's own client, as a child process
 # ---------------------------------------------------------------------------
 
-# The child's argument list, in full. `-p` is print mode — read a prompt, write an answer, exit.
-# There is deliberately nothing else: no MCP configuration, no tool allowlist and no permission
-# mode. A client with no tools has no path to the warehouse at all, so "the generating model never
-# read a row, and never saw the answer key" is a property of the SHAPE of this invocation rather
-# than of an allowlist somebody has to keep correct. What the model needs to write a statement —
-# the tables and columns — is inlined in the prompt instead, by whoever built this generator.
-_CLIENT_ARGV = ("claude", "-p")
+# The child's argument list, in full, and a tuple so that nothing can conditionally append to it:
+# every run of this generator gets the same four decisions, or none of them.
+#
+# Do not delete a flag here as noise. In this client the ABSENCE of a flag is not deny-all, it is
+# the permissive default, and each of these three overrides one:
+#
+# * `--tools ""` — omitting it gives the child EVERY built-in tool, Read and Glob and Bash among
+#   them. `""` is the documented way to spell "none of them".
+# * `--strict-mcp-config` — the default loads the operator's user-scope, project-scope, `.mcp.json`
+#   and plugin MCP servers. With this flag the child uses only the servers `--mcp-config` names,
+#   and no `--mcp-config` is passed, so that is the empty set.
+# * `--setting-sources ""` — the default loads the user, project and local setting sources, which
+#   is how a `CLAUDE.md`, a `.claude/settings.json` or a `.mcp.json` would reach the child.
+#
+# All three matter because `HOME` is on the environment allowlist below, and every path this run
+# withholds the name of is computed from it: the artifacts pointer, the artifacts directory it
+# names, the dataset inside that carrying `expected.sql` and its recorded rows, and the warehouse
+# credentials file beside it. A child with no tool to read a file has no use for `HOME`, which is
+# what makes withholding the NAME of the path sufficient. `-p` is print mode — read a prompt from
+# stdin, write an answer, exit. What the model needs to write a statement — the tables and
+# columns — is inlined in the prompt instead, by whoever built this generator.
+_CLIENT_ARGV = (
+    "claude",
+    "-p",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+)
 
 # The child's whole environment, by name. An ALLOWLIST and not a filter, and that is the decision:
 # `subprocess.run` passes the parent's environment through by default, and the parent's carries the
@@ -372,6 +401,11 @@ _CLIENT_ARGV = ("claude", "-p")
 # operator's own key for their own client, in a process whose only job is to answer a question. It
 # is not a datasource credential, and no datasource credential has a name that could reach this
 # tuple.
+#
+# `HOME` is here because a client that cannot find its own configuration cannot start, and it is
+# inert only because of the flags above: the artifacts pointer, the dataset and the credentials file
+# are all under it, so this list withholds the NAME of a path the child has no tool to open. The two
+# halves are one decision — never add a tool without revisiting this tuple.
 _CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "ANTHROPIC_API_KEY")
 
 # Why a generation produced no statement. Fixed sentences, and the fixedness is the point: a client
@@ -451,7 +485,7 @@ def _child_env() -> dict[str, str]:
 
 
 class ClaudeCliGenerator:
-    """Answer a question by spawning the operator's own client, once, with no tools.
+    """Answer a question by spawning the operator's own client, once, with every tool switched off.
 
     `schema` is the tables and columns the model may write against, already rendered by whoever
     built this generator — inlining it is what makes the no-tools invocation above sufficient.
@@ -467,18 +501,25 @@ class ClaudeCliGenerator:
         """One question in, one statement out — or a fixed sentence saying why there is not one."""
         prompt = _generation_prompt(question, org, datasource, self.schema)
         try:
-            # The prompt goes on STDIN rather than in the argument list: a schema is long, an
-            # argument list is bounded, and a process list is readable by other users on most
-            # systems.
-            completed = subprocess.run(
-                list(_CLIENT_ARGV),
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_s,
-                env=_child_env(),
-                check=False,
-            )
+            # A directory of its own, empty, thrown away afterwards. The child would otherwise start
+            # in whatever directory the eval was launched from, and a `CLAUDE.md`,
+            # `.claude/settings.json` or `.mcp.json` sitting there is project configuration the
+            # client reads. `--setting-sources ""` already refuses to load those; starting somewhere
+            # that has none of them means the two would have to fail together.
+            with tempfile.TemporaryDirectory(prefix="agami-generation-") as workdir:
+                # The prompt goes on STDIN rather than in the argument list: a schema is long, an
+                # argument list is bounded, and a process list is readable by other users on most
+                # systems.
+                completed = subprocess.run(
+                    list(_CLIENT_ARGV),
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_s,
+                    env=_child_env(),
+                    cwd=workdir,
+                    check=False,
+                )
         except subprocess.TimeoutExpired:
             # `TimeoutExpired` carries the command and whatever output was captured before the kill.
             # None of it is read.
