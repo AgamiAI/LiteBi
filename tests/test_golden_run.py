@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -37,8 +38,9 @@ sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
 
 import execute_sql  # noqa: E402
 import guardrail  # noqa: E402
+from semantic_model import comparator  # noqa: E402
 from semantic_model import golden_run as gr  # noqa: E402
-from semantic_model.golden import GoldenDataset, GoldenItem  # noqa: E402
+from semantic_model.golden import GoldenDataset, GoldenItem, MatchLevel  # noqa: E402
 
 PROFILE = "acme"
 ORG = "demo"
@@ -328,6 +330,61 @@ def test_a_case_with_no_answer_key_is_judged_on_its_own_only_where_the_level_all
     assert result.outcomes[1].score.status == "unscored"
     # One statement ran in total: neither case has an answer key, and the second never got that far.
     assert [call[0] for call in spy.calls] == [GENERATED_SQL]
+
+
+def test_a_self_judging_level_does_not_run_the_answer_key_it_happens_to_have(chokepoint):
+    """`bounded` judges the generated result against a band and never reads the golden rows, so an
+    item that also carries an answer key must not spend a warehouse query producing rows nobody
+    looks at."""
+    item = _item("banded", match="bounded", bounds={"min_rows": 1})
+    spy = _SpyExecutor()
+
+    result = _run(_dataset(item), _StubGenerator(), spy)
+
+    assert [call[0] for call in spy.calls] == [GENERATED_SQL]
+    assert result.outcomes[0].passed
+
+
+def test_a_refused_answer_key_cannot_unscore_a_level_that_never_needed_it(chokepoint, monkeypatch):
+    """The reason the ordering above is a correctness fix and not a saved query.
+
+    Running the answer key first meant a guard refusal of it returned `unscored` — so a `bounded`
+    item inherited a refusal from a statement its match level does not consult, and an eval lost a
+    case it could have scored.
+    """
+    refusal = guardrail.refuse(
+        guardrail.RULE_TABLE_SCOPE, detail="out of scope", remediation="Ask about a declared table."
+    )
+    monkeypatch.setattr(
+        execute_sql,
+        "_model_safety",
+        lambda s, p, a: (s, refusal if s == GOLDEN_SQL else None),
+    )
+    item = _item("banded", match="bounded", bounds={"min_rows": 1})
+
+    result = _run(_dataset(item), _StubGenerator(), _SpyExecutor())
+
+    assert result.outcomes[0].score.status == "scored"
+    assert result.outcomes[0].passed
+
+
+def test_every_match_level_is_either_self_judging_or_keyed(chokepoint):
+    """The runner's list of self-judging levels is the complement of the comparator's keyed ones,
+    and nothing but this holds the two together. A sixth level would land in neither, and `_score`
+    would quietly report 'no answer key' for a level that judges the result on its own terms."""
+    assert set(gr._SELF_JUDGING_LEVELS) | set(comparator._KEYED_LEVELS) == set(get_args(MatchLevel))
+    assert not set(gr._SELF_JUDGING_LEVELS) & set(comparator._KEYED_LEVELS)
+
+
+def test_a_generators_own_error_text_is_bounded_before_it_is_persisted(chokepoint):
+    """A returned error is as much somebody else's text as a raised one, and a raised one is
+    dropped. This reason is persisted with the run and rendered beside the item, so an adapter that
+    hands back a whole log gets it cut to a length rather than relayed at whatever size it chose."""
+    result = _run(_dataset(_item()), _StubGenerator(error="x" * 5_000), _SpyExecutor())
+
+    reason = result.outcomes[0].score.reason
+    assert len(reason) < 5_000
+    assert reason.startswith("x") and reason.endswith("…")
 
 
 # --- the shipped generator: what the child process is, and is not, given ------------------------

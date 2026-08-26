@@ -77,13 +77,23 @@ _NO_ANSWER_KEY = (
     "the item has no answer key, and its match level judges the result against one"
 )
 
+# How much of an injected generator's own error sentence is persisted with the run. A generator is
+# somebody else's code, and a raised exception's text is dropped here for exactly that reason; a
+# RETURNED error is no more trustworthy, so it is bounded rather than relayed whole. The shipped
+# generator's sentences are all far shorter than this, so the cut only ever falls on text the
+# runner did not write.
+_MAX_RELAYED_ERROR = 200
+_ERROR_TRUNCATED = "…"
+
 
 @dataclass(frozen=True)
 class GeneratedSql:
     """What a generator answered with: a statement, or the reason there is not one.
 
-    `sql` is empty exactly when `error` is set. The error is a fixed sentence chosen by the
-    generator — never a client's stderr, never the prompt, and never anything the model wrote.
+    A generator SHOULD leave `sql` empty exactly when it sets `error`, and its error should be a
+    fixed sentence it chose — never a client's stderr, never the prompt, and never anything the
+    model wrote. Neither is enforceable across the seam: `SqlGenerator` is a Protocol and the
+    implementation is somebody else's, so the runner checks both halves rather than trusting them.
     """
 
     sql: str
@@ -268,7 +278,7 @@ def _run_item(
         return ItemOutcome(
             item_key=item.item_key,
             score=ItemScore(
-                status="error", accuracy=None, reason=generated.error or _NOTHING_GENERATED
+                status="error", accuracy=None, reason=_relayed_error(generated.error)
             ),
             generated_sql="",
             claims=None,
@@ -299,6 +309,20 @@ def _run_item(
     )
 
 
+def _relayed_error(error: Optional[str]) -> str:
+    """The generator's own reason, bounded, or the runner's sentence when there is not one.
+
+    A generator that returned nothing and set no error still has to say something to the reader, and
+    a generator that did set one wrote it itself — this reason is persisted and rendered, so it is
+    cut to a length rather than passed through at whatever size the adapter felt like.
+    """
+    if not error:
+        return _NOTHING_GENERATED
+    if len(error) <= _MAX_RELAYED_ERROR:
+        return error
+    return error[:_MAX_RELAYED_ERROR] + _ERROR_TRUNCATED
+
+
 def _score(
     item: GoldenItem,
     generated_sql: str,
@@ -310,17 +334,23 @@ def _score(
 ) -> ItemScore:
     """Run both statements through the chokepoint and score what came back.
 
-    The answer key goes first. If it cannot be run there is nothing to judge the generated
+    The MATCH LEVEL is read before either statement runs, because it decides whether there are two.
+    A level that judges the generated result on its own terms never looks at the answer key, so an
+    item written at one is not charged for running a statement whose rows would be discarded — and,
+    more than a wasted query, is not left unscored because the guard refused a statement the level
+    never needed.
+
+    Otherwise the answer key goes first. If it cannot be run there is nothing to judge the generated
     statement against, so the generated statement is not run either — executing it would spend a
     warehouse query on a comparison that cannot happen.
     """
-    if golden_sql:
+    if item.match in _SELF_JUDGING_LEVELS:
+        golden_result = ExecResult(columns=[], rows=[])
+    elif golden_sql:
         envelope = execute_guarded(golden_sql, profile, None, executor=executor)
         if envelope.status != "ok":
             return _not_ok(envelope, answer_key=True)
         golden_result = envelope.data
-    elif item.match in _SELF_JUDGING_LEVELS:
-        golden_result = ExecResult(columns=[], rows=[])
     else:
         return ItemScore(status="unscored", accuracy=None, reason=_NO_ANSWER_KEY)
 
