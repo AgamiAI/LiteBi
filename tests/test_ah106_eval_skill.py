@@ -15,6 +15,7 @@ sample store, the reader, the chokepoint and the comparator.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -609,3 +610,50 @@ def test_the_skill_says_a_verdict_is_not_zero_failures():
     zero of them and is not green. The skill reads `completed` and `errored` too."""
     assert 'A verdict is not "zero failures"' in SKILL
     assert "completed" in SKILL and "gating_failures" in SKILL and "errored" in SKILL
+
+
+# ---------------------------------------------------------------------------
+# The shared docs
+#
+# A skill nobody is told to invoke is a skill nobody invokes, and a path nobody documents is one
+# the next author invents a second spelling for. Both are prose, so both are asserted as prose.
+# ---------------------------------------------------------------------------
+
+SKILLS_DIR = REPO_ROOT / "plugins" / "agami" / "skills"
+SHARED = REPO_ROOT / "plugins" / "agami" / "shared"
+CONVENTIONS = (SHARED / "invocation-conventions.md").read_text(encoding="utf-8")
+FILE_LAYOUT = (SHARED / "file-layout.md").read_text(encoding="utf-8")
+
+# The opening sentence counts in words, so a test that reads it has to spell them too. Only the
+# range a plugin can plausibly ship — a count outside it is a drift worth failing on by itself.
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+
+
+def test_invocation_conventions_lists_the_skill():
+    """The routing doc is where a caller learns a skill exists. Absent from it, `/agami-eval` is
+    reachable only by someone who already knows the name."""
+    assert "| agami-eval |" in CONVENTIONS
+    assert "`/agami-eval`" in CONVENTIONS
+
+
+def test_invocation_conventions_count_matches_the_directory():
+    """The doc said "five" while the directory held seven — two skills shipped and nothing caught
+    it, because the count was prose and the truth was a directory listing. Derive both."""
+    shipped = sorted(path.name for path in SKILLS_DIR.iterdir() if path.is_dir())
+    match = re.search(r"agami ships (\w+) skills", CONVENTIONS)
+
+    assert match, "the opening sentence no longer states how many skills agami ships"
+    assert NUMBER_WORDS.get(match.group(1)) == len(shipped)
+    # …and the table is what a reader actually routes from, so it carries every one of them.
+    for name in shipped:
+        assert f"| {name} |" in CONVENTIONS
+
+
+def test_file_layout_documents_the_golden_dataset_path():
+    """Where a dataset is authored and where a run's artifact lands. Neither appeared in the layout
+    doc before this skill, so an author had only the skill's prose to go on."""
+    assert "golden_datasets" in FILE_LAYOUT
+    assert "eval" in FILE_LAYOUT

@@ -17,7 +17,7 @@ Everything in here is either a secret, an auth file derived from a secret, or pe
 | `query_log.jsonl` | Personal record of every query you ran |
 | `charts/<profile>/<ts>.html` | Per-query HTML reports |
 | `exports/<profile>/<ts>.csv` | Per-query CSV exports |
-| `{review,model,examples-validation}/<profile>/<ts>.html` | Per-profile dashboards |
+| `{review,model,examples-validation,eval}/<profile>/<ts>.html` | Per-profile dashboards. The `eval` kind also holds a JSON run artifact per run (the answer key and the generated statement, side by side) alongside the HTML rendered from it |
 | `serve/`, `tunnels/` | The copied MCP server; SSH tunnel scripts |
 | `.duckdb_init_*.sql` | Ephemeral, chmod-600 — federation init files, deleted after the query |
 
@@ -37,6 +37,7 @@ Everything else in here is non-secret and team-useful. The default location is `
 | `<profile>/subject_areas/<area>/metrics/<slug>.yaml`, `entities/<slug>.yaml` | One metric / entity per file |
 | `<profile>/subject_areas/<area>/relationships.yaml` | In-area join edges (cardinality + trust block) |
 | `<profile>/prompt_examples/<area>/examples.yaml` | Per-area NL→SQL few-shot library |
+| `<profile>/golden_datasets/<name>.yaml` | The profile's golden datasets — each case a question, its answer key, and how strictly to compare. **User-authored**: a team writes and confirms these; no skill writes one |
 | `<profile>/datasource.md` | Per-profile human narrative (the model-derived summary + glossary are assembled at read time, not stored here) |
 | `<profile>/.snapshots/<hash>/` | Pinned model snapshots — an answer reproduces against the hash it ran on |
 

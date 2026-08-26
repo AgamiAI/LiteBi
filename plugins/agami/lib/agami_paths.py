@@ -80,7 +80,7 @@ def query_log_path(art: Path | None = None) -> Path:
 
 
 def dashboard_dir(kind: str, profile: str, art: Path | None = None) -> Path:
-    """Rendered dashboards: kind in {model, review, examples-validation}."""
+    """Rendered dashboards: kind in {model, review, examples-validation, eval}."""
     return local_dir(art) / kind / profile
 
 
