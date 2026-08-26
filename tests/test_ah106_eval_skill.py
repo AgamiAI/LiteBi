@@ -543,3 +543,69 @@ def test_the_generator_is_handed_the_tables_and_the_timeout(artifacts, monkeypat
     # Every table in the sample store, once each, rendered as `name(col TYPE, …)`.
     assert len(lines) == len(set(lines)) == 11
     assert any(line.startswith("orders(") and "status string" in line for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# The skill's prose
+#
+# Everything below asserts on SKILL.md rather than on code, for the reason
+# `test_skill_guardrails.py` gives: these behaviors have no code-level equivalent. The helper cannot
+# make the model separate the unconfirmed from the failures, refuse to paste a statement it can
+# read out of the artifact, or say that a run of nothing but errors is not green — the skill is the
+# only place those live, so "the skill says X" is the only decidable check there is.
+# ---------------------------------------------------------------------------
+
+SKILL = (REPO_ROOT / "plugins" / "agami" / "skills" / "agami-eval" / "SKILL.md").read_text(
+    encoding="utf-8"
+)
+FRONTMATTER = SKILL.split("---")[1]
+
+
+def test_the_skill_carries_the_four_frontmatter_keys():
+    """The house shape. `argument-hint` is the one a new skill forgets, and without it the dataset
+    name has nowhere to arrive from."""
+    assert SKILL.startswith("---\n")               # frontmatter at the top, not prose
+    assert "name: agami-eval" in FRONTMATTER
+    assert "description:" in FRONTMATTER
+    assert "when_to_use:" in FRONTMATTER
+    assert 'argument-hint: "[dataset-name]"' in FRONTMATTER
+
+
+def test_the_skill_refuses_in_plan_mode():
+    """A run executes SQL and writes a report, so it cannot proceed read-only."""
+    assert "shared/plan-mode-check.md" in SKILL            # the shared detection logic
+    assert "I can't run an eval in plan mode" in SKILL     # …and the refusal it ends the turn on
+    assert "DO NOT call `ExitPlanMode`" in SKILL           # …without leaving a plan file behind
+
+
+def test_the_skill_routes_authoring_to_the_shared_shape():
+    """Naming the reference at the authoring moment is what keeps the model from globbing another
+    profile's datasets to learn the shape — an answer key is a tenant's data."""
+    assert "shared/golden-dataset-shape.md" in SKILL
+    assert "never read another profile" in SKILL
+
+
+def test_the_summary_names_the_unscored_count():
+    """A dataset whose relative windows have outrun its data must not read as a clean run."""
+    assert "unscored" in SKILL
+    assert "Unscored" in SKILL  # its own section, not just a number in the summary line
+
+
+def test_the_skill_separates_the_unconfirmed_from_the_failures():
+    """They ran and they reported and they can never gate, so a reader who scans the failures must
+    not find one of these in the list."""
+    assert "can never gate" in SKILL
+    assert "### 3e" in SKILL  # a section of their own, visibly after the ones that can
+
+
+def test_the_skill_forbids_pasting_sql():
+    """The helper withholds both statements; the artifact carries them, and the model can read it."""
+    assert "Never paste SQL in chat" in SKILL
+    assert "do not read it out of the artifact" in SKILL
+
+
+def test_the_skill_says_a_verdict_is_not_zero_failures():
+    """`gating_failures` counts items that were SCORED, so a run where every generation errored has
+    zero of them and is not green. The skill reads `completed` and `errored` too."""
+    assert 'A verdict is not "zero failures"' in SKILL
+    assert "completed" in SKILL and "gating_failures" in SKILL and "errored" in SKILL
