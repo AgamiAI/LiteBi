@@ -314,6 +314,7 @@ def _resolve_date_window(
     """
     bounds: dict[str, list[tuple[str, str, bool]]] = {}
     written_as: dict[str, str] = {}
+    bare_names: dict[str, str] = {}
     unreduced: set[str] = set()
     for conjunct in conjuncts:
         found = _temporal_bounds(conjunct)
@@ -321,14 +322,23 @@ def _resolve_date_window(
             unreduced |= rt._predicate_columns(conjunct)
             continue
         column, pieces = found
-        key = column.name.lower()
+        # Keyed on the QUALIFIED column, so `orders.created_at` and `shipments.created_at` in one
+        # join are two columns rather than one. Keyed bare, their bounds merged into a single
+        # window neither statement wrote — and this is one of the two claims allowed to gate, so an
+        # invented window is a correct statement failed.
+        key = _expression_key(column, aliases)
         bounds.setdefault(key, []).extend(pieces)
-        written_as.setdefault(key, _expression_key(column, aliases))
+        written_as.setdefault(key, key)
+        # The bare name is kept alongside because the unreduced set is bare, by its own design:
+        # `runtime._predicate_columns` folds to bare names so the membership test errs toward
+        # undetermined. Matching a qualified key against it would never hit, and a partial
+        # reduction would then be reported as a whole interval.
+        bare_names.setdefault(key, column.name.lower())
 
     if len(bounds) != 1:
         return None
     key, pieces = next(iter(bounds.items()))
-    if key in unreduced:
+    if bare_names.get(key, key) in unreduced:
         return None
 
     edges: dict[str, tuple[Optional[str], bool]] = {"start": (None, False), "end": (None, False)}
@@ -492,9 +502,7 @@ def _join_keys(
         on = join.args.get("on")
         if on is not None:
             pairs |= {
-                frozenset(
-                    (rt._echo_name(table), rt._echo_name(column)) for table, column in pair
-                )
+                frozenset((rt._echo_name(table), rt._echo_name(column)) for table, column in pair)
                 for pair in rt._predicate_pairs(on, aliases)
             }
     return frozenset(pairs)

@@ -362,7 +362,10 @@ def _relayed_error(error: Optional[str]) -> str:
         return _NOTHING_GENERATED
     if len(error) <= _MAX_RELAYED_ERROR:
         return error
-    return error[:_MAX_RELAYED_ERROR] + _ERROR_TRUNCATED
+    # The marker is part of the bound, not added past it. `_MAX_RELAYED_ERROR` is what a reader of
+    # this field may assume about its length, and a cut that overshoots the number it is named for
+    # is the one length nobody downstream planned for.
+    return error[: _MAX_RELAYED_ERROR - len(_ERROR_TRUNCATED)] + _ERROR_TRUNCATED
 
 
 def _score(
@@ -409,7 +412,10 @@ def _score(
         golden_result,
         envelope.data,
         match=item.match,
-        golden_sql=golden_sql or None,
+        # Withheld at a self-judging level, which never ran the answer key: reading its ORDER BY
+        # would set `order_sensitive` from a statement that had no part in the score, and a
+        # diagnostic naming evidence nobody consulted is worse than one naming none.
+        golden_sql=None if item.match in _SELF_JUDGING_LEVELS else (golden_sql or None),
         bounds=item.bounds,
         dialect=dialect,
     )
@@ -600,7 +606,13 @@ class ClaudeCliGenerator:
                 completed = subprocess.run(
                     list(_CLIENT_ARGV),
                     input=prompt,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    # Discarded by the OS rather than captured and then not read. A client can
+                    # echo the whole prompt on stderr, and the prompt carries the model's
+                    # vocabulary; the fixed sentences this module relays are written here, never
+                    # taken from the child. Holding it in memory to ignore it is a copy of
+                    # something with no reader and one way to leak.
+                    stderr=subprocess.DEVNULL,
                     text=True,
                     timeout=self.timeout_s,
                     env=_child_env(),
