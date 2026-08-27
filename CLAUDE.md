@@ -18,7 +18,7 @@ demand by `uvx`, the same on macOS / Linux / Windows. From the repo root:
 
 ```bash
 uv run dev.py setup     # once: wire the local pre-commit hooks
-uv run dev.py check     # ruff + tests + gitleaks — the same checks CI gates on
+uv run dev.py check     # ruff + tests + gitleaks + conflict markers — the same checks CI gates on
 uv run dev.py cover     # did the lines I changed get tested? (patch coverage)
 ```
 

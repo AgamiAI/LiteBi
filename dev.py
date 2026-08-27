@@ -10,7 +10,7 @@ unbypassable version that runs on every PR.
 
 Tasks:
   setup   wire the local pre-commit hooks (ruff + gitleaks on commit; tests on push)
-  check   the full local gate: ruff lint + tests + gitleaks (what CI runs)
+  check   the full local gate: ruff lint + tests + gitleaks + conflict markers (what CI runs)
   test    just the test suite
   lint    just ruff (lint + format check)
   fmt     apply ruff's auto-formatter to the tree
@@ -30,7 +30,9 @@ RUFF = ["uvx", "ruff@0.15.19"]
 # The suite imports the agami-core library, so install it editable with the [model]
 # extra (pydantic/pyyaml/sqlglot). DB drivers are omitted on purpose — those tests skip without a DB.
 TEST_DEPS = ["--with", "pytest-cov", "--with-editable", "packages/agami-core[model,server]"]
-TARGETS = ["plugins", "packages", "tests", "dev.py"]
+# `dev` (the directory) as well as `dev.py` (the file) — the helper scripts under dev/ were
+# unlinted until the conflict-marker gate landed there.
+TARGETS = ["plugins", "packages", "tests", "dev.py", "dev"]
 
 _ROOT = Path(__file__).resolve().parent
 # The plugin's runtime scripts import a small stdlib-only slice of the agami-core library. The
@@ -73,6 +75,11 @@ def secrets() -> int:
     return run(["uvx", "pre-commit", "run", "gitleaks", "--all-files"])
 
 
+def conflicts() -> int:
+    """Fail on a merge-conflict marker that survived into a tracked file (CI's `hygiene` job)."""
+    return run([sys.executable, str(_ROOT / "dev" / "check_conflict_markers.py")])
+
+
 def sync_lib() -> int:
     """Regenerate plugins/agami/lib/ from packages/agami-core/src (the vendored closure the scripts import)."""
     for rel in _VENDORED:
@@ -98,10 +105,11 @@ def _lib_drift() -> int:
 
 
 def check() -> int:
-    """ruff lint + tests + gitleaks + the vendored-lib drift check — the same checks CI gates on."""
+    """ruff + tests + gitleaks + conflict markers + vendored-lib drift — the same checks CI gates on."""
     rc = lint()
     rc |= test()
     rc |= secrets()
+    rc |= conflicts()
     rc |= _lib_drift()
     print("\n✓ all checks passed" if rc == 0 else "\n✗ some checks failed")
     return rc

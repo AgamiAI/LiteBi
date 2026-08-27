@@ -29,7 +29,7 @@ jobs:
       # Lint + import sorting — blocking. Rules come from pyproject.toml.
       # packages/ holds the agami-core library.
       - name: ruff check
-        run: uvx ruff@0.15.19 check plugins packages tests
+        run: uvx ruff@0.15.19 check plugins packages tests dev.py dev
 
       # Format check is informational for now: the tree has a large unformatted
       # backlog (~74 files). Flip `continue-on-error` off after a dedicated
@@ -171,6 +171,17 @@ jobs:
           --with pytest --with psycopg2-binary
           --with-editable "packages/agami-core[model,server]"
           pytest tests/e2e -q
+
+  hygiene:
+    name: hygiene (conflict markers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Its own job rather than a step on `gitleaks`, so a failure here reads as what it
+      # is instead of arriving under a secret-scan heading. Pre-commit runs the same
+      # script locally; this is the copy that cannot be skipped with `--no-verify`.
+      - name: no merge-conflict markers
+        run: python3 dev/check_conflict_markers.py
 
   gitleaks:
     name: gitleaks (secret scan)
