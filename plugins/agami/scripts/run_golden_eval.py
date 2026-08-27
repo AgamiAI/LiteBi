@@ -94,6 +94,51 @@ def _section(outcome: Any) -> str:
     return "pass" if outcome.passed else "failure"
 
 
+def _glossary_text(org: Datasource) -> str:
+    """The datasource's own glossary, rendered for the generator.
+
+    `key_terminology` is where a curator writes down what an opaque literal means — a NetSuite
+    transaction-type code, a status abbreviation, a GL account class. The generator has no tool with
+    which to look one up, and a column's type says `string` and nothing more, so a question about
+    invoices is unanswerable without it: the reader guesses the English word and the statement
+    matches no rows. REQ-010 sends "the question and the model context", and the glossary is the half
+    of that context a schema rendering cannot carry.
+    """
+    terms = getattr(org, "key_terminology", None) or {}
+    if not terms:
+        return ""
+    lines = [f"{name} -- {str(meaning).strip()}" for name, meaning in sorted(terms.items())]
+    return "\n".join(lines)
+
+
+def _column_text(column: dict) -> str:
+    """One column as the generator sees it: name, type, and the model's own description.
+
+    The description is the point. REQ-010 sends "the question and the model context", and a
+    name-and-type rendering is a narrower reading than that: it drops the sentence a curator wrote
+    precisely so a reader would filter the column correctly. A column called `type` on a table that
+    mixes invoices, payments and sales orders is unanswerable from its name — the description is
+    where the warning lives, and the generator has no tool with which to go and read it.
+    """
+    head = f"{column['name']} {column.get('type') or ''}".strip()
+    description = (column.get("description") or "").strip()
+    return f"{head} -- {description}" if description else head
+
+
+def _model_context(org: Datasource) -> str:
+    """Everything the generator is given about the model: the vocabulary, then what its codes mean.
+
+    Two sections in one string rather than two prompt fields, because `SqlGenerator.generate` takes
+    the schema already flattened and widening that signature is a contract change — the argument
+    list is the isolation boundary.
+    """
+    schema = _schema_text(org)
+    glossary = _glossary_text(org)
+    if not glossary:
+        return schema
+    return f"{schema}\n\nWhat the codes in these columns mean:\n{glossary}"
+
+
 def _schema_text(org: Datasource) -> str:
     """The tables and columns the generator may write against, one table per line.
 
@@ -120,10 +165,7 @@ def _schema_text(org: Datasource) -> str:
             name = f"{schema}.{table['name']}" if schema else table["name"]
             if name in tables:
                 continue
-            columns = ", ".join(
-                f"{column['name']} {column.get('type') or ''}".strip()
-                for column in table.get("columns", [])
-            )
+            columns = ", ".join(_column_text(column) for column in table.get("columns", []))
             tables[name] = f"{name}({columns})"
     return "\n".join(tables.values())
 
@@ -196,9 +238,7 @@ def _list_payload(profile: str) -> dict[str, Any]:
             {
                 "name": dataset.name,
                 "total": len(dataset.test_cases),
-                "confirmed": sum(
-                    1 for item in dataset.test_cases if item.expected.sql_confirmed
-                ),
+                "confirmed": sum(1 for item in dataset.test_cases if item.expected.sql_confirmed),
                 "unconfirmed": sum(
                     1 for item in dataset.test_cases if not item.expected.sql_confirmed
                 ),
@@ -390,7 +430,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     result = run_golden_dataset(
         dataset,
         profile=args.profile,
-        generator=ClaudeCliGenerator(_schema_text(org_model), timeout_s=args.timeout_s),
+        generator=ClaudeCliGenerator(_model_context(org_model), timeout_s=args.timeout_s),
         executor=execute_sql.BUILTIN_EXECUTOR,
         # The deployment's own resolver, so this run scores a tenant's dataset against the warehouse
         # that tenant's credentials resolve to — `local` on the single-operator path.
