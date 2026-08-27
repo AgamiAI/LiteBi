@@ -125,18 +125,78 @@ def _column_text(column: dict) -> str:
     return f"{head} -- {description}" if description else head
 
 
-def _model_context(org: Datasource) -> str:
+def _metrics_text(org: Datasource) -> str:
+    """The subject areas' approved metrics, with the binding a correct answer reuses verbatim.
+
+    A metric is the curated form of an aggregation a team has already argued about and signed off:
+    `billings` is not "sum the totals", it is "sum the totals of invoices only, and never as one
+    bare number across currencies". Withheld, the generator hand-rolls the aggregate and the run
+    scores an invented definition against a reviewed one.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for area in runtime.list_subject_areas(org):
+        for metric in loader.get_subject_area_bundle(org, area["name"])["metrics"]:
+            name = metric.get("name") or ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            parts = [name]
+            aliases = metric.get("other_names") or []
+            if aliases:
+                parts.append(f"(also: {', '.join(str(a) for a in aliases)})")
+            for field in ("description", "calculation"):
+                value = (metric.get(field) or "").strip()
+                if value:
+                    parts.append(value)
+            bindings = metric.get("bindings") or {}
+            if isinstance(bindings, dict) and bindings:
+                binding = next(iter(bindings.values()))
+                parts.append(f"SQL: {str(binding).strip()}")
+            lines.append(" -- ".join(parts))
+    return "\n".join(lines)
+
+
+def _examples_text(org: Datasource, root: Path) -> str:
+    """Worked question/SQL pairs a curator confirmed, which are where a house convention lives.
+
+    The convention is the point and it is not written down anywhere else: which of two equally
+    correct date spellings this team uses, whether a currency is broken out, how a join is phrased.
+    A generator with no example guesses one, and a guess that differs from the answer key's is
+    reported as a disagreement when it is a dialect of the same sentence.
+    """
+    lines: list[str] = []
+    for area in runtime.list_subject_areas(org):
+        for example in loader.list_prompt_examples(root, area["name"]):
+            question = (example.get("question") or "").strip()
+            sql = " ".join(str(example.get("sql") or "").split())
+            if question and sql:
+                lines.append(f"Q: {question}\nA: {sql}")
+    return "\n\n".join(lines)
+
+
+def _model_context(org: Datasource, root: Path) -> str:
     """Everything the generator is given about the model: the vocabulary, then what its codes mean.
 
     Two sections in one string rather than two prompt fields, because `SqlGenerator.generate` takes
     the schema already flattened and widening that signature is a contract change — the argument
     list is the isolation boundary.
     """
-    schema = _schema_text(org)
-    glossary = _glossary_text(org)
-    if not glossary:
-        return schema
-    return f"{schema}\n\nWhat the codes in these columns mean:\n{glossary}"
+    sections = [_schema_text(org)]
+    for heading, body in (
+        ("What the codes in these columns mean:", _glossary_text(org)),
+        (
+            "Approved metrics — reuse a binding verbatim when the question names one:",
+            _metrics_text(org),
+        ),
+        (
+            "Worked examples this team has confirmed — follow their conventions:",
+            _examples_text(org, root),
+        ),
+    ):
+        if body:
+            sections.append(f"{heading}\n{body}")
+    return "\n\n".join(sections)
 
 
 def _schema_text(org: Datasource) -> str:
@@ -430,7 +490,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     result = run_golden_dataset(
         dataset,
         profile=args.profile,
-        generator=ClaudeCliGenerator(_model_context(org_model), timeout_s=args.timeout_s),
+        generator=ClaudeCliGenerator(
+            _model_context(org_model, agami_paths.profile_dir(args.profile)),
+            timeout_s=args.timeout_s,
+        ),
         executor=execute_sql.BUILTIN_EXECUTOR,
         # The deployment's own resolver, so this run scores a tenant's dataset against the warehouse
         # that tenant's credentials resolve to — `local` on the single-operator path.

@@ -279,6 +279,7 @@ def _sections(payload: dict[str, Any]) -> list[str]:
 # --list — the cheap answer, with no database and no generator
 # ---------------------------------------------------------------------------
 
+
 def test_listing_a_profile_with_no_datasets_is_not_an_error(artifacts, capsys):
     """The starting state of every profile. It has to name the directory to create, because that
     is the whole of the advice a caller can give from it."""
@@ -296,9 +297,7 @@ def test_listing_reports_what_is_confirmed_and_what_is_not(artifacts, capsys):
 
     _, payload, _ = _run(capsys, "--list")
 
-    assert payload["datasets"] == [
-        {"name": "mixed", "total": 4, "confirmed": 3, "unconfirmed": 1}
-    ]
+    assert payload["datasets"] == [{"name": "mixed", "total": 4, "confirmed": 3, "unconfirmed": 1}]
 
 
 def test_listing_reads_no_credentials(artifacts, monkeypatch, capsys):
@@ -316,6 +315,7 @@ def test_listing_reads_no_credentials(artifacts, monkeypatch, capsys):
 # A run — every item, in presentation order
 # ---------------------------------------------------------------------------
 
+
 def test_a_run_reports_every_item_and_the_summary_counts_them(artifacts, scripted, capsys):
     """Nothing is dropped between the dataset and the payload, and the summary describes exactly
     the items that were printed."""
@@ -330,7 +330,10 @@ def test_a_run_reports_every_item_and_the_summary_counts_them(artifacts, scripte
     assert payload["summary"]["errored"] == sections.count("error")
     assert payload["summary"]["gating_failures"] == sections.count("failure")
     assert {item["item_key"] for item in payload["items"]} == {
-        "orders-count", "payments-count", "products-count", "customers-count"
+        "orders-count",
+        "payments-count",
+        "products-count",
+        "customers-count",
     }
 
 
@@ -428,6 +431,7 @@ def test_an_item_that_could_not_be_scored_is_counted_rather_than_dropped(
 # The rule the whole payload exists to keep
 # ---------------------------------------------------------------------------
 
+
 def test_stdout_carries_neither_statement(artifacts, scripted, capsys):
     """Neither the answer key nor the generated statement appears anywhere in what is printed —
     asserted over the serialized payload, so a field added later is covered without being named."""
@@ -476,9 +480,7 @@ def test_a_type_mismatch_does_not_name_the_answer_keys_column(artifacts, scripte
 
     assert GOLDEN_SENTINEL not in json.dumps(payload)
     assert payload["items"][0]["section"] == "failure"
-    assert payload["items"][0]["reason"] == (
-        "a column does not carry the type the answer key does"
-    )
+    assert payload["items"][0]["reason"] == ("a column does not carry the type the answer key does")
 
 
 def test_a_dataset_that_does_not_parse_does_not_relay_the_offending_line(artifacts, capsys):
@@ -555,6 +557,7 @@ def test_what_the_reader_dropped_reaches_the_findings(artifacts, scripted, capsy
 # Choosing the dataset
 # ---------------------------------------------------------------------------
 
+
 def test_a_single_dataset_needs_no_argument(artifacts, scripted, capsys):
     _write(artifacts, "green", PASSING_DATASET)
 
@@ -596,10 +599,22 @@ def test_a_dataset_with_no_cases_runs_and_reports_nothing(artifacts, scripted, c
 def test_a_dataset_whose_only_case_is_unconfirmed_gates_on_nothing(artifacts, scripted, capsys):
     """The state most profiles are actually in. It runs, it reports, and its verdict rests on
     nothing — which the summary has to make visible."""
-    _write(artifacts, "draft", {"test_cases": [
-        {"id": "payments-count", "query": Q_UNCONFIRMED,
-         "expected": {"sql": "SELECT COUNT(*) AS n FROM payments", "sql_confirmed": False}},
-    ]})
+    _write(
+        artifacts,
+        "draft",
+        {
+            "test_cases": [
+                {
+                    "id": "payments-count",
+                    "query": Q_UNCONFIRMED,
+                    "expected": {
+                        "sql": "SELECT COUNT(*) AS n FROM payments",
+                        "sql_confirmed": False,
+                    },
+                },
+            ]
+        },
+    )
 
     _, payload, _ = _run(capsys, "--dataset", "draft")
 
@@ -610,6 +625,7 @@ def test_a_dataset_whose_only_case_is_unconfirmed_gates_on_nothing(artifacts, sc
 # ---------------------------------------------------------------------------
 # The two runs that are not green and do not look like failures
 # ---------------------------------------------------------------------------
+
 
 def test_a_generator_that_raises_stops_the_run_and_the_payload_says_so(
     artifacts, monkeypatch, capsys
@@ -662,6 +678,7 @@ def test_a_run_where_every_item_errors_is_not_green(artifacts, monkeypatch, caps
 # ---------------------------------------------------------------------------
 # The one raise on the run path
 # ---------------------------------------------------------------------------
+
 
 def test_the_artifact_write_failing_does_not_discard_the_run(artifacts, scripted, capsys):
     """A run costs a model call and two warehouse queries per case. A directory it cannot write to
@@ -747,7 +764,8 @@ def test_the_generator_is_handed_the_tables_and_the_timeout(artifacts, monkeypat
     _run(capsys, "--dataset", "green", "--timeout-s", "7")
 
     assert seen["timeout_s"] == 7.0
-    lines = seen["schema"].splitlines()
+    # The vocabulary is several sections separated by a blank line; the first is the schema.
+    lines = seen["schema"].split("\n\n")[0].splitlines()
     # Every table in the sample store, once each, rendered as `schema.name(col TYPE, …)`.
     assert len(lines) == len(set(lines)) == 11
     assert any(line.startswith("main.orders(") and "status string" in line for line in lines)
@@ -762,24 +780,39 @@ def test_the_schema_qualifies_every_table_that_declares_one(monkeypatch):
     Qualifying also fixes the dedup: two same-named tables in two schemas are two tables, and a
     key on the bare name silently kept one of them."""
     bundles = {
-        "billing": {"tables": {"invoices": {
-            "name": "invoices", "schema": "billing",
-            "columns": [{"name": "id", "type": "integer"}],
-        }}},
-        "reporting": {"tables": {"invoices": {
-            "name": "invoices", "schema": "reporting",
-            "columns": [{"name": "id", "type": "integer"}],
-        }}},
+        "billing": {
+            "tables": {
+                "invoices": {
+                    "name": "invoices",
+                    "schema": "billing",
+                    "columns": [{"name": "id", "type": "integer"}],
+                }
+            }
+        },
+        "reporting": {
+            "tables": {
+                "invoices": {
+                    "name": "invoices",
+                    "schema": "reporting",
+                    "columns": [{"name": "id", "type": "integer"}],
+                }
+            }
+        },
         # A model that declares no schema — the repo's convention renders the bare name.
-        "staging": {"tables": {"drafts": {
-            "name": "drafts", "schema": None,
-            "columns": [{"name": "id", "type": "integer"}],
-        }}},
+        "staging": {
+            "tables": {
+                "drafts": {
+                    "name": "drafts",
+                    "schema": None,
+                    "columns": [{"name": "id", "type": "integer"}],
+                }
+            }
+        },
     }
     monkeypatch.setattr(
-        run_golden_eval.runtime, "list_subject_areas", lambda org: [
-            {"name": name} for name in bundles
-        ]
+        run_golden_eval.runtime,
+        "list_subject_areas",
+        lambda org: [{"name": name} for name in bundles],
     )
     monkeypatch.setattr(
         run_golden_eval.loader, "get_subject_area_bundle", lambda org, area: bundles[area]
@@ -813,7 +846,7 @@ FRONTMATTER = SKILL.split("---")[1]
 def test_the_skill_carries_the_four_frontmatter_keys():
     """The house shape. `argument-hint` is the one a new skill forgets, and without it the dataset
     name has nowhere to arrive from."""
-    assert SKILL.startswith("---\n")               # frontmatter at the top, not prose
+    assert SKILL.startswith("---\n")  # frontmatter at the top, not prose
     assert "name: agami-eval" in FRONTMATTER
     assert "description:" in FRONTMATTER
     assert "when_to_use:" in FRONTMATTER
@@ -822,9 +855,9 @@ def test_the_skill_carries_the_four_frontmatter_keys():
 
 def test_the_skill_refuses_in_plan_mode():
     """A run executes SQL and writes a report, so it cannot proceed read-only."""
-    assert "shared/plan-mode-check.md" in SKILL            # the shared detection logic
-    assert "I can't run an eval in plan mode" in SKILL     # …and the refusal it ends the turn on
-    assert "DO NOT call `ExitPlanMode`" in SKILL           # …without leaving a plan file behind
+    assert "shared/plan-mode-check.md" in SKILL  # the shared detection logic
+    assert "I can't run an eval in plan mode" in SKILL  # …and the refusal it ends the turn on
+    assert "DO NOT call `ExitPlanMode`" in SKILL  # …without leaving a plan file behind
 
 
 def test_the_skill_routes_authoring_to_the_shared_shape():
@@ -899,8 +932,18 @@ FILE_LAYOUT = (SHARED / "file-layout.md").read_text(encoding="utf-8")
 # The opening sentence counts in words, so a test that reads it has to spell them too. Only the
 # range a plugin can plausibly ship — a count outside it is a drift worth failing on by itself.
 NUMBER_WORDS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
 }
 
 
