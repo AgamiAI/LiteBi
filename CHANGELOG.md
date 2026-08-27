@@ -12,6 +12,48 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-08-27
+
+### Added
+
+- **An existing password account can move onto an identity provider, keeping everything attached to
+  it.** A deployment running on usernames and passwords could not switch to single sign-on:
+  `_resolve_oidc_user` refuses an account not already bound to the provider, so on the day it was
+  turned on every person already using the product would be locked out, with their conversations
+  orphaned behind an account nobody could reach. Verified against a real account rather than
+  reasoned about — it came back `None`.
+
+  `migrate_password_user_to_oidc` keeps the row, so the id, the address and everything keyed on it
+  survive. **The password is cleared**, because left in place the directory would not actually be in
+  charge: revoking somebody there would not stop them signing in with a password they chose months
+  ago, and nothing would show it. Guarded so it can never take an account already bound to a
+  different provider — the identity-confusion guard has to survive the migration that relaxes the
+  password case.
+
+  Deciding *whether* to adopt is deliberately not this function's job. It is safe only where the
+  caller has already verified the token against a pinned tenant and checked the address against that
+  company's own domains; core has neither of those facts, and its consumer does.
+
+- **`set_user_names`** fills in a display name from whatever the provider now says, so a name
+  corrected in a directory reaches the product without anybody retyping it. A blank never erases
+  what is there: a provider that omits a name is silent rather than authoritative, and treating
+  silence as an instruction to delete would wipe a name an administrator typed in.
+
+### Changed
+
+- **`http://localhost` is accepted for `PUBLIC_BASE_URL`.** TLS is still required everywhere else,
+  for the reason it always was — a browser drops a `Secure` cookie over http. Browsers make a
+  specific exception for loopback, which is a secure context by their own definition, so nothing
+  that rule protects is lost. It is also the only thing that works: identity providers permit a
+  plain-http redirect only on loopback, so a developer signing in against a real provider from their
+  own machine had no https option to choose and could not run the server at all. The host is parsed
+  rather than prefix-matched, because `http://localhost.example.com` is somebody else's domain.
+
+- The sign-in consent line now reads **"Allow `<client>` to connect to your data"** rather than "to
+  access your data". What is granted is a connection the person can see and remove, not a handover
+  of the data itself, and on a screen read in two seconds before deciding that is the whole
+  decision.
+
 ## [0.6.8] — 2026-08-27
 
 ### Fixed
