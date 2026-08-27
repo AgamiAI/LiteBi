@@ -149,8 +149,19 @@ def test_bool_and_int_do_not_collide():
 
 @pytest.mark.parametrize(
     "spelling, expected",
-    [("t", True), ("T", True), ("true", True), ("TRUE", True), ("yes", True), ("Yes", True),
-     ("f", False), ("false", False), ("FALSE", False), ("no", False), ("NO", False)],
+    [
+        ("t", True),
+        ("T", True),
+        ("true", True),
+        ("TRUE", True),
+        ("yes", True),
+        ("Yes", True),
+        ("f", False),
+        ("false", False),
+        ("FALSE", False),
+        ("no", False),
+        ("NO", False),
+    ],
 )
 def test_boolean_spellings_become_bools(spelling, expected):
     assert c.canonical_cell(spelling) == ("bool", expected)
@@ -214,8 +225,16 @@ def test_an_aware_midnight_utc_matches_the_date():
 
 @pytest.mark.parametrize(
     "not_a_date",
-    ["00000000000042", "2025", "20250101", "2025-1-1", "x2025-01-01", "2025-01-01x",
-     "2025-01-01T00:00:00Z ", "the 2025-01-01 order"],
+    [
+        "00000000000042",
+        "2025",
+        "20250101",
+        "2025-1-1",
+        "x2025-01-01",
+        "2025-01-01x",
+        "2025-01-01T00:00:00Z ",
+        "the 2025-01-01 order",
+    ],
 )
 def test_a_string_that_is_not_strictly_date_shaped_stays_text(not_a_date):
     # A zero-padded identifier is the case that matters: coerced to a date it would compare equal
@@ -278,10 +297,21 @@ def test_two_rows_that_agree_land_in_one_counter_bucket():
 
 @pytest.mark.parametrize(
     "value, expected",
-    [(None, None), (True, "bool"), ("t", "bool"), (5, "number"), (Decimal("1.5"), "number"),
-     (float("nan"), "number"), (float("inf"), "number"), (date(2025, 1, 1), "date"),
-     ("2025-01-01", "date"), (datetime(2025, 1, 1, 9, 30), "date"), ("shipped", "text"),
-     ("", "text"), (b"paid", "text")],
+    [
+        (None, None),
+        (True, "bool"),
+        ("t", "bool"),
+        (5, "number"),
+        (Decimal("1.5"), "number"),
+        (float("nan"), "number"),
+        (float("inf"), "number"),
+        (date(2025, 1, 1), "date"),
+        ("2025-01-01", "date"),
+        (datetime(2025, 1, 1, 9, 30), "date"),
+        ("shipped", "text"),
+        ("", "text"),
+        (b"paid", "text"),
+    ],
 )
 def test_cell_type_over_every_tag(value, expected):
     assert c.cell_type(c.canonical_cell(value)) == expected
@@ -296,9 +326,26 @@ def test_a_null_contributes_no_type():
 
 @pytest.mark.parametrize(
     "value",
-    [None, True, False, "t", 5, 5.0, Decimal("5.00"), float("nan"), float("inf"), float("-inf"),
-     date(2025, 1, 1), datetime(2025, 1, 1, 9, 30), "2025-01-01", "", " a ", b"paid",
-     ["web", "store"], {"channel": "web"}],
+    [
+        None,
+        True,
+        False,
+        "t",
+        5,
+        5.0,
+        Decimal("5.00"),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        date(2025, 1, 1),
+        datetime(2025, 1, 1, 9, 30),
+        "2025-01-01",
+        "",
+        " a ",
+        b"paid",
+        ["web", "store"],
+        {"channel": "web"},
+    ],
 )
 def test_every_canonical_cell_is_hashable(value):
     key = c.canonical_cell(value)
@@ -342,8 +389,12 @@ def test_order_by_with_a_limit_is_ordered():
 
 @pytest.mark.parametrize(
     "sql",
-    ["SELECT a FROM t ORDER BY a;", "-- the answer key\nSELECT a FROM t ORDER BY a",
-     "   \n\tSELECT a FROM t ORDER BY a", "select a from t order by a"],
+    [
+        "SELECT a FROM t ORDER BY a;",
+        "-- the answer key\nSELECT a FROM t ORDER BY a",
+        "   \n\tSELECT a FROM t ORDER BY a",
+        "select a from t order by a",
+    ],
 )
 def test_incidental_spelling_does_not_hide_the_ordering(sql):
     assert c.has_top_level_order_by(sql) == (True, None)
@@ -401,8 +452,10 @@ def test_a_dialect_parse_still_reads_an_unordered_statement():
 
 def test_columns_in_a_different_order_match():
     pairing, unmatched = c.match_columns(
-        ["channel", "orders"], [("web", 1), ("store", 2)],
-        ["orders", "channel"], [(1, "web"), (2, "store")],
+        ["channel", "orders"],
+        [("web", 1), ("store", 2)],
+        ["orders", "channel"],
+        [(1, "web"), (2, "store")],
         ordered=True,
     )
     assert pairing == {0: 1, 1: 0}
@@ -420,8 +473,10 @@ def test_columns_with_different_names_match():
 
 def test_a_golden_column_with_no_partner_is_named():
     pairing, unmatched = c.match_columns(
-        ["channel", "revenue"], [("web", 10), ("store", 20)],
-        ["channel"], [("web",), ("store",)],
+        ["channel", "revenue"],
+        [("web", 10), ("store", 20)],
+        ["channel"],
+        [("web",), ("store",)],
         ordered=True,
     )
     assert pairing == {0: 0}
@@ -435,8 +490,10 @@ def test_identical_value_vectors_do_not_collapse_onto_one_partner():
     golden_rows = [(1, "web", 1), (2, "store", 2)]
     generated_rows = [("web", 1, 1), ("store", 2, 2)]
     pairing, unmatched = c.match_columns(
-        ["first", "channel", "second"], golden_rows,
-        ["channel", "left", "right"], generated_rows,
+        ["first", "channel", "second"],
+        golden_rows,
+        ["channel", "left", "right"],
+        generated_rows,
         ordered=True,
     )
     assert unmatched == ()
@@ -537,7 +594,9 @@ def test_duplicate_rows_count_as_a_multiset_not_a_set():
     # A set would say these two agree once; they agree twice, and the duplicate is signal.
     pairing = {0: 0}
     assert c.compare_rows([("web",), ("web",)], [("web",), ("web",)], pairing, ordered=False) == (
-        2, 2, 2,
+        2,
+        2,
+        2,
     )
 
 
@@ -571,9 +630,11 @@ def test_comparing_forwards_quantize():
     golden_rows = [(Decimal("1.00000000001"),)]
     generated_rows = [(Decimal("1.0"),)]
     assert c.compare_rows(golden_rows, generated_rows, {0: 0}, ordered=False) == (0, 1, 1)
-    assert c.compare_rows(
-        golden_rows, generated_rows, {0: 0}, ordered=False, quantize=True
-    ) == (1, 1, 1)
+    assert c.compare_rows(golden_rows, generated_rows, {0: 0}, ordered=False, quantize=True) == (
+        1,
+        1,
+        1,
+    )
 
 
 def test_comparing_a_ragged_row_is_surfaced_as_this_module_s_error():
@@ -649,8 +710,9 @@ def test_an_extra_generated_column_passes_values_and_fails_exact():
 def test_two_empty_result_sets_are_unscored():
     # Deliberately not a pass. Two empty results agree about nothing: the comparison checked no
     # value, and reporting that as a full match is how a broken statement scores like a right one.
-    score = c.compare_result_sets(_res(["channel"], []), _res(["channel"], []),
-                                  golden_sql=_UNORDERED)
+    score = c.compare_result_sets(
+        _res(["channel"], []), _res(["channel"], []), golden_sql=_UNORDERED
+    )
     assert score.status == "unscored"
     assert score.accuracy is None
     assert score.reason
@@ -678,8 +740,10 @@ def test_the_ordering_is_read_from_the_answer_key_alone():
 
 @pytest.mark.parametrize(
     "sql",
-    ["SELECT channel FROM (SELECT channel FROM t ORDER BY channel) x",
-     "SELECT channel, ROW_NUMBER() OVER (ORDER BY channel) FROM t"],
+    [
+        "SELECT channel FROM (SELECT channel FROM t ORDER BY channel) x",
+        "SELECT channel, ROW_NUMBER() OVER (ORDER BY channel) FROM t",
+    ],
 )
 def test_an_order_by_below_the_top_level_leaves_the_result_unordered(sql):
     golden = _res(["channel"], [("web",), ("store",)])
@@ -719,8 +783,9 @@ def test_a_near_miss_over_a_wide_result_cannot_round_up_to_a_pass():
     rows = [(index, index) for index in range(size)]
     swapped = list(rows)
     swapped[0], swapped[1] = (0, 1), (1, 0)
-    score = c.compare_result_sets(_res(["id", "n"], rows), _res(["id", "n"], swapped),
-                                  golden_sql=_UNORDERED)
+    score = c.compare_result_sets(
+        _res(["id", "n"], rows), _res(["id", "n"], swapped), golden_sql=_UNORDERED
+    )
     assert score.accuracy < 1.0
     assert score.accuracy == pytest.approx(4002 / size)
 
@@ -729,8 +794,9 @@ def test_the_canonical_keys_reach_the_public_comparison():
     # Slice 1's three cases end to end: a padded decimal, a date written as text, and a
     # zero-padded identifier that must stay text rather than being read as a day.
     golden = _res(["total", "day", "account"], [(5, date(2025, 1, 1), "00000000000042")])
-    generated = _res(["total", "day", "account"],
-                     [(Decimal("5.00"), "2025-01-01", "00000000000042")])
+    generated = _res(
+        ["total", "day", "account"], [(Decimal("5.00"), "2025-01-01", "00000000000042")]
+    )
     score = c.compare_result_sets(golden, generated, golden_sql=_UNORDERED)
     assert score.accuracy == 1.0
     assert score.unmatched_golden_columns == ()
@@ -746,11 +812,11 @@ def test_a_null_does_not_match_the_empty_string_end_to_end():
 
 def test_a_boolean_agrees_with_its_text_spelling_but_never_with_an_int():
     golden = _res(["is_active"], [(True,), (False,)])
-    spelled = c.compare_result_sets(golden, _res(["is_active"], [("t",), ("f",)]),
-                                    golden_sql=_UNORDERED)
+    spelled = c.compare_result_sets(
+        golden, _res(["is_active"], [("t",), ("f",)]), golden_sql=_UNORDERED
+    )
     assert spelled.accuracy == 1.0
-    stored = c.compare_result_sets(golden, _res(["is_active"], [(1,), (0,)]),
-                                   golden_sql=_UNORDERED)
+    stored = c.compare_result_sets(golden, _res(["is_active"], [(1,), (0,)]), golden_sql=_UNORDERED)
     assert stored.accuracy == 0.0
     assert stored.unmatched_golden_columns == ("is_active",)
 
@@ -764,18 +830,38 @@ def test_a_boolean_agrees_with_its_text_spelling_but_never_with_an_int():
         ("exact", _res(["orders"], [(1,), (2,)]), _res(["orders"], [(1,), (2,)]), None, 1.0),
         ("exact", _res(["orders"], [(1,), (2,)]), _res(["orders"], [(1,), (9,)]), None, 0.0),
         # A twelfth-digit difference is inside `values`' tolerance and outside `exact`'s.
-        ("values", _res(["total"], [(Decimal("1.00000000001"),)]),
-         _res(["total"], [(Decimal("1.0"),)]), None, 1.0),
+        (
+            "values",
+            _res(["total"], [(Decimal("1.00000000001"),)]),
+            _res(["total"], [(Decimal("1.0"),)]),
+            None,
+            1.0,
+        ),
         ("values", _res(["total"], [(2,)]), _res(["total"], [(3,)]), None, 0.0),
         # `shape` never looks at a value: not one of these cells agrees, and the counts and the
         # coarse types all do.
-        ("shape", _res(["channel", "orders"], [("web", 1), ("store", 2)]),
-         _res(["c", "n"], [("kiosk", 77), ("phone", 88)]), None, 1.0),
+        (
+            "shape",
+            _res(["channel", "orders"], [("web", 1), ("store", 2)]),
+            _res(["c", "n"], [("kiosk", 77), ("phone", 88)]),
+            None,
+            1.0,
+        ),
         ("shape", _res(["orders"], [(1,), (2,)]), _res(["orders"], [(1,)]), None, 0.0),
-        ("bounded", _res(["orders"], [(1,), (2,)]), _res(["orders"], [(1,), (2,)]),
-         GoldenBounds(min_rows=1, max_rows=3), 1.0),
-        ("bounded", _res(["orders"], [(1,)]), _res(["orders"], [(1,), (2,), (3,), (4,), (5,)]),
-         GoldenBounds(min_rows=1, max_rows=3), 0.0),
+        (
+            "bounded",
+            _res(["orders"], [(1,), (2,)]),
+            _res(["orders"], [(1,), (2,)]),
+            GoldenBounds(min_rows=1, max_rows=3),
+            1.0,
+        ),
+        (
+            "bounded",
+            _res(["orders"], [(1,)]),
+            _res(["orders"], [(1,), (2,), (3,), (4,), (5,)]),
+            GoldenBounds(min_rows=1, max_rows=3),
+            0.0,
+        ),
         ("nonempty", _res(["orders"], [(1,)]), _res(["orders"], [(9,)]), None, 1.0),
         # The golden side is empty because a `nonempty` item has no answer key to fill it.
         ("nonempty", _res(["orders"], []), _res(["orders"], []), None, 0.0),
@@ -792,12 +878,16 @@ def test_each_level_over_a_passing_and_a_failing_pair(level, golden, generated, 
 def test_shape_passes_a_pair_whose_values_disagree_entirely():
     # The reason `shape` exists: an item whose answer moves with the data still gates on the
     # answer having the right form.
-    golden = _res(["channel", "orders", "day"],
-                  [("web", 1, date(2025, 1, 1)), ("store", 2, date(2025, 1, 2))])
-    generated = _res(["c", "n", "d"],
-                     [("kiosk", 900, date(2030, 6, 6)), ("phone", 901, date(2030, 6, 7))])
-    assert c.compare_result_sets(golden, generated, match="shape",
-                                 golden_sql=_UNORDERED).accuracy == 1.0
+    golden = _res(
+        ["channel", "orders", "day"], [("web", 1, date(2025, 1, 1)), ("store", 2, date(2025, 1, 2))]
+    )
+    generated = _res(
+        ["c", "n", "d"], [("kiosk", 900, date(2030, 6, 6)), ("phone", 901, date(2030, 6, 7))]
+    )
+    assert (
+        c.compare_result_sets(golden, generated, match="shape", golden_sql=_UNORDERED).accuracy
+        == 1.0
+    )
 
 
 def test_shape_fails_when_a_column_type_disagrees():
@@ -811,8 +901,10 @@ def test_shape_fails_when_a_column_type_disagrees():
 def test_shape_fails_when_the_column_count_disagrees():
     golden = _res(["channel", "orders"], [("web", 1)])
     generated = _res(["channel"], [("web",)])
-    assert c.compare_result_sets(golden, generated, match="shape",
-                                 golden_sql=_UNORDERED).accuracy == 0.0
+    assert (
+        c.compare_result_sets(golden, generated, match="shape", golden_sql=_UNORDERED).accuracy
+        == 0.0
+    )
 
 
 def test_shape_lets_an_all_null_column_agree_with_anything():
@@ -820,8 +912,10 @@ def test_shape_lets_an_all_null_column_agree_with_anything():
     # nothing about the type of its partner.
     golden = _res(["note"], [(None,), (None,)])
     generated = _res(["note"], [("shipped",), ("held",)])
-    assert c.compare_result_sets(golden, generated, match="shape",
-                                 golden_sql=_UNORDERED).accuracy == 1.0
+    assert (
+        c.compare_result_sets(golden, generated, match="shape", golden_sql=_UNORDERED).accuracy
+        == 1.0
+    )
 
 
 # --- the bounded band ------------------------------------------------------------------------
@@ -830,8 +924,9 @@ def test_shape_lets_an_all_null_column_agree_with_anything():
 def test_bounded_without_a_band_is_an_error():
     # The reader refuses to author this pair, but the function can be called directly and has to
     # say so rather than passing an item it compared nothing about.
-    score = c.compare_result_sets(_res(["orders"], [(1,)]), _res(["orders"], [(1,)]),
-                                  match="bounded", golden_sql=_UNORDERED)
+    score = c.compare_result_sets(
+        _res(["orders"], [(1,)]), _res(["orders"], [(1,)]), match="bounded", golden_sql=_UNORDERED
+    )
     assert score.status == "error"
     assert score.accuracy is None
     assert score.reason
@@ -839,8 +934,11 @@ def test_bounded_without_a_band_is_an_error():
 
 def test_a_value_band_on_a_multi_cell_result_is_an_error():
     score = c.compare_result_sets(
-        _res(["orders"], [(1,)]), _res(["channel", "orders"], [("web", 1), ("store", 2)]),
-        match="bounded", golden_sql=_UNORDERED, bounds=GoldenBounds(min_value=0, max_value=10),
+        _res(["orders"], [(1,)]),
+        _res(["channel", "orders"], [("web", 1), ("store", 2)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(min_value=0, max_value=10),
     )
     assert score.status == "error"
     assert score.reason
@@ -855,8 +953,11 @@ def test_a_value_band_on_a_multi_cell_result_is_an_error():
 )
 def test_a_value_band_judges_the_single_generated_cell(value, expected):
     score = c.compare_result_sets(
-        _res(["total"], [(7,)]), _res(["total"], [(value,)]),
-        match="bounded", golden_sql=_UNORDERED, bounds=GoldenBounds(min_value=0, max_value=10),
+        _res(["total"], [(7,)]),
+        _res(["total"], [(value,)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(min_value=0, max_value=10),
     )
     assert score.status == "scored"
     assert score.accuracy == expected
@@ -864,18 +965,31 @@ def test_a_value_band_judges_the_single_generated_cell(value, expected):
 
 def test_a_row_band_judges_the_generated_row_count():
     golden = _res(["orders"], [(1,)])
-    in_band = c.compare_result_sets(golden, _res(["orders"], [(1,), (2,)]), match="bounded",
-                                    golden_sql=_UNORDERED, bounds=GoldenBounds(min_rows=2))
+    in_band = c.compare_result_sets(
+        golden,
+        _res(["orders"], [(1,), (2,)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(min_rows=2),
+    )
     assert in_band.accuracy == 1.0
-    out_of_band = c.compare_result_sets(golden, _res(["orders"], [(1,)]), match="bounded",
-                                        golden_sql=_UNORDERED, bounds=GoldenBounds(min_rows=2))
+    out_of_band = c.compare_result_sets(
+        golden,
+        _res(["orders"], [(1,)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(min_rows=2),
+    )
     assert out_of_band.accuracy == 0.0
 
 
 def test_a_value_band_on_a_non_numeric_cell_is_an_error():
     score = c.compare_result_sets(
-        _res(["total"], [(5,)]), _res(["total"], [("shipped",)]),
-        match="bounded", golden_sql=_UNORDERED, bounds=GoldenBounds(max_value=10),
+        _res(["total"], [(5,)]),
+        _res(["total"], [("shipped",)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(max_value=10),
     )
     assert score.status == "error"
     assert score.reason
@@ -885,12 +999,15 @@ def test_a_value_band_on_a_non_numeric_cell_is_an_error():
 
 
 def test_status_is_three_way_and_distinguishable():
-    scored = c.compare_result_sets(_res(["orders"], [(1,)]), _res(["orders"], [(1,)]),
-                                   golden_sql=_UNORDERED)
-    unscored = c.compare_result_sets(_res(["orders"], []), _res(["orders"], []),
-                                     golden_sql=_UNORDERED)
-    errored = c.compare_result_sets(_res(["orders"], [(1,)]), _res(["orders"], [(1,)]),
-                                    match="bounded", golden_sql=_UNORDERED)
+    scored = c.compare_result_sets(
+        _res(["orders"], [(1,)]), _res(["orders"], [(1,)]), golden_sql=_UNORDERED
+    )
+    unscored = c.compare_result_sets(
+        _res(["orders"], []), _res(["orders"], []), golden_sql=_UNORDERED
+    )
+    errored = c.compare_result_sets(
+        _res(["orders"], [(1,)]), _res(["orders"], [(1,)]), match="bounded", golden_sql=_UNORDERED
+    )
     assert {scored.status, unscored.status, errored.status} == {"scored", "unscored", "error"}
     assert scored.accuracy == 1.0
     assert unscored.accuracy is None and errored.accuracy is None
@@ -944,16 +1061,18 @@ def test_an_unreadable_answer_key_is_scored_order_sensitively_and_says_so(sql):
 
 
 def test_a_readable_answer_key_leaves_the_notes_empty():
-    score = c.compare_result_sets(_res(["orders"], [(1,)]), _res(["orders"], [(1,)]),
-                                  golden_sql=_UNORDERED)
+    score = c.compare_result_sets(
+        _res(["orders"], [(1,)]), _res(["orders"], [(1,)]), golden_sql=_UNORDERED
+    )
     assert score.notes == ()
 
 
 def test_an_item_score_is_a_frozen_dataclass():
     # A returned value, never an authored file — so a dataclass like `ExecResult` and `Envelope`,
     # not a pydantic model, and frozen so a caller cannot edit a verdict in place.
-    score = c.compare_result_sets(_res(["orders"], [(1,)]), _res(["orders"], [(1,)]),
-                                  golden_sql=_UNORDERED)
+    score = c.compare_result_sets(
+        _res(["orders"], [(1,)]), _res(["orders"], [(1,)]), golden_sql=_UNORDERED
+    )
     assert dataclasses.is_dataclass(score)
     with pytest.raises(dataclasses.FrozenInstanceError):
         score.accuracy = 0.0
@@ -961,8 +1080,9 @@ def test_an_item_score_is_a_frozen_dataclass():
 
 def test_an_unknown_match_level_is_an_error_rather_than_a_crash():
     # `MatchLevel` is a Literal, which a type checker enforces and a direct caller can ignore.
-    score = c.compare_result_sets(_res(["orders"], [(1,)]), _res(["orders"], [(1,)]),
-                                  match="whatever", golden_sql=_UNORDERED)
+    score = c.compare_result_sets(
+        _res(["orders"], [(1,)]), _res(["orders"], [(1,)]), match="whatever", golden_sql=_UNORDERED
+    )
     assert score.status == "error"
     assert score.accuracy is None
 
@@ -1050,8 +1170,11 @@ def test_nonempty_scores_zero_when_both_sides_are_empty():
 
 def test_bounded_scores_zero_when_both_sides_are_empty():
     score = c.compare_result_sets(
-        _res(["orders"], []), _res(["orders"], []), match="bounded",
-        golden_sql=_UNORDERED, bounds=GoldenBounds(min_rows=1),
+        _res(["orders"], []),
+        _res(["orders"], []),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(min_rows=1),
     )
     assert score.status == "scored"
     assert score.accuracy == 0.0
@@ -1140,13 +1263,19 @@ def test_a_row_band_still_judges_a_result_the_value_band_cannot_reach():
     bounds = GoldenBounds(min_rows=1, max_rows=5, max_value=100)
     golden = _res(["orders"], [(1,)])
     inside = c.compare_result_sets(
-        golden, _res(["channel", "orders"], [("web", 1), ("store", 2)]),
-        match="bounded", golden_sql=_UNORDERED, bounds=bounds,
+        golden,
+        _res(["channel", "orders"], [("web", 1), ("store", 2)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=bounds,
     )
     assert (inside.status, inside.accuracy) == ("scored", 1.0)
     outside = c.compare_result_sets(
-        golden, _res(["channel", "orders"], [("web", n) for n in range(6)]),
-        match="bounded", golden_sql=_UNORDERED, bounds=bounds,
+        golden,
+        _res(["channel", "orders"], [("web", n) for n in range(6)]),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=bounds,
     )
     assert (outside.status, outside.accuracy) == ("scored", 0.0)
     assert "rows" in outside.reason
@@ -1156,8 +1285,11 @@ def test_an_empty_result_under_a_value_band_scores_zero_rather_than_erroring():
     # "The agent returned nothing" is a wrong answer and not an unjudgeable case — catching it is
     # half of why a band is authored at all.
     score = c.compare_result_sets(
-        _res(["total"], [(5,)]), _res(["total"], []),
-        match="bounded", golden_sql=_UNORDERED, bounds=GoldenBounds(min_value=0, max_value=10),
+        _res(["total"], [(5,)]),
+        _res(["total"], []),
+        match="bounded",
+        golden_sql=_UNORDERED,
+        bounds=GoldenBounds(min_value=0, max_value=10),
     )
     assert score.status == "scored"
     assert score.accuracy == 0.0

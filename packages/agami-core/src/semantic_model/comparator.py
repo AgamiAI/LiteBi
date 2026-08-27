@@ -123,7 +123,12 @@ def _canonical_number(value: int | float | Decimal, quantize: bool) -> tuple[str
     # test is on the VALUE and not on the Python type, because the same id arrives as an int from
     # one driver and a Decimal from another, and exempting only one of them would fail two
     # identical numbers.
-    if quantize and dec != dec.to_integral_value():
+    # The context is named rather than inherited. Nothing observable turns on it today —
+    # `to_integral_value` is exempt from the Inexact and Rounded traps, and no rounding mode
+    # changes whether a non-integral value differs from its integral form — but every other
+    # decimal operation in this module names its context, and a module whose promise is
+    # independence from how a number arrived should not read the process-global one at all.
+    if quantize and dec != dec.to_integral_value(context=_NORMALIZE_CTX):
         dec = _QUANTIZE_CTX.plus(dec)
     return ("num", dec.normalize(context=_NORMALIZE_CTX))
 
@@ -456,19 +461,26 @@ def _score_values(
         # differ no column can pair, and reporting that through the unmatched-column branch below
         # tells a reader a column is absent when every one of them is present.
         return _Verdict(
-            "scored", 0.0,
-            f"the answer key has {len(golden.rows)} rows and the generated result "
+            "scored",
+            0.0,
+            f"the answer key has {len(golden.rows)} rows and the generated result has "
             f"{len(generated.rows)}",
         )
     pairing, unmatched = match_columns(
-        golden.columns, golden.rows, generated.columns, generated.rows,
-        ordered=ordered, quantize=loose,
+        golden.columns,
+        golden.rows,
+        generated.columns,
+        generated.rows,
+        ordered=ordered,
+        quantize=loose,
     )
     if unmatched:
         # Not a partial answer. The question asked for that column and the result does not carry
         # it, so how well the remaining columns overlap says nothing about whether it is right.
         return _Verdict(
-            "scored", 0.0, "no generated column carries the values of: " + ", ".join(unmatched),
+            "scored",
+            0.0,
+            "no generated column carries the values of: " + ", ".join(unmatched),
             unmatched,
         )
     if not loose and len(generated.columns) > len(golden.columns):
@@ -483,9 +495,10 @@ def _score_values(
     if accuracy == 1.0:
         return _Verdict("scored", 1.0, "")
     return _Verdict(
-        "scored", accuracy,
+        "scored",
+        accuracy,
         f"{overlap} of the answer key's {golden_count} rows matched, "
-        f"out of {generated_count} the generated statement returned",
+        f"and the generated statement returned {generated_count} rows",
     )
 
 
@@ -508,18 +521,23 @@ def _score_shape(golden: ExecResult, generated: ExecResult) -> _Verdict:
     """
     if len(golden.rows) != len(generated.rows):
         return _Verdict(
-            "scored", 0.0,
-            f"the answer key has {len(golden.rows)} rows and the generated result "
+            "scored",
+            0.0,
+            f"the answer key has {len(golden.rows)} rows and the generated result has "
             f"{len(generated.rows)}",
         )
     if len(golden.columns) != len(generated.columns):
         return _Verdict(
-            "scored", 0.0,
-            f"the answer key has {len(golden.columns)} columns and the generated result "
+            "scored",
+            0.0,
+            f"the answer key has {len(golden.columns)} columns and the generated result has "
             f"{len(generated.columns)}",
         )
-    pairs = zip(golden.columns, _column_types(golden.columns, golden.rows),
-                _column_types(generated.columns, generated.rows))
+    pairs = zip(
+        golden.columns,
+        _column_types(golden.columns, golden.rows),
+        _column_types(generated.columns, generated.rows),
+    )
     for name, golden_types, generated_types in pairs:
         # An empty set is an all-NULL column, or a result with no rows at all, and it constrains
         # nothing: a NULL is the absence of a value, not a value of some type.
@@ -535,7 +553,8 @@ def _score_bounds(generated: ExecResult, bounds: Optional[GoldenBounds]) -> _Ver
     a bounded item has no answer key to count against, which is why it is bounded."""
     if bounds is None:
         return _Verdict(
-            "error", None,
+            "error",
+            None,
             "a bounded item is judged against a band, and no bounds were given to judge it with",
         )
     row_band = bounds.min_rows is not None or bounds.max_rows is not None
@@ -552,7 +571,8 @@ def _score_bounds(generated: ExecResult, bounds: Optional[GoldenBounds]) -> _Ver
             # that is left — the case cannot be decided, and calling it wrong would blame the run.
             if not row_band:
                 return _Verdict(
-                    "error", None,
+                    "error",
+                    None,
                     "a value band judges a single numeric cell, and the generated result is not "
                     "one",
                 )
