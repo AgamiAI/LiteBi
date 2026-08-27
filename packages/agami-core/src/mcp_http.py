@@ -622,7 +622,7 @@ def create_app(
                         _log.info("seeded the configured admin")  # not the email — no PII in logs
                     store.commit()
                 except Exception:  # noqa: BLE001 — a concurrent boot won the seed; not fatal
-                    store.conn.rollback()
+                    store.rollback()
                     _log.warning(
                         "admin seed skipped (already seeded or a concurrent boot won the race)"
                     )

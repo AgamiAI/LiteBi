@@ -53,6 +53,8 @@ class _Cursor:
         self.description = [("ok",)]
 
     def execute(self, sql, params=None):
+        if self._conn.raise_on_execute is not None:
+            raise self._conn.raise_on_execute
         if self._conn.die_on_execute:
             self._conn.die_on_execute = False
             self._conn.closed = True
@@ -69,6 +71,8 @@ class _Conn:
     def __init__(self, *, dead: bool = False, die_on_execute: bool = False) -> None:
         self.closed = dead
         self.die_on_execute = die_on_execute
+        # A failure that leaves the connection HEALTHY — a timeout, a cancelled query.
+        self.raise_on_execute: Exception | None = None
         self.statements: list[str] = []
         self.commits = 0
         self.rollbacks = 0
@@ -147,7 +151,9 @@ def test_a_reconnect_is_attempted_once_not_in_a_loop(fake_psycopg2, monkeypatch)
         store.execute("SELECT 1")
 
 
-def test_a_connection_that_cannot_be_reopened_raises_the_original_failure(fake_psycopg2, monkeypatch):
+def test_a_connection_that_cannot_be_reopened_raises_the_original_failure(
+    fake_psycopg2, monkeypatch
+):
     """The database being unreachable is a real error and must not be disguised as anything else."""
     module = sys.modules["psycopg2"]
 
@@ -306,3 +312,55 @@ def test_which_statements_count_as_reads(sql, is_read):
     from store import _is_read
 
     assert _is_read(sql) is is_read
+
+
+# --- what Copilot found: three ways the retry was too eager -------------------------------------
+
+
+def test_an_operational_error_on_a_LIVE_connection_is_not_retried(fake_psycopg2):
+    """**`OperationalError` is a broad base class.** A cancelled query, a statement timeout and a
+    full disk all raise it on a connection that is perfectly healthy. Retrying blindly re-runs the
+    statement — and for the first write of a transaction, where the guard correctly allows a
+    reconnect, that lands the row twice. Only the driver's own `closed` flag decides.
+    """
+    conn = _Conn()
+    conn.raise_on_execute = _OperationalError("canceling statement due to statement timeout")
+
+    store = _store(conn)
+    with pytest.raises(_OperationalError, match="statement timeout"):
+        store.execute("INSERT INTO t VALUES (1)")
+
+    assert fake_psycopg2 == [], "reconnected on a healthy connection; the insert would run twice"
+
+
+def test_an_operational_error_that_did_close_the_connection_is_retried(fake_psycopg2):
+    """The other side of the same test: a real reap must still recover."""
+    store = _store(_Conn(die_on_execute=True))
+    assert store.query("SELECT 1 AS ok") == [{"ok": 1}]
+    assert len(fake_psycopg2) == 1
+
+
+def test_no_reconnect_while_the_migration_lock_is_held(fake_psycopg2):
+    """The advisory lock belongs to the connection, not to a transaction. Reconnecting part-way
+    through a migration would continue **without** it, letting a second instance apply the same
+    files at once — the exact thing the lock exists to prevent, reintroduced by the mechanism meant
+    to make things more reliable."""
+    conn = _Conn()
+    store = _store(conn)
+    store._session_state_held = True
+    conn.closed = True
+
+    with pytest.raises(_InterfaceError):
+        store.execute("SELECT 1")
+    assert fake_psycopg2 == []
+
+
+def test_releasing_the_lock_allows_reconnecting_again(fake_psycopg2):
+    conn = _Conn()
+    store = _store(conn)
+    store._session_state_held = True
+    store._session_state_held = False
+    conn.closed = True
+
+    store.execute("SELECT 1")
+    assert len(fake_psycopg2) == 1
