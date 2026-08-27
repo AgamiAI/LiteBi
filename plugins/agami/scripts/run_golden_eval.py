@@ -536,16 +536,17 @@ def _last_failures(profile: str, dataset_name: str) -> Optional[list[str]]:
             if record["selection"] is not None:
                 continue
             summary = record["summary"]
-            if _verdict_of(
-                completed=summary["completed"],
-                total=summary["total"],
-                errored=summary["errored"],
-                gating_failures=summary["gating_failures"],
-            ) == _CANNOT_START:
+            if (
+                _verdict_of(
+                    completed=summary["completed"],
+                    total=summary["total"],
+                    errored=summary["errored"],
+                    gating_failures=summary["gating_failures"],
+                )
+                == _CANNOT_START
+            ):
                 continue
-            return [
-                item["item_key"] for item in record["items"] if item["section"] == "failure"
-            ]
+            return [item["item_key"] for item in record["items"] if item["section"] == "failure"]
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return None
@@ -685,17 +686,16 @@ def _write_artifact(
         "summary": summary,
         "items": [
             {
-                "item_key": outcome.item_key,
                 # Indexed rather than defaulted: both dicts are built from the same `test_cases`
                 # the run was handed, and a key that stopped resolving should say so rather than
                 # write an artifact with an empty question in it.
                 "question": questions[outcome.item_key],
                 "expected_sql": keys[outcome.item_key],
-                # The runner's own record, rather than three of its keys re-spelled here: it
-                # already carries `confirmed`, `passed`, `gated` and the claim difference the
-                # report renders beside the two statements.
+                # The runner's own record, whole. It already carries `item_key`, `generated_sql`,
+                # `confirmed`, `passed`, `gated` and the claim difference the report renders beside
+                # the two statements — re-spelling any of them here is a second source of truth for
+                # a value that has one, and the copy is what goes stale.
                 **outcome.as_dict(),
-                "generated_sql": outcome.generated_sql,
                 # The same classifier the terminal printed, so "re-run the failures" runs what a
                 # reader actually saw under that heading rather than a second opinion about it.
                 "section": _section(outcome),
@@ -819,14 +819,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     # Two ways of narrowing the same dataset, so naming both is a question with no answer rather
     # than a combination worth defining.
-    selection = parser.add_mutually_exclusive_group()
-    selection.add_argument(
+    narrowing = parser.add_mutually_exclusive_group()
+    narrowing.add_argument(
         "--tag",
         action="append",
         help="run only the cases carrying this tag; repeatable, and a case carrying any of the "
         "tags given runs",
     )
-    selection.add_argument(
+    narrowing.add_argument(
         "--rerun-failures",
         action="store_true",
         help="run only the cases the last run of this dataset recorded as failures",
@@ -866,9 +866,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # real one, so the evidence a later re-run needs would be gone.
         return 0
 
-    selection = (
-        "rerun" if args.rerun_failures else (",".join(args.tag) if args.tag else None)
-    )
+    selection = "rerun" if args.rerun_failures else (",".join(args.tag) if args.tag else None)
 
     # Reading the model and resolving its dialect are the three raises this path reaches, and
     # everything below them is total. None of them is relayed as a stack: a traceback prints the
@@ -924,7 +922,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     keys = {item.item_key: item.expected.sql or "" for item in dataset.test_cases}
     payload = _run_payload(result, questions)
     try:
-        payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"], selection))
+        payload["artifact"] = str(
+            _write_artifact(result, questions, keys, payload["summary"], selection)
+        )
     except OSError as exc:
         # The run is already paid for — a model call and up to two warehouse queries per case — so
         # a directory it cannot write to costs the drill-down and nothing else. The verdicts print

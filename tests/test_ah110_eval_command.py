@@ -196,6 +196,7 @@ def _run(capsys, *argv: str) -> tuple[int, dict[str, Any], str]:
 # The three verdicts
 # ---------------------------------------------------------------------------
 
+
 def test_a_run_whose_confirmed_cases_all_pass_is_green(artifacts, scripted, capsys):
     """And it stays green with a failing UNCONFIRMED case beside them.
 
@@ -310,6 +311,7 @@ def test_an_incomplete_run_with_failures_in_it_reports_the_broken_pipeline(
 # What a green run has to admit about itself
 # ---------------------------------------------------------------------------
 
+
 def test_a_run_with_nothing_confirmed_is_green_and_says_it_gated_on_nothing(
     artifacts, scripted, capsys
 ):
@@ -341,9 +343,8 @@ def test_a_run_with_a_confirmed_case_does_not_warn_about_gating(artifacts, scrip
 # The human line, and the stream it does not go on
 # ---------------------------------------------------------------------------
 
-def test_the_summary_line_goes_to_stderr_and_leaves_stdout_parseable(
-    artifacts, scripted, capsys
-):
+
+def test_the_summary_line_goes_to_stderr_and_leaves_stdout_parseable(artifacts, scripted, capsys):
     """A pipeline log needs one line a person can read the run against, and every caller of this
     helper parses stdout as a JSON document — so the sentence goes on stderr, where the prefixed
     refusals already are. `_run` parses stdout, so a line printed there fails this outright."""
@@ -384,6 +385,7 @@ def test_the_summary_line_says_when_the_run_did_not_complete(artifacts, monkeypa
 # The rule the payload exists to keep, at the surface that now gates
 # ---------------------------------------------------------------------------
 
+
 def test_a_failing_run_still_carries_neither_statement(artifacts, scripted, capsys):
     """Asserted on a FAILING case, because a passing one proves nothing: its `reason` is empty, and
     the two reasons built out of the answer key's own column names are only ever built on a
@@ -404,6 +406,7 @@ def test_a_failing_run_still_carries_neither_statement(artifacts, scripted, caps
 # ---------------------------------------------------------------------------
 # Selecting a slice of a dataset by tag
 # ---------------------------------------------------------------------------
+
 
 def test_a_tag_runs_only_the_cases_carrying_it(artifacts, scripted, capsys):
     """The selection is asserted on what the run actually contains rather than on a printed count:
@@ -505,6 +508,7 @@ def test_a_tag_against_a_dataset_with_no_tags_says_so(artifacts, scripted, capsy
 # ---------------------------------------------------------------------------
 # The artifact, and re-running what failed
 # ---------------------------------------------------------------------------
+
 
 def _artifacts_in(art: Path) -> list[Path]:
     return sorted((art / "local" / "eval" / PROFILE).glob("*.json"))
@@ -688,7 +692,10 @@ def test_a_rerun_carries_no_statement_on_stdout(artifacts, scripted, capsys):
 # A re-run may only trust a whole, concluded run
 # ---------------------------------------------------------------------------
 
-ERRORING_ITEM: dict[str, Any] = {
+# Named apart from the file's other erroring case on purpose: that one errors because the
+# generator refuses the question, this one because no generator was scripted for it at all, and
+# a re-run has to tell the sections apart rather than the reasons.
+UNSCRIPTED_ITEM: dict[str, Any] = {
     "id": "unscripted-count",
     "query": "A question no generator has an answer for",
     "expected": {"sql": "SELECT COUNT(*) AS n FROM products", "sql_confirmed": True},
@@ -696,9 +703,7 @@ ERRORING_ITEM: dict[str, Any] = {
 
 # One of each section a re-run must tell apart: a confirmed miss, an unconfirmed miss that can
 # never gate, and a case whose generation produced nothing at all.
-ONE_OF_EACH: dict[str, Any] = {
-    "test_cases": [FAILING_ITEM, UNCONFIRMED_ITEM, ERRORING_ITEM]
-}
+ONE_OF_EACH: dict[str, Any] = {"test_cases": [FAILING_ITEM, UNCONFIRMED_ITEM, UNSCRIPTED_ITEM]}
 
 
 def test_a_tagged_slice_does_not_become_the_datasets_failure_record(
@@ -767,9 +772,7 @@ def test_an_incomplete_run_is_not_read_as_a_failure_record(artifacts, capsys, mo
     assert "no previous run" in err
 
 
-def test_a_rerun_selects_the_failures_and_not_merely_what_did_not_pass(
-    artifacts, scripted, capsys
-):
+def test_a_rerun_selects_the_failures_and_not_merely_what_did_not_pass(artifacts, scripted, capsys):
     """`section` and not `passed`. An errored case did not pass and an unconfirmed miss did not
     pass, and neither is a failure — selecting on `passed` would re-run the whole dataset."""
     _write(artifacts, "each", ONE_OF_EACH)
