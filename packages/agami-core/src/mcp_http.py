@@ -487,6 +487,30 @@ def build_server(
     return server
 
 
+
+def _is_loopback(base: str) -> bool:
+    """Whether this is a local address, where plain http is safe and is the only thing that works.
+
+    **Not a relaxation of the TLS rule — the reason for that rule does not apply here.** It exists
+    because a browser drops a `Secure` cookie sent over http, which would silently break the admin
+    session. Browsers make a specific exception for loopback: `http://localhost` is a *secure
+    context* by the W3C definition, so `Secure` cookies are kept and everything the rule protects
+    still holds.
+
+    It is also the only thing that works. Identity providers permit a plain-http redirect **only**
+    on loopback, for exactly the same reason, so a developer signing in against a real provider from
+    their own machine has no https option to choose instead.
+
+    The host is parsed rather than matched as a prefix: `http://localhost.example.com` is somebody
+    else's domain, and `startswith("http://localhost")` would have said yes to it.
+    """
+    from urllib.parse import urlsplit
+
+    if not base.startswith("http://"):
+        return False
+    return urlsplit(base).hostname in ("localhost", "127.0.0.1", "::1")
+
+
 def create_app(
     extra_tools: dict | None = None,
     adapters: Adapters | None = None,
@@ -514,9 +538,10 @@ def create_app(
     # plain-http PUBLIC_BASE_URL would silently break the admin login (the browser drops a Secure
     # cookie), so fail fast with a clear message instead. (Set this to the public https URL even when
     # TLS terminates at a proxy — the browser↔proxy hop is what must be https.)
-    if not base.startswith("https://"):
+    if not base.startswith("https://") and not _is_loopback(base):
         raise RuntimeError(
-            "PUBLIC_BASE_URL must be https:// (OAuth + the Secure admin cookie need TLS)."
+            "PUBLIC_BASE_URL must be https:// (OAuth + the Secure admin cookie need TLS). "
+            "http://localhost is the one exception, for local development."
         )
     bootstrap_paths()
     adapters = adapters or default_adapters()

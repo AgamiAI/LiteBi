@@ -285,12 +285,16 @@ def login_body_html(
     carried = {k: params.get(k, "") for k in _OAUTH_CONTEXT_KEYS}
     alert = f'<div class="alert error">{ui.esc(error)}</div>' if error else ""
     client = _client_label(params.get("redirect_uri", ""))
-    # Consent banner mirrors the web app: a quiet "Allow <client> to access your data". When the
+    # Consent banner mirrors the web app: a quiet "Allow <client> to connect to your data". When the
     # client isn't a recognised AI assistant we just show the logo (no banner) — no filler text.
+    #
+    # "connect to" rather than "access": what is being granted is a connection the person can see and
+    # remove, not a handover of the data itself. On a screen somebody reads in two seconds before
+    # deciding, the difference between those two readings is the whole decision.
     consent = (
         f'<div class="consent"><p class="small">Allow</p>'
         f'<p class="who">{ui.esc(client)}</p>'
-        f'<p class="small">to access your data</p></div>'
+        f'<p class="small">to connect to your data</p></div>'
         if client
         else ""
     )
