@@ -59,6 +59,28 @@ def register_migration_overlay(path: Path) -> None:
         _MIGRATION_OVERLAYS.append(path)
 
 
+
+def _is_read(sql: str) -> bool:
+    """Whether a statement can be assumed to write nothing.
+
+    **Deliberately one keyword, and deliberately conservative.** This is not a SQL parser and must
+    not become one — the repo has exactly one of those and a second would be a second thing to keep
+    correct. It decides one thing: may a reconnect drop this statement without losing data?
+
+    Only a bare `SELECT` qualifies. `WITH` is excluded even though most CTEs are reads, because
+    Postgres allows a data-modifying statement inside one and a wrong answer here is silent. Anything
+    unrecognised counts as a write, so the failure direction is a refused reconnect rather than a
+    lost row.
+
+    The word boundary is not pedantry: a prefix match alone reads any identifier beginning with those
+    six letters as a query, and being wrong in that direction is the one direction that loses data.
+    """
+    head = sql.lstrip()
+    if head[:6].upper() != "SELECT":
+        return False
+    after = head[6:7]
+    return after == "" or not (after.isalnum() or after == "_")
+
 class Store:
     """A DB-API connection + its dialect, with portable execute/query helpers.
 
@@ -66,9 +88,15 @@ class Store:
     dicts on every backend (built from cursor.description), so callers never branch on the backend.
     """
 
-    def __init__(self, conn: Any, dialect: str) -> None:
+    def __init__(self, conn: Any, dialect: str, *, url: str = "") -> None:
         self.conn = conn
         self.dialect = dialect  # "sqlite" | "postgres"
+        # Kept so a connection the server reaped can be reopened — see `execute`. Empty for SQLite
+        # and for a hand-built Store, and an empty url simply means no reconnect is attempted.
+        self._url = url
+        # Whether a statement has run since the last commit or rollback. **This is what makes the
+        # reconnect safe**, and it is the whole reason this flag exists: see `_reconnected`.
+        self._mid_transaction = False
 
     # --- construction -------------------------------------------------------
 
@@ -85,7 +113,7 @@ class Store:
         if url.startswith(("postgresql://", "postgres://")):
             import psycopg2  # in the [server] extra; only needed for the Postgres backend
 
-            return cls(psycopg2.connect(url), "postgres")
+            return cls(psycopg2.connect(url), "postgres", url=url)
         raise ValueError(
             f"Unsupported AGAMI_DB_URL scheme: {url.split('://', 1)[0]!r} "
             "(expected sqlite:// or postgresql://)"
@@ -112,7 +140,57 @@ class Store:
         # Our SQL never contains a literal '?'; Postgres wants %s placeholders.
         return sql if self.dialect == "sqlite" else sql.replace("?", "%s")
 
+    def _dead_connection_errors(self) -> tuple:
+        """The exceptions that mean "this connection is gone", or nothing on SQLite.
+
+        Both are needed and they arrive at different moments. `OperationalError` is raised the first
+        time a statement meets a socket the server has closed — so it comes out of `cursor.execute`.
+        Every call after that gets `InterfaceError` from `conn.cursor()`, because the driver has by
+        then marked the connection closed. A deployment that handled only the second would recover
+        from every failure except the one that starts each outage.
+        """
+        if self.dialect != "postgres":
+            return ()
+        import psycopg2
+
+        return (psycopg2.InterfaceError, psycopg2.OperationalError)
+
+    def _reconnected(self) -> bool:
+        """Reopen the connection, unless doing so would be unsafe or impossible.
+
+        **Refuses mid-transaction, and that refusal is the point of this method.** Several callers
+        write two rows that must land together — a role change and its audit line, a credential and
+        the record of who set it. If the connection dies between the two statements, the first is
+        already lost, and silently reconnecting would let the second commit **alone**: an audit line
+        for a grant that never happened, which is precisely the property the audit line exists to
+        provide. A caller mid-transaction must see the failure and roll back.
+
+        Between statements there is nothing uncommitted to lose, which is the ordinary case — a read,
+        or the first statement of a unit of work — and that is where an hour-idle connection is
+        reaped in practice.
+        """
+        if self._mid_transaction or not self._url:
+            return False
+        import psycopg2
+
+        try:
+            self.conn = psycopg2.connect(self._url)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
     def execute(self, sql: str, params: tuple = ()) -> Any:
+        try:
+            return self._execute_once(sql, params)
+        except self._dead_connection_errors():
+            # A connection idle long enough gets closed by the server, and nothing tells the process.
+            # Without this the instance is poisoned for as long as it lives: every request afterwards
+            # fails in milliseconds, having attempted no round trip at all.
+            if not self._reconnected():
+                raise
+        return self._execute_once(sql, params)
+
+    def _execute_once(self, sql: str, params: tuple = ()) -> Any:
         cur = self.conn.cursor()
         # **No params argument at all when there are none**, and that is not a tidy-up.
         # psycopg2 treats a non-None `params` as a request to interpolate, so it reads `%` in the SQL
@@ -128,6 +206,16 @@ class Store:
             cur.execute(self._adapt(sql), params)
         else:
             cur.execute(self._adapt(sql))
+        # **Only a write marks the transaction, and only after it has actually run.**
+        #
+        # What the guard in `_reconnected` protects is uncommitted *writes*: reconnecting after one
+        # would let a later statement commit without it. A read leaves nothing to lose, so it must
+        # not set the flag — and the difference is not cosmetic. The path this whole change exists
+        # for reads five tables in a row and never commits, because there is nothing to commit. If a
+        # read marked the transaction, that caller would reconnect once and then be refused for the
+        # life of the process: the fix would not fix the bug. A test pins exactly that.
+        if not _is_read(sql):
+            self._mid_transaction = True
         return cur
 
     def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
@@ -137,9 +225,18 @@ class Store:
 
     def commit(self) -> None:
         self.conn.commit()
+        self._mid_transaction = False
+
+    def rollback(self) -> None:
+        """Abandon the open transaction. Callers reached past this into `store.conn.rollback()`
+        before it existed; going through here is what keeps the reconnect guard honest, because a
+        connection left marked mid-transaction never reconnects again."""
+        self.conn.rollback()
+        self._mid_transaction = False
 
     def close(self) -> None:
         self.conn.close()
+        self._mid_transaction = False
 
     # --- migrations ---------------------------------------------------------
 
