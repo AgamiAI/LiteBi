@@ -184,11 +184,17 @@ _NOW_ANCHOR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A day pinned in the text: a quoted ISO date, with an optional time. Deliberately NOT a bare
-# four-digit integer — `LIMIT 2000`, `total_amount > 1999` and `order_id = 2024` are all far more
-# common than a year written loose, and this lint is error severity, so a false positive here
-# flips a correct file to not-ok and teaches readers to skim the findings that matter.
-_FROZEN_DATE_RE = re.compile(r"'\d{4}-\d{2}-\d{2}(?:[ T][\d:.]+)?'")
+# A day pinned in the text: a quoted ISO date, with an optional time and — on that time — an
+# optional UTC designator or offset. The zone has to be part of the pattern rather than left off
+# the end: the closing quote is what terminates the match, so `'2024-01-01T00:00:00Z'` and
+# `'2024-01-01 00:00:00+00'` would otherwise not match at all, and a timestamp is no less frozen
+# for carrying the zone it was written in. Deliberately NOT a bare four-digit integer —
+# `LIMIT 2000`, `total_amount > 1999` and `order_id = 2024` are all far more common than a year
+# written loose, and this lint is error severity, so a false positive here flips a correct file to
+# not-ok and teaches readers to skim the findings that matter.
+_FROZEN_DATE_RE = re.compile(
+    r"'\d{4}-\d{2}-\d{2}(?:[ T][\d:.]+(?:[Zz]|[+-]\d{2}(?::?\d{2})?)?)?'"
+)
 
 
 def _read_failure(exc: OSError | UnicodeDecodeError | yaml.YAMLError) -> str:

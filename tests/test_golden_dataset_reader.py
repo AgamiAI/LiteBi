@@ -484,6 +484,29 @@ def test_relativity_lint_fires(tmp_path, monkeypatch):
     assert [i.item_key for i in datasets[0].test_cases] == ["orders-window"]
 
 
+@pytest.mark.parametrize("literal", [
+    "'2024-01-01T00:00:00Z'",
+    "'2024-01-01T00:00:00.123Z'",
+    "'2024-01-01T00:00:00+00:00'",
+    "'2024-01-01T00:00:00-05:00'",
+    "'2024-01-01 00:00:00+00'",
+])
+def test_relativity_lint_reads_a_pinned_timestamp_with_its_zone(tmp_path, monkeypatch, literal):
+    """A frozen day is no less frozen for carrying the zone it was written in.
+
+    The closing quote is what ends the match, so a zone suffix left out of the pattern does not
+    make the lint lenient — it makes it blind, and this is the one direction that matters: the
+    finding goes missing on an answer key that is pinned to a moment as hard as any other.
+    """
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    sql = f"SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= {literal}"
+    _write(_golden_dir(tmp_path), "orders.yaml",
+           {"test_cases": [_window_case(RELATIVE_QUERY, sql)]})
+    datasets, res = g.load_golden_datasets(PROFILE)
+    assert [f.code for f in res.findings] == ["golden_relative_question_frozen_sql"]
+    assert len(datasets[0].test_cases) == 1
+
+
 def test_relativity_lint_clean_when_anchored(tmp_path, monkeypatch):
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
     # Carries a frozen literal too, so only the anchor can be what keeps the lint quiet.
