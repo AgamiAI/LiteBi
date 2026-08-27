@@ -121,6 +121,66 @@ def claim_pending_oidc(store: Store, username: str, provider: str, subject: str)
     return cur.rowcount
 
 
+def migrate_password_user_to_oidc(store: Store, username: str, provider: str, subject: str) -> int:
+    """Move an existing PASSWORD account onto an identity provider, and take the password away.
+
+    **This is a migration, not a login.** `claim_pending_oidc` above adopts an account nobody has used
+    yet; this one takes over an account somebody has been signing into with a password for weeks, and
+    keeps everything attached to it — the row, the username, and therefore every conversation,
+    membership and audit line keyed on that address. Nothing is recreated, so nothing is orphaned.
+
+    **The password is cleared, and that is the point rather than tidiness.** Left in place, the
+    identity provider would not actually be in charge: revoke somebody in the directory and they
+    could still sign in with the password they chose months ago, with nothing to show for it. A
+    deployment that moves to single sign-on is saying the directory decides, and a surviving password
+    is a way around that decision.
+
+    **Guarded so it can never take an account belonging to another provider.** The WHERE matches only
+    an account bound to nobody or already bound to THIS provider, so a second identity provider
+    cannot claim a person by presenting the same address. As with `claim_pending_oidc` the caller must
+    re-read and confirm the binding is theirs rather than trusting the row count alone — a concurrent
+    claim is the case that makes the difference.
+
+    Deciding *whether* a deployment should adopt accounts this way is the caller's, not this
+    function's: it is safe only where the caller has already verified the token against a pinned
+    tenant and checked the address against that company's own domains. Returns the row count
+    (0 ⇒ nothing was adopted).
+    """
+    cur = store.execute(
+        "UPDATE users SET oidc_provider = ?, oidc_subject = ?, password_hash = NULL "
+        "WHERE username = ? AND (oidc_provider IS NULL OR oidc_provider = ?)",
+        (provider, subject, username, provider),
+    )
+    store.commit()
+    return cur.rowcount
+
+
+def set_user_names(store: Store, username: str, first_name: str, last_name: str) -> int:
+    """Fill in a person's display name from whatever their identity provider now says.
+
+    **A blank never erases what is there.** An identity provider that simply does not send a name is
+    silent, not authoritative — treating silence as an instruction to delete would wipe a name an
+    administrator typed in, on the next sign-in, with nothing to point at. So each half is written
+    only when a value arrives for it.
+
+    Returns the row count; 0 means nothing was supplied, or the account does not exist.
+    """
+    first_name, last_name = (first_name or "").strip(), (last_name or "").strip()
+    sets, params = [], []
+    if first_name:
+        sets.append("first_name = ?")
+        params.append(first_name)
+    if last_name:
+        sets.append("last_name = ?")
+        params.append(last_name)
+    if not sets:
+        return 0
+    params.append(username)
+    cur = store.execute(f"UPDATE users SET {', '.join(sets)} WHERE username = ?", tuple(params))  # noqa: S608
+    store.commit()
+    return cur.rowcount
+
+
 def claim_pending_password(store: Store, username: str, password: str) -> int:
     """A **pending** user sets their own password (a password deployment, via the admin setup link).
     Guarded so it fires ONLY while still pending — if an OIDC provider already bound (or a password was
