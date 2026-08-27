@@ -49,7 +49,7 @@ below corresponds to one such version.
   own machine had no https option to choose and could not run the server at all. The host is parsed
   rather than prefix-matched, because `http://localhost.example.com` is somebody else's domain.
 
-- The sign-in consent line now reads **"Allow <client> to connect to your data"** rather than "to
+- The sign-in consent line now reads **"Allow `<client>` to connect to your data"** rather than "to
   access your data". What is granted is a connection the person can see and remove, not a handover
   of the data itself, and on a screen read in two seconds before deciding that is the whole
   decision.
