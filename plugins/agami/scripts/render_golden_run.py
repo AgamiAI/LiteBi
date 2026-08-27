@@ -55,7 +55,7 @@ _ACCURACY_DECIMALS = 3
 # is not enough: 4002/4004 rounds to 1.000, so a near miss would read as a perfect score printed
 # beside the sentence saying it did not reproduce the answer key. That is the one confusion this
 # report exists to remove, so a score short of the mark is shown short of the mark.
-_NEARLY_ONE = 1.0 - 10.0 ** -_ACCURACY_DECIMALS
+_NEARLY_ONE = 1.0 - 10.0**-_ACCURACY_DECIMALS
 
 # The counts the header reads. Taken from the run's own summary and never recounted from the
 # items: a report that recomputed one would be a second place that decides what a run looks like.
@@ -102,10 +102,16 @@ def _tables_claim(item: dict) -> Optional[dict[str, Any]]:
     never produced a statement has no claims at all — so the absence is carried as None rather than
     faked as an agreement.
     """
-    claims = (item.get("claims") or {}).get("claims") or []
-    if not claims:
+    block = item.get("claims")
+    claims = block.get("claims") if isinstance(block, dict) else None
+    if not isinstance(claims, list) or not claims:
         return None
     claim = claims[0]
+    # The payload's shape is promised by a docstring on the far side of a `--items-file` handoff,
+    # not by anything here, and a hand-edited or third-party run that breaks the promise must
+    # cost this one line rather than the whole page.
+    if not isinstance(claim, dict):
+        return None
     return {
         # Carried rather than assumed: the page labels the line from the claim's own name, so a
         # run that one day writes its claims in another order labels it correctly instead of
@@ -125,8 +131,16 @@ def _item(item: dict) -> dict[str, Any]:
     including, one day, the result rows this report promises not to show. What is not named here
     cannot reach the file.
     """
-    score = item.get("score") or {}
+    score = item.get("score")
+    if not isinstance(score, dict):
+        score = {}
     accuracy = score.get("accuracy")
+    # A string where a number was promised reaches `_shown`'s comparison and throws, and one
+    # malformed item would take the report down with it. Anything not numeric reads as unscored,
+    # which is what the absence of a usable score means. `bool` is excluded on purpose: it is an
+    # `int` subclass, and True is not an accuracy.
+    if isinstance(accuracy, bool) or not isinstance(accuracy, (int, float)):
+        accuracy = None
     return {
         "item_key": item.get("item_key", ""),
         "question": item.get("question", ""),
@@ -159,9 +173,14 @@ def _summary(run: dict, items: list) -> dict[str, Any]:
     summary = run.get("summary") or {}
     return {
         **{name: summary.get(name) for name in _SUMMARY_COUNTS},
-        "completed": bool(summary.get("completed")),
+        # Absent is not False. A run that omits the field — an older artifact, a hand-edited one —
+        # has not told us it stopped partway, and banner-ing one that finished is the worse error
+        # of the two.
+        "completed": bool(summary.get("completed", True)),
         "sections": summary.get("sections") or {},
-        "verified": any(item.get("confirmed") for item in items),
+        # `_item` has already narrowed `confirmed` to a real bool, so a truthy non-bool in the
+        # payload (the string "False") cannot make a run read as verified.
+        "verified": any(item.get("confirmed") is True for item in items),
     }
 
 
@@ -207,10 +226,11 @@ def render(
     # stops parsing, the script throws at load, and — because the whole body is built by that script
     # — the report renders blank with nothing anywhere saying why.
     return (
-        template
-        .replace("{{REPORT_TITLE}}", title)
-        .replace("{{GENERATED_AT}}",
-                 datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
+        template.replace("{{REPORT_TITLE}}", title)
+        .replace(
+            "{{GENERATED_AT}}",
+            datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        )
         .replace("{{PROFILE}}", profile or "")
         .replace("{{AGAMI_LOGO_DARK_TEXT}}", logo_dark_svg)
         .replace("{{AGAMI_LOGO_LIGHT_TEXT}}", logo_light_svg)
@@ -221,29 +241,30 @@ def render(
 
 def main(argv: Optional[list] = None) -> int:
     p = argparse.ArgumentParser(description="Render one golden run as a self-contained report.")
-    p.add_argument("--title", required=True,
-                   help="Report title (e.g., 'Golden run · orders · demo')")
+    p.add_argument(
+        "--title", required=True, help="Report title (e.g., 'Golden run · orders · demo')"
+    )
     p.add_argument("--profile", required=True, help="Active profile name")
-    p.add_argument("--items-file", required=True,
-                   help="Path to the run's JSON artifact")
+    p.add_argument("--items-file", required=True, help="Path to the run's JSON artifact")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
 
     with open(os.path.expanduser(args.items_file)) as f:
         run = json.load(f)
     if not isinstance(run, dict):
-        sys.stderr.write(
-            f"--items-file must contain a JSON object, got {type(run).__name__}\n"
-        )
+        sys.stderr.write(f"--items-file must contain a JSON object, got {type(run).__name__}\n")
         return 1
 
     out_path = Path(os.path.expanduser(args.out))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(render(
-        title=args.title,
-        profile=args.profile,
-        run=run,
-    ), encoding="utf-8")
+    out_path.write_text(
+        render(
+            title=args.title,
+            profile=args.profile,
+            run=run,
+        ),
+        encoding="utf-8",
+    )
     count = len(run.get("items") or [])
     print(f"Wrote {out_path} ({count} case{'s' if count != 1 else ''})")
     return 0

@@ -60,8 +60,14 @@ def _claims(generated: list[str], golden: list[str], status: str = "differs") ->
     """A statement difference in the shape the run writes it — seven claims, tables first."""
     rest = [
         {"name": name, "status": "agrees", "generated": None, "golden": None}
-        for name in ("filter_predicates", "date_window", "group_keys", "join_keys",
-                     "ordering", "limit")
+        for name in (
+            "filter_predicates",
+            "date_window",
+            "group_keys",
+            "join_keys",
+            "ordering",
+            "limit",
+        )
     ]
     return {
         "claims": [
@@ -110,8 +116,9 @@ def _run(items: list[dict[str, Any]], **summary: Any) -> dict[str, Any]:
         "errored": sum(1 for item in items if item["section"] == "error"),
         "gating_failures": sum(1 for item in items if item["section"] == "failure"),
         "completed": True,
-        "sections": {name: sum(1 for item in items if item["section"] == name)
-                     for name in SECTIONS},
+        "sections": {
+            name: sum(1 for item in items if item["section"] == name) for name in SECTIONS
+        },
     }
     return {
         "run_id": "0f1e2d3c4b5a",
@@ -134,7 +141,9 @@ def _mixed() -> list[dict[str, Any]]:
     """One case of each section — the run a report is actually opened for."""
     return [
         _item(
-            item_key="customers-count", section="failure", passed=False,
+            item_key="customers-count",
+            section="failure",
+            passed=False,
             question="How many customers are on file?",
             expected_sql=f"SELECT COUNT(*) AS {GOLDEN_SENTINEL} FROM customers",
             generated_sql=f"SELECT COUNT(DISTINCT country) AS {GENERATED_SENTINEL} FROM orders",
@@ -142,20 +151,34 @@ def _mixed() -> list[dict[str, Any]]:
             claims=_claims(["orders"], ["customers"]),
         ),
         _item(
-            item_key="products-count", section="error", passed=False, generated_sql="",
+            item_key="products-count",
+            section="error",
+            passed=False,
+            generated_sql="",
             question="How many products are listed?",
-            score={"status": "error", "accuracy": None,
-                   "reason": "the generator returned no statement for this question"},
+            score={
+                "status": "error",
+                "accuracy": None,
+                "reason": "the generator returned no statement for this question",
+            },
             claims=None,
         ),
         _item(
-            item_key="unused-status", section="unscored", passed=False,
+            item_key="unused-status",
+            section="unscored",
+            passed=False,
             question="How many orders are in a status nobody uses?",
-            score={"status": "unscored", "accuracy": None,
-                   "reason": "both result sets are empty, so the comparison would check no value"},
+            score={
+                "status": "unscored",
+                "accuracy": None,
+                "reason": "both result sets are empty, so the comparison would check no value",
+            },
         ),
         _item(
-            item_key="payments-count", section="unconfirmed", confirmed=False, passed=False,
+            item_key="payments-count",
+            section="unconfirmed",
+            confirmed=False,
+            passed=False,
             question="How many payments have been taken?",
             score={"status": "scored", "accuracy": 0.0, "reason": "no row matched"},
         ),
@@ -163,7 +186,10 @@ def _mixed() -> list[dict[str, Any]]:
         # the statement still did not answer the question the dataset requires. It is the only path
         # on which a genuine 1.000 is printed beside "Did not reproduce the answer key".
         _item(
-            item_key="orders-by-status-scoped", section="failure", passed=False, gated=True,
+            item_key="orders-by-status-scoped",
+            section="failure",
+            passed=False,
+            gated=True,
             question="How many orders are there, by status?",
             score={"status": "scored", "accuracy": 1.0, "reason": "every row matched"},
         ),
@@ -172,6 +198,7 @@ def _mixed() -> list[dict[str, Any]]:
 
 
 # --- The file itself ------------------------------------------------------
+
 
 def test_no_placeholder_survives_rendering():
     """The template carries no literal `{{...}}` of its own, so a leftover is a substitution miss."""
@@ -211,6 +238,7 @@ def test_the_renderer_imports_only_the_standard_library():
 
 # --- The two data rules ---------------------------------------------------
 
+
 def test_both_statements_are_rendered_whatever_the_verdict():
     """The answer key and the generated statement, on the failing item and the passing one alike —
     the difference is a diagnostic, not a failure report. Rendering the key here is deliberate: the
@@ -244,10 +272,18 @@ def test_no_result_row_reaches_the_report():
 def test_a_closing_script_tag_in_a_statement_cannot_end_the_block():
     """A question or a statement is somebody's text, and the payload lives inside a `<script>`. The
     escape is the sibling renderer's, and it matters more here because the payload IS SQL."""
-    html = render(title="x", profile="demo", run=_run([_item(
-        question="What breaks </script><img src=x> here?",
-        generated_sql="SELECT 1 -- </script>",
-    )]))
+    html = render(
+        title="x",
+        profile="demo",
+        run=_run(
+            [
+                _item(
+                    question="What breaks </script><img src=x> here?",
+                    generated_sql="SELECT 1 -- </script>",
+                )
+            ]
+        ),
+    )
 
     assert "</script><img" not in html
     assert "<\\/script>" in html
@@ -256,6 +292,7 @@ def test_a_closing_script_tag_in_a_statement_cannot_end_the_block():
 
 
 # --- The header -----------------------------------------------------------
+
 
 def test_the_header_reports_the_runs_own_counts():
     """Pass, fail, unscored and error come from the run's summary and are never recounted here — a
@@ -276,7 +313,14 @@ def test_the_header_reports_the_runs_own_counts():
     # Exactly what the header draws, plus the two things no count says. A whitelist that carried a
     # name nothing on the page reads would not be doing the job the projection exists for.
     assert set(summary) == {
-        "total", "passed", "failed", "unscored", "errored", "completed", "sections", "verified",
+        "total",
+        "passed",
+        "failed",
+        "unscored",
+        "errored",
+        "completed",
+        "sections",
+        "verified",
     }
 
 
@@ -290,7 +334,9 @@ def test_a_run_that_confirmed_nothing_does_not_read_as_a_clean_pass():
     drafted = render(title="x", profile="demo", run=draft)
 
     assert _payload(drafted)["summary"]["verified"] is False
-    assert _payload(render(title="x", profile="demo", run=signed_off))["summary"]["verified"] is True
+    assert (
+        _payload(render(title="x", profile="demo", run=signed_off))["summary"]["verified"] is True
+    )
     # …and the page says what that means, in the words the skill already uses for it. Asserted over
     # the template rather than over the rendered file, because the banner's words are in the file
     # whether or not the banner is drawn: what is worth pinning is that the flag draws it.
@@ -310,6 +356,7 @@ def test_a_run_that_stopped_partway_says_so():
 
 
 # --- Per item -------------------------------------------------------------
+
 
 def test_every_item_carries_its_question_and_verdict():
     """The question, what the run decided, and why — for every case, in every section."""
@@ -359,8 +406,9 @@ def test_the_accuracy_is_shown_to_three_decimals():
     """The score is deliberately unrounded upstream — an item passes at exactly 1.0, and rounding
     there would hand the pass mark to a near miss. 3995 of 4000 rows is one such near miss, and
     presenting it to a person is this renderer's job."""
-    near_miss = _item(passed=False, section="failure",
-                      score={"status": "scored", "accuracy": 3995 / 4000})
+    near_miss = _item(
+        passed=False, section="failure", score={"status": "scored", "accuracy": 3995 / 4000}
+    )
 
     payload = _payload(render(title="x", profile="demo", run=_run([near_miss])))
 
@@ -373,10 +421,10 @@ def test_a_near_miss_is_never_shown_as_a_perfect_score():
     rounding alone would print a perfect-looking score beside the sentence saying the statement did
     not reproduce the answer key — the one confusion this report exists to remove. Only a real 1.0
     may read as 1.000."""
-    near_miss = _item(passed=False, section="failure",
-                      score={"status": "scored", "accuracy": 4002 / 4004})
-    perfect = _item(passed=True, section="pass",
-                    score={"status": "scored", "accuracy": 1.0})
+    near_miss = _item(
+        passed=False, section="failure", score={"status": "scored", "accuracy": 4002 / 4004}
+    )
+    perfect = _item(passed=True, section="pass", score={"status": "scored", "accuracy": 1.0})
 
     payload = _payload(render(title="x", profile="demo", run=_run([near_miss, perfect])))
 
@@ -385,16 +433,19 @@ def test_a_near_miss_is_never_shown_as_a_perfect_score():
 
 
 def test_the_table_set_delta_is_rendered_above_the_statements():
-    """"Generated read `orders`, the answer key read `customers`" is usually the whole finding, so
-    it is one line above the two statements rather than something to be spotted in them."""
+    """The table-set delta is usually the whole finding — "generated read `orders`, the answer key
+    read `customers`" — so it is one line above the two statements rather than something to be
+    spotted in them."""
     items = {
         item["item_key"]: item
         for item in _payload(render(title="x", profile="demo", run=_run(_mixed())))["items"]
     }
 
     assert items["customers-count"]["tables"] == {
-        "name": "tables", "status": "differs",
-        "generated": ["orders"], "golden": ["customers"],
+        "name": "tables",
+        "status": "differs",
+        "generated": ["orders"],
+        "golden": ["customers"],
     }
     assert items["orders-count"]["tables"]["status"] == "agrees"
     # A case that never produced a statement has no difference to show, and the page has to render
@@ -407,11 +458,22 @@ def test_a_claim_that_is_not_a_list_of_names_cannot_reach_the_page():
     list was promised makes that join undefined, throws, and — since the whole body is built by that
     script — leaves the report blank with no error on it. Nothing on this side of the handoff
     enforces the comparator's shape, so the projection coerces instead of trusting it."""
-    run = _run([_item(claims={"claims": [{
-        "name": "tables", "status": "differs",
-        "generated": ["orders", ["nested", "list"], {"a": 1}, None, 7],
-        "golden": "customers",
-    }]})])
+    run = _run(
+        [
+            _item(
+                claims={
+                    "claims": [
+                        {
+                            "name": "tables",
+                            "status": "differs",
+                            "generated": ["orders", ["nested", "list"], {"a": 1}, None, 7],
+                            "golden": "customers",
+                        }
+                    ]
+                }
+            )
+        ]
+    )
 
     tables = _payload(render(title="x", profile="demo", run=run))["items"][0]["tables"]
 
@@ -443,13 +505,22 @@ def test_the_sections_keep_the_order_the_run_wrote_them_in():
     reads the same one so the two cannot disagree. So the renderer takes the order from the run
     instead of holding a second copy of it."""
     run = _run(_mixed())
-    run["summary"]["sections"] = {"pass": 1, "failure": 1, "error": 1, "unscored": 1,
-                                  "unconfirmed": 1}
+    run["summary"]["sections"] = {
+        "pass": 1,
+        "failure": 1,
+        "error": 1,
+        "unscored": 1,
+        "unconfirmed": 1,
+    }
 
     payload = _payload(render(title="x", profile="demo", run=run))
 
     assert list(payload["summary"]["sections"]) == [
-        "pass", "failure", "error", "unscored", "unconfirmed"
+        "pass",
+        "failure",
+        "error",
+        "unscored",
+        "unconfirmed",
     ]
 
 
@@ -470,14 +541,19 @@ def test_a_case_under_a_section_the_summary_never_listed_still_reaches_the_page(
 
 # --- The two sizes --------------------------------------------------------
 
+
 def test_a_run_of_one_and_a_run_of_two_hundred_both_render():
     """The smallest dataset anybody writes and one large enough that the page has to stay usable."""
     one = render(title="x", profile="demo", run=_run([_item()]))
     assert len(_payload(one)["items"]) == 1
 
     many = [
-        _item(item_key=f"case-{n:03d}", question=f"Question {n}?",
-              section="failure" if n % 2 else "pass", passed=bool(n % 2 == 0))
+        _item(
+            item_key=f"case-{n:03d}",
+            question=f"Question {n}?",
+            section="failure" if n % 2 else "pass",
+            passed=bool(n % 2 == 0),
+        )
         for n in range(200)
     ]
     big = render(title="x", profile="demo", run=_run(many))
@@ -499,6 +575,7 @@ def test_a_run_with_no_items_still_renders():
 
 # --- The substitutions ----------------------------------------------------
 
+
 def test_the_title_the_profile_and_the_dataset_reach_the_page():
     """The profile is drawn from its own placeholder, so it is asserted there and carried in the
     payload nowhere — a second copy of it would be a value the page never reads."""
@@ -516,10 +593,18 @@ def test_a_placeholder_written_into_a_question_is_not_substituted_into():
     text of another placeholder. The run's JSON is substituted last for exactly this: substituted
     earlier, a later replace splices a stylesheet into the object literal, the JSON stops parsing,
     the script throws at load and the report renders blank with nothing on it saying why."""
-    html = render(title="x", profile="demo", run=_run([_item(
-        question="How many {{THEME_CSS}} orders?",
-        generated_sql="SELECT COUNT(*) FROM orders -- {{PROFILE}}",
-    )]))
+    html = render(
+        title="x",
+        profile="demo",
+        run=_run(
+            [
+                _item(
+                    question="How many {{THEME_CSS}} orders?",
+                    generated_sql="SELECT COUNT(*) FROM orders -- {{PROFILE}}",
+                )
+            ]
+        ),
+    )
 
     # The assertion is that this parses at all; the values are checked so it cannot pass by having
     # eaten the placeholders instead.
@@ -545,6 +630,7 @@ def test_a_run_that_is_not_an_object_is_refused():
 # that each call site is present, and that the ones whose order carries meaning are in that order.
 # It is not a substitute for a rendered DOM; it is the check that fails when the drawing is gutted.
 
+
 def _css_rule(selector: str) -> str:
     """One CSS rule's declarations, by exact selector."""
     match = re.search(re.escape(selector) + r"\s*\{([^}]*)\}", TEMPLATE)
@@ -566,7 +652,7 @@ def test_the_template_draws_the_question_the_verdict_and_the_delta_for_a_case():
     table and the answer key read another" is usually the whole finding, so it is read before them
     rather than spotted inside them."""
     assert 'class: "question", text: item.question' in TEMPLATE
-    assert 'text: SECTION_LABEL[item.section] || item.section' in TEMPLATE
+    assert "text: SECTION_LABEL[item.section] || item.section" in TEMPLATE
 
     verdict = TEMPLATE.index("verdictLine(item),")
     delta = TEMPLATE.index("deltaLine(item),")
@@ -589,3 +675,66 @@ def test_an_unscored_case_and_an_errored_case_do_not_look_alike():
 
     assert unscored and errored
     assert unscored != errored
+
+
+# ---------------------------------------------------------------------------
+# A payload this renderer did not write
+# ---------------------------------------------------------------------------
+# `--items-file` is a handoff, and the shape on the far side of one is promised by a docstring
+# rather than enforced by anything here. A run edited by hand, written by an older version, or
+# produced by something else entirely must cost the field it broke and never the whole page: the
+# report is what a person opens when a run has already gone wrong, so it failing too is the one
+# failure with no recourse.
+
+
+def test_a_non_dict_claims_block_costs_the_delta_line_and_not_the_page():
+    items = _mixed()
+    items[0]["claims"] = ["tables", "differs"]
+    payload = _payload(render(title="x", profile="demo", run=_run(items)))
+    assert payload["items"][0]["tables"] is None
+    assert len(payload["items"]) == len(items)
+
+
+def test_a_non_dict_first_claim_costs_the_delta_line_and_not_the_page():
+    items = _mixed()
+    items[0]["claims"] = {"claims": ["tables"]}
+    payload = _payload(render(title="x", profile="demo", run=_run(items)))
+    assert payload["items"][0]["tables"] is None
+
+
+def test_a_non_numeric_accuracy_reads_as_unscored_rather_than_throwing():
+    """`_shown` compares against 1.0, so a string here would raise and take the report with it."""
+    items = _mixed()
+    items[0]["score"] = {"status": "scored", "accuracy": "0.0", "reason": "hand-edited"}
+    payload = _payload(render(title="x", profile="demo", run=_run(items)))
+    assert payload["items"][0]["accuracy"] is None
+    assert payload["items"][0]["reason"] == "hand-edited"
+
+
+def test_a_non_dict_score_reads_as_unscored_rather_than_throwing():
+    items = _mixed()
+    items[0]["score"] = "scored"
+    payload = _payload(render(title="x", profile="demo", run=_run(items)))
+    assert payload["items"][0]["accuracy"] is None
+    assert payload["items"][0]["status"] == ""
+
+
+def test_a_run_that_omits_completed_is_not_banner_ed_as_stopped_partway():
+    """Absent is not False. Only a run that SAYS it stopped is shown as one."""
+    run = _run(_mixed())
+    del run["summary"]["completed"]
+    assert _payload(render(title="x", profile="demo", run=run))["summary"]["completed"] is True
+
+
+def test_a_run_that_says_it_stopped_is_still_banner_ed():
+    run = _run(_mixed(), completed=False)
+    assert _payload(render(title="x", profile="demo", run=run))["summary"]["completed"] is False
+
+
+def test_a_truthy_non_bool_confirmed_does_not_make_a_run_read_as_verified():
+    """The string "False" is truthy, and a run nobody signed off must never render as verified."""
+    items = _mixed()
+    for item in items:
+        item["confirmed"] = "False"
+    payload = _payload(render(title="x", profile="demo", run=_run(items)))
+    assert payload["summary"]["verified"] is False
