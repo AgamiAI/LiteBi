@@ -12,6 +12,53 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.6.8] — 2026-08-27
+
+### Fixed
+
+- **A database connection the server closed is now reopened, instead of poisoning the process until
+  it is replaced.** `Store` opened one Postgres connection at startup and held it for the life of the
+  process. A deployment that sits idle for about an hour has that connection reaped from the server
+  side, and nothing told the process: `execute` called `conn.cursor()` with no liveness check and
+  there was no reconnect path anywhere in the package.
+
+  The instance was then poisoned for as long as it lived — **every** request, not only the ones that
+  touch data, answered in about three milliseconds having attempted no round trip at all. The three
+  milliseconds are the tell. A downstream deployment hit this four times in four days, one to two
+  hours each, across two revisions; thirty days of that service's error logs contained 123 tracebacks
+  and every one was this.
+
+  It fails closed on all traffic because the first thing a request does is resolve the caller's org,
+  and that read goes down the dead connection — before authentication, before routing. Somebody who
+  has just signed in successfully sees a connector error, which reads as a login failure and gets
+  reported as one.
+
+  `Store` now keeps the URL it connected with and retries once when the connection is gone. Three
+  things bound that retry, and each of them was a real defect in an earlier draft rather than
+  caution for its own sake:
+
+  - **It refuses while an uncommitted write is outstanding.** Callers write two rows that must land
+    together — a role change and the audit line naming who granted it. If the connection dies between
+    them the first is already lost, and reconnecting silently would let the second commit **alone**:
+    an audit line for a grant that never happened, which is exactly what that line exists to make
+    impossible.
+  - **A read does not count as an outstanding write**, and that distinction is the difference between
+    fixing this and appearing to. The path this exists for reads five tables in a row and never
+    commits, because there is nothing to commit. Counting reads would have reconnected once and then
+    refused for the life of the process.
+  - **`OperationalError` alone is not enough to act on.** It is a broad base class — a cancelled
+    query, a statement timeout, a full disk. Retrying on any of them re-runs the statement, and for
+    the first write of a transaction that lands the row twice. Only the driver marking the connection
+    closed counts. `InterfaceError` needs no such test, since the driver raises it only on a
+    connection it has already closed.
+
+  It also refuses while a session-scoped advisory lock is held, so a reconnect part-way through a
+  migration cannot continue without the lock and let a second instance apply the same files.
+
+  `Store.rollback()` is new, and callers that reached past it into `store.conn.rollback()` now go
+  through it — a rollback that bypassed it would leave the connection marked mid-transaction forever
+  and unable to reconnect again.
+
 ## [0.6.7] — 2026-08-18
 
 ### Added
