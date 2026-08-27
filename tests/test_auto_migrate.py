@@ -120,6 +120,15 @@ class _Recorder:
     def commit(self) -> None:
         pass
 
+    def rollback(self) -> None:
+        """`run_migrations` rolls back through `Store` rather than reaching into `store.conn`.
+
+        Changed when the reconnect guard landed: `Store.rollback` is what clears the flag saying an
+        uncommitted write is outstanding, and a rollback that bypassed it would leave the connection
+        marked mid-transaction forever, so it could never reconnect again.
+        """
+        self.conn.rollback()
+
     def _run_script(self, sql: str) -> None:
         if self._fail:
             raise RuntimeError("bad migration")
