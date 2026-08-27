@@ -33,12 +33,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-# A dev checkout keeps the package beside the plugin and does not install it; a marketplace install
-# ships the plugin alone, with the package already importable. Prepending the checkout's source when
-# it is actually there covers both without asking which install this is.
-_PKG_SRC = Path(__file__).resolve().parents[3] / "packages" / "agami-core" / "src"
-if _PKG_SRC.is_dir() and str(_PKG_SRC) not in sys.path:
-    sys.path.insert(0, str(_PKG_SRC))
+# Three layouts reach this script and only one of them has `packages/` on disk: a dev checkout
+# keeps the source beside the plugin, a marketplace install ships `<version>/lib` and no checkout
+# at all, and a pip install has the library importable already. `_agami_lib` is the one helper
+# that knows all three, and every other runtime script in this directory calls it — resolving the
+# path here instead would have covered the checkout and told a marketplace user to pip-install a
+# library their plugin already ships.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _agami_lib  # noqa: E402
+
+_agami_lib.ensure_importable()
 
 try:
     import agami_paths
