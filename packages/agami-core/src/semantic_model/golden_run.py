@@ -73,9 +73,7 @@ _SELF_JUDGING_LEVELS = ("bounded", "nonempty")
 # Why an item could not be judged. Sentences rather than codes, because they are printed beside the
 # item, and value-free because a run's result is persisted and rendered further on.
 _NOTHING_GENERATED = "the generator returned no statement for this question"
-_NO_ANSWER_KEY = (
-    "the item has no answer key, and its match level judges the result against one"
-)
+_NO_ANSWER_KEY = "the item has no answer key, and its match level judges the result against one"
 
 # How much of an injected generator's own error sentence is persisted with the run. A generator is
 # somebody else's code, and a raised exception's text is dropped here for exactly that reason; a
@@ -290,9 +288,7 @@ def run_golden_dataset(
             )
             break
         outcomes.append(
-            _run_item(
-                item, generated, profile=profile, org=org, executor=executor, dialect=dialect
-            )
+            _run_item(item, generated, profile=profile, org=org, executor=executor, dialect=dialect)
         )
     return GoldenRunResult(
         run_id=run_id,
@@ -318,9 +314,7 @@ def _run_item(
     if generated.error is not None or not generated.sql.strip():
         return ItemOutcome(
             item_key=item.item_key,
-            score=ItemScore(
-                status="error", accuracy=None, reason=_relayed_error(generated.error)
-            ),
+            score=ItemScore(status="error", accuracy=None, reason=_relayed_error(generated.error)),
             generated_sql="",
             claims=None,
             gated=False,
@@ -328,8 +322,15 @@ def _run_item(
         )
 
     golden_sql = item.expected.sql or ""
-    score = _score(item, generated.sql, golden_sql, profile=profile, org=org, executor=executor,
-                   dialect=dialect)
+    score = _score(
+        item,
+        generated.sql,
+        golden_sql,
+        profile=profile,
+        org=org,
+        executor=executor,
+        dialect=dialect,
+    )
     # After the score, and on EVERY item that produced a statement — an answer key is not the
     # condition. The diff is what turns "the rows disagree" into a reason, and one of its two gates
     # reads the generated statement alone: `must_filter` is the DATASET's requirement rather than a
@@ -509,6 +510,10 @@ The question:
 Reply with a single JSON object and no other text: {{"sql": "<one SELECT statement>"}}
 Write one read-only SELECT over the tables above. You have no tools here and nothing you write is
 executed by you, so do not try to run it, verify it, or read any data.
+Answer exactly what was asked and nothing more: no extra columns, no extra grouping, no volunteered
+breakdown. A metric's guidance on how to present a result applies to the question that asks for that
+result, not to every question touching the same table. The answer is scored against one a person
+already agreed to, so a richer statement is a different answer rather than a better one.
 """
 
 
