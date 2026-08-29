@@ -241,7 +241,12 @@ def test_the_run_summary_is_the_same_on_a_second_run(profile):
 
     assert first.as_dict()["summary"] == second.as_dict()["summary"]
     assert first.as_dict()["summary"] == {
-        "total": 4, "passed": 3, "failed": 1, "unscored": 0, "errored": 0, "gating_failures": 1,
+        "total": 4,
+        "passed": 3,
+        "failed": 1,
+        "unscored": 0,
+        "errored": 0,
+        "gating_failures": 1,
     }
     assert first.run_id != second.run_id
 
@@ -279,12 +284,15 @@ def test_a_real_run_writes_a_report_with_both_statements_and_no_rows(
     code = run_golden_eval.main(["--profile", PROFILE, "--dataset", "orders"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert code == 0
+    # `1`, not `0`: this dataset carries a confirmed case that fails on purpose — the one whose
+    # `must_filter` the generated statement does not write — and a confirmed failure is what the
+    # exit code exists to report. A report is still written; a failing run is a run that worked.
+    assert code == run_golden_eval._FAILED
     report = Path(payload["report"])
     assert report.parent == agami_paths.dashboard_dir("eval", PROFILE, profile)
     html = report.read_text(encoding="utf-8")
-    assert "SELECT COUNT(*) AS order_count FROM orders" in html   # the answer key
-    assert "SELECT COUNT(id) AS n FROM orders" in html            # what the model wrote
+    assert "SELECT COUNT(*) AS order_count FROM orders" in html  # the answer key
+    assert "SELECT COUNT(id) AS n FROM orders" in html  # what the model wrote
     assert COUNT_QUESTION in html
     with sqlite3.connect(warehouse) as db:
         (statuses,) = db.execute("SELECT COUNT(DISTINCT status) FROM orders").fetchone()
