@@ -6,6 +6,11 @@ and no command of its own, so this is the wiring that lets a person — or a ski
 does three things nothing upstream does: it chooses the dataset, it renders the tables and columns
 the generator is given, and it decides what a verdict looks like on a terminal.
 
+**The exit code is the contract a pipeline gates on**: `0` every confirmed case passed, `1` a
+confirmed case failed, `2` no verdict could be produced — the preflight refused, the run stopped
+partway, or every generation errored. `2` reads as "go look at the harness", never as "the model
+regressed". See `_verdict`, whose ordering is the whole of that distinction.
+
 **Stdout carries verdicts and never SQL.** Neither the answer key nor the generated statement
 appears in the printed payload — nor the answer key's own column names, which two of the
 comparator's reasons are built out of — so a terminal that gets pasted into a chat window carries
@@ -20,6 +25,19 @@ Usage:
 
     python3 run_golden_eval.py --profile main --list
     python3 run_golden_eval.py --profile main --dataset orders --timeout-s 120
+    python3 run_golden_eval.py --profile main --dataset orders --tag smoke --tag revenue
+    python3 run_golden_eval.py --profile main --dataset orders --rerun-failures
+
+**What a run sends outbound.** Generating a statement spawns the operator's own client with every
+tool switched off, and hands it the question, the organization, the datasource name and the tables
+and columns of the semantic model. It is handed neither the answer key nor any result row —
+generation finishes before anything is executed, so no row exists yet. It is not told where the
+dataset lives either, though that withholds a name rather than a capability: the child keeps `HOME`
+and is given the profile's name, and what actually stops it reading the answer key off disk is that
+it is started with no tools to read one with. That
+egress is the operator's own model provider and nothing else. It matters most in CI, where the
+model's vocabulary leaves a shared runner rather than one person's machine, and where the
+credential is whatever the environment supplies to the client.
 """
 
 from __future__ import annotations
@@ -74,10 +92,16 @@ except ImportError as exc:
 # the same order, so the two cannot disagree about what a run looks like.
 _SECTION_ORDER = ("failure", "error", "unscored", "unconfirmed", "pass")
 
-# Where a run's exit code is decided is a later slice's problem. This one exits 0 for any run that
-# reached the end of its wiring — a run with failures in it is a run that worked — and non-zero
-# only when it could not start.
+# What a run's exit code means, and the whole of what CI reads. `_CANNOT_START` is both "the
+# preflight refused" and "the run produced no verdict": to a pipeline those are the same event —
+# nothing was judged — and a second code for it would only be a second thing to configure.
+_FAILED = 1
 _CANNOT_START = 2
+
+# Marks the lines a caller is meant to strip — the refusals and the warnings, this helper talking
+# about itself. The run's own summary line carries no prefix, because that one is the thing to
+# keep.
+_PREFIX = "agami-eval:"
 
 
 def _section(outcome: Any) -> str:
@@ -481,9 +505,137 @@ def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[Gold
     return None
 
 
+def _last_failures(profile: str, dataset_name: str) -> Optional[list[str]]:
+    """The item keys the most recent WHOLE, CONCLUDED run of this dataset recorded as failures.
+
+    Three things disqualify a record, and each of them was a false green before it did:
+
+    * **A run that produced no verdict.** An all-errored or half-finished run records no failures
+      because it scored nothing, not because nothing was wrong. Trusting its empty list makes the
+      next re-run exit `0` over a dataset with live regressions in it — the exact reading the `2`
+      branch exists to prevent, arrived at two invocations later.
+    * **A run that was itself a selection.** A `--tag` slice or an earlier re-run describes some of
+      the dataset, so its failure list is silently narrower than the truth and every re-run after it
+      inherits the narrowing.
+    * **A record this version cannot read**, including one written before the verdict fields were
+      added.
+
+    Artifacts are keyed on the profile, not the dataset, so the newest file in the directory may
+    describe something else entirely — matching on the recorded `dataset` is what stops a re-run
+    executing another dataset's failures and reporting confidently about it. `*.json` and not `*`
+    because the report slice writes its HTML into this same directory.
+    """
+    out = agami_paths.dashboard_dir("eval", profile)
+    if not out.is_dir():
+        return None
+    for path in sorted(out.glob("*.json"), reverse=True):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record["dataset"] != dataset_name:
+                continue
+            if record["selection"] is not None:
+                continue
+            summary = record["summary"]
+            if (
+                _verdict_of(
+                    completed=summary["completed"],
+                    total=summary["total"],
+                    errored=summary["errored"],
+                    gating_failures=summary["gating_failures"],
+                )
+                == _CANNOT_START
+            ):
+                continue
+            return [item["item_key"] for item in record["items"] if item["section"] == "failure"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def _reselect(dataset: GoldenDataset, profile: str) -> Optional[GoldenDataset]:
+    """The dataset narrowed to what its last run failed, or None having said why not.
+
+    No previous run refuses rather than falling back to running everything: someone re-running a
+    failure list is asking a narrow question, and answering a wider one costs a model call per case
+    and buries the answer they wanted.
+    """
+    failures = _last_failures(profile, dataset.name)
+    if failures is None:
+        _stop(
+            f"no previous run of {dataset.name!r} to re-read on this profile — "
+            "run it once before re-running its failures"
+        )
+        return None
+    by_key = {item.item_key: item for item in dataset.test_cases}
+    selected = [by_key[key] for key in failures if key in by_key]
+    missing = len(failures) - len(selected)
+    if missing:
+        # Editing a case away between runs is ordinary; running fewer than the last run reported
+        # without saying so is not.
+        _warn(
+            f"{missing} of the last run's failures are no longer in {dataset.name!r} and were "
+            "skipped"
+        )
+    if not selected and not missing:
+        # Not a wrong selector — the last run genuinely had nothing to re-run — so this is a clean
+        # exit. Only claimed when nothing was skipped: saying "recorded no failures" right after
+        # saying some were skipped contradicts it, and a skill reads this sentence back as "the
+        # previous run was green".
+        _warn(
+            f"the last run of {dataset.name!r} recorded no failures, so this re-run had nothing "
+            "to do"
+        )
+    return dataset.model_copy(update={"test_cases": selected})
+
+
+def _select(dataset: GoldenDataset, tags: Optional[list[str]]) -> Optional[GoldenDataset]:
+    """The dataset narrowed to the cases carrying one of `tags`, or None having said why not.
+
+    OR and never AND: a tag names a slice its author wrote, so a suite is the union of the slices
+    asked for. Intersecting them would make every extra `--tag` narrow the run, which is the
+    opposite of what naming a second suite means.
+
+    Matching is CASE-SENSITIVE. `tags` is free text with no vocabulary and no normalization
+    anywhere it is read, so folding case here would invent one that no other reader of the dataset
+    applies — `Smoke` and `smoke` would select the same cases from this helper and different ones
+    from anything else looking at the same file.
+
+    A tag no case carries is a wrong selector rather than an empty result, so it refuses instead of
+    running zero cases green: a typo in a pipeline's arguments would otherwise pass forever. The
+    refusal names the tags that do exist, because that list is what the next invocation needs.
+    """
+    if not tags:
+        return dataset
+    wanted = set(tags)
+    selected = [item for item in dataset.test_cases if wanted.intersection(item.tags)]
+    if not selected:
+        present = sorted({tag for item in dataset.test_cases for tag in item.tags})
+        tags_shown = ", ".join(repr(tag) for tag in tags)
+        names = (
+            f"Tags present: {', '.join(present)}"
+            if present
+            else "No case in this dataset carries a tag at all."
+        )
+        _stop(f"no case in {dataset.name!r} carries any of: {tags_shown}. {names}")
+        return None
+    # A copy and not a mutation: the model forbids unknown fields and the caller's dataset is what
+    # the reader handed back, so narrowing in place would edit the record every other reader sees.
+    return dataset.model_copy(update={"test_cases": selected})
+
+
 def _stop(reason: str) -> None:
-    """Say why the run cannot start. One prefix everywhere, so a caller can strip it."""
-    print(f"agami-eval: {reason}", file=sys.stderr)
+    """Say why the run cannot start."""
+    print(f"{_PREFIX} {reason}", file=sys.stderr)
+
+
+def _warn(reason: str) -> None:
+    """Say something about a run that still finished.
+
+    Same stream and same prefix as `_stop`, and a separate name for one reason: `_stop` is called
+    at six sites that all return `_CANNOT_START`, so a call reading `_stop(...)` where nothing
+    stops would misdescribe the control flow at every one of them.
+    """
+    print(f"{_PREFIX} {reason}", file=sys.stderr)
 
 
 def _section_counts(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -506,6 +658,7 @@ def _write_artifact(
     questions: dict[str, str],
     keys: dict[str, str],
     summary: dict[str, Any],
+    selection: Optional[str],
 ) -> Path:
     """Join the run to the dataset it ran and persist both statements.
 
@@ -516,22 +669,36 @@ def _write_artifact(
 
     This lands under `local/`, which is gitignored per-user state, and the answer key it repeats is
     already on disk in the dataset file the run just read, so it adds no exposure.
+
+    The verdict fields are here because the score alone cannot say which cases failed: `passed`
+    folds `gated` into itself, so a gated-but-accurate case reads exactly like a pass, and a re-run
+    of the failures would silently skip it. Widening this record is additive on purpose — the report
+    slice reads the same file, so a field may be added but none may be reshaped or dropped.
     """
     joined = {
         "run_id": result.run_id,
         "profile": result.profile,
         "dataset": result.dataset,
+        # What narrowed this run, or None for a whole one. A later re-run reads only whole runs:
+        # a slice's failure list is silently narrower than the truth, and inheriting it narrows
+        # every re-run after it.
+        "selection": selection,
         "summary": summary,
         "items": [
             {
-                "item_key": outcome.item_key,
                 # Indexed rather than defaulted: both dicts are built from the same `test_cases`
                 # the run was handed, and a key that stopped resolving should say so rather than
                 # write an artifact with an empty question in it.
                 "question": questions[outcome.item_key],
                 "expected_sql": keys[outcome.item_key],
-                "generated_sql": outcome.generated_sql,
-                "score": outcome.as_dict()["score"],
+                # The runner's own record, whole. It already carries `item_key`, `generated_sql`,
+                # `confirmed`, `passed`, `gated` and the claim difference the report renders beside
+                # the two statements — re-spelling any of them here is a second source of truth for
+                # a value that has one, and the copy is what goes stale.
+                **outcome.as_dict(),
+                # The same classifier the terminal printed, so "re-run the failures" runs what a
+                # reader actually saw under that heading rather than a second opinion about it.
+                "section": _section(outcome),
             }
             for outcome in result.outcomes
         ],
@@ -583,12 +750,86 @@ def _run_payload(result: GoldenRunResult, questions: dict[str, str]) -> dict[str
     }
 
 
+def _verdict(result: GoldenRunResult) -> int:
+    """The run's exit code, so a pipeline can gate on it.
+
+    The ORDER of these checks is the substance, not an implementation detail. A broken pipeline
+    outranks a regression, so a run that stopped partway AND carries gating failures reports
+    `_CANNOT_START` rather than `_FAILED`: sending somebody to debug a model change against a run
+    that never happened is the expensive mistake this ordering exists to prevent.
+
+    A run in which EVERY generation errored is `_CANNOT_START` for the same reason — nothing was
+    scored, so it is neither a regression nor a passing suite. That rule is CATEGORICAL and not
+    proportional on purpose: any fraction here would be a pass-rate threshold, which a verdict
+    built on a confirmed answer key deliberately does not have.
+
+    `gating_failures` and never `failed`. `failed` counts every scored miss including the
+    unconfirmed ones, whose answer keys nobody has reviewed and which can therefore never gate;
+    resting the exit code on it would fail CI on an item no human has agreed to. Confirmed-only is
+    the contract's invariant, and this is the surface it is observable at.
+    """
+    return _verdict_of(
+        completed=result.completed,
+        total=len(result.outcomes),
+        errored=result.errored,
+        gating_failures=result.gating_failures,
+    )
+
+
+def _verdict_of(*, completed: bool, total: int, errored: int, gating_failures: int) -> int:
+    """The rule itself, over four numbers rather than a run.
+
+    A recorded run has to be judged by the same rule as a live one — `_last_failures` must know
+    whether the artifact it is about to trust produced a verdict at all — and an artifact carries
+    these four values and not a `GoldenRunResult`. One spelling, so the two can never drift into
+    disagreeing about what a green run was.
+    """
+    if not completed:
+        return _CANNOT_START
+    if total and errored == total:
+        return _CANNOT_START
+    if gating_failures:
+        return _FAILED
+    return 0
+
+
+def _summary_line(result: GoldenRunResult, summary: dict[str, Any]) -> str:
+    """The one line a person reads a pipeline log against.
+
+    Built from `sections` rather than the runner's counters, for the reason `_section_counts`
+    gives: these are the rows that were printed, and `failed` is a different number. Word for word
+    the sentence the skill renders from the same payload, so a CI log and a chat report describe
+    one run in one wording instead of two.
+    """
+    sections = summary["sections"]
+    return (
+        f"Ran {result.dataset} on {result.profile}: "
+        f"{sections['failure']} failed, {sections['error']} errored, "
+        f"{sections['unscored']} unscored, {sections['unconfirmed']} unconfirmed, "
+        f"{sections['pass']} passed — run completed: {'yes' if summary['completed'] else 'no'}."
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Run a golden dataset and score every case.")
     parser.add_argument("--profile", required=True, help="the semantic-model profile to run")
     parser.add_argument("--dataset", help="which dataset to run (needed only if there are several)")
     parser.add_argument(
         "--list", action="store_true", help="describe the profile's datasets and run nothing"
+    )
+    # Two ways of narrowing the same dataset, so naming both is a question with no answer rather
+    # than a combination worth defining.
+    narrowing = parser.add_mutually_exclusive_group()
+    narrowing.add_argument(
+        "--tag",
+        action="append",
+        help="run only the cases carrying this tag; repeatable, and a case carrying any of the "
+        "tags given runs",
+    )
+    narrowing.add_argument(
+        "--rerun-failures",
+        action="store_true",
+        help="run only the cases the last run of this dataset recorded as failures",
     )
     parser.add_argument(
         "--timeout-s", type=float, default=120.0, help="how long one generation may take"
@@ -609,6 +850,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     dataset = _pick(datasets, args.dataset)
     if dataset is None:
         return _CANNOT_START
+
+    # Before the model is read and long before the generator is reached, so a wrong selector costs
+    # nothing. The selection is applied to the dataset here rather than threaded into the run:
+    # `run_golden_dataset` takes a dataset, an environment and a generator, and widening that
+    # signature with a notion of which cases to skip would make every caller of it carry one.
+    dataset = (
+        _reselect(dataset, args.profile) if args.rerun_failures else _select(dataset, args.tag)
+    )
+    if dataset is None:
+        return _CANNOT_START
+    if args.rerun_failures and not dataset.test_cases:
+        # Nothing to re-run is a clean exit, and it stops here rather than running: an empty run
+        # would write a 0-case artifact that becomes this dataset's newest record and shadows the
+        # real one, so the evidence a later re-run needs would be gone.
+        return 0
+
+    selection = "rerun" if args.rerun_failures else (",".join(args.tag) if args.tag else None)
 
     # Reading the model and resolving its dialect are the three raises this path reaches, and
     # everything below them is total. None of them is relayed as a stack: a traceback prints the
@@ -664,18 +922,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     keys = {item.item_key: item.expected.sql or "" for item in dataset.test_cases}
     payload = _run_payload(result, questions)
     try:
-        payload["artifact"] = str(_write_artifact(result, questions, keys, payload["summary"]))
+        payload["artifact"] = str(
+            _write_artifact(result, questions, keys, payload["summary"], selection)
+        )
     except OSError as exc:
         # The run is already paid for — a model call and up to two warehouse queries per case — so
         # a directory it cannot write to costs the drill-down and nothing else. The verdicts print
         # either way. The path is not relayed, for the reason the preflight guards give.
         payload["artifact"] = ""
-        _stop(
+        _warn(
             "the verdicts are below, but this run's artifact could not be written "
             f"({exc.__class__.__name__}: {exc.strerror or 'cannot be written'})"
         )
     print(json.dumps(payload, indent=2))
-    return 0
+
+    # Everything below prints AFTER the payload, and the exit code is computed last: a run costs a
+    # model call and up to two warehouse queries per case, so a verdict must never cost the
+    # verdicts. The summary goes to stderr because stdout is a JSON document — a human sentence
+    # there would break every caller that parses it — and stderr already carries the refusals, so a
+    # log has one place to look. It is unprefixed because it is the thing to keep rather than the
+    # thing to strip.
+    print(_summary_line(result, payload["summary"]), file=sys.stderr)
+    if not any(outcome.confirmed for outcome in result.outcomes):
+        # A green run that verified nothing is the one most easily mistaken for evidence, so it
+        # says so out loud. The exit code stays 0: the run worked, there was simply nothing in it
+        # that could gate.
+        _warn(
+            "this run gated on nothing — no case in it has a confirmed answer key, so a green "
+            "exit says only that the run worked"
+        )
+    return _verdict(result)
 
 
 if __name__ == "__main__":

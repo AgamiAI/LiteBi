@@ -406,13 +406,16 @@ def test_listing_reads_no_credentials(artifacts, monkeypatch, capsys):
 
 def test_a_run_reports_every_item_and_the_summary_counts_them(artifacts, scripted, capsys):
     """Nothing is dropped between the dataset and the payload, and the summary describes exactly
-    the items that were printed."""
+    the items that were printed.
+
+    The dataset carries one confirmed miss, so the run exits `1` — the payload is the point here
+    and it prints in full either way, which is the reason the verdict is computed after it."""
     _write(artifacts, "mixed", MIXED_DATASET)
 
     code, payload, _ = _run(capsys, "--dataset", "mixed")
 
     sections = _sections(payload)
-    assert code == 0
+    assert code == 1
     assert payload["summary"]["total"] == len(payload["items"]) == 4
     assert payload["summary"]["passed"] == sections.count("pass")
     assert payload["summary"]["errored"] == sections.count("error")
@@ -647,6 +650,8 @@ def test_what_the_reader_dropped_reaches_the_findings(artifacts, scripted, capsy
 
 
 def test_a_single_dataset_needs_no_argument(artifacts, scripted, capsys):
+    """Also the exit-0 anchor: an all-pass run over one confirmed case is the only shape that
+    is green on every one of the verdict's checks."""
     _write(artifacts, "green", PASSING_DATASET)
 
     code, payload, _ = _run(capsys)
@@ -675,13 +680,17 @@ def test_naming_a_dataset_that_does_not_exist_lists_what_does(artifacts, scripte
 
 def test_a_dataset_with_no_cases_runs_and_reports_nothing(artifacts, scripted, capsys):
     """An author who created the file but has not written a case yet. The reader calls that a
-    dataset, so the run does too — an empty summary rather than a failure."""
+    dataset, so the run does too — an empty summary rather than a failure.
+
+    It exits `0` because the run worked, and it says on stderr that it gated on nothing, because a
+    green exit over zero confirmed cases is the one most easily mistaken for evidence."""
     _write(artifacts, "blank", {"description": "nothing yet"})
 
-    code, payload, _ = _run(capsys, "--dataset", "blank")
+    code, payload, err = _run(capsys, "--dataset", "blank")
 
     assert code == 0 and payload["items"] == []
     assert payload["summary"]["total"] == 0 and payload["summary"]["completed"] is True
+    assert "gated on nothing" in err
 
 
 def test_a_dataset_whose_only_case_is_unconfirmed_gates_on_nothing(artifacts, scripted, capsys):
@@ -719,7 +728,8 @@ def test_a_generator_that_raises_stops_the_run_and_the_payload_says_so(
     artifacts, monkeypatch, capsys
 ):
     """`completed: false` and the cases after the raise simply absent. A reader who only counted
-    failures would call this run clean."""
+    failures would call this run clean, which is why the exit code refuses to give a verdict at
+    all rather than reporting the fraction of the dataset it reached."""
 
     class _RaisesOnTheSecond:
         def __init__(self, schema: str, *, timeout_s: float) -> None:
@@ -736,7 +746,7 @@ def test_a_generator_that_raises_stops_the_run_and_the_payload_says_so(
 
     code, payload, _ = _run(capsys, "--dataset", "mixed")
 
-    assert code == 0
+    assert code == 2
     assert payload["summary"]["completed"] is False
     assert [item["item_key"] for item in payload["items"]] == ["orders-count"]
     assert payload["summary"]["total"] == 1
@@ -744,7 +754,8 @@ def test_a_generator_that_raises_stops_the_run_and_the_payload_says_so(
 
 def test_a_run_where_every_item_errors_is_not_green(artifacts, monkeypatch, capsys):
     """Zero gating failures, and nothing was answered. The counter is over items that were SCORED,
-    so `errored` is the only field that distinguishes this from a clean run."""
+    so `errored` is the only field that distinguishes this from a clean run — and the exit code
+    reads it, which is what keeps a runner with no `claude` on it from passing CI."""
 
     class _AnswersNothing:
         def __init__(self, schema: str, *, timeout_s: float) -> None:
@@ -756,8 +767,9 @@ def test_a_run_where_every_item_errors_is_not_green(artifacts, monkeypatch, caps
     monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _AnswersNothing)
     _write(artifacts, "mixed", MIXED_DATASET)
 
-    _, payload, _ = _run(capsys, "--dataset", "mixed")
+    code, payload, _ = _run(capsys, "--dataset", "mixed")
 
+    assert code == 2
     assert payload["summary"]["gating_failures"] == 0
     assert payload["summary"]["errored"] == 4 and payload["summary"]["completed"] is True
     assert _sections(payload) == ["error", "error", "error", "error"]
@@ -770,8 +782,9 @@ def test_a_run_where_every_item_errors_is_not_green(artifacts, monkeypatch, caps
 
 def test_the_artifact_write_failing_does_not_discard_the_run(artifacts, scripted, capsys):
     """A run costs a model call and two warehouse queries per case. A directory it cannot write to
-    loses the drill-down and nothing else — the verdicts still print, the exit code still says the
-    run reached the end of its wiring, and the path is not relayed onto stderr."""
+    loses the drill-down and nothing else — the verdicts still print, the exit code is still the
+    dataset's own (`0` here: one confirmed case, and it passed), and the path is not relayed onto
+    stderr. A missing artifact is not a broken run, so it does not become a `2`."""
     _write(artifacts, "green", PASSING_DATASET)
     out = agami_paths.dashboard_dir("eval", PROFILE, artifacts)
     out.mkdir(parents=True)
