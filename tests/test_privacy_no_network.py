@@ -1,11 +1,23 @@
 """
-Privacy invariant: NO shipped script makes a network call.
+Privacy invariant: NO shipped script opens a connection of its own.
 
-agami's entire promise is that nothing leaves your machine — "grep the source,
-there is no network call in any skill code path" (docs/privacy.md). This test is
-the automated backing for that claim: it scans every Python script that ships in
-the plugin and fails the build if any of them references a network-egress
+agami's promise is that nothing leaves your machine unless you asked for it. This
+test is the automated backing for that claim: it scans every Python script that
+ships in the plugin and fails the build if any of them references a network-egress
 primitive.
+
+This docstring used to say "NO shipped script makes a network call", and that is
+no longer the posture. `semantic_model/golden_run.py` starts the operator's OWN
+AI client as a CHILD PROCESS to generate the SQL a golden-dataset eval grades —
+their client, their account, an explicit command, and a child whose every tool,
+MCP server and setting source is switched off BY A FLAG (`--tools ""`,
+`--strict-mcp-config`, `--setting-sources ""`), started in an empty directory,
+with an allowlisted environment. Being out of process, it matches
+none of the primitives below, so nothing here went red when it landed. That is
+exactly why the wording is corrected deliberately: a doc that keeps promising what
+the code stopped doing is worse than one that never promised it. What the scan
+still holds, and what the product still promises, is that there is no in-process
+network CLIENT — nothing agami ships opens a socket itself.
 
 What's allowed and why:
   - `urllib.parse` — pure string parsing of DSNs (execute_sql.py). NOT network.
