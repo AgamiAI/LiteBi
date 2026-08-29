@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -240,9 +241,65 @@ def test_the_run_summary_is_the_same_on_a_second_run(profile):
 
     assert first.as_dict()["summary"] == second.as_dict()["summary"]
     assert first.as_dict()["summary"] == {
-        "total": 4, "passed": 3, "failed": 1, "unscored": 0, "errored": 0, "gating_failures": 1,
+        "total": 4,
+        "passed": 3,
+        "failed": 1,
+        "unscored": 0,
+        "errored": 0,
+        "gating_failures": 1,
     }
     assert first.run_id != second.run_id
+
+
+def test_a_real_run_writes_a_report_with_both_statements_and_no_rows(
+    profile, warehouse, monkeypatch, capsys
+):
+    """The last step of the path, driven through the command a person actually runs.
+
+    Everything before it is already asserted above; what this adds is that a finished run leaves a
+    report behind — in the profile's own eval directory, carrying the confirmed answer key beside
+    the generated statement, which is the pair a failure is read from.
+
+    And the rule that goes with it: what the comparator read off the two result sets is not on the
+    page. The rows themselves never reach a `GoldenRunResult` — the comparator reduces them where
+    they are read — so asserting their absence here would assert nothing;
+    `test_no_result_row_reaches_the_report` in the renderer's own suite is that guard. What a real
+    run does carry is the row counts and the column names the comparator wrote down, and the
+    report's projection drops those too, so a projection that quietly started passing an item
+    through shows up here.
+    """
+    # Imported here rather than at the top of the file: every other test in it drives the runner
+    # directly, and the helper is the one thing this test adds.
+    import agami_paths
+    import run_golden_eval
+
+    class _Helper(_ScriptedGenerator):
+        def __init__(self, schema: str, *, timeout_s: float) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Helper)
+    # The helper resolves the single-operator org, so it reads the org-less form of the DSN.
+    monkeypatch.setenv("DATASOURCE_URL__AGAMI_EXAMPLE", f"sqlite:///{warehouse}")
+
+    code = run_golden_eval.main(["--profile", PROFILE, "--dataset", "orders"])
+    payload = json.loads(capsys.readouterr().out)
+
+    # `1`, not `0`: this dataset carries a confirmed case that fails on purpose — the one whose
+    # `must_filter` the generated statement does not write — and a confirmed failure is what the
+    # exit code exists to report. A report is still written; a failing run is a run that worked.
+    assert code == run_golden_eval._FAILED
+    report = Path(payload["report"])
+    assert report.parent == agami_paths.dashboard_dir("eval", PROFILE, profile)
+    html = report.read_text(encoding="utf-8")
+    assert "SELECT COUNT(*) AS order_count FROM orders" in html  # the answer key
+    assert "SELECT COUNT(id) AS n FROM orders" in html  # what the model wrote
+    assert COUNT_QUESTION in html
+    with sqlite3.connect(warehouse) as db:
+        (statuses,) = db.execute("SELECT COUNT(DISTINCT status) FROM orders").fetchone()
+    artifact = json.loads(Path(payload["artifact"]).read_text(encoding="utf-8"))
+    scored = {item["item_key"]: item for item in artifact["items"]}
+    assert scored["orders-by-status"]["score"]["golden_row_count"] == statuses
+    assert "golden_row_count" not in html and "unmatched_golden_columns" not in html
 
 
 def test_the_run_is_json_and_carries_no_filesystem_path(profile, tmp_path):

@@ -15,7 +15,7 @@ This skill orchestrates:
 2. **Choose** one — the only one, the one named, or the one the user picks.
 3. **Run** it via `scripts/run_golden_eval.py`, which generates, executes and scores every case.
 4. **Present** the verdicts in the order the script emitted them, failures first.
-5. **Point** at the run's JSON artifact for the drill-down the terminal deliberately withholds.
+5. **Point** at the run's report — and the JSON beside it — for the drill-down the terminal deliberately withholds.
 
 Spec for the deterministic half: [`scripts/run_golden_eval.py`](../../scripts/run_golden_eval.py) (dataset choice + schema rendering + the printed payload). The scoring itself is agami-core's.
 
@@ -162,11 +162,14 @@ Most of them were also scored, but not all: an unconfirmed item can come back `u
 One compact line — the passes build the case, the failures drive the conversation. Then:
 
 ```
-Full run (both statements per case, side by side): <artifact>
-Re-run one dataset after a fix, or open the artifact to see what the model wrote.
+Report (both statements per case, side by side): <report>
+Raw run: <artifact>
+Re-run one dataset after a fix, or open the report to see what the model wrote.
 ```
 
-`<artifact>` is `artifact` from the payload. That file is where the answer key and the generated statement live; it is the drill-down, and reading it aloud is not.
+`<report>` is `report` from the payload — the `.html` file the run just rendered, and the thing to hand over: it opens in a browser, needs no network, shows every case's question, its verdict, the table-set delta and the two statements side by side, and carries no result rows. `<artifact>` is `artifact` from the payload, the same run as JSON for anyone who wants to grep it.
+
+Both files are where the answer key and the generated statement live. Handing over a path is the drill-down; reading either file aloud is not. If `report` is empty the render did not land — say so and point at the JSON, exactly as you would the other way round.
 
 End the turn.
 
@@ -189,7 +192,7 @@ End the turn.
 | The dataset has 0 confirmed items | Say the verdict will rest on nothing (Phase 1), then run if they want. Every case reports; none can gate. |
 | `agami-eval: cannot run this profile — …no storage connection…` | The preflight stop: the model declares no storage connection, so no dialect can be resolved and nothing can execute. Route to `/agami-connect` to finish the profile. Nothing ran; this is not a failing eval. |
 | `agami-eval: cannot read the semantic model…` / `…does not parse…` | The model is missing or broken, so the generator has no tables to write against. Route to `/agami-connect` to build or rebuild it. Nothing ran; this is not a failing eval, and don't try to repair the YAML from here. |
-| `agami-eval: the verdicts are below, but…could not be written` | The run finished and its JSON artifact did not land — usually a permissions problem on `<artifacts_dir>/local/eval/<profile>/`. Report the verdicts normally, and say there is no drill-down file for this run rather than pointing at an empty `artifact`. |
+| `agami-eval: the verdicts are below, but…could not be written` | The run finished and one of its two files did not land — usually a permissions problem on `<artifacts_dir>/local/eval/<profile>/`, which takes out both and prints this line twice. Report the verdicts normally, and point at whichever of `report` / `artifact` is non-empty rather than at an empty one. If both are empty, say there is no drill-down file for this run rather than pointing at a path that isn't there. |
 | Every item says *"the generator command could not be started on this machine"* | The generator is the `claude` client and it is not on this PATH (or not on the PATH of whatever shell ran the script). Nothing was scored — report it as a broken run, not a red one. |
 | `completed: false` | The run stopped partway: the cases after the stop were never attempted and are absent from `items`. Say so on the summary line, and don't compare the counts to a previous run. Exit code is `2`. |
 | `agami-eval: no previous run of … to re-read` | `--rerun-failures` with nothing to re-read. Run the dataset once first; it deliberately does not fall back to running everything. |

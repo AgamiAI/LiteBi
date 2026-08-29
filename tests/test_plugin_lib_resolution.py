@@ -58,7 +58,9 @@ def test_connect_resolve_runs_in_marketplace_layout(marketplace_cache):
     json.loads(r.stdout)  # valid JSON → agami_paths resolved via the bundled lib, not site-packages
 
 
-@pytest.mark.parametrize("mod", ["csv_to_sections", "setup_pgauth", "build_duckdb_attach"])
+@pytest.mark.parametrize("mod",
+                         ["csv_to_sections", "setup_pgauth", "build_duckdb_attach",
+                          "render_golden_run"])
 def test_scripts_import_in_marketplace_layout(marketplace_cache, mod):
     code = f"import sys; sys.path.insert(0, {str(marketplace_cache / 'scripts')!r}); import {mod}"
     r = subprocess.run([*_NOPKG, "-c", code], env=_ENV, capture_output=True, text=True)
