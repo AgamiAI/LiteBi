@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -210,11 +211,15 @@ class _Scripted:
     """The shipped generator's stand-in, constructed the same way the script constructs the real
     one — so a change to that call site fails here rather than silently bypassing the schema."""
 
-    def __init__(self, schema: str, *, timeout_s: float) -> None:
+    def __init__(self, schema, *, timeout_s: float) -> None:
         self.schema = schema
         self.timeout_s = timeout_s
 
     def generate(self, question: str, org: str, datasource: Optional[str]) -> gr.GeneratedSql:
+        # Resolved and discarded, because the real generator resolves it per question and the
+        # ranking it triggers is the observable this file asserts on. A stand-in that skipped it
+        # would leave the per-question fetch untested while every test still passed.
+        self.schema(question) if callable(self.schema) else self.schema
         sql = GENERATED.get(question)
         if sql is None:
             return gr.GeneratedSql(sql="", error="no statement was scripted for this question")
@@ -246,9 +251,92 @@ def artifacts(tmp_path, monkeypatch, warehouse) -> Path:
 
 
 @pytest.fixture()
-def scripted(monkeypatch) -> None:
-    """Answer every question from a table instead of spawning the operator's client."""
+def scripted(monkeypatch, sm) -> None:
+    """Answer every question from a table instead of spawning the operator's client.
+
+    Takes `sm` too: a run that scripts the generator still builds a context first, and letting that
+    reach the real CLI would spend a second per call to receive a fixture back.
+    """
     monkeypatch.setattr(run_golden_eval, "ClaudeCliGenerator", _Scripted)
+
+
+class _RecordedSm:
+    """Stand in for the `sm` CLI, and record what was asked of it.
+
+    Stubbed rather than run for the reason every other subprocess in this suite is stubbed: a real
+    call starts an interpreter, and at about a second each that is most of this file's runtime. The
+    payloads are the shapes `cli.py` documents, small enough to read here.
+    """
+
+    AREAS = [{"name": "sales"}, {"name": "ops"}]
+    BUNDLES = {
+        "sales": {
+            "tables": {
+                "orders": {
+                    "name": "orders",
+                    "schema": "main",
+                    "columns": [{"name": "status", "type": "string", "description": "paid or not"}],
+                }
+            },
+            "metrics": [
+                {"name": "revenue", "other_names": ["sales"], "bindings": {"SQLite": "SUM(total)"}}
+            ],
+            "entities": [
+                {
+                    "name": "order",
+                    "plural": "orders",
+                    "maps_to": [{"table": "orders", "column": "id"}],
+                }
+            ],
+            "relationships": [
+                {
+                    "from_table": "orders",
+                    "to_table": "customers",
+                    "from_column": "customer_id",
+                    "to_column": "id",
+                    "relationship": "many_to_one",
+                }
+            ],
+        },
+        "ops": {"tables": {}, "metrics": [], "entities": [], "relationships": []},
+    }
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        # argv is ["bash", "<path>/sm", <subcommand>, ...]
+        self.calls.append(list(argv[2:]))
+        sub = argv[2]
+        if sub == "areas":
+            out = json.dumps(self.AREAS)
+        elif sub == "bundle":
+            out = json.dumps(self.BUNDLES[argv[argv.index("--area") + 1]])
+        elif sub == "org-context":
+            out = "# demo\nCustInvc -- a customer invoice"
+        elif sub == "examples":
+            asked = argv[argv.index("--query") + 1]
+            out = json.dumps(
+                {
+                    "high_confidence": False,
+                    "matches": [
+                        {"score": 0.5, "example": {"question": f"like: {asked}", "sql": "SELECT 1"}}
+                    ],
+                }
+            )
+        else:  # pragma: no cover — a subcommand this helper does not call
+            raise AssertionError(f"unexpected sm subcommand {sub!r}")
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    def subcommands(self) -> list[str]:
+        return [call[0] for call in self.calls]
+
+
+@pytest.fixture()
+def sm(monkeypatch) -> _RecordedSm:
+    recorder = _RecordedSm()
+    monkeypatch.setattr(run_golden_eval.subprocess, "run", recorder)
+    return recorder
 
 
 def _write(art: Path, name: str, dataset: dict[str, Any]) -> None:
@@ -747,13 +835,16 @@ def test_a_datasource_with_no_storage_connection_fails_preflight(artifacts, scri
     assert "storage connection" in err and "Traceback" not in err
 
 
-def test_the_generator_is_handed_the_tables_and_the_timeout(artifacts, monkeypatch, capsys):
-    """The schema is this helper's own to build — nothing upstream renders one — so what reaches
-    the generator is asserted here or nowhere."""
+def test_the_generator_is_handed_every_section_and_the_timeout(artifacts, monkeypatch, sm, capsys):
+    """What reaches the generator is asserted here or nowhere: it is assembled in this helper and
+    handed straight to a subprocess.
+
+    The schema arrives as a CALLABLE now, because the examples are ranked per question. Resolving it
+    is what the real generator does per item."""
     seen: dict[str, Any] = {}
 
     class _Records(_Scripted):
-        def __init__(self, schema: str, *, timeout_s: float) -> None:
+        def __init__(self, schema, *, timeout_s: float) -> None:
             super().__init__(schema, timeout_s=timeout_s)
             seen["schema"] = schema
             seen["timeout_s"] = timeout_s
@@ -764,14 +855,82 @@ def test_the_generator_is_handed_the_tables_and_the_timeout(artifacts, monkeypat
     _run(capsys, "--dataset", "green", "--timeout-s", "7")
 
     assert seen["timeout_s"] == 7.0
-    # The vocabulary is several sections separated by a blank line; the first is the schema.
-    lines = seen["schema"].split("\n\n")[0].splitlines()
-    # Every table in the sample store, once each, rendered as `schema.name(col TYPE, …)`.
-    assert len(lines) == len(set(lines)) == 11
-    assert any(line.startswith("main.orders(") and "status string" in line for line in lines)
+    context = seen["schema"]("How many orders?")
+    # The first blank-line-delimited section is the vocabulary; the headings introduce the rest.
+    assert context.split("\n\n")[0] == "main.orders(status string -- paid or not)"
+    assert "CustInvc -- a customer invoice" in context  # org-context, verbatim
+    assert "revenue -- (also: sales) -- SQL: SUM(total)" in context  # a metric's binding
+    assert "order -- (also: orders) -- maps to orders.id" in context  # an entity
+    assert "orders -> customers -- on orders.customer_id = customers.id" in context  # a join
+    assert "many_to_one" in context  # …with the cardinality that decides fan-out
 
 
-def test_the_schema_qualifies_every_table_that_declares_one(monkeypatch):
+def test_the_examples_are_ranked_for_the_question_being_asked(artifacts, scripted, sm, capsys):
+    """The reason for shelling out at all: `sm examples --query` is the product's own ranker, so the
+    eval sends the handful nearest THIS question rather than the whole library to every item."""
+    _write(artifacts, "green", PASSING_DATASET)
+
+    _run(capsys, "--dataset", "green")
+
+    example_calls = [call for call in sm.calls if call[0] == "examples"]
+    assert {call[call.index("--query") + 1] for call in example_calls} == {
+        item["query"] for item in PASSING_DATASET["test_cases"]
+    }
+    assert all("--top-k" in call for call in example_calls)
+
+
+def test_every_area_is_ranked_rather_than_whichever_sorted_first(artifacts, scripted, sm, capsys):
+    """`sm examples` reads ONE area's library, and an eval is not told which area a question belongs
+    to. Ranking only the first would hand a question the wrong library entirely — on a profile whose
+    areas are asset, change, incident … an incident question got asset examples."""
+    _write(artifacts, "green", PASSING_DATASET)
+
+    _run(capsys, "--dataset", "green")
+
+    asked = [call[call.index("--area") + 1] for call in sm.calls if call[0] == "examples"]
+    assert set(asked) == {area["name"] for area in _RecordedSm.AREAS}
+
+
+def test_the_question_independent_context_is_fetched_once_for_the_whole_run(
+    artifacts, scripted, sm, capsys
+):
+    """Each `sm` call starts an interpreter. Only the ranking depends on the question, so the rest
+    is fetched once — a per-item fetch would spend a second an item to receive the same bytes."""
+    _write(artifacts, "green", PASSING_DATASET)
+
+    _run(capsys, "--dataset", "green")
+
+    subcommands = sm.subcommands()
+    assert subcommands.count("areas") == 1
+    assert subcommands.count("org-context") == 1
+    assert subcommands.count("bundle") == len(_RecordedSm.AREAS)
+    # The ranking is the one call the question changes, and it reads one area's library at a time.
+    assert subcommands.count("examples") == len(PASSING_DATASET["test_cases"]) * len(
+        _RecordedSm.AREAS
+    )
+
+
+def test_a_context_that_cannot_be_built_stops_the_run_before_the_first_item(
+    artifacts, scripted, monkeypatch, capsys
+):
+    """A run whose context failed has no generator, and reporting that as every item erroring would
+    read as a model regression rather than as the wiring fault it is."""
+
+    def _fails(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 3, stdout="", stderr="")
+
+    monkeypatch.setattr(run_golden_eval.subprocess, "run", _fails)
+    _write(artifacts, "green", PASSING_DATASET)
+
+    code, payload, err = _run(capsys, "--dataset", "green")
+
+    assert code == run_golden_eval._CANNOT_START
+    assert payload == {}
+    assert "model context" in err and "Traceback" not in err
+    assert str(artifacts) not in err  # the path encodes the tenant on a hosted deployment
+
+
+def test_the_schema_qualifies_every_table_that_declares_one():
     """The rendered schema is the entire vocabulary the generator gets, so a table rendered bare is
     a statement written bare — which on a profile whose schema is not on the connection's search
     path errors on every item and reads as a model regression. The sqlite sample cannot show it,
@@ -809,16 +968,7 @@ def test_the_schema_qualifies_every_table_that_declares_one(monkeypatch):
             }
         },
     }
-    monkeypatch.setattr(
-        run_golden_eval.runtime,
-        "list_subject_areas",
-        lambda org: [{"name": name} for name in bundles],
-    )
-    monkeypatch.setattr(
-        run_golden_eval.loader, "get_subject_area_bundle", lambda org, area: bundles[area]
-    )
-
-    lines = run_golden_eval._schema_text(object()).splitlines()
+    lines = run_golden_eval._schema_text(list(bundles.values())).splitlines()
 
     assert lines == [
         "billing.invoices(id integer)",

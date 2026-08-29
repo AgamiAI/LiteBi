@@ -27,11 +27,15 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+# The semantic-model CLI, beside this script in every layout the plugin ships in.
+_SM = Path(__file__).resolve().parent / "sm"
 
 # Three layouts reach this script and only one of them has `packages/` on disk: a dev checkout
 # keeps the source beside the plugin, a marketplace install ships `<version>/lib` and no checkout
@@ -49,11 +53,10 @@ try:
     import execute_sql
     import tools
     from pydantic import ValidationError
-    from semantic_model import loader, runtime
+    from semantic_model import loader
     from semantic_model.comparator import ItemScore
     from semantic_model.golden import GoldenDataset, load_golden_datasets
     from semantic_model.golden_run import ClaudeCliGenerator, GoldenRunResult, run_golden_dataset
-    from semantic_model.models import Datasource
     from semantic_model.sql_dialect import DialectUnresolved, resolve_datasource_dialect
 except ImportError as exc:
     # A fresh plugin install genuinely lacks these, and the traceback a bare ImportError prints
@@ -98,21 +101,38 @@ def _section(outcome: Any) -> str:
     return "pass" if outcome.passed else "failure"
 
 
-def _glossary_text(org: Datasource) -> str:
-    """The datasource's own glossary, rendered for the generator.
+class SmFailed(RuntimeError):
+    """An `sm` call this run cannot continue without."""
 
-    `key_terminology` is where a curator writes down what an opaque literal means — a NetSuite
-    transaction-type code, a status abbreviation, a GL account class. The generator has no tool with
-    which to look one up, and a column's type says `string` and nothing more, so a question about
-    invoices is unanswerable without it: the reader guesses the English word and the statement
-    matches no rows. REQ-010 sends "the question and the model context", and the glossary is the half
-    of that context a schema rendering cannot carry.
+
+def _sm(*args: str, json_out: bool = True) -> Any:
+    """Run one semantic-model CLI command and return what it printed.
+
+    Shelled out rather than called in-process, and that is the decision. The Python functions behind
+    these subcommands are importable, but `agami-query` reaches them THROUGH this CLI, and the whole
+    point of sourcing context here is that the eval and the product read the model the same way. An
+    in-process call would be a second route to the same data, which is the drift this replaces.
+
+    `org-context` prints markdown and the rest print JSON, so the caller says which it wants.
     """
-    terms = getattr(org, "key_terminology", None) or {}
-    if not terms:
-        return ""
-    lines = [f"{name} -- {str(meaning).strip()}" for name, meaning in sorted(terms.items())]
-    return "\n".join(lines)
+    completed = subprocess.run(
+        ["bash", str(_SM), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        # Exit 3 is `no model` from the CLI and `no usable interpreter` from the wrapper, and the
+        # `{"error": "no_model"}` payload is what tells them apart. Neither message is relayed:
+        # both quote the artifacts path, which encodes the tenant on a hosted deployment.
+        raise SmFailed(f"`sm {args[0]}` exited {completed.returncode}")
+    if not json_out:
+        return completed.stdout
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SmFailed(f"`sm {args[0]}` did not print JSON") from exc
 
 
 def _column_text(column: dict) -> str:
@@ -129,8 +149,8 @@ def _column_text(column: dict) -> str:
     return f"{head} -- {description}" if description else head
 
 
-def _metrics_text(org: Datasource) -> str:
-    """The subject areas' approved metrics, with the binding a correct answer reuses verbatim.
+def _metrics_text(bundles: list[dict]) -> str:
+    """The approved metrics, with the binding a correct answer reuses verbatim.
 
     A metric is the curated form of an aggregation a team has already argued about and signed off:
     `billings` is not "sum the totals", it is "sum the totals of invoices only, and never as one
@@ -139,8 +159,8 @@ def _metrics_text(org: Datasource) -> str:
     """
     lines: list[str] = []
     seen: set[str] = set()
-    for area in runtime.list_subject_areas(org):
-        for metric in loader.get_subject_area_bundle(org, area["name"])["metrics"]:
+    for bundle in bundles:
+        for metric in bundle.get("metrics") or []:
             name = metric.get("name") or ""
             if not name or name in seen:
                 continue
@@ -155,47 +175,145 @@ def _metrics_text(org: Datasource) -> str:
                     parts.append(value)
             bindings = metric.get("bindings") or {}
             if isinstance(bindings, dict) and bindings:
-                binding = next(iter(bindings.values()))
-                parts.append(f"SQL: {str(binding).strip()}")
+                parts.append(f"SQL: {str(next(iter(bindings.values()))).strip()}")
             lines.append(" -- ".join(parts))
     return "\n".join(lines)
 
 
-def _examples_text(org: Datasource, root: Path) -> str:
-    """Worked question/SQL pairs a curator confirmed, which are where a house convention lives.
+def _entities_text(bundles: list[dict]) -> str:
+    """The vocabulary a reader uses for the things in the model, and what each one maps to.
 
-    The convention is the point and it is not written down anywhere else: which of two equally
-    correct date spellings this team uses, whether a currency is broken out, how a join is phrased.
-    A generator with no example guesses one, and a guess that differs from the answer key's is
-    reported as a disagreement when it is a dialect of the same sentence.
+    An entity is the bridge between the words in a question and the columns that answer it: a
+    question naming "invoices" is answerable only by whoever knows that word reaches
+    `transactions.type`. The generator is given the question in the reader's words, so without the
+    entities it is matching those words against column names alone.
     """
     lines: list[str] = []
-    for area in runtime.list_subject_areas(org):
-        for example in loader.list_prompt_examples(root, area["name"]):
-            question = (example.get("question") or "").strip()
-            sql = " ".join(str(example.get("sql") or "").split())
-            if question and sql:
-                lines.append(f"Q: {question}\nA: {sql}")
+    seen: set[str] = set()
+    for bundle in bundles:
+        for entity in bundle.get("entities") or []:
+            name = entity.get("name") or ""
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            parts = [name]
+            aliases = [str(a) for a in (entity.get("other_names") or []) if a]
+            plural = entity.get("plural")
+            if plural:
+                aliases.insert(0, str(plural))
+            if aliases:
+                parts.append(f"(also: {', '.join(aliases)})")
+            # A list of {table, column, primary} rather than a string, and rendered rather than
+            # stringified: the repr of a dict in a prompt reads as Python to a model being asked
+            # for SQL.
+            targets = [
+                f"{m.get('table')}.{m.get('column')}"
+                for m in (entity.get("maps_to") or [])
+                if isinstance(m, dict) and m.get("table") and m.get("column")
+            ]
+            if targets:
+                parts.append(f"maps to {', '.join(targets)}")
+            description = (entity.get("description") or "").strip()
+            if description:
+                parts.append(description)
+            lines.append(" -- ".join(parts))
+    return "\n".join(lines)
+
+
+def _relationships_text(bundles: list[dict]) -> str:
+    """How the tables join, with the cardinality that decides whether a join fans a total out.
+
+    Cardinality is the half that matters to a scored answer. A one-to-many joined the wrong way
+    multiplies the rows on the one side, and a SUM over that is wrong by a factor nobody can see in
+    the number. The generator cannot infer it from column names.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for bundle in bundles:
+        for rel in bundle.get("relationships") or []:
+            left, right = rel.get("from_table"), rel.get("to_table")
+            if not left or not right:
+                continue
+            # Qualified on both sides, matching how `_schema_text` names a table: an edge between
+            # two same-named tables in different schemas is two edges, and the generator is being
+            # given one vocabulary for both.
+            if rel.get("from_schema"):
+                left = f"{rel['from_schema']}.{left}"
+            if rel.get("to_schema"):
+                right = f"{rel['to_schema']}.{right}"
+            on = f"{left}.{rel.get('from_column')} = {right}.{rel.get('to_column')}"
+            if on in seen:
+                continue
+            seen.add(on)
+            parts = [f"{left} -> {right}", f"on {on}"]
+            for field in ("relationship", "join_type"):
+                value = rel.get(field)
+                if value:
+                    parts.append(str(value))
+            description = (rel.get("description") or "").strip()
+            if description:
+                parts.append(description)
+            lines.append(" -- ".join(parts))
+    return "\n".join(lines)
+
+
+def _examples_text(root: Path, areas: list[str], question: str, top_k: int) -> str:
+    """The worked question/SQL pairs this team confirmed, ranked for THIS question.
+
+    Ranked rather than dumped, because that is what `agami-query` does and the ranker is the same
+    one: `sm examples --query` is the product's own signal for which curated answer is nearest. A
+    bulk dump sends every example to every item and leaves the choosing to the model, which is a
+    different reading of the same library.
+
+    Every area is ranked and the best few overall are kept, because `sm examples` reads one area's
+    library at a time and an eval is not told which area a question belongs to. `agami-query` picks
+    the area by reading the descriptions, which is a judgement this has no model to make; taking
+    the top of the merged list is the approximation, and it is the one that cannot send an incident
+    question the asset library because that is the area that sorted first.
+
+    The convention is the point and it is written nowhere else: which of two equally correct date
+    spellings this team uses, whether a currency is broken out, how a join is phrased.
+    """
+    scored: list[tuple[float, dict]] = []
+    for area in areas:
+        ranked = _sm(
+            "examples", str(root), "--area", area, "--query", question, "--top-k", str(top_k)
+        )
+        for match in ranked.get("matches") or []:
+            scored.append((match.get("score") or 0.0, match.get("example") or {}))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    lines: list[str] = []
+    for _, example in scored[:top_k]:
+        asked = (example.get("question") or "").strip()
+        sql = " ".join(str(example.get("sql") or "").split())
+        if asked and sql:
+            lines.append(f"Q: {asked}\nA: {sql}")
     return "\n\n".join(lines)
 
 
-def _model_context(org: Datasource, root: Path) -> str:
-    """Everything the generator is given about the model: the vocabulary, then what its codes mean.
+def _model_context(cached: dict, question: str) -> str:
+    """Everything the generator is given about the model, assembled for one question.
 
-    Two sections in one string rather than two prompt fields, because `SqlGenerator.generate` takes
+    One flattened string rather than several prompt fields, because `SqlGenerator.generate` takes
     the schema already flattened and widening that signature is a contract change — the argument
     list is the isolation boundary.
+
+    Section order mirrors `agami-query/SKILL.md` Phase 2b: the vocabulary, then the datasource
+    context, then the examples. Only the last of these depends on the question; everything above it
+    was fetched once for the run.
     """
-    sections = [_schema_text(org)]
+    sections = [cached["schema"]]
     for heading, body in (
-        ("What the codes in these columns mean:", _glossary_text(org)),
+        ("What this datasource means, and what its codes stand for:", cached["org_context"]),
         (
             "Approved metrics — reuse a binding verbatim when the question names one:",
-            _metrics_text(org),
+            cached["metrics"],
         ),
+        ("The words a reader uses for these things:", cached["entities"]),
+        ("How these tables join:", cached["relationships"]),
         (
-            "Worked examples this team has confirmed — follow their conventions:",
-            _examples_text(org, root),
+            "Worked examples this team has confirmed, nearest first — follow their conventions:",
+            _examples_text(cached["root"], cached["areas"], question, cached["top_k"]),
         ),
     ):
         if body:
@@ -203,13 +321,8 @@ def _model_context(org: Datasource, root: Path) -> str:
     return "\n\n".join(sections)
 
 
-def _schema_text(org: Datasource) -> str:
+def _schema_text(bundles: list[dict]) -> str:
     """The tables and columns the generator may write against, one table per line.
-
-    This helper owns the rendering because nothing upstream produces it: `ClaudeCliGenerator` takes
-    the schema already flattened, and the generating context has no tool with which to read a model
-    off disk. Built in-process rather than by shelling out to the `sm` CLI, whose `areas` and
-    `bundle` subcommands are two-line wrappers over exactly these two calls.
 
     Every table is named the way the rest of the repo names one — `schema.table` where the model
     declares a schema, the bare name where it does not. This string is the whole of the vocabulary
@@ -222,9 +335,8 @@ def _schema_text(org: Datasource) -> str:
     two same-named tables in two schemas really are two.
     """
     tables: dict[str, str] = {}
-    for area in runtime.list_subject_areas(org):
-        bundle = loader.get_subject_area_bundle(org, area["name"])
-        for table in bundle["tables"].values():
+    for bundle in bundles:
+        for table in (bundle.get("tables") or {}).values():
             schema = table.get("schema")
             name = f"{schema}.{table['name']}" if schema else table["name"]
             if name in tables:
@@ -232,6 +344,31 @@ def _schema_text(org: Datasource) -> str:
             columns = ", ".join(_column_text(column) for column in table.get("columns", []))
             tables[name] = f"{name}({columns})"
     return "\n".join(tables.values())
+
+
+def _fetch_context(root: Path, top_k: int) -> dict:
+    """The three `sm` calls that do not depend on the question, run once for the whole run.
+
+    Cached because each costs about a second of interpreter start-up, and a per-item fetch would
+    spend that on every case to receive the same bytes back. `examples` is the only one the question
+    changes, so it is the only one left in the loop.
+    """
+    areas = _sm("areas", str(root))
+    if not areas:
+        raise SmFailed("this profile declares no subject areas")
+    bundles = [_sm("bundle", str(root), "--area", area["name"]) for area in areas]
+    return {
+        "root": root,
+        # Every area, because the ranker reads one library at a time and the question decides which
+        # one matters — not the order `sm areas` happens to return.
+        "areas": [area["name"] for area in areas],
+        "top_k": top_k,
+        "schema": _schema_text(bundles),
+        "org_context": _sm("org-context", str(root), json_out=False).strip(),
+        "metrics": _metrics_text(bundles),
+        "entities": _entities_text(bundles),
+        "relationships": _relationships_text(bundles),
+    }
 
 
 # The second reason built from an answer-key column name, and the one that carries no structured
@@ -454,6 +591,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--timeout-s", type=float, default=120.0, help="how long one generation may take"
     )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="how many ranked prompt examples to give the generator per question",
+    )
     args = parser.parse_args(argv)
 
     if args.list:
@@ -491,11 +634,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         _stop(f"cannot run this profile — {exc}")
         return _CANNOT_START
 
+    try:
+        cached = _fetch_context(agami_paths.profile_dir(args.profile), args.top_k)
+    except SmFailed as exc:
+        # Before the first item rather than during one: a run whose context could not be built has
+        # no generator, and reporting that as every item erroring would read as a model regression.
+        _stop(f"cannot build the model context for profile {args.profile!r} — {exc}")
+        return _CANNOT_START
+
     result = run_golden_dataset(
         dataset,
         profile=args.profile,
         generator=ClaudeCliGenerator(
-            _model_context(org_model, agami_paths.profile_dir(args.profile)),
+            lambda question: _model_context(cached, question),
             timeout_s=args.timeout_s,
         ),
         executor=execute_sql.BUILTIN_EXECUTOR,

@@ -51,7 +51,7 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
 from execute_sql import ExecResult, execute_guarded
 from guardrail import Envelope
@@ -576,7 +576,12 @@ class ClaudeCliGenerator:
     """Answer a question by spawning the operator's own client, once, with every tool switched off.
 
     `schema` is the tables and columns the model may write against, already rendered by whoever
-    built this generator — inlining it is what makes the no-tools invocation above sufficient.
+    built this generator — inlining it is what makes the no-tools invocation above sufficient. It
+    may also be a CALLABLE taking the question, for a caller whose context depends on what is being
+    asked: ranked prompt examples are chosen per question, and a caller that had to pick them before
+    the loop would send every example to every item. Resolving it here rather than widening
+    `SqlGenerator.generate` keeps that argument list — the isolation boundary — unchanged.
+
     `timeout_s` is `subprocess.run`'s own bound, so a client that hangs is killed rather than waited
     on. Execution has no timer of its own here: its bound is the deployment's, at the chokepoint.
 
@@ -586,13 +591,14 @@ class ClaudeCliGenerator:
     generator that hangs hangs the run, with nothing above it to cut the call off.
     """
 
-    def __init__(self, schema: str, *, timeout_s: float) -> None:
+    def __init__(self, schema: "str | Callable[[str], str]", *, timeout_s: float) -> None:
         self.schema = schema
         self.timeout_s = timeout_s
 
     def generate(self, question: str, org: str, datasource: Optional[str]) -> GeneratedSql:
         """One question in, one statement out — or a fixed sentence saying why there is not one."""
-        prompt = _generation_prompt(question, org, datasource, self.schema)
+        schema = self.schema(question) if callable(self.schema) else self.schema
+        prompt = _generation_prompt(question, org, datasource, schema)
         try:
             # A directory of its own, empty, thrown away afterwards. The child would otherwise start
             # in whatever directory the eval was launched from, and a `CLAUDE.md`,
