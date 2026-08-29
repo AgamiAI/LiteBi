@@ -53,7 +53,7 @@ Expected output:
 
 ```
 Installed agami-core v0.3.3 (from agami)
-7 skills available: agami-connect, agami-query, agami-model, agami-save-correction, agami-reconcile, agami-serve, agami-deploy
+8 skills available: agami-connect, agami-query, agami-model, agami-save-correction, agami-reconcile, agami-eval, agami-serve, agami-deploy
 ```
 
 > `agami-deploy` (the self-hosted team server) is **early access — in testing**: usable today, but newer than the local single-player skills. See its [early-access note](../../deploy/README.md).

@@ -77,6 +77,12 @@ Stay-in-plan-mode → **refuse to proceed. Do not write a plan file. Do not call
 
 > I can't reconcile in plan mode — each row runs a live query and writes a receipt. Switch to **Auto** or **Edit Automatically** mode (Shift+Tab to cycle) and re-invoke me with the CSV path.
 
+### `agami-eval`
+
+Stay-in-plan-mode → **refuse to proceed. Do not write a plan file. Do not call ExitPlanMode.** Every case generates SQL and executes it (Bash), and the run writes its JSON artifact (Write). Surface ONLY this:
+
+> I can't run an eval in plan mode — every case executes live SQL and the run writes a report. Switch to **Auto** or **Edit Automatically** mode (Shift+Tab to cycle) and re-invoke me with the dataset name.
+
 ## When the system context is silent
 
 If neither signal 1 nor signal 2 confirms plan mode is active, **skip this phase silently** and go to Phase 0 of the skill. Don't pop a modal asking "are you in plan mode?" — that's noise for the 95% of users who aren't. The probe-on-Bash-failure path catches the rest naturally.

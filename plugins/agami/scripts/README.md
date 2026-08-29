@@ -37,6 +37,7 @@ registers `python -m mcp_harness`. See [`docs/mcp-server.md`](../../../docs/mcp-
 |---|---|---|
 | `setup_desktop_mcp.py` | One-command wiring of the local MCP server into the Claude Desktop app (used by the `agami-serve` skill). Auto-detects the right Python interpreter, installs agami-core into it via `sm install`, and safely merges the entry into `claude_desktop_config.json` (timestamped backup + atomic write, preserving every other key). `--dry-run` previews. | stdlib (delegates install to `sm`) |
 | `render_chart.py` | Substitutes `chart-template.html` placeholders programmatically. Used by the agami-query SKILL to produce HTML reports (Phase 4e). | stdlib only |
+| `run_golden_eval.py` | Runs one golden dataset for a profile (used by the `agami-eval` skill): lists the profile's datasets with `--list`, else regenerates SQL per question, executes and scores each case, prints the verdicts failures-first as JSON, and writes the run artifact. Neither statement reaches stdout. | the agami-core package with the `model` extra (imports `semantic_model`) |
 | `connect_resolve.py` · `setup_pgauth.py` · `promote_credentials.py` · `reconcile.py` · `parse_*.py` · `csv_to_sections.py` · `sm` (CLI launcher) · `build_duckdb_attach.py` (retired) | Connect/auth, model reconcile, parsing, and the `sm` launcher for `python -m semantic_model.cli`. | stdlib; some import the agami-core package |
 
 ## Install dependencies (only if you want the Python driver path)
