@@ -450,16 +450,14 @@ def _list_payload(profile: str) -> dict[str, Any]:
     }
 
 
-def _pick(
-    datasets: list[GoldenDataset], wanted: Optional[str], datasets_dir: Path
-) -> Optional[GoldenDataset]:
+def _pick(datasets: list[GoldenDataset], wanted: Optional[str]) -> Optional[GoldenDataset]:
     """The dataset to run, or None having said on stderr why there is not one.
 
     A bare invocation against a single dataset is the common case and needs no argument. Against
     several it stops: choosing for the person would run the wrong dataset silently, and asking them
     which one is the skill's job rather than this helper's. Every refusal names what is present,
-    because a name is what the next invocation needs — and when nothing is present, the directory
-    to create instead, which is the only thing a caller can act on from there.
+    because a name is what the next invocation needs. None of them names the artifacts path: that
+    is `--list`'s job, where a caller asks for it rather than having it printed at them.
     """
     names = ", ".join(dataset.name for dataset in datasets)
     if wanted is not None:
@@ -468,9 +466,13 @@ def _pick(
                 return dataset
         _stop(f"no golden dataset named {wanted!r}. Datasets present: {names or 'none'}")
     elif not datasets:
+        # The path is named but not printed. Every other refusal here withholds the artifacts
+        # directory because it encodes the tenant on a hosted deployment, and this one was quoting
+        # it in full. `--list` prints the resolved path in the payload, where a caller who needs it
+        # can read it deliberately.
         _stop(
-            "this profile has no golden datasets to run. The first one goes in "
-            f"{datasets_dir}/<name>.yaml"
+            "this profile has no golden datasets to run. The first one goes in its "
+            "golden_datasets/ directory as <name>.yaml — run --list for the resolved path"
         )
     elif len(datasets) > 1:
         _stop(f"name a dataset with --dataset. Datasets present: {names}")
@@ -604,7 +606,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     datasets, findings = load_golden_datasets(args.profile)
-    dataset = _pick(datasets, args.dataset, _datasets_dir(args.profile))
+    dataset = _pick(datasets, args.dataset)
     if dataset is None:
         return _CANNOT_START
 

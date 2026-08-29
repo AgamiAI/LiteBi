@@ -32,8 +32,8 @@ from pathlib import Path
 
 POINTER_PATH = Path.home() / ".config" / "agami" / "path"
 DEFAULT_ARTIFACTS_DIR = Path.home() / "agami-artifacts"
-LEGACY_HOME = Path.home() / ".agami"          # the pre-consolidation location
-LOCAL_SUBDIR = "local"                          # gitignored secrets/state dir inside the artifacts dir
+LEGACY_HOME = Path.home() / ".agami"  # the pre-consolidation location
+LOCAL_SUBDIR = "local"  # gitignored secrets/state dir inside the artifacts dir
 
 
 def artifacts_dir() -> Path:
@@ -66,6 +66,7 @@ def local_dir(art: Path | None = None) -> Path:
 
 # --- specific paths (everything that used to live under ~/.agami) -----------
 
+
 def credentials_path(art: Path | None = None) -> Path:
     return local_dir(art) / "credentials"
 
@@ -80,7 +81,11 @@ def query_log_path(art: Path | None = None) -> Path:
 
 
 def dashboard_dir(kind: str, profile: str, art: Path | None = None) -> Path:
-    """Rendered dashboards: kind in {model, review, examples-validation, eval}."""
+    """Per-profile run output: kind in {model, review, examples-validation, eval}.
+
+    Named for dashboards because the first four kinds are rendered HTML a person opens. `eval`
+    writes a JSON run artifact beside its report, so what a kind stores is the kind's own business
+    and not this helper's."""
     return local_dir(art) / kind / profile
 
 
@@ -94,6 +99,7 @@ def profile_dir(profile: str, art: Path | None = None) -> Path:
 
 
 # --- gitignore + migration --------------------------------------------------
+
 
 def ensure_gitignore(art: Path | None = None) -> None:
     """Make sure the artifacts dir's .gitignore excludes the secrets/state dir."""
@@ -120,6 +126,7 @@ def _legacy_artifacts_dir() -> Path | None:
         return None
     try:
         import json
+
         ad = json.loads(cfg.read_text(encoding="utf-8")).get("artifacts_dir")
         if ad:
             return Path(os.path.expanduser(str(ad))).resolve()
@@ -160,6 +167,7 @@ def migrate_legacy_home(art: Path | None = None) -> bool:
         # filesystem than ~/.agami (external drive, separate mount). Fall back
         # to a copy+delete move, which crosses devices.
         import shutil
+
         shutil.move(str(LEGACY_HOME), str(dest))
     ensure_gitignore(art)
     set_artifacts_dir(art)
@@ -167,7 +175,9 @@ def migrate_legacy_home(art: Path | None = None) -> bool:
         LEGACY_HOME.mkdir(parents=True, exist_ok=True)
         (LEGACY_HOME / "MOVED.txt").write_text(
             f"agami now keeps everything under your artifacts folder.\n"
-            f"This dir's contents moved to: {dest}\n", encoding="utf-8")
+            f"This dir's contents moved to: {dest}\n",
+            encoding="utf-8",
+        )
     except OSError:
         pass
     return True

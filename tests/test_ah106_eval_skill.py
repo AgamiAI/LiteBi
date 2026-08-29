@@ -910,6 +910,17 @@ def test_the_question_independent_context_is_fetched_once_for_the_whole_run(
     )
 
 
+def test_no_refusal_prints_the_artifacts_path(artifacts, scripted, capsys):
+    """Every refusal here withholds the artifacts directory, because on a hosted deployment the
+    path encodes the tenant. The no-datasets one quoted it in full while saying where to put the
+    first file; `--list` is where a caller asks for the resolved path instead."""
+    code, _, err = _run(capsys)  # no datasets written, so this is the empty-profile refusal
+
+    assert code == run_golden_eval._CANNOT_START
+    assert "golden_datasets" in err  # still says WHERE, in relative terms
+    assert str(artifacts) not in err  # …and never the absolute path
+
+
 def test_a_context_that_cannot_be_built_stops_the_run_before_the_first_item(
     artifacts, scripted, monkeypatch, capsys
 ):
