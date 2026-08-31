@@ -47,7 +47,7 @@ If plan mode is not active, skip this phase silently and go to Phase 0.
 1. **Plan-mode check** — Phase −1 above. Do it first; a refusal halfway through a parse is a confusing partial state.
 2. **Model present** — `<artifacts_dir>/<profile>/datasource.yaml` must exist. If not, invoke `/agami-connect`. A dataset belongs to a profile, and a profile with no model has nothing to be scored against.
 3. **See what exists** — `ls <artifacts_dir>/<profile>/golden_datasets/`. It writes nothing, and it is how you find out whether this is a new dataset or an existing one you are appending to. A missing directory is ordinary: the first write creates it.
-4. **Which dataset** — the one named in `$ARGUMENTS`, the only one that exists, or ask with `AskUserQuestion` listing what is there plus "a new one". The name is the **filename stem** (`orders` → `orders.yaml`); the file never declares its own name and the writer never puts one in.
+4. **Which dataset** — the one named in `$ARGUMENTS`, the only one that exists, or ask with `AskUserQuestion` listing what is there plus "a new one". The name is the **filename stem** (`orders` → `orders.yaml`); the file never declares its own name and the writer never puts one in. A stem is **one plain name** — letters, digits, dots, dashes and underscores, nothing else. `--profile` is held to the same rule. Both are joined straight into the path the writer truncates and rewrites, so anything with a separator or a `..` in it is refused with exit `2` before a single byte is read; never "helpfully" pass a path where a name is asked for.
 
 **Never glob for a dataset outside this profile.** [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md) is the authority on every field and it carries the hard rule verbatim: **never read another profile** to learn the file shape. A golden dataset is the business definitions and the answer key in one file, so a glob across `<artifacts_dir>` returns another customer's questions together with the SQL that correctly answers them — a tenant-data leak in a hosted deployment and a lift of somebody's business definitions even locally. The reference has every field; a sibling profile never is the reference.
 
@@ -105,6 +105,8 @@ Ids are derived from the question when the sheet has none, so they are stable ac
 
 If `skipped` is non-empty, list every skipped row with its number and reason **before** asking. A question missing from a dataset is one nobody notices is missing.
 
+Derived ids are unique by construction, but a sheet with its **own `id` column** can repeat one. The import refuses the whole batch and names the id, because an id is the key a result is stored under and the second row would otherwise overwrite the first inside one write. The table you just rendered is where to spot it — ask the user which row keeps the id.
+
 Then ask, plainly: *"Import these `<N>` questions into `<dataset>`? They'll be written unconfirmed — none of them can gate a run until someone verifies an answer."* **Wait for an explicit yes.** Never skip this and never infer it from the user having handed you the file.
 
 ### 2d — Import
@@ -150,8 +152,10 @@ Write the item with the **Write tool** as JSON — the same rule as any JSON fil
 - `id` is optional — derived from the question when absent, the same way the import door derives it, so saving an answer to an imported question lands on that item rather than beside it.
 - `recorded` is the **receipt**: what the answer looked like on the day. It is never the comparison target; a run is judged against `expected`. Take the columns and rows from the result the user just looked at.
 - `confirmed_by.method` is free text and is **required** — an answer key whose provenance is blank cannot be audited later, and the script refuses without it. Say how it was checked ("read on screen and accepted", "cross-checked against the finance close"), not who in a way that names a person.
-- `match` is optional and defaults to `exact`. Reach for `values` when column order or naming shouldn't matter, or `bounded` with `bounds` for an answer that legitimately moves — see [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md).
+- `match` is optional and defaults to `exact`. Reach for `values` when column order or naming shouldn't matter, or `bounded` **with** a `bounds` block for an answer that legitimately moves — see [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md). `bounded` with no band is refused with exit `2`: a level with nothing to consult would keep passing forever.
 - `must_filter` gates *how* the answer was reached. Add it when the question only means what it says with a filter in place (`must_filter: [status]`).
+
+`match`, `bounds` and `must_filter` all reach the written item exactly as sent — which is why a replacement has to repeat whatever the existing item carried (Phase 4).
 
 ```bash
 python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
@@ -169,7 +173,7 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
 **Read the exit code before the payload.** Both write doors share it:
 
 - **`0`** — written. Report `added` / `replaced` and the path.
-- **`1`** — **needs confirmation.** Nothing was written. Not a failure and not a success; a pipeline that treated it as either would be wrong in both directions.
+- **`1`** — **needs confirmation.** Nothing was written. Not a failure and not a success; a pipeline that treated it as either would be wrong in both directions. **This is the only thing that produces `1`** — every other outcome, expected or not, is `2` with a sentence on stderr — so a `1` always carries a `needs_confirmation` payload and is never a crash. If you ever see `1` with no such payload, stop and report it rather than re-running with `--confirm-replace`.
 - **`2`** — cannot start. The stderr line (prefix `agami-save-golden:`) says why. Nothing was written, or a failed write was rolled back to the bytes that were there before.
 
 On `1`, the payload carries `needs_confirmation`: a list of `{id, before, after}`. **Render both sides** — a markdown table or two fenced blocks per id, the existing item and the one that would take its place. "This id already exists" is not enough for anyone to decide with: the thing being overwritten is an answer key, and they have to see what they would lose.
@@ -211,6 +215,11 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
 | `agami-save-golden: N row(s) were skipped` on a successful parse | A warning, not a stop. List every entry in `skipped` with its row number and reason before asking for the import — a question silently missing from a dataset is the failure this line exists to prevent. |
 | A `.xlsx` / `.xls` path | Refuse with the Save As → CSV UTF-8 instruction (Phase 2a). Do not attempt to read it and do not reconstruct its contents from memory. |
 | `agami-save-golden: this item does not say how its answer was confirmed` | `confirmed_by.method` was blank. Ask how the result was checked and re-write the item JSON — provenance is most of what a receipt is for. |
-| `agami-save-golden: <name>.yaml cannot be read as it stands` | The existing dataset has a fault, so nothing may be merged into it — a merge into a file the reader can't fully read would drop whatever it couldn't parse. Report the finding, point at [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md), and let the user fix the named case first. |
+| `agami-save-golden: '<name>' is not a usable dataset name` / `profile name` | The stem or the profile was a path, not a name. Ask for the plain name (`orders`, not `orders/2024` or `../orders`) and re-invoke. Nothing was read and nothing was written. |
+| `agami-save-golden: dataset '<name>' names the file rather than the dataset` | The extension was typed too. The stem *is* the dataset's name, so pass `orders`, not `orders.yaml`. Re-invoke; nothing was written. |
+| `agami-save-golden: this batch carries the id '<id>' twice` | The sheet's own `id` column repeats a key, so two questions would land under one. Nothing was written. Show the user the two rows and ask which keeps the id. |
+| `agami-save-golden: this does not fit a golden case — …` | The item JSON is a shape the dataset reader refuses — most often `match: bounded` with no `bounds` block, or a `sql: null` on a save. The sentence names the field and the reason (never the value). Fix the item JSON and re-run. |
+| `agami-save-golden: <path> does not exist` / `this file is not readable JSON` | The `--csv` / `--rows` / `--item` path is wrong or the file you wrote is truncated. Re-write it with the Write tool and re-run; nothing was written. |
+| `agami-save-golden: <name>.yaml cannot be read as it stands` | The existing dataset has a fault that costs it a case, so nothing may be merged into it — a merge into a file the reader can't fully read would drop whatever it couldn't parse. Report the finding, point at [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md), and let the user fix the named case first. (A dataset that merely *reports* a relative question over a frozen answer key is not this: that finding drops nothing, and writing to the dataset still works.) |
 | A relative question refused at save time | The window slides and the SQL doesn't. Anchor the statement to the current date, or rewrite the question to name its window, then re-invoke. Don't save it "for now". |
 | `golden_author's write doors need agami-core and its model extra` | The plugin's interpreter is missing `agami-core[model]`. Route to `/agami-connect`, which sets the environment up; nothing was written. |

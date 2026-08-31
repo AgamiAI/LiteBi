@@ -324,7 +324,6 @@ def test_the_written_file_never_declares_its_own_name(tmp_path, monkeypatch, cap
     _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
     doc = yaml.safe_load(_dataset_file(tmp_path).read_text(encoding="utf-8"))
     assert "name" not in doc
-    assert doc["description"] == ""
 
 
 def test_re_importing_the_same_sheet_asks_before_it_doubles_anything(tmp_path, monkeypatch, capsys):
@@ -571,3 +570,405 @@ def test_a_relative_question_anchored_on_the_current_date_saves(tmp_path, monkey
     )
     assert code == 0
     assert _items(tmp_path)[0].expected.sql == ANCHORED_SQL
+
+
+# --- the names the doors are handed, and the tree they may not leave ---
+#
+# `--profile` and `--dataset` are joined straight into a filesystem path this helper then WRITES,
+# so they are the one pair of inputs where being wrong is destructive rather than merely useless.
+# Every test here asserts the neighbour is untouched as well as the refusal, because a refusal that
+# still landed the file would pass a test that only read the exit code.
+
+
+def _neighbour(tmp_path) -> Path:
+    """A model file beside the datasets dir, standing in for whatever the profile already holds."""
+    path = tmp_path / PROFILE / "datasource.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("datasource: store\n", encoding="utf-8")
+    return path
+
+
+def test_a_dataset_name_that_climbs_out_of_the_profile_is_refused(tmp_path, monkeypatch, capsys):
+    """A stem is one filename, so a stem that walks up out of the profile is not a stem.
+
+    The escape is the whole finding: `../../other/golden_datasets/stolen` writes an answer key into
+    a sibling profile, which in a hosted deployment is another tenant's tree. Refused on the name,
+    before any path is built from it.
+    """
+    rows = _rows_file(tmp_path, [_row()])
+    stem = "../../othertenant/golden_datasets/stolen"
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _import_argv(rows, stem))
+    assert code == 2
+    assert "dataset" in err
+    assert not (tmp_path / "othertenant").exists()
+
+
+def test_a_profile_name_that_climbs_out_of_the_artifacts_dir_is_refused(
+    tmp_path, monkeypatch, capsys
+):
+    """The other half of the join. A profile is a directory name under the artifacts dir, and one
+    that climbs above it leaves the tree agami owns entirely."""
+    rows = _rows_file(tmp_path, [_row()])
+    code, _, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        ["import", "--profile", "../outside", "--dataset", "orders", "--rows", rows],
+    )
+    assert code == 2
+    assert "profile" in err
+    assert not (tmp_path.parent / "outside").exists()
+
+
+def test_a_dataset_name_carrying_a_separator_is_refused(tmp_path, monkeypatch, capsys):
+    """`sub/nested` needs no `..` to break the contract, which is why the rule is a whitelist.
+
+    The reader globs `*.yaml` in one directory and never recurses, so a file written a level down is
+    one the re-read cannot see: `_our_faults` finds nothing, and the write reports itself validated
+    when nothing validated it.
+    """
+    rows = _rows_file(tmp_path, [_row()])
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _import_argv(rows, "sub/nested"))
+    assert code == 2
+    assert "dataset" in err
+    assert not (tmp_path / PROFILE / "golden_datasets" / "sub").exists()
+
+
+def test_a_dataset_name_carrying_its_own_extension_is_refused(tmp_path, monkeypatch, capsys):
+    """`--dataset orders.yaml` reads as helpful and writes `orders.yaml.yaml`.
+
+    The stem is the dataset's name, and the reader takes that name from the filename stem — so the
+    extension the author typed becomes part of what their dataset is called. `orders.yml` is the
+    worse half: the reader refuses a real `.yml` file as misnamed, so a dataset called `orders.yml`
+    reads back fine and contradicts the one rule the directory has.
+    """
+    rows = _rows_file(tmp_path, [_row()])
+    for stem in ("orders.yaml", "orders.yml", "ORDERS.YML"):
+        code, _, err = _run(tmp_path, monkeypatch, capsys, _import_argv(rows, stem))
+        assert code == 2, stem
+        assert "without the extension" in err, stem
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+def test_a_traversing_dataset_name_never_touches_the_file_it_names(tmp_path, monkeypatch, capsys):
+    """The destructive direction, and the reason the check runs before any I/O.
+
+    `../datasource` resolves onto the profile's own semantic model, and this door truncates and
+    rewrites whatever `<stem>.yaml` names — so an unchecked stem does not merely write in the wrong
+    place, it destroys the file already there and reports success.
+    """
+    neighbour = _neighbour(tmp_path)
+    before = neighbour.read_bytes()
+    rows = _rows_file(tmp_path, [_row()])
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(rows, "../datasource"))
+    assert code == 2
+    assert neighbour.read_bytes() == before
+
+
+def test_an_ordinary_stem_with_dots_and_dashes_still_writes(tmp_path, monkeypatch, capsys):
+    """The control. The rule refuses separators and parent hops, not the names people use."""
+    rows = _rows_file(tmp_path, [_row()])
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(rows, "orders.v2-smoke"))
+    assert code == 0
+    assert [item.query for item in _items(tmp_path, "orders.v2-smoke")] == [QUERY]
+
+
+# --- exit 1 means one thing, so nothing unexpected may produce it ---
+#
+# The skill reads the exit code before the payload and `1` tells it to render a `needs_confirmation`
+# block and re-run with `--confirm-replace`. An uncaught exception exiting 1 therefore escalates a
+# crash into a confirmed-overwrite attempt, which is why every one of these asserts on the code
+# rather than only on the message.
+
+
+def _json_file(tmp_path, name: str, body) -> str:
+    path = tmp_path / name
+    path.write_text(body if isinstance(body, str) else json.dumps(body), encoding="utf-8")
+    return str(path)
+
+
+def test_an_item_missing_its_statement_refuses_rather_than_crashing(tmp_path, monkeypatch, capsys):
+    """A save-door item with no `sql` key: ordinary input, and a `KeyError` before the fix."""
+    item = _json_file(
+        tmp_path, "item.json", {"query": QUERY, "confirmed_by": {"method": METHOD}}
+    )
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
+    assert code == 2
+    assert golden_author._PREFIX in err
+    assert "sql" in err
+    assert "Traceback" not in err
+
+
+def test_an_item_whose_statement_is_null_refuses_without_echoing_the_item(
+    tmp_path, monkeypatch, capsys
+):
+    """`sql: null` builds a confirmed case with no answer key, which pydantic refuses.
+
+    The value must not travel with the refusal: pydantic's own text carries `input_value=`, which
+    for this model is the answer key and the recorded result — the exact thing
+    `golden._validation_digest` exists to strip before a finding is forwarded anywhere.
+    """
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path, sql=None)))
+    assert code == 2
+    assert "input_value" not in err
+    assert QUERY not in err
+    assert "order_count" not in err
+    assert "Traceback" not in err
+
+
+def test_a_malformed_item_file_refuses_with_its_own_sentence(tmp_path, monkeypatch, capsys):
+    """A truncated or hand-mangled JSON file is a caller mistake, not a crash."""
+    item = _json_file(tmp_path, "item.json", '{"query": "How many orders?",')
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
+    assert code == 2
+    assert "JSON" in err
+    assert "Traceback" not in err
+
+
+def test_a_missing_input_file_refuses_with_its_own_sentence(tmp_path, monkeypatch, capsys):
+    """The commonest mistake of all — a path that is not there — and the least useful traceback."""
+    missing = str(tmp_path / "not-here.csv")
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    code = golden_author.main(["parse", "--csv", missing])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "not-here.csv" in err
+    assert "Traceback" not in err
+
+
+# --- a dataset that already holds a relative/frozen case is not a dataset nobody may write to ---
+
+
+def _with_frozen_case(tmp_path, stem: str = "orders") -> Path:
+    """A hand-written dataset holding one item the relativity lint reports and does not drop.
+
+    Hand-authoring is a supported path, and the lint deliberately keeps the item — so this file is
+    readable, complete, and reports a finding forever. A guard that treated any finding as a reason
+    to refuse a merge would make it a dataset nobody can ever add to again.
+    """
+    path = _dataset_file(tmp_path, stem)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "test_cases": [
+                    {
+                        "id": "stale-window",
+                        "query": RELATIVE,
+                        "expected": {"sql": FROZEN_SQL, "sql_confirmed": True},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _cases(tmp_path, stem: str = "orders"):
+    """The dataset's cases without asserting the read was clean — for the files that report one."""
+    datasets, _ = load_golden_datasets(PROFILE, tmp_path)
+    return next(d.test_cases for d in datasets if d.name == stem)
+
+
+def test_a_dataset_holding_a_frozen_case_still_accepts_a_save(tmp_path, monkeypatch, capsys):
+    """The deadlock. The lint keeps the item, so its finding is permanent — and a pre-read guard
+    that refused on it would refuse every future write to this dataset, with Hard Rule 6 forbidding
+    the hand edit that is the only way out."""
+    _with_frozen_case(tmp_path)
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+    assert code == 0, err
+    assert [item.id for item in _cases(tmp_path)] == [
+        "stale-window",
+        "how-many-orders-have-been-placed",
+    ]
+
+
+def test_a_dataset_holding_a_frozen_case_still_accepts_an_import(tmp_path, monkeypatch, capsys):
+    """The same deadlock through the other door, because the guard is in the shared funnel."""
+    _with_frozen_case(tmp_path)
+    code, _, err = _run(
+        tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row(REVENUE)]))
+    )
+    assert code == 0, err
+    assert len(_cases(tmp_path)) == 2
+
+
+def test_a_dataset_the_reader_would_drop_a_case_from_refuses_the_merge(
+    tmp_path, monkeypatch, capsys
+):
+    """The guard's real job, which the fix above must not remove.
+
+    A case the reader cannot parse is a case it DROPS, so merging into this file would rewrite it
+    without the dropped case — this write deleting somebody else's question to make room for its
+    own. Refused, and the file is left exactly as it was.
+    """
+    path = _dataset_file(tmp_path, "orders")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # `sql_confirmed` is the one field with no default, so this case cannot be read at all.
+    path.write_text(
+        yaml.safe_dump({"test_cases": [{"id": "stale", "query": QUERY, "expected": {}}]}),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+    assert code == 2
+    assert "cannot be read as it stands" in err
+    assert path.read_bytes() == before
+
+
+def test_a_frozen_item_over_an_existing_id_is_refused_before_the_confirmation_walk(
+    tmp_path, monkeypatch, capsys
+):
+    """The relativity refusal is unconditional, so asking about the replacement first is asking a
+    question whose every answer is refused. It comes before the append-only stop."""
+    rows = _rows_file(tmp_path, [_row(RELATIVE)])
+    assert _run(tmp_path, monkeypatch, capsys, _import_argv(rows))[0] == 0
+    code, payload, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _save_argv(_item_file(tmp_path, query=RELATIVE, sql=FROZEN_SQL)),
+    )
+    assert code == 2
+    assert payload is None
+    assert "moves with time" in err
+
+
+# --- one id, one item: a duplicate inside a single write is refused, never merged away ---
+
+
+def _dup_rows(tmp_path) -> str:
+    """A sheet whose own `id` column repeats — two different questions under one key."""
+    return _rows_file(tmp_path, [_row(QUERY, id="q1"), _row(REVENUE, id="q1")])
+
+
+def test_two_rows_sharing_an_id_are_refused_against_the_sheet_not_the_file(
+    tmp_path, monkeypatch, capsys
+):
+    """A repeated `id` column value is a clash in the person's own sheet, and has to read as one.
+
+    Left to the re-read, the fault arrives as `orders.yaml[q1]: this id was already used in this
+    file` and the WHOLE import is rolled back — 200 good rows lost, blamed on a file the person did
+    not write, for a duplicate that is two rows of their spreadsheet.
+    """
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _import_argv(_dup_rows(tmp_path)))
+    assert code == 2
+    assert "q1" in err
+    assert "already used in this file" not in err
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+def test_a_duplicated_id_never_reports_more_items_than_it_wrote(tmp_path, monkeypatch, capsys):
+    """The payload is what the skill reports to the person, so it may not overcount the file.
+
+    `added` / `replaced` are counted off the raw list while the merge keys on the id, so with
+    `--confirm-replace` the duplicate lands: exit 0, `replaced: [q1, q1]`, and one item on disk with
+    the first row's question gone and nothing said about it.
+    """
+    assert _run(
+        tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row(QUERY, id="q1")]))
+    )[0] == 0
+    code, payload, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _import_argv(_dup_rows(tmp_path), "orders", "--confirm-replace"),
+    )
+    assert code == 2, payload
+    assert "q1" in err
+    assert [item.query for item in _items(tmp_path)] == [QUERY]
+
+
+# --- the fields the item JSON documents, carried rather than dropped ---
+
+
+def test_a_must_filter_survives_the_save(tmp_path, monkeypatch, capsys):
+    """`must_filter` gates HOW the answer was reached, and the skill tells the model to carry it
+    forward on a replacement — so a door that dropped it would lose the gate on every save-over,
+    silently and at exit 0."""
+    code, _, _ = _run(
+        tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path, must_filter=["status"]))
+    )
+    assert code == 0
+    assert _items(tmp_path)[0].must_filter == ["status"]
+
+
+def test_a_bounded_item_saves_with_its_band(tmp_path, monkeypatch, capsys):
+    """`bounds` is the other half of `match: bounded`, and AH-100 refuses either half alone."""
+    code, _, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _save_argv(_item_file(tmp_path, match="bounded", bounds={"min_rows": 1})),
+    )
+    assert code == 0, err
+    item = _items(tmp_path)[0]
+    assert item.match == "bounded"
+    assert item.bounds.min_rows == 1
+
+
+def test_a_bounded_item_with_no_band_is_refused_not_crashed(tmp_path, monkeypatch, capsys):
+    """A band nothing consults and a level with nothing to consult both keep passing, so AH-100
+    refuses the shape — and that refusal has to reach the person as a sentence, not a traceback."""
+    code, _, err = _run(
+        tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path, match="bounded"))
+    )
+    assert code == 2
+    assert "bounds" in err
+    assert "Traceback" not in err
+
+
+# --- the small ones ---
+
+
+def test_a_neighbour_named_after_this_stem_does_not_roll_our_write_back(
+    tmp_path, monkeypatch, capsys
+):
+    """`orders.yaml.yaml` is a different dataset whose locator starts with `orders.yaml`.
+
+    Prefix matching would attribute its findings to this write and roll back a correct file, which
+    is the same misattribution `_our_faults` exists to prevent for any other neighbour.
+    """
+    gdir = tmp_path / PROFILE / "golden_datasets"
+    gdir.mkdir(parents=True)
+    (gdir / "orders.yaml.yaml").write_text(
+        yaml.safe_dump({"test_cases": [{"id": "stale", "query": QUERY, "expected": {}}]}),
+        encoding="utf-8",
+    )
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
+    assert code == 0, err
+    assert _dataset_file(tmp_path).exists()
+
+
+def test_a_dataset_written_without_a_description_carries_no_empty_one(
+    tmp_path, monkeypatch, capsys
+):
+    """`description: ''` as line 1 is exactly the noise `_drop_empty` exists to keep out of a file
+    a person reads and diffs — the reader defaults it, so writing it says nothing."""
+    _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
+    doc = yaml.safe_load(_dataset_file(tmp_path).read_text(encoding="utf-8"))
+    assert "description" not in doc
+
+
+def test_an_item_with_no_confirmation_method_is_refused(tmp_path, monkeypatch, capsys):
+    """An answer key whose provenance is blank cannot be audited later, which is most of what a
+    receipt is for. Blank rather than absent: a whitespace method is the likelier mistake."""
+    code, _, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _save_argv(_item_file(tmp_path, confirmed_by={"method": "  "})),
+    )
+    assert code == 2
+    assert "confirmed_by.method" in err
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+def test_an_empty_sheet_refuses_and_says_what_is_missing(tmp_path, monkeypatch, capsys):
+    """A zero-byte CSV has no header row, so there is no column contract to match at all."""
+    code, payload, err = _parse(tmp_path, monkeypatch, capsys, "")
+    assert code == 2
+    assert payload is None
+    assert "empty" in err

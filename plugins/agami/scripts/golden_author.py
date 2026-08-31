@@ -65,13 +65,19 @@ import reconcile
 try:
     import agami_paths
     import yaml
+    from pydantic import ValidationError
+
+    # The module rather than its members for the two privates below: a rename of
+    # `golden._lint_relativity` imported by name would be an ImportError, caught by this same
+    # handler and reported as a missing dependency — diagnosing code drift as something to install.
+    # Referenced through the module, it surfaces at the call site as the AttributeError it is.
+    from semantic_model import golden
     from semantic_model.golden import (
         GoldenConfirmedBy,
         GoldenDataset,
         GoldenExpected,
         GoldenItem,
         GoldenRecorded,
-        _lint_relativity,
         load_golden_datasets,
     )
     from semantic_model.validator import ValidationResult
@@ -111,6 +117,20 @@ _ALIASES: dict[str, frozenset[str]] = {
 # into a `--rerun` argument, and a whole question spelled out is neither.
 _MAX_SLUG = 60
 
+# What `--profile` and `--dataset` may be. A whitelist rather than a hunt for `..`, because these
+# two strings are joined into a path this helper then TRUNCATES AND REWRITES: a stem that is not
+# plainly one name is not a stem written to the wrong place, it is a stem that destroys whatever
+# `<stem>.yaml` resolves onto — a sibling tenant's answer key, or the profile's own model file.
+# A leading dot is refused with the separators, which is what makes `..` itself unspellable.
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+# The one error code the reader raises that does not drop anything. `_lint_relativity` deliberately
+# keeps the item it reports (`semantic_model.golden` says so in as many words), so it is neither a
+# reason to refuse a merge into a file that already holds one — that file would otherwise be
+# unwritable forever, with Hard Rule 6 forbidding the hand edit out of it — nor a reason to roll
+# this write back. Incoming items are checked for it before the write instead.
+_KEPT_ITEM_CODE = "golden_relative_question_frozen_sql"
+
 
 def _stop(reason: str) -> None:
     """Say why the parse cannot start."""
@@ -124,6 +144,22 @@ def _warn(reason: str) -> None:
     where nothing stops misdescribes the control flow at the call site.
     """
     print(f"{_PREFIX} {reason}", file=sys.stderr)
+
+
+def _bad_name(kind: str, value: str) -> Optional[str]:
+    """Why `value` cannot be used as a `kind`, or None if it can."""
+    if not _NAME_RE.fullmatch(value):
+        return (
+            f"{value!r} is not a usable {kind} name — it has to be one name: a letter or digit "
+            "first, then letters, digits, dots, dashes or underscores, and no path separators"
+        )
+    # The stem IS the dataset's name — the reader takes it from the filename — so a typed extension
+    # would become part of what the dataset is called. `.yml` is the worse half: the reader refuses
+    # a real `.yml` file as misnamed, and a dataset *named* `orders.yml` would read back fine and
+    # contradict the only rule the directory has.
+    if value.lower().endswith((".yaml", ".yml")):
+        return f"{kind} {value!r} names the file rather than the {kind} — pass it without the extension"
+    return None
 
 
 def _fold(header: str) -> str:
@@ -205,8 +241,8 @@ def _parse_rows(header: list[str], body: list[list[str]]) -> dict[str, Any]:
     columns = _columns(header)
     rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    # Derived ids only. An explicit id that repeats is a real duplicate in the person's own sheet,
-    # and the write door's append-only path is where that gets resolved — silently suffixing it
+    # Derived ids only. An explicit id that repeats is a real duplicate in the person's own sheet
+    # and the write door refuses the whole batch over it, naming the id — silently suffixing it
     # here would turn a clash they need to see into two rows that both look fine.
     derived: dict[str, int] = {}
 
@@ -303,14 +339,15 @@ def _datasets_dir(profile: str) -> Path:
 
 
 def _drop_empty(doc: dict[str, Any], *keys: str) -> None:
-    """Remove the named keys when they hold an empty list.
+    """Remove the named keys when they hold an empty list or an empty string.
 
-    `exclude_none` does not drop `[]`, so a model dumped straight out writes `tags: []`,
-    `must_filter: []` and `tables_used: []` into every item — noise in a file a person reads and
-    diffs, and a shape nobody would ever author by hand.
+    `exclude_none` does not drop `[]` or `""`, so a model dumped straight out writes `tags: []`,
+    `must_filter: []`, `tables_used: []` and a blank `description:` — noise in a file a person reads
+    and diffs, and a shape nobody would ever author by hand. The reader defaults every one of them,
+    so writing them says nothing the file did not already say by omission.
     """
     for key in keys:
-        if doc.get(key) == []:
+        if key in doc and doc[key] in ([], ""):
             del doc[key]
 
 
@@ -332,6 +369,7 @@ def _dataset_doc(dataset: GoldenDataset) -> dict[str, Any]:
     write a file this helper could never read back.
     """
     doc = dataset.model_dump(mode="json", exclude_none=True, exclude={"name", "test_cases"})
+    _drop_empty(doc, "description")
     doc["test_cases"] = [_item_doc(item) for item in dataset.test_cases]
     return doc
 
@@ -341,13 +379,20 @@ def _our_faults(res: ValidationResult, stem: str) -> list[str]:
 
     The reader validates the whole profile, so a neighbouring dataset that was already broken lands
     in the same result. Rolling our write back because of it would restore a correct file and blame
-    a locator the person never touched, so only findings against this stem count.
+    a locator the person never touched, so only findings against this stem count — and `orders.yaml`
+    is a prefix of `orders.yaml.yaml`, which is a different dataset, so the match is the locator
+    exactly or the locator plus a case suffix rather than any string starting with it.
+
+    `_KEPT_ITEM_CODE` is excluded: the reader keeps that item, so the finding describes neither a
+    dropped case nor anything this write did.
     """
     prefix = f"{stem}.yaml"
     return [
         finding.message
         for finding in res.findings
-        if finding.severity == "error" and (finding.locator or "").startswith(prefix)
+        if finding.severity == "error"
+        and finding.code != _KEPT_ITEM_CODE
+        and (finding.locator == prefix or (finding.locator or "").startswith(f"{prefix}["))
     ]
 
 
@@ -367,7 +412,7 @@ def _relativity_fault(item: GoldenItem, stem: str) -> Optional[str]:
     it lives in the funnel anyway, so the import door inherits it for the sheets that carry SQL.
     """
     res = ValidationResult()
-    _lint_relativity(item, stem, res)
+    golden._lint_relativity(item, stem, res)
     return res.errors[0] if res.errors else None
 
 
@@ -399,11 +444,40 @@ def _write_items(
     """Merge `items` into a profile's dataset, print what happened, and return the exit code.
 
     THE write path. Both doors call it and AH-111 will too, so the append-only rule is enforced
-    once rather than remembered by each caller. The order of the steps is the contract: nothing is
-    written until the person has agreed to every replacement, and nothing survives a re-read the
-    runner's own reader would refuse.
+    once rather than remembered by each caller. The order of the steps is the contract: the names
+    are checked before any path is built from them, the batch is checked before any of it is
+    written, nothing is written until the person has agreed to every replacement, and nothing
+    survives a re-read the runner's own reader would refuse.
     """
-    path = _datasets_dir(profile) / f"{stem}.yaml"
+    for kind, value in (("profile", profile), ("dataset", stem)):
+        fault = _bad_name(kind, value)
+        if fault:
+            _stop(fault)
+            return _CANNOT_START
+
+    # One id, one item. Merging keys on the id, so a repeat is one question quietly overwriting
+    # another inside a single batch while `added`/`replaced` — counted off the raw list — report
+    # both. Refused here rather than left to the re-read, which would blame `<stem>.yaml` for a
+    # duplicate that is two rows of the person's own sheet and roll the whole import back over it.
+    seen: set[str] = set()
+    for item in items:
+        if item.id in seen:
+            _stop(
+                f"this batch carries the id {item.id!r} twice. An id is the key a result is stored "
+                "under, so each one may appear once — give the second one its own id and re-run"
+            )
+            return _CANNOT_START
+        seen.add(item.id)
+
+    gdir = _datasets_dir(profile)
+    path = gdir / f"{stem}.yaml"
+    # Belt and braces behind the name rule. The rule is what refuses a bad name with a sentence a
+    # person can act on; this is the invariant itself — the file this door writes is a direct child
+    # of the directory the runner reads — asserted against the paths that were actually built.
+    if path.resolve().parent != gdir.resolve():
+        _stop(f"{stem!r} does not name a file inside this profile's golden_datasets directory")
+        return _CANNOT_START
+
     snapshot = path.read_bytes() if path.exists() else None
     existing: list[GoldenItem] = []
     fields: dict[str, Any] = {}
@@ -413,15 +487,32 @@ def _write_items(
         prior = _our_faults(res, stem)
         if prior:
             # Merging into a file the reader cannot fully read would silently drop whatever it
-            # could not parse — this write deleting somebody's case to make room for its own.
+            # could not parse — this write deleting somebody's case to make room for its own. Only
+            # a fault that costs a case counts, which is why `_our_faults` excludes the one lint
+            # that keeps the item it reports.
             _stop(
                 f"{stem}.yaml cannot be read as it stands, so nothing may be merged into it: "
                 f"{prior[0]}"
             )
             return _CANNOT_START
-        found = next(dataset for dataset in datasets if dataset.name == stem)
+        found = next((dataset for dataset in datasets if dataset.name == stem), None)
+        if found is None:
+            # The file exists and the reader returned no dataset for it, so it was dropped whole
+            # for a reason `_our_faults` did not attribute to this stem. Refusing beats merging
+            # into an empty `existing` and overwriting the file with only the incoming items.
+            _stop(f"{stem}.yaml exists but the reader returned no dataset for it")
+            return _CANNOT_START
         existing = list(found.test_cases)
         fields = found.model_dump(exclude={"name", "test_cases"}, exclude_none=True)
+
+    # Before the append-only stop rather than after it: this refusal is unconditional, so asking
+    # the person to walk a before and an after and say yes, only to refuse the re-run anyway, is
+    # asking a question whose every answer is the same.
+    for item in items:
+        fault = _relativity_fault(item, stem)
+        if fault:
+            _stop(fault)
+            return _CANNOT_START
 
     by_id = {item.id: item for item in existing}
     added = [item for item in items if item.id not in by_id]
@@ -449,12 +540,6 @@ def _write_items(
             )
         )
         return _NEEDS_CONFIRMATION
-
-    for item in items:
-        fault = _relativity_fault(item, stem)
-        if fault:
-            _stop(fault)
-            return _CANNOT_START
 
     incoming = {item.id: item for item in items}
     # A replacement lands in place: the id is the key results are already stored under, and moving
@@ -575,10 +660,14 @@ def _save(
             method=method, at=(payload.get("confirmed_by") or {}).get("at") or now
         ),
     }
-    if payload.get("match"):
-        # Omitted rather than defaulted, so how strictly a saved item compares stays AH-100's
-        # answer to that question and not a second one written down here.
-        fields["match"] = payload["match"]
+    # Omitted rather than defaulted, so how strictly a saved item compares, what band it compares
+    # against and what gate the answer had to be reached through all stay AH-100's answers to those
+    # questions and not second ones written down here. All three are documented on the save door's
+    # payload, so a whitelist that forwarded only `match` dropped a `must_filter` the skill is told
+    # to carry forward on every replacement, and built a `bounded` item with no band to compare to.
+    for key in ("match", "bounds", "must_filter"):
+        if payload.get(key):
+            fields[key] = payload[key]
 
     return _write_items(
         profile, stem, [GoldenItem(**fields)], confirm_replace=confirm_replace,
@@ -598,23 +687,12 @@ def _add_write_args(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument("--description", help="the dataset's description")
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Author golden-dataset items from a spreadsheet.")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+def _dispatch(args: argparse.Namespace) -> int:
+    """Run the verb the arguments name.
 
-    parse_cmd = sub.add_parser("parse", help="Read a question-bank CSV and print what it holds.")
-    parse_cmd.add_argument("--csv", required=True, help="the question bank to read")
-
-    import_cmd = sub.add_parser("import", help="Write confirmed parse rows as unverified items.")
-    import_cmd.add_argument("--rows", required=True, help="the confirmed `parse` payload")
-    _add_write_args(import_cmd)
-
-    save_cmd = sub.add_parser("save", help="Write one confirmed answer, statement and receipt.")
-    save_cmd.add_argument("--item", required=True, help="the accepted answer, as JSON")
-    _add_write_args(save_cmd)
-
-    args = parser.parse_args(argv)
-
+    Every exit code this helper deliberately returns is decided here or below it; `main` wraps this
+    so that nothing else can invent one.
+    """
     if args.cmd == "parse":
         payload = _parse(args.csv)
         if payload is None:
@@ -638,6 +716,54 @@ def main(argv: Optional[list[str]] = None) -> int:
         confirm_replace=args.confirm_replace,
         description=args.description,
     )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Author golden-dataset items from a spreadsheet.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    parse_cmd = sub.add_parser("parse", help="Read a question-bank CSV and print what it holds.")
+    parse_cmd.add_argument("--csv", required=True, help="the question bank to read")
+
+    import_cmd = sub.add_parser("import", help="Write confirmed parse rows as unverified items.")
+    import_cmd.add_argument("--rows", required=True, help="the confirmed `parse` payload")
+    _add_write_args(import_cmd)
+
+    save_cmd = sub.add_parser("save", help="Write one confirmed answer, statement and receipt.")
+    save_cmd.add_argument("--item", required=True, help="the accepted answer, as JSON")
+    _add_write_args(save_cmd)
+
+    args = parser.parse_args(argv)
+
+    # Nothing gets out of here as a traceback. `1` is the skill's signal to render a
+    # `needs_confirmation` block and re-run with `--confirm-replace`, and an uncaught exception
+    # exits `1` too — so a crash would be read as a stop the person can agree to, and the answer to
+    # it would be a confirmed overwrite. Every unexpected failure becomes `2` and a stderr sentence.
+    try:
+        return _dispatch(args)
+    except FileNotFoundError as exc:
+        _stop(f"{exc.filename} does not exist")
+    except IsADirectoryError as exc:
+        _stop(f"{exc.filename} is a directory, not a file")
+    except json.JSONDecodeError as exc:
+        # Named separately from the catch-all because the fix is specific: this file is hand-built
+        # by the skill, and a truncated one is re-written rather than investigated.
+        _stop(f"this file is not readable JSON — {exc.msg} at line {exc.lineno}")
+    except (OSError, UnicodeDecodeError) as exc:
+        _stop(f"a file could not be read: {exc.__class__.__name__}")
+    except KeyError as exc:
+        _stop(f"the input is missing a required key: {exc}")
+    except ValidationError as exc:
+        # Through the digest, never the raw text: pydantic renders `input_value=`, which for these
+        # models is the answer key, the recorded result and the question — and this sentence goes
+        # to a terminal. The field and the reason are what a fix needs anyway.
+        _stop(f"this does not fit a golden case — {golden._validation_digest(exc)}")
+    except Exception as exc:
+        # Deliberately bare. A named list of what these doors can raise would be a list that goes
+        # stale, and the one thing that must never happen is a failure this helper did not name
+        # reaching the caller as the exit code that means "say yes to overwrite".
+        _stop(f"this could not be completed: {exc.__class__.__name__}")
+    return _CANNOT_START
 
 
 if __name__ == "__main__":
