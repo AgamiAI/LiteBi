@@ -425,3 +425,149 @@ def test_a_failed_reread_on_a_new_dataset_leaves_nothing_behind(tmp_path, monkey
     code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
     assert code == 2
     assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+# --- the save door, and the lint it is refused by ---
+#
+# The second door is the only one that can produce an item able to gate a run, because it is the
+# only one behind which a person looked at a result. It writes through the same funnel as the
+# import door, so everything asserted above holds here too and is not re-asserted.
+
+METHOD = "read on screen and accepted"
+RELATIVE = "How many orders were placed in the last 7 days?"
+FROZEN_SQL = "SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= '2026-01-01'"
+ANCHORED_SQL = (
+    "SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= CURRENT_DATE - 7"
+)
+
+
+def _item_file(tmp_path, **kw) -> str:
+    """One answer somebody accepted, in the shape AH-111 will send."""
+    payload = {
+        "id": None,
+        "query": QUERY,
+        "sql": SQL,
+        "match": None,
+        "tags": None,
+        "recorded": {"columns": ["order_count"], "rows": [[42]]},
+        "confirmed_by": {"method": METHOD},
+    }
+    payload.update(kw)
+    path = tmp_path / "item.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def _save_argv(item_path: str, stem: str = "orders", *extra: str) -> list[str]:
+    return ["save", "--profile", PROFILE, "--dataset", stem, "--item", item_path, *extra]
+
+
+def test_a_saved_answer_carries_its_statement_and_receipt(tmp_path, monkeypatch, capsys):
+    """SC-6. The one door that can produce an item able to gate a run.
+
+    All four parts have to survive the round trip together: without the statement there is nothing
+    to compare, without `sql_confirmed` the runner will not let the case gate, and without the
+    receipt a reviewer months later cannot see what the answer looked like on the day somebody
+    accepted it. `confirmed_by.method` is carried verbatim — AH-100 types it as free text on
+    purpose, so nothing here narrows it to a vocabulary.
+    """
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+    assert code == 0
+    item = _items(tmp_path)[0]
+    assert item.id == "how-many-orders-have-been-placed"
+    assert item.expected.sql_confirmed is True
+    assert item.expected.sql == SQL
+    assert item.recorded.columns == ["order_count"] and item.recorded.rows == [[42]]
+    assert item.confirmed_by.method == METHOD
+    # Both stamps are set here rather than left None: a receipt that cannot say when it was taken
+    # is not much of a receipt.
+    assert item.recorded.at and item.confirmed_by.at
+    assert item.match == "exact"
+
+
+def test_a_duplicate_save_declined_leaves_the_file_byte_identical(tmp_path, monkeypatch, capsys):
+    """SC-7, the decline direction. An answer key that can be overwritten in passing is not one.
+
+    This is the whole of the append-only objection: the risk was never that the door exists, but
+    that it would make a failing item easy to replace. So the person is shown the statement that is
+    there and the statement that would take its place, and until they say yes the file is not
+    touched at all — byte-identical, not merely equivalent.
+    """
+    _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+    before = _dataset_file(tmp_path).read_bytes()
+
+    replacement = _item_file(
+        tmp_path, sql=REVENUE_SQL, recorded={"columns": ["revenue"], "rows": [[1234.56]]}
+    )
+    code, payload, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(replacement))
+    assert code == 1
+    assert _dataset_file(tmp_path).read_bytes() == before
+
+    entry = payload["needs_confirmation"][0]
+    assert entry["id"] == "how-many-orders-have-been-placed"
+    assert entry["before"]["expected"]["sql"] == SQL
+    assert entry["after"]["expected"]["sql"] == REVENUE_SQL
+
+
+def test_a_duplicate_save_confirmed_replaces_the_item_in_place(tmp_path, monkeypatch, capsys):
+    """SC-7, the accept direction. The yes replaces one item and disturbs nothing else.
+
+    In place rather than appended: the id is the key every stored result is already filed under,
+    and moving the case to the end of the file would reorder a diff nobody asked to reorder. Its
+    siblings staying unconfirmed is the other half — a confirmation is about one answer, and a
+    door that promoted the whole file would be the forged gate again by another route.
+    """
+    rows = [_row(REVENUE), _row(), _row("How many customers are on file?")]
+    assert _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, rows)))[0] == 0
+
+    code, payload, _ = _run(
+        tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path), "orders", "--confirm-replace")
+    )
+    assert code == 0
+    assert payload["replaced"] == ["how-many-orders-have-been-placed"]
+    assert payload["added"] == []
+
+    items = _items(tmp_path)
+    assert [item.id for item in items] == [
+        "what-is-our-total-revenue",
+        "how-many-orders-have-been-placed",
+        "how-many-customers-are-on-file",
+    ]
+    assert items[1].expected.sql == SQL
+    assert [item.expected.sql_confirmed for item in items] == [False, True, False]
+
+
+def test_a_relative_question_with_frozen_sql_is_refused_at_save_time(tmp_path, monkeypatch, capsys):
+    """SC-8. A question that moves with time and an answer key that does not is refused now.
+
+    The lint is AH-100's, called rather than restated — a second copy of those three regexes would
+    drift, and this is exactly the "no second parser" failure the repo guards against. The point of
+    running it here is the timing: the reader would report this at the next run, by which time the
+    dataset is written and whoever reads the finding has to work out that saving it was the mistake.
+    """
+    code, _, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _save_argv(_item_file(tmp_path, query=RELATIVE, sql=FROZEN_SQL)),
+    )
+    assert code == 2
+    assert "moves with time" in err
+    # Nothing was written, not even the directory — the refusal is before the write, not a rollback.
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+def test_a_relative_question_anchored_on_the_current_date_saves(tmp_path, monkeypatch, capsys):
+    """The control for the refusal above: the lint objects to the pinning, not to the question.
+
+    Without this, a pre-check that refused every question phrased against today would pass the test
+    beside it while making the save door useless for the commonest question there is.
+    """
+    code, _, _ = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _save_argv(_item_file(tmp_path, query=RELATIVE, sql=ANCHORED_SQL)),
+    )
+    assert code == 0
+    assert _items(tmp_path)[0].expected.sql == ANCHORED_SQL

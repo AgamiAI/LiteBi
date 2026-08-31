@@ -26,6 +26,7 @@ Usage:
 
     python3 golden_author.py parse  --csv /path/to/question-bank.csv
     python3 golden_author.py import --profile main --dataset orders --rows /path/to/parsed.json
+    python3 golden_author.py save   --profile main --dataset orders --item /path/to/item.json
 
 Stdout is always one JSON document; every refusal and every warning goes to stderr with the prefix
 below, so a caller can parse the one and strip the other. The parse door is stdlib only, plus
@@ -40,6 +41,7 @@ import csv
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -64,9 +66,12 @@ try:
     import agami_paths
     import yaml
     from semantic_model.golden import (
+        GoldenConfirmedBy,
         GoldenDataset,
         GoldenExpected,
         GoldenItem,
+        GoldenRecorded,
+        _lint_relativity,
         load_golden_datasets,
     )
     from semantic_model.validator import ValidationResult
@@ -346,6 +351,26 @@ def _our_faults(res: ValidationResult, stem: str) -> list[str]:
     ]
 
 
+def _relativity_fault(item: GoldenItem, stem: str) -> Optional[str]:
+    """AH-100's relativity lint, asked about one item before it is written.
+
+    Called, never restated. The rule is three regexes in `semantic_model.golden`, and a second copy
+    of them would drift — the failure the repo's "no second SQL parser" guardrail exists to prevent.
+
+    What running it here buys is the timing. The reader runs the same lint on every read, so a
+    question phrased against today with an answer key pinned to a fixed date would surface anyway —
+    as a finding at the next run, with the file already written and whoever reads it having to work
+    out that saving it was the mistake. Refused at the moment of saving, it is the one person who
+    can still fix it being told.
+
+    The lint only fires on an item that has a statement, so in practice this is a save-door rule;
+    it lives in the funnel anyway, so the import door inherits it for the sheets that carry SQL.
+    """
+    res = ValidationResult()
+    _lint_relativity(item, stem, res)
+    return res.errors[0] if res.errors else None
+
+
 def _rollback(path: Path, snapshot: Optional[bytes], created_dir: bool) -> None:
     """Put the tree back exactly as it was before this write.
 
@@ -425,6 +450,12 @@ def _write_items(
         )
         return _NEEDS_CONFIRMATION
 
+    for item in items:
+        fault = _relativity_fault(item, stem)
+        if fault:
+            _stop(fault)
+            return _CANNOT_START
+
     incoming = {item.id: item for item in items}
     # A replacement lands in place: the id is the key results are already stored under, and moving
     # a case to the end of the file would reorder a diff for no reason anyone asked for.
@@ -498,6 +529,75 @@ def _import(
     )
 
 
+def _save(
+    profile: str,
+    stem: str,
+    item_path: str,
+    *,
+    confirm_replace: bool,
+    description: Optional[str],
+) -> int:
+    """Write one answer somebody looked at and accepted.
+
+    The only door that can produce an item able to gate a run, and everything that makes it one is
+    written here: the statement, `sql_confirmed`, the receipt of what the answer looked like, and
+    how it was confirmed. AH-111 is a caller of this door, not a second write path.
+
+    `confirmed_by.method` is free text by AH-100's deliberate choice — a `Literal` would refuse
+    files for saying something reasonable — so the only check is that somebody said something. An
+    item with no method is the one refusal: an answer key whose provenance is blank cannot be
+    audited later, which is most of what a receipt is for.
+    """
+    payload = json.loads(Path(item_path).expanduser().read_text(encoding="utf-8"))
+    method = ((payload.get("confirmed_by") or {}).get("method") or "").strip()
+    if not method:
+        _stop(
+            "this item does not say how its answer was confirmed; set confirmed_by.method to how "
+            "the result was checked"
+        )
+        return _CANNOT_START
+
+    # Stamped here when the caller did not stamp it. AH-100 types both as optional, but a receipt
+    # that cannot say when it was taken is not much of a receipt.
+    now = datetime.now(timezone.utc).isoformat()
+    recorded = payload.get("recorded") or {}
+    fields: dict[str, Any] = {
+        "id": payload.get("id") or _slug(payload["query"]),
+        "query": payload["query"],
+        "expected": GoldenExpected(sql=payload["sql"], sql_confirmed=True),
+        "tags": payload.get("tags") or [],
+        "recorded": GoldenRecorded(
+            columns=recorded.get("columns") or [],
+            rows=recorded.get("rows") or [],
+            at=recorded.get("at") or now,
+        ),
+        "confirmed_by": GoldenConfirmedBy(
+            method=method, at=(payload.get("confirmed_by") or {}).get("at") or now
+        ),
+    }
+    if payload.get("match"):
+        # Omitted rather than defaulted, so how strictly a saved item compares stays AH-100's
+        # answer to that question and not a second one written down here.
+        fields["match"] = payload["match"]
+
+    return _write_items(
+        profile, stem, [GoldenItem(**fields)], confirm_replace=confirm_replace,
+        description=description,
+    )
+
+
+def _add_write_args(cmd: argparse.ArgumentParser) -> None:
+    """The flags both write doors take. They go through one funnel, so they take one set."""
+    cmd.add_argument("--profile", required=True, help="the profile whose dataset to write")
+    cmd.add_argument("--dataset", required=True, help="the dataset's filename stem")
+    cmd.add_argument(
+        "--confirm-replace",
+        action="store_true",
+        help="agree to overwrite the items whose id already exists",
+    )
+    cmd.add_argument("--description", help="the dataset's description")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Author golden-dataset items from a spreadsheet.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -506,15 +606,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parse_cmd.add_argument("--csv", required=True, help="the question bank to read")
 
     import_cmd = sub.add_parser("import", help="Write confirmed parse rows as unverified items.")
-    import_cmd.add_argument("--profile", required=True, help="the profile whose dataset to write")
-    import_cmd.add_argument("--dataset", required=True, help="the dataset's filename stem")
     import_cmd.add_argument("--rows", required=True, help="the confirmed `parse` payload")
-    import_cmd.add_argument(
-        "--confirm-replace",
-        action="store_true",
-        help="agree to overwrite the items whose id already exists",
-    )
-    import_cmd.add_argument("--description", help="the dataset's description")
+    _add_write_args(import_cmd)
+
+    save_cmd = sub.add_parser("save", help="Write one confirmed answer, statement and receipt.")
+    save_cmd.add_argument("--item", required=True, help="the accepted answer, as JSON")
+    _add_write_args(save_cmd)
 
     args = parser.parse_args(argv)
 
@@ -525,10 +622,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps(payload, indent=2))
         return 0
 
-    return _import(
+    if args.cmd == "import":
+        return _import(
+            args.profile,
+            args.dataset,
+            args.rows,
+            confirm_replace=args.confirm_replace,
+            description=args.description,
+        )
+
+    return _save(
         args.profile,
         args.dataset,
-        args.rows,
+        args.item,
         confirm_replace=args.confirm_replace,
         description=args.description,
     )
