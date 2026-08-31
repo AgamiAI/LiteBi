@@ -24,6 +24,12 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
+# The write doors go through AH-100's models, so the whole module needs the optional model extra
+# even though the parse door is stdlib-only.
+pytest.importorskip("pydantic")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
 if str(PKG_SRC) not in sys.path:
@@ -31,6 +37,8 @@ if str(PKG_SRC) not in sys.path:
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
 
 import golden_author  # noqa: E402
+import yaml  # noqa: E402
+from semantic_model.golden import load_golden_datasets  # noqa: E402
 
 PROFILE = "demo"
 
@@ -217,3 +225,203 @@ def test_tags_split_on_commas(tmp_path, monkeypatch, capsys):
     )
     assert code == 0
     assert payload["rows"][0]["tags"] == ["smoke", "revenue"]
+
+
+# --- the write core, and the import door on top of it ---
+#
+# Every write in this helper — both doors, and AH-111's promotion later — goes through one funnel,
+# so the append-only rule and the write-then-re-read gate are asserted once here and inherited.
+# The reader is the only validator there is (`semantic_model.golden` ships no writer and no
+# standalone `validate()`), which is why every one of these tests ends by reading the file back
+# rather than by inspecting the YAML it just wrote.
+
+REVENUE = "What is our total revenue?"
+REVENUE_SQL = "SELECT ROUND(SUM(total_amount), 2) AS revenue FROM orders"
+
+
+def _run(tmp_path, monkeypatch, capsys, argv: list[str]):
+    """Run any verb and return (exit code, stdout payload, stderr)."""
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", str(tmp_path))
+    code = golden_author.main(argv)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out) if captured.out.strip() else None
+    return code, payload, captured.err
+
+
+def _row(query: str = QUERY, **kw) -> dict:
+    """One row of the `parse` payload, keyed the way the parse door keys it."""
+    return {
+        "id": golden_author._slug(query),
+        "query": query,
+        "expected_value": None,
+        "sql": None,
+        "tags": [],
+        **kw,
+    }
+
+
+def _rows_file(tmp_path, rows: list[dict]) -> str:
+    """The `parse` payload as the skill hands it back after the person has confirmed it."""
+    path = tmp_path / "parsed.json"
+    path.write_text(json.dumps({"rows": rows}), encoding="utf-8")
+    return str(path)
+
+
+def _import_argv(rows_path: str, stem: str = "orders", *extra: str) -> list[str]:
+    return ["import", "--profile", PROFILE, "--dataset", stem, "--rows", rows_path, *extra]
+
+
+def _dataset_file(tmp_path, stem: str = "orders") -> Path:
+    return tmp_path / PROFILE / "golden_datasets" / f"{stem}.yaml"
+
+
+def _items(tmp_path, stem: str = "orders"):
+    """The dataset's cases as the runner would see them, asserting the read was clean."""
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert res.ok, res.errors
+    return next(d.test_cases for d in datasets if d.name == stem)
+
+
+def test_imported_items_read_back_through_the_reader(tmp_path, monkeypatch, capsys):
+    """SC-1. A sheet of questions becomes items the runner can read, in sheet order.
+
+    Reading them back through `load_golden_datasets` rather than through the YAML is the whole
+    assertion: the writer's only claim to correctness is that the reader the runner uses accepts
+    what it wrote, so a test that inspected the dump would be checking the writer against itself.
+    """
+    rows = [_row(), _row(REVENUE)]
+    code, payload, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, rows)))
+    assert code == 0
+    assert payload["added"] == ["how-many-orders-have-been-placed", "what-is-our-total-revenue"]
+    assert payload["replaced"] == []
+    assert payload["summary"] == {"added": 2, "replaced": 0}
+    assert [item.query for item in _items(tmp_path)] == [QUERY, REVENUE]
+
+
+def test_an_import_never_marks_its_own_rows_confirmed(tmp_path, monkeypatch, capsys):
+    """SC-2. Not one imported row is confirmed — least of all the row that came with SQL.
+
+    A sheet's statement column is carried, because throwing it away would lose work; but nobody
+    ran it, and an import that marked its own rows verified would forge the gate the confirmed-only
+    rule exists to be. The row with a statement is in this fixture precisely because it is the one
+    a writer would be tempted to promote.
+    """
+    rows = [_row(), _row(REVENUE, sql=REVENUE_SQL)]
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, rows)))
+    assert code == 0
+    items = _items(tmp_path)
+    assert [item.expected.sql_confirmed for item in items] == [False, False]
+    assert items[1].expected.sql == REVENUE_SQL
+
+
+def test_the_written_file_never_declares_its_own_name(tmp_path, monkeypatch, capsys):
+    """The dataset's name is its filename, and a file that says so again is refused by the reader.
+
+    `load_golden_datasets` rejects a `name:` key outright (`golden_invalid_dataset`), so a dumper
+    that serialized the model whole would write a file it could never read back. The reader would
+    catch it, but only after the write — this pins the shape at the point it is produced.
+    """
+    _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
+    doc = yaml.safe_load(_dataset_file(tmp_path).read_text(encoding="utf-8"))
+    assert "name" not in doc
+    assert doc["description"] == ""
+
+
+def test_re_importing_the_same_sheet_asks_before_it_doubles_anything(tmp_path, monkeypatch, capsys):
+    """The determinism of the derived id is what makes a second import a duplicate, not a doubling.
+
+    This is the payoff of `_slug`: sequential ids would land the same questions under fresh keys,
+    the append-only rule would never fire on the import door, and a dataset would silently grow a
+    second copy of every question each time somebody re-ran the sheet.
+    """
+    argv = _import_argv(_rows_file(tmp_path, [_row()]))
+    assert _run(tmp_path, monkeypatch, capsys, argv)[0] == 0
+    code, payload, _ = _run(tmp_path, monkeypatch, capsys, argv)
+    assert code == 1
+    assert [entry["id"] for entry in payload["needs_confirmation"]] == [
+        "how-many-orders-have-been-placed"
+    ]
+    assert len(_items(tmp_path)) == 1
+
+
+def test_a_broken_dataset_elsewhere_neither_blocks_the_write_nor_gets_repaired(
+    tmp_path, monkeypatch, capsys
+):
+    """A correct write must not be rolled back by somebody else's already-broken file.
+
+    The re-read validates the whole profile, so an unrelated dataset that was already failing would
+    otherwise fail our write too — rolling back a correct file and reporting a fault at a locator
+    the person did not touch. The other half matters as much: the broken file is left exactly as it
+    was, because quietly rewriting a neighbour is not this door's business either.
+    """
+    gdir = tmp_path / PROFILE / "golden_datasets"
+    gdir.mkdir(parents=True)
+    broken = gdir / "legacy.yaml"
+    # `sql_confirmed` is the one field with no default, so this case cannot be read at all.
+    broken.write_text(
+        yaml.safe_dump({"test_cases": [{"id": "stale", "query": QUERY, "expected": {}}]}),
+        encoding="utf-8",
+    )
+    before = broken.read_bytes()
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
+    assert code == 0
+    assert _dataset_file(tmp_path).exists()
+    assert broken.read_bytes() == before
+
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert [d.name for d in datasets] == ["legacy", "orders"]
+    assert [f.locator for f in res.findings] == ["legacy.yaml[stale]"]
+
+
+def _break_the_reread(monkeypatch, stem: str, marker: str) -> None:
+    """Make the re-read report an error for `stem` once `marker` reaches disk.
+
+    There is no input this door can construct that the reader then refuses — the writer builds
+    `GoldenItem`s, so pydantic has already accepted everything by the time it is dumped. That is
+    the design working, and it also means the rollback has no natural fixture: the only way to
+    exercise it is to fail the re-read on purpose.
+    """
+    real = golden_author.load_golden_datasets
+
+    def fake(profile, art=None):
+        datasets, res = real(profile, art)
+        path = golden_author._datasets_dir(profile) / f"{stem}.yaml"
+        if path.exists() and marker in path.read_text(encoding="utf-8"):
+            locator = f"{stem}.yaml[{marker}]"
+            res.error("golden_invalid_case", f"{locator}: injected by the test", locator=locator)
+        return datasets, res
+
+    monkeypatch.setattr(golden_author, "load_golden_datasets", fake)
+
+
+def test_a_failed_reread_restores_the_previous_bytes(tmp_path, monkeypatch, capsys):
+    """A write the reader rejects leaves the dataset byte-identical to what it was.
+
+    Byte-identical rather than merely equivalent: a rollback that re-dumped the parsed model would
+    silently reformat a file the person may have hand-written, which is a change nobody asked for
+    on the path where nothing was supposed to change at all.
+    """
+    assert _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))[0] == 0
+    before = _dataset_file(tmp_path).read_bytes()
+
+    _break_the_reread(monkeypatch, "orders", "what-is-our-total-revenue")
+    code, _, err = _run(
+        tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row(REVENUE)]))
+    )
+    assert code == 2
+    assert _dataset_file(tmp_path).read_bytes() == before
+    assert "injected by the test" in err
+
+
+def test_a_failed_reread_on_a_new_dataset_leaves_nothing_behind(tmp_path, monkeypatch, capsys):
+    """The first write to a profile creates the directory too, so the rollback has to unmake both.
+
+    A half-created `golden_datasets/` holding a file the reader refused is worse than no dataset:
+    the next run reads it, reports the fault, and the person has to work out that nothing they did
+    ever succeeded.
+    """
+    _break_the_reread(monkeypatch, "orders", "how-many-orders-have-been-placed")
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row()])))
+    assert code == 2
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()

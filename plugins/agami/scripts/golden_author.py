@@ -17,13 +17,20 @@ through as `sql`, but nobody ran it, so an imported row is unverified by constru
 confirmed-only rule is what makes a green golden run mean something, and a spreadsheet column is
 not a person who looked at a result.
 
+**Every write goes through one funnel.** `_write_items` is it: both doors call it and AH-111's
+promotion will too, so the append-only rule — a change to an item that already exists renders the
+before and the after and stops for an explicit yes — is a property of the software rather than a
+rule each caller has to remember.
+
 Usage:
 
-    python3 golden_author.py parse --csv /path/to/question-bank.csv
+    python3 golden_author.py parse  --csv /path/to/question-bank.csv
+    python3 golden_author.py import --profile main --dataset orders --rows /path/to/parsed.json
 
 Stdout is always one JSON document; every refusal and every warning goes to stderr with the prefix
-below, so a caller can parse the one and strip the other. Stdlib only, plus `reconcile.parse_value`
-for the expected-value column.
+below, so a caller can parse the one and strip the other. The parse door is stdlib only, plus
+`reconcile.parse_value` for the expected-value column; the write doors go through AH-100's models,
+which is what the guarded import below is for.
 """
 
 from __future__ import annotations
@@ -40,7 +47,38 @@ from typing import Any, Optional
 # plugin ships in — the marketplace cache invokes these scripts by absolute path, where the
 # interpreter's own `sys.path[0]` is not something to rely on.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import reconcile  # noqa: E402
+
+# Three layouts reach this script and only one of them has `packages/` on disk: a dev checkout keeps
+# the source beside the plugin, a marketplace install ships `<version>/lib` and no checkout at all,
+# and a pip install has the library importable already. `_agami_lib` is the one helper that knows
+# all three, and every other runtime script in this directory calls it.
+import _agami_lib  # noqa: E402
+
+_agami_lib.ensure_importable()
+
+# A sibling script and stdlib-only, so it is imported plainly: it has none of the dependencies the
+# guard below exists for.
+import reconcile
+
+try:
+    import agami_paths
+    import yaml
+    from semantic_model.golden import (
+        GoldenDataset,
+        GoldenExpected,
+        GoldenItem,
+        load_golden_datasets,
+    )
+    from semantic_model.validator import ValidationResult
+except ImportError as exc:
+    # A fresh plugin install genuinely lacks these, and the traceback a bare ImportError prints
+    # names an internal module rather than the thing to install.
+    print(
+        "golden_author's write doors need agami-core and its model extra (pydantic, pyyaml): "
+        f"install `agami-core[model]` into this interpreter. ({exc})",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from exc
 
 # Marks the lines a caller is meant to strip — the refusals and the warnings, this helper talking
 # about itself.
@@ -244,6 +282,222 @@ def _parse(path: str) -> Optional[dict[str, Any]]:
     return payload
 
 
+# ---------------------------------------------------------------------------
+# The write core — one funnel, and the append-only rule lives in it
+# ---------------------------------------------------------------------------
+
+
+def _datasets_dir(profile: str) -> Path:
+    """Where a profile's datasets live.
+
+    The same path `run_golden_eval.py` names. A door that wrote somewhere the runner does not read
+    would produce a dataset nobody ever runs, and two spellings of this path would be two answers to
+    "where does one go".
+    """
+    return agami_paths.profile_dir(profile) / "golden_datasets"
+
+
+def _drop_empty(doc: dict[str, Any], *keys: str) -> None:
+    """Remove the named keys when they hold an empty list.
+
+    `exclude_none` does not drop `[]`, so a model dumped straight out writes `tags: []`,
+    `must_filter: []` and `tables_used: []` into every item — noise in a file a person reads and
+    diffs, and a shape nobody would ever author by hand.
+    """
+    for key in keys:
+        if doc.get(key) == []:
+            del doc[key]
+
+
+def _item_doc(item: GoldenItem) -> dict[str, Any]:
+    """One case as it goes on disk, and as the confirmation prompt shows it."""
+    doc = item.model_dump(mode="json", exclude_none=True)
+    _drop_empty(doc, "tags", "must_filter")
+    _drop_empty(doc["expected"], "tables_used")
+    if "recorded" in doc:
+        _drop_empty(doc["recorded"], "columns", "rows")
+    return doc
+
+
+def _dataset_doc(dataset: GoldenDataset) -> dict[str, Any]:
+    """A whole dataset file as it goes on disk.
+
+    `name` is excluded, and that is the one exclusion that is not cosmetic: the reader injects the
+    name from the filename and REFUSES a file that declares one, so dumping the model whole would
+    write a file this helper could never read back.
+    """
+    doc = dataset.model_dump(mode="json", exclude_none=True, exclude={"name", "test_cases"})
+    doc["test_cases"] = [_item_doc(item) for item in dataset.test_cases]
+    return doc
+
+
+def _our_faults(res: ValidationResult, stem: str) -> list[str]:
+    """The error findings this write is answerable for.
+
+    The reader validates the whole profile, so a neighbouring dataset that was already broken lands
+    in the same result. Rolling our write back because of it would restore a correct file and blame
+    a locator the person never touched, so only findings against this stem count.
+    """
+    prefix = f"{stem}.yaml"
+    return [
+        finding.message
+        for finding in res.findings
+        if finding.severity == "error" and (finding.locator or "").startswith(prefix)
+    ]
+
+
+def _rollback(path: Path, snapshot: Optional[bytes], created_dir: bool) -> None:
+    """Put the tree back exactly as it was before this write.
+
+    The original bytes rather than a re-dump of the parsed model: a file the person hand-wrote has
+    to come back with their formatting, on the path where nothing was supposed to change at all. A
+    file that is new goes away entirely, along with the directory if this write is what made it —
+    a half-created `golden_datasets/` holding a file the reader refuses is worse than no dataset,
+    because the next run reads it and reports a fault nobody meant to create.
+    """
+    if snapshot is not None:
+        path.write_bytes(snapshot)
+        return
+    path.unlink()
+    if created_dir and not any(path.parent.iterdir()):
+        path.parent.rmdir()
+
+
+def _write_items(
+    profile: str,
+    stem: str,
+    items: list[GoldenItem],
+    *,
+    confirm_replace: bool,
+    description: Optional[str] = None,
+) -> int:
+    """Merge `items` into a profile's dataset, print what happened, and return the exit code.
+
+    THE write path. Both doors call it and AH-111 will too, so the append-only rule is enforced
+    once rather than remembered by each caller. The order of the steps is the contract: nothing is
+    written until the person has agreed to every replacement, and nothing survives a re-read the
+    runner's own reader would refuse.
+    """
+    path = _datasets_dir(profile) / f"{stem}.yaml"
+    snapshot = path.read_bytes() if path.exists() else None
+    existing: list[GoldenItem] = []
+    fields: dict[str, Any] = {}
+
+    if snapshot is not None:
+        datasets, res = load_golden_datasets(profile)
+        prior = _our_faults(res, stem)
+        if prior:
+            # Merging into a file the reader cannot fully read would silently drop whatever it
+            # could not parse — this write deleting somebody's case to make room for its own.
+            _stop(
+                f"{stem}.yaml cannot be read as it stands, so nothing may be merged into it: "
+                f"{prior[0]}"
+            )
+            return _CANNOT_START
+        found = next(dataset for dataset in datasets if dataset.name == stem)
+        existing = list(found.test_cases)
+        fields = found.model_dump(exclude={"name", "test_cases"}, exclude_none=True)
+
+    by_id = {item.id: item for item in existing}
+    added = [item for item in items if item.id not in by_id]
+    replaced = [item for item in items if item.id in by_id]
+
+    if replaced and not confirm_replace:
+        # The before AND the after, because "this id already exists" is not enough for a person to
+        # decide with: an answer key is the thing being overwritten, and they have to see both.
+        print(
+            json.dumps(
+                {
+                    "dataset": stem,
+                    "path": str(path),
+                    "added": [item.id for item in added],
+                    "needs_confirmation": [
+                        {
+                            "id": item.id,
+                            "before": _item_doc(by_id[item.id]),
+                            "after": _item_doc(item),
+                        }
+                        for item in replaced
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return _NEEDS_CONFIRMATION
+
+    incoming = {item.id: item for item in items}
+    # A replacement lands in place: the id is the key results are already stored under, and moving
+    # a case to the end of the file would reorder a diff for no reason anyone asked for.
+    merged = [incoming.get(item.id, item) for item in existing] + added
+    if description is not None:
+        fields["description"] = description
+    doc = _dataset_doc(GoldenDataset(name=stem, test_cases=merged, **fields))
+
+    created_dir = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The canonical dump kwargs, the same ones `build.py` writes every other model file with.
+    path.write_text(
+        yaml.safe_dump(doc, sort_keys=False, allow_unicode=True, width=100), encoding="utf-8"
+    )
+
+    # Reading IS validating: `semantic_model.golden` ships no writer and no standalone `validate()`,
+    # so the only way to know the runner will accept this file is to hand it to the runner's reader.
+    _, res = load_golden_datasets(profile)
+    faults = _our_faults(res, stem)
+    if faults:
+        _rollback(path, snapshot, created_dir)
+        for fault in faults:
+            _stop(fault)
+        return _CANNOT_START
+
+    print(
+        json.dumps(
+            {
+                "dataset": stem,
+                "path": str(path),
+                "added": [item.id for item in added],
+                "replaced": [item.id for item in replaced],
+                "summary": {"added": len(added), "replaced": len(replaced)},
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _import(
+    profile: str,
+    stem: str,
+    rows_path: str,
+    *,
+    confirm_replace: bool,
+    description: Optional[str],
+) -> int:
+    """Turn a confirmed `parse` payload into items, every one of them unverified.
+
+    `expected.sql_confirmed` is False for every row without exception, including the rows whose
+    sheet carried a statement: nobody ran it, and an import that marked its own rows verified would
+    forge the gate the confirmed-only rule exists to be.
+
+    `expected_value` is dropped. AH-100's shape has no home for it, and parking it in
+    `validation_notes` would put a number nothing compares against into a field a reader would
+    reasonably read as an answer key.
+    """
+    payload = json.loads(Path(rows_path).expanduser().read_text(encoding="utf-8"))
+    items = [
+        GoldenItem(
+            id=row["id"],
+            query=row["query"],
+            expected=GoldenExpected(sql=row.get("sql"), sql_confirmed=False),
+            tags=row.get("tags") or [],
+        )
+        for row in payload["rows"]
+    ]
+    return _write_items(
+        profile, stem, items, confirm_replace=confirm_replace, description=description
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Author golden-dataset items from a spreadsheet.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -251,13 +505,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     parse_cmd = sub.add_parser("parse", help="Read a question-bank CSV and print what it holds.")
     parse_cmd.add_argument("--csv", required=True, help="the question bank to read")
 
+    import_cmd = sub.add_parser("import", help="Write confirmed parse rows as unverified items.")
+    import_cmd.add_argument("--profile", required=True, help="the profile whose dataset to write")
+    import_cmd.add_argument("--dataset", required=True, help="the dataset's filename stem")
+    import_cmd.add_argument("--rows", required=True, help="the confirmed `parse` payload")
+    import_cmd.add_argument(
+        "--confirm-replace",
+        action="store_true",
+        help="agree to overwrite the items whose id already exists",
+    )
+    import_cmd.add_argument("--description", help="the dataset's description")
+
     args = parser.parse_args(argv)
 
-    payload = _parse(args.csv)
-    if payload is None:
-        return _CANNOT_START
-    print(json.dumps(payload, indent=2))
-    return 0
+    if args.cmd == "parse":
+        payload = _parse(args.csv)
+        if payload is None:
+            return _CANNOT_START
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    return _import(
+        args.profile,
+        args.dataset,
+        args.rows,
+        confirm_replace=args.confirm_replace,
+        description=args.description,
+    )
 
 
 if __name__ == "__main__":
