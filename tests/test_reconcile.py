@@ -19,6 +19,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
 
+import reconcile  # noqa: E402
 from reconcile import band, diff, parse_csv, parse_value  # noqa: E402
 
 # --- parse_value ---------------------------------------------------------
@@ -208,6 +209,32 @@ def test_band_output_is_accepted_by_the_bounds_model():
         bounds = GoldenBounds(**band(value))
         assert bounds.min_rows == 1
         assert bounds.min_value <= bounds.max_value
+
+
+# --- the band verb, at the CLI -------------------------------------------
+
+class TestBandCli:
+    """`parse_value` returns None for anything it cannot read, and `band` takes a float. The verb
+    is what stands between them, and the exit code it refuses with is the whole point: on this
+    path exit `1` is the save door's `needs_confirmation`, so a value nobody could read has to
+    come back as `2` — cannot start — rather than as a traceback landing on whatever code it likes.
+    """
+
+    def test_a_readable_value_bands_and_exits_zero(self, capsys):
+        assert reconcile.main(["band", "--value", "$4.2M", "--tolerance", "0.01"]) == 0
+        assert '"min_value"' in capsys.readouterr().out
+
+    def test_an_unreadable_value_is_refused_and_not_crashed(self, capsys):
+        code = reconcile.main(["band", "--value", "n/a"])
+        assert code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "could not read a number from --value" in captured.err
+
+    def test_the_sentinels_the_parser_knows_are_all_refused_the_same_way(self, capsys):
+        for value in ("n/a", "—", "", "not a number"):
+            assert reconcile.main(["band", "--value", value]) == 2
+            assert "reconcile band:" in capsys.readouterr().err
 
 
 # --- parse_csv -----------------------------------------------------------

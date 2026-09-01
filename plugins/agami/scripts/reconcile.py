@@ -297,7 +297,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "band":
-        print(json.dumps(band(parse_value(args.value), tolerance=args.tolerance), indent=2))
+        value = parse_value(args.value)
+        if value is None:
+            # Refused rather than crashed, and specifically not with exit 1: the band feeds a
+            # golden item, and 1 on that path is the save door's "needs confirmation" — a
+            # traceback landing on it would read as a stop somebody could say yes to.
+            print(
+                f"reconcile band: could not read a number from --value {args.value!r}; "
+                "pass the observed value as it was recorded.",
+                file=sys.stderr,
+            )
+            return 2
+        print(json.dumps(band(value, tolerance=args.tolerance), indent=2))
         return 0
 
     return 2
