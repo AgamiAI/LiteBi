@@ -23,7 +23,7 @@ Spec for the deterministic helpers: [`scripts/reconcile.py`](../../scripts/recon
 
 - **Tight loops.** This skill is a tool, not a tutorial. One question per turn, max two sentences of prose between phases.
 - **Surface mismatches loud.** A reconcile run with 9/12 matches and 3 mismatches is a SUCCESSFUL run — the mismatches are the value. Lead with what didn't match.
-- **Don't paste raw SQL in chat.** The receipt has it. Same hard rule as agami-query.
+- **Don't paste raw SQL in chat.** The receipt has it. Same hard rule as agami-query — with one exception, Phase 3e's promotion offer, where the statement is shown because it is the thing being accepted into an answer key and cannot be hidden behind a receipt link at the moment somebody agrees to replay it.
 
 ---
 
@@ -202,9 +202,11 @@ The rows that agreed are the most reusable thing this run produced: a question, 
 
 **Make the offer once, here, after the summary. Never per row.** A per-row prompt turns a twelve-number reconcile into twelve interruptions and buries the mismatches, which are the point of the run.
 
-> Ten of these agreed. Want to keep them as golden questions? I'll write each one with the statement that produced it and a ±1% band around the number, so a later run tells you if any of them drifts.
+> Ten of these agreed. Want to keep them as golden questions? I'll write each one with the statement that produced it and a ±<the run's tolerance> band around the number, so a later run tells you if any of them drifts.
 
-**Only rows whose `status` is `match` are offered.** That is the run's own tolerance — `reconcile.diff` decided it back in Phase 2c, and it is the only notion of agreement this skill has, so nothing here re-judges a number. One predicate drops `mismatch`, `error`, `missing_expected` and `missing_actual` together. **A row with no statement is never offered**: an error row carries `sql: null` (Phase 2d), so there is nothing to replay and nothing worth promoting.
+**Only rows whose `status` is `match` are offered.** That is the run's own tolerance — `reconcile.diff` decided it back in Phase 2c, and it is the only notion of agreement this skill has, so nothing here re-judges a number. One predicate drops `mismatch` and `error` together, and with them the `missing_expected` and `missing_actual` rows — those are `reconcile.diff`'s own reasons rather than a row status, and a row that could not be diffed never reached `match` either. **A row with no statement is never offered**: an error row carries `sql: null` (Phase 2d), so there is nothing to replay and nothing worth promoting.
+
+**Only a single-cell result is offered.** A row whose `recorded` carries more than one column has no single number to band, and a `bounded` item over a wider result is scored on its row count alone — it would pass forever without ever checking the number it was promoted for.
 
 **If no row agreed, make no offer at all** — not an empty one, not "there's nothing to promote here". A run where nothing matched is having a different conversation (Phase 3b), and an offer with nothing in it interrupts it.
 
@@ -225,6 +227,8 @@ Two things get past the refusal and **only one of them is right**:
 
 So the offer edits the **question**, with the person's answer to "which window?". It never edits the SQL.
 
+**Ask which window it means in the offer, before anything is written** — not after the refusal lands. A batch is written one row at a time (below), so a refusal on the seventh row arrives with six items already on disk: **items already written stay written, and nothing is rolled back**. The cheat sheet's exit-`2` row is the fallback for a question that slips through, not the plan.
+
 #### What gets written, per kept row
 
 Write the item with the **Write tool** — never a heredoc, never `python3 -c`, per [`shared/invocation-conventions.md`](../../shared/invocation-conventions.md) — to `/tmp/agami-golden-item-<ts>.json`:
@@ -237,7 +241,7 @@ Write the item with the **Write tool** — never a heredoc, never `python3 -c`, 
   "bounds": {"min_rows": 1, "max_rows": 1, "min_value": 3851100.0, "max_value": 3928900.0},
   "recorded": {"columns": ["total_revenue"], "rows": [[3890000]]},
   "tags": ["reconciled"],
-  "confirmed_by": {"method": "reconciled against the finance dashboard on 2026-08-31; agreed within ±1%"}
+  "confirmed_by": {"method": "reconciled against the finance dashboard on 2026-08-31; agreed within ±<the run's tolerance>"}
 }
 ```
 
@@ -248,7 +252,7 @@ Write the item with the **Write tool** — never a heredoc, never `python3 -c`, 
 
   ```bash
   python3 "$AGAMI_PLUGIN_ROOT/scripts/reconcile.py" band \
-    --value "<the row's actual>" --tolerance 0.01
+    --value "<the row's actual>" --tolerance <the run's tolerance>
   ```
 
   Pass the same tolerance the run diffed with. The four keys it prints *are* the `bounds` block — paste them in unchanged.
@@ -263,6 +267,8 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
 ```
 
 `<stem>` is the dataset's **filename stem** — one plain name (`reconciled`), never a path and never `reconciled.yaml`. Ask which dataset once, for the whole batch.
+
+**One call per kept row.** The door takes one item, not an array — ten kept rows are ten runs of that command, each with its own item file. The dataset is asked once; the writing is a loop.
 
 #### `confirmed_by.method` — two shapes, kept apart
 
@@ -304,7 +310,7 @@ End the turn. The user typically:
 
 1. **No automatic question generation for ambiguous labels.** If the label is too short or too vague (e.g., `Total`, `Number`, `Value`), surface to the user: *"Row 5's label is just 'Total' — too ambiguous to translate to a question. Skipping. Add more context to the CSV (e.g., `Total Revenue Q3` instead of `Total`) and re-run."* Don't guess.
 2. **Receipt is non-optional.** Every per-row run MUST produce a chart-template HTML report with the trust receipt — that's what the drill-down link points at, and it's what makes mismatches actionable. If the underlying query path can't produce a receipt (legacy pre-trust-layer model), refuse with: *"This profile pre-dates the trust-layer launch. Re-run `/agami-connect` to enable receipts, then retry."*
-3. **Don't write to the semantic model from this skill.** Reconcile reads + diffs; it never mutates a metric, a join, a column or any other part of the model. If a definitional disagreement surfaces and the user wants to update the metric, route them through `/agami-save-correction`. **The one write this skill can make is Phase 3e's promotion, and it is not a model write:** a golden dataset is the answer key that *tests* the model, not the model itself. It goes through `golden_author.py save` — that door and nothing else, never a hand-edited YAML — only for rows this run scored as agreeing, and only after the user has said yes to the offer.
+3. **Don't write to the semantic model from this skill.** Reconcile reads + diffs; it never mutates a metric, a join, a column or any other part of the model. If a definitional disagreement surfaces and the user wants to update the metric, route them through `/agami-save-correction`. **The one write this skill can make is Phase 3e's promotion, and it is not a model write:** a golden dataset is the answer key that *tests* the model, not the model itself. It goes through `golden_author.py save` — that door and nothing else, never a hand-edited YAML — by exactly two routes, with the person's yes in front of either: a row this run scored as agreeing, accepted through Phase 3e's offer, or a row it scored as a mismatch that the person has explicitly resolved in agami's favour.
 4. **CSV stays local.** Don't upload, don't summarize-and-send. The reconcile run produces local artifacts (the per-query chart HTML, and `/tmp/agami-reconcile-results-*.jsonl`, which now carries the statement behind every row as well as its numbers) and nothing leaves the machine. A promoted row stays local too: the save door writes into the profile's own `golden_datasets/` directory on this machine.
 
 ---
@@ -336,4 +342,4 @@ The screenshot is an **image of numbers**, and a misread expected value reads ex
 ## Roadmap (not in v1)
 
 - **Tableau / Looker / Mode export parsing** — parse `.twb` / `.twbx` / JSON exports directly (today a screenshot of any of them already works via the vision branch).
-- **Recurring reconcile runs** — wire into `agami test` so the golden-test suite includes reconciliation against a pinned dashboard.
+- **Recurring reconcile runs** — re-run a reconcile against a pinned dashboard on a schedule, rather than by asking each time.

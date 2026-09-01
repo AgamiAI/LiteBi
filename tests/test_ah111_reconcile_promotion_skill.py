@@ -31,6 +31,9 @@ CONVENTIONS = (SHARED / "invocation-conventions.md").read_text(encoding="utf-8")
 # over a file that also documents the mismatch conversation.
 OFFER = SKILL.split("### 3e — Offer promotion")[1].split("### 3f — Closing prompt")[0]
 
+# Slice 1's own product: the record a row is written down as, which is what Phase 3e later reads.
+RECORD = SKILL.split("### 2d — Build the row record")[1].split("## Phase 3: Present")[0]
+
 
 def test_the_skill_carries_the_four_frontmatter_keys():
     """The house shape, and the frontmatter is where the new routing triggers have to land: a
@@ -40,6 +43,45 @@ def test_the_skill_carries_the_four_frontmatter_keys():
     assert "description:" in FRONTMATTER
     assert "when_to_use:" in FRONTMATTER
     assert 'argument-hint: "<screenshot | path-to-csv | pasted numbers>"' in FRONTMATTER
+
+
+def test_the_row_record_keeps_the_statement_and_the_result_beside_the_number():
+    """Slice 1's whole product, asserted on the RECORD rather than on anything rendered from it.
+
+    The record is what Phase 3e reads to build an item, so a promotion that FORWARDS the statement
+    and the receipt instead of rebuilding them is only possible if the record carried both. And the
+    keys a reader already knows have to still be there beside them: the run writes this shape to a
+    jsonl a person opens later, and the two new keys are additive or they are a break.
+    """
+    assert '"sql":' in RECORD
+    assert '"recorded":' in RECORD
+    # `recorded` is shaped like the golden receipt — the two keys a promotion hands straight on.
+    recorded = next(line for line in RECORD.splitlines() if line.strip().startswith('"recorded":'))
+    assert '"columns"' in recorded and '"rows"' in recorded
+    # An error row carries neither, so nothing on it can be mistaken for a verified answer.
+    assert '**On a `status: "error"` row both `sql` and `recorded` are `null`.**' in RECORD
+
+    for key in (
+        "label", "question", "expected", "actual", "delta_pct",
+        "match", "status", "report_path", "error",
+    ):
+        assert f'"{key}":' in RECORD, key
+
+
+def test_sql_stays_out_of_the_narration_except_where_it_is_the_thing_being_accepted():
+    """Both halves of the shipped rule.
+
+    The rule itself still stands — agami-query spells out what it forbids, and this skill defers to
+    it. The offer is named as its one exception because what the person is accepting there is the
+    STATEMENT: a receipt link is not where you read something you are about to agree to replay.
+    """
+    style = SKILL.split("## Conversation style")[1].split("\n---")[0]
+    assert "**Don't paste raw SQL in chat.**" in style
+    assert "Same hard rule as agami-query" in style
+    assert "with one exception, Phase 3e's promotion offer" in style
+    assert "the thing being accepted into an answer key" in style
+    # One exception in the whole skill, and it is that one.
+    assert SKILL.count("exception") == 1
 
 
 def test_the_offer_is_made_once_after_the_summary_and_only_for_agreeing_rows():
@@ -68,6 +110,27 @@ def test_the_agreeing_rows_start_selected_and_the_statement_is_shown():
     assert "Every agreeing row starts selected." in OFFER
     assert "they can edit any question before it is written" in OFFER
     assert "Show the statement and the result, not just the number." in OFFER
+
+
+def test_only_a_single_cell_result_is_offered():
+    """A value band judges one number. Handed a wider result the comparator finds no single cell,
+    skips the value band and scores the item on its row count alone — so a two-column row promoted
+    here writes an answer key that passes forever without checking the number it was promoted for.
+    """
+    assert "**Only a single-cell result is offered.**" in OFFER
+    assert "more than one column" in OFFER
+    assert "scored on its row count alone" in OFFER
+
+
+def test_the_offer_carries_the_runs_own_tolerance_and_never_a_hardcoded_one():
+    """The offer is told to pass the tolerance the run diffed with, so every literal in the section
+    has to be that placeholder. A hardcoded ±1% in the sentence said out loud, in the provenance
+    line or in the band command makes a `tolerance=5%` run offer a band it did not agree on."""
+    assert "±<the run's tolerance> band around the number" in OFFER
+    assert "agreed within ±<the run's tolerance>" in OFFER
+    assert "--tolerance <the run's tolerance>" in OFFER
+    assert "0.01" not in OFFER
+    assert "±1%" not in OFFER
 
 
 def test_a_run_with_no_agreeing_rows_makes_no_offer():
@@ -112,13 +175,34 @@ def test_the_relativity_guidance_renames_the_question_and_never_reanchors_the_sq
     # And again in the cheat sheet, where somebody lands holding an exit 2.
     assert "**Rename the question, don't re-anchor the statement.**" in SKILL
 
-    forbidding = ("Never", "never", "don't", "trap")
-    offenders = [
-        line
-        for line in SKILL.splitlines()
-        if "CURRENT_DATE" in line and not any(word in line for word in forbidding)
-    ]
-    assert not offenders, f"CURRENT_DATE offered rather than refused: {offenders}"
+    # The skill mentions `CURRENT_DATE` in exactly two places and both are these lines, verbatim.
+    # A looser sweep — any line carrying a forbidding word somewhere on it — would wave through
+    # "never rewrite the question, anchor to CURRENT_DATE", which is the instruction being banned.
+    permitted = {
+        "- **Never re-anchor the statement to `CURRENT_DATE`.** It clears the lint and it is a "
+        "**trap**: the band was recorded around today's value of a window that slides, so next "
+        "month the same question asks about different days, returns a different number, and fails "
+        "against a band nobody moved. That is a false alarm on the one surface whose whole job is "
+        "to be believed.",
+        "| A promotion exits `2` saying the question moves with time and the answer key doesn't | "
+        "**Rename the question, don't re-anchor the statement.** Ask which window it meant, "
+        'rewrite the question to name it ("…in August 2026"), and re-run with the SQL exactly as '
+        "it ran. Anchoring the SQL to `CURRENT_DATE` clears the lint and bands a sliding window "
+        "around one day's value — a false alarm at the next run. |",
+    }
+    mentions = {line for line in SKILL.splitlines() if "CURRENT_DATE" in line}
+    assert mentions == permitted, f"CURRENT_DATE said in a way this test has not read: {mentions}"
+
+
+def test_the_window_is_settled_in_the_offer_and_a_late_refusal_rolls_nothing_back():
+    """Which window a relative question meant is asked BEFORE anything is written, not in reaction
+    to the refusal — because a batch is one call per row, so a refusal on the seventh row lands
+    with six items already on disk. Saying that out loud is the point: nothing is rolled back, and
+    a model that believed otherwise would go looking for an undo that does not exist."""
+    assert "**Ask which window it means in the offer, before anything is written**" in OFFER
+    assert "**items already written stay written, and nothing is rolled back**" in OFFER
+    # The cheat-sheet row stays, demoted to the fallback it is.
+    assert "is the fallback for a question that slips through, not the plan" in OFFER
 
 
 def test_the_promotion_writes_through_the_save_door_and_nothing_else():
@@ -131,6 +215,11 @@ def test_the_promotion_writes_through_the_save_door_and_nothing_else():
     assert "never a heredoc, never `python3 -c`" in OFFER
     assert "**`id` is omitted on purpose.**" in OFFER
     assert "rather than beside it" in OFFER
+    # And it is called once per row. The door reads `payload["query"]` — an array handed to it is
+    # a TypeError nobody catches, and "ask which dataset once" reads like one call if nothing says
+    # otherwise.
+    assert "**One call per kept row.**" in OFFER
+    assert "one item, not an array" in OFFER
 
 
 def test_the_band_comes_from_the_band_verb_and_not_from_prose_arithmetic():
@@ -187,9 +276,22 @@ def test_hard_rule_3_still_forbids_mutating_the_semantic_model():
     )[0]
     assert "never mutates a metric, a join, a column" in rule
     assert "/agami-save-correction" in rule
-    # …and the carve-out is exactly one door, with the user's yes in front of it.
+    # …and the carve-out is exactly one door, with the person's yes in front of it. It names BOTH
+    # routes: a hard rule is the most authoritative prose in a skill, so one that named only the
+    # offer would have a model refuse the resolution write the rest of Phase 3e requires.
     assert "golden_author.py save" in rule
-    assert "after the user has said yes" in rule
+    assert "with the person's yes in front of either" in rule
+    assert "a row this run scored as agreeing" in rule
+    assert "resolved in agami's favour" in rule
+
+
+def test_the_roadmap_no_longer_promises_the_half_this_slice_shipped():
+    """Promotion put reconciled numbers into the golden suite. What is still ahead is the recurring
+    run against a pinned dashboard, and that is all the entry may now claim."""
+    roadmap = SKILL.split("## Roadmap (not in v1)")[1]
+    assert "**Recurring reconcile runs**" in roadmap
+    assert "golden-test suite" not in roadmap
+    assert "agami test" not in roadmap
 
 
 def test_the_hard_rules_are_not_renumbered():
