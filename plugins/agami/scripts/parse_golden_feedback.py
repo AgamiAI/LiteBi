@@ -2,7 +2,8 @@
 """Parse the golden-dataset explorer's back-channel feedback block into a
 curate-ready ops set — deterministically.
 
-The explorer page renders one dataset and queues curation actions against it.
+The explorer page renders every golden dataset in a profile and queues curation
+actions against any of them, which is why each op names its own dataset.
 This script does the parse so the skill reads structured output and applies it
 through the golden write path (append-only, validator in front).
 

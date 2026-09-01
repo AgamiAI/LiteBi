@@ -29,7 +29,8 @@
                               items:[{id,dataset,question,confirmed,match,tags,must_filter,
                                       has_recorded,has_confirmed_by,sql,verdict}],
                               coverage:{dialect,tables_exercised,tables_untouched,
-                                        metrics_named,metrics_unnamed},
+                                        metrics_named,metrics_unnamed,
+                                        unreadable:[{dataset,id,reason}]},
                               lint:[{severity,code,message,locator}] }
     AGAMI_LOGO_DARK_TEXT  — full SVG content of agami-logo-dark.svg
     AGAMI_LOGO_LIGHT_TEXT — full SVG content of agami-logo-light.svg
@@ -763,7 +764,7 @@
         [t.datasets, 'Datasets', ''],
         [t.total, 'Items in the datasets', ''],
         [t.gating, 'Items that can gate a run', 'gating'],
-        [DATA.coverage.tables_untouched.length, 'Model tables no item reads', 'gap'],
+        [DATA.coverage.tables_untouched.length, 'Model tables no confirmed answer key reads', 'gap'],
       ].forEach(([n, label, cls]) => {
         counts.appendChild(el('div', { class: 'count-tile ' + cls }, [
           el('div', { class: 'n', text: String(n) }),
