@@ -1,7 +1,7 @@
 ---
 name: agami-reconcile
 description: "Reconciles known (label, expected_value) numbers from an existing dashboard against agami's answers. Input can be a SCREENSHOT of a Metabase / Power BI / Tableau / Looker dashboard (Claude's vision extracts the pairs), a CSV, or numbers pasted inline — the user doesn't need to know which; they can just ask. For each pair, the skill generates a matching NL question, runs it through the active profile's semantic model, diffs actual vs expected, and surfaces matches in green and mismatches in red with drill-down receipts. The strongest onboarding demo for a skeptical data engineer — either we agree with their numbers (trust earned via evidence) or we surface a real definitional disagreement (trust earned via transparency)."
-when_to_use: "Use when the user says 'reconcile against this dashboard', 'do these numbers match?', 'validate against my Tableau export', '/agami-reconcile <csv>', drops a screenshot of a BI dashboard (Metabase/Power BI/Tableau/Looker/spreadsheet) and asks agami to reproduce the numbers, or pastes a CSV / table of known numbers. Requires agami-connect to have been run first (need a semantic model + examples library). A high-leverage validation surface for a skeptical data team — reproduce their dashboard numbers, or surface the definitional gap."
+when_to_use: "Use when the user says 'reconcile against this dashboard', 'do these numbers match?', 'validate against my Tableau export', '/agami-reconcile <csv>', drops a screenshot of a BI dashboard (Metabase/Power BI/Tableau/Looker/spreadsheet) and asks agami to reproduce the numbers, or pastes a CSV / table of known numbers. Also use after a run, when the user says 'keep these as golden questions' or 'promote these to a golden dataset' — the rows that agreed become an answer key later runs are scored against. Requires agami-connect to have been run first (need a semantic model + examples library). A high-leverage validation surface for a skeptical data team — reproduce their dashboard numbers, or surface the definitional gap."
 argument-hint: "<screenshot | path-to-csv | pasted numbers>"
 ---
 
@@ -196,7 +196,97 @@ This is where the trust win lands. The DE doesn't have to chase the disagreement
 
 Don't dump every match's drill-down — they're not interesting. The matches build the case; the mismatches drive the conversation.
 
-### 3e — Closing prompt
+### 3e — Offer promotion
+
+The rows that agreed are the most reusable thing this run produced: a question, the statement that answered it, and a number the user's own dashboard already vouches for. That is what a golden dataset is made of — the answer key `/agami-eval` replays later to catch a regression — so offer to keep them.
+
+**Make the offer once, here, after the summary. Never per row.** A per-row prompt turns a twelve-number reconcile into twelve interruptions and buries the mismatches, which are the point of the run.
+
+> Ten of these agreed. Want to keep them as golden questions? I'll write each one with the statement that produced it and a ±1% band around the number, so a later run tells you if any of them drifts.
+
+**Only rows whose `status` is `match` are offered.** That is the run's own tolerance — `reconcile.diff` decided it back in Phase 2c, and it is the only notion of agreement this skill has, so nothing here re-judges a number. One predicate drops `mismatch`, `error`, `missing_expected` and `missing_actual` together. **A row with no statement is never offered**: an error row carries `sql: null` (Phase 2d), so there is nothing to replay and nothing worth promoting.
+
+**If no row agreed, make no offer at all** — not an empty one, not "there's nothing to promote here". A run where nothing matched is having a different conversation (Phase 3b), and an offer with nothing in it interrupts it.
+
+**Every agreeing row starts selected.** The person reviewed each row's agreement as it landed; asking them to opt each one back in asks the same question twice. They can deselect any row, and **they can edit any question before it is written** — a later run regenerates SQL from the question, so the wording *is* the item.
+
+**Show the statement and the result, not just the number.** Per row: the question (editable), the statement that answered it, and the recorded result. What they are accepting is that this statement answers this question — that is what gets replayed — and a row accepted on its number alone is a row nobody checked the meaning of.
+
+**Declining writes nothing.** No dataset is created, no file is touched, and the run ends exactly where Phase 3f leaves it. Say that when you ask, and say it again if they decline.
+
+#### A question asked relative to today
+
+The save door refuses a question asked over a window that slides when its statement is pinned to fixed dates — exit `2`, nothing written. That is the **common** case here, not the exotic one: Phase 2a's own example turns `Mean order size last 30 days` into *"What's the average order size over the last 30 days?"*, and the statement that answered it names the thirty days that were current when it ran.
+
+Two things get past the refusal and **only one of them is right**:
+
+- **Ask which window the question means, and rewrite the question to name it.** *"'The last 30 days' was 2–31 August 2026 when this ran — save it as '…in August 2026'?"* The statement stays exactly as it ran, the question finally names the window it always meant, and the item stays true for as long as it exists.
+- **Never re-anchor the statement to `CURRENT_DATE`.** It clears the lint and it is a **trap**: the band was recorded around today's value of a window that slides, so next month the same question asks about different days, returns a different number, and fails against a band nobody moved. That is a false alarm on the one surface whose whole job is to be believed.
+
+So the offer edits the **question**, with the person's answer to "which window?". It never edits the SQL.
+
+#### What gets written, per kept row
+
+Write the item with the **Write tool** — never a heredoc, never `python3 -c`, per [`shared/invocation-conventions.md`](../../shared/invocation-conventions.md) — to `/tmp/agami-golden-item-<ts>.json`:
+
+```json
+{
+  "query": "What was total revenue in Q3 2025?",
+  "sql": "<the row's `sql`, verbatim>",
+  "match": "bounded",
+  "bounds": {"min_rows": 1, "max_rows": 1, "min_value": 3851100.0, "max_value": 3928900.0},
+  "recorded": {"columns": ["total_revenue"], "rows": [[3890000]]},
+  "tags": ["reconciled"],
+  "confirmed_by": {"method": "reconciled against the finance dashboard on 2026-08-31; agreed within ±1%"}
+}
+```
+
+- **`id` is omitted on purpose.** The save door derives it from the question, exactly as the import door does, so a promotion lands **on** an already-imported question of the same wording rather than beside it as a second copy.
+- `sql` and `recorded` come from the row record (Phase 2d) as they stand. Neither is rebuilt here — the record kept them so that nobody would have to.
+- `match: "bounded"` because a reconciled number is one that legitimately moves. `bounded` with no band is refused (exit `2`), which is why the band below is not optional.
+- **`bounds` comes from the helper, never from arithmetic written in prose:**
+
+  ```bash
+  python3 "$AGAMI_PLUGIN_ROOT/scripts/reconcile.py" band \
+    --value "<the row's actual>" --tolerance 0.01
+  ```
+
+  Pass the same tolerance the run diffed with. The four keys it prints *are* the `bounds` block — paste them in unchanged.
+
+Then call the save door. It is the only writer of a golden dataset anywhere in the plugin, and this skill does not become a second one:
+
+```bash
+python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
+  --profile <profile> --dataset <stem> \
+  --item /tmp/agami-golden-item-<ts>.json \
+  > /tmp/agami-golden-save-<ts>.json
+```
+
+`<stem>` is the dataset's **filename stem** — one plain name (`reconciled`), never a path and never `reconciled.yaml`. Ask which dataset once, for the whole batch.
+
+#### `confirmed_by.method` — two shapes, kept apart
+
+The method line is what somebody consults a year later to find out where this item's authority came from, so the two ways a number reaches a dataset from here read differently on purpose. Each names **the source, the date and the tolerance**:
+
+- **Agreed** — the row matched and the person accepted the offer:
+
+  > `reconciled against <source> on <date>; agreed within ±<tolerance>`
+
+- **Resolved** — the row did *not* match, and the person judged agami right anyway:
+
+  > `reconciled against <source> on <date>; disagreed beyond ±<tolerance>, resolved in agami's favour by the analyst`
+
+`<source>` is what the numbers came from, as the user described it ("the finance dashboard", "the Q3 export"); `<date>` is the day the run happened.
+
+**The resolution path is not part of the offer.** A disagreeing row is not offered and cannot be written by accepting the offer — the selection has no room for one. If the person opens a mismatch, decides their dashboard is wrong and agami is right, they have to say so explicitly, as its own step, and it writes with the *resolved* method above. **That friction is deliberate**: promoting a mismatch writes an answer key that contradicts the number the team currently believes, and that should cost a sentence rather than a checkbox.
+
+#### If the item already exists
+
+Exit `1`, a `needs_confirmation` payload, and **nothing written**. Render the `before` AND the `after` for every id — the item on disk and the one that would take its place — ask, and only on an explicit yes re-run the **same command with `--confirm-replace` appended**. **Never pass `--confirm-replace` pre-emptively**: the flag means one thing, that a person saw both sides and said yes, and passing it before that has happened makes the stop decorative.
+
+A replacement is wholesale — the item sent is the item written — so read the `before` and carry forward whatever it holds that still applies (its `tags`, a `must_filter`) into the item JSON before you re-run. On a no, say the file is untouched and stop.
+
+### 3f — Closing prompt
 
 ```
 Re-run with `tolerance=5%` to see softer matches, or open any drill-down to find the definitional gap.
@@ -206,6 +296,7 @@ End the turn. The user typically:
 - Opens a mismatch's drill-down, finds the definitional gap, says *"the dashboard is gross-of-refunds; can we update the metric?"* — chain into `/agami-save-correction` to update the metric definition.
 - Asks `tolerance=5%` to widen the matches.
 - Asks for a different CSV.
+- Takes the promotion offer from Phase 3e, and the rows that agreed become a golden dataset later runs are scored against.
 
 ---
 
@@ -213,8 +304,8 @@ End the turn. The user typically:
 
 1. **No automatic question generation for ambiguous labels.** If the label is too short or too vague (e.g., `Total`, `Number`, `Value`), surface to the user: *"Row 5's label is just 'Total' — too ambiguous to translate to a question. Skipping. Add more context to the CSV (e.g., `Total Revenue Q3` instead of `Total`) and re-run."* Don't guess.
 2. **Receipt is non-optional.** Every per-row run MUST produce a chart-template HTML report with the trust receipt — that's what the drill-down link points at, and it's what makes mismatches actionable. If the underlying query path can't produce a receipt (legacy pre-trust-layer model), refuse with: *"This profile pre-dates the trust-layer launch. Re-run `/agami-connect` to enable receipts, then retry."*
-3. **Don't write to the semantic model from this skill.** Reconcile reads + diffs; it never mutates. If a definitional disagreement surfaces and the user wants to update the metric, route them through `/agami-save-correction`.
-4. **CSV stays local.** Don't upload, don't summarize-and-send. The reconcile run produces local artifacts (`/tmp/agami-reconcile-results-*.jsonl` + the per-query chart HTML) and nothing leaves the machine.
+3. **Don't write to the semantic model from this skill.** Reconcile reads + diffs; it never mutates a metric, a join, a column or any other part of the model. If a definitional disagreement surfaces and the user wants to update the metric, route them through `/agami-save-correction`. **The one write this skill can make is Phase 3e's promotion, and it is not a model write:** a golden dataset is the answer key that *tests* the model, not the model itself. It goes through `golden_author.py save` — that door and nothing else, never a hand-edited YAML — only for rows this run scored as agreeing, and only after the user has said yes to the offer.
+4. **CSV stays local.** Don't upload, don't summarize-and-send. The reconcile run produces local artifacts (the per-query chart HTML, and `/tmp/agami-reconcile-results-*.jsonl`, which now carries the statement behind every row as well as its numbers) and nothing leaves the machine. A promoted row stays local too: the save door writes into the profile's own `golden_datasets/` directory on this machine.
 
 ---
 
@@ -229,6 +320,10 @@ End the turn. The user typically:
 | User pastes inline CSV instead of a path | Accept it. Write to `/tmp/agami-reconcile-pasted-<ts>.csv` and proceed. |
 | Screenshot is blurry / a value is cut off / can't read a tile | Don't guess the number. Extract what's legible, and tell the user which tiles you skipped: "Couldn't read 'Pipeline value' clearly — re-snip it or type that one in." |
 | User says "reconcile my dashboard" but attaches nothing | Ask for the screenshot (or CSV / pasted numbers) per Phase 0.4 — don't proceed without the expected numbers. |
+| A promotion exits `0` | Written. Report `added` / `replaced` and the path, and say the dataset can be run with "run the evals". |
+| A promotion exits `1` with `needs_confirmation` | Nothing was written. Render the `before` and the `after` for every id, carry forward the `tags` / `must_filter` the `before` holds, ask, and re-run with `--confirm-replace` only on an explicit yes. On a no, the file is untouched. |
+| A promotion exits `2` | Cannot start. The `agami-save-golden:` line on stderr names the cause. Nothing was written; a rolled-back write left the previous bytes exactly as they were. |
+| A promotion exits `2` saying the question moves with time and the answer key doesn't | **Rename the question, don't re-anchor the statement.** Ask which window it meant, rewrite the question to name it ("…in August 2026"), and re-run with the SQL exactly as it ran. Anchoring the SQL to `CURRENT_DATE` clears the lint and bands a sliding window around one day's value — a false alarm at the next run. |
 
 ---
 

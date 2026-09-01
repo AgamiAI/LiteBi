@@ -7,6 +7,11 @@ looks at the answer and saves it — and the dataset the runner then reads holds
 That last read is the assertion that matters: the writer's only claim to correctness is that
 AH-100's reader, the one `/agami-eval` uses, accepts what it wrote.
 
+AH-111 adds a third way in and no third writer: a reconcile run's agreeing rows are promoted
+through this same save door. Those tests go further than a read-back — they hand the written item
+to the comparator `/agami-eval` scores with, because a promoted row whose band its own recorded
+result falls outside of would fail the next run as a false alarm on the day it was written.
+
 The script is driven in-process (`golden_author.main`) rather than through a subprocess so that a
 failure surfaces as a traceback in the code under test rather than as a non-zero exit code. Nothing
 is stubbed: the real column contract, the real writer, the real reader.
@@ -24,6 +29,8 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("pydantic")
+# The comparator parses the answer key's statement to find out whether the author ordered the rows.
+pytest.importorskip("sqlglot")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_SRC = REPO_ROOT / "packages" / "agami-core" / "src"
@@ -32,6 +39,9 @@ if str(PKG_SRC) not in sys.path:
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
 
 import golden_author  # noqa: E402
+import reconcile  # noqa: E402
+from execute_sql import ExecResult  # noqa: E402
+from semantic_model.comparator import compare_result_sets  # noqa: E402
 from semantic_model.golden import load_golden_datasets  # noqa: E402
 
 PROFILE = "demo"
@@ -170,3 +180,205 @@ def test_a_question_bank_imports_unconfirmed_and_one_verified_answer_confirms_it
     # …and the other two are untouched: still questions with no answer, still unable to gate.
     others = [item for item in dataset.test_cases if item.id != target]
     assert [item.expected.sql_confirmed for item in others] == [False, False]
+
+
+# --- the promotion door: a reconcile run's agreeing rows, written through the same save ---------
+
+# The dataset a promotion lands in. Separate from the imported bank on purpose: the rows a
+# reconcile run agreed on are their own body of evidence, and the two are only forced together
+# when a promoted question happens to be one somebody already imported.
+RECONCILED = "reconciled"
+
+Q3_REVENUE = "What was total revenue in Q3 2025?"
+Q3_REVENUE_SQL = (
+    "SELECT SUM(o.amount) AS total_revenue FROM orders o "
+    "WHERE o.placed_at >= '2025-07-01' AND o.placed_at < '2025-10-01'"
+)
+Q3_ACTUAL = 3890000.0
+TOLERANCE = 0.01
+
+# The two provenance shapes the skill documents. They differ in words rather than only in tone,
+# because a reader a year from now has to be able to tell "the dashboard agreed" from "the
+# dashboard disagreed and a person overruled it".
+AGREED_METHOD = "reconciled against the finance dashboard on 2026-08-31; agreed within ±1%"
+RESOLVED_METHOD = (
+    "reconciled against the finance dashboard on 2026-08-31; disagreed beyond ±1%, "
+    "resolved in agami's favour by the analyst"
+)
+
+
+def _promotion_item(
+    query: str, sql: str, actual: float, method: str, column: str = "total_revenue"
+) -> dict:
+    """One kept row as the skill writes it out — `id` omitted, band from the helper.
+
+    The band goes through `reconcile.band` rather than being written out here for the same reason
+    the skill is told to call it: two spellings of ±1% is two answers to what the run's tolerance
+    meant, and this one would be the one nobody runs.
+    """
+    return {
+        "query": query,
+        "sql": sql,
+        "match": "bounded",
+        "bounds": reconcile.band(actual, tolerance=TOLERANCE),
+        "recorded": {"columns": [column], "rows": [[actual]]},
+        "tags": ["reconciled"],
+        "confirmed_by": {"method": method},
+    }
+
+
+def test_an_agreeing_row_promotes_and_scores_on_its_own_next_run(tmp_path, monkeypatch, capsys):
+    """The promotion end to end, ending on the check that matters most.
+
+    A read-back only proves the file parses. What a promotion actually claims is that this item can
+    gate a run, so the last step hands the written `match` and `bounds` to the comparator
+    `/agami-eval` scores with, over the very result the band was drawn around. An item that scored
+    anything but a clean pass there would fail its next run as a false alarm on the day it was
+    written — which is exactly the trap the skill's relativity guidance exists to avoid, reached by
+    a different road.
+    """
+    item_file = _write(
+        tmp_path,
+        "promotion.json",
+        json.dumps(_promotion_item(Q3_REVENUE, Q3_REVENUE_SQL, Q3_ACTUAL, AGREED_METHOD)),
+    )
+    code, saved = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item", item_file],
+    )
+    assert code == 0
+    assert saved["summary"] == {"added": 1, "replaced": 0}
+
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert res.ok, res.errors
+    (promoted,) = next(d.test_cases for d in datasets if d.name == RECONCILED)
+
+    # It came through the save door, so it is confirmed and it carries the statement it verified.
+    assert promoted.expected.sql_confirmed is True
+    assert promoted.expected.sql == Q3_REVENUE_SQL
+    # A reconciled number legitimately moves, so it is banded rather than pinned.
+    assert promoted.match == "bounded"
+    assert promoted.bounds.min_value < Q3_ACTUAL < promoted.bounds.max_value
+    # The receipt is the run's own recorded result, forwarded rather than rebuilt from a number.
+    assert promoted.recorded.columns == ["total_revenue"]
+    assert promoted.recorded.rows == [[Q3_ACTUAL]]
+    assert promoted.tags == ["reconciled"]
+    # Provenance names the source, the day and the tolerance — the whole of what makes the claim
+    # auditable later.
+    for part in ("the finance dashboard", "2026-08-31", "±1%"):
+        assert part in promoted.confirmed_by.method
+
+    # …and it passes its own next run.
+    result = ExecResult(columns=list(promoted.recorded.columns), rows=[(Q3_ACTUAL,)])
+    score = compare_result_sets(
+        result,
+        result,
+        match=promoted.match,
+        bounds=promoted.bounds,
+        golden_sql=promoted.expected.sql,
+    )
+    assert score.status == "scored"
+    assert score.accuracy == 1.0
+
+    # A promotion writes the answer key and nothing else. The examples library is a different
+    # skill's business, and a reconcile run that quietly taught the model would be one.
+    assert not (tmp_path / PROFILE / "prompt_examples").exists()
+
+
+def test_a_relative_question_is_refused_until_it_names_the_window_it_meant(
+    tmp_path, monkeypatch, capsys
+):
+    """The common case, not the exotic one: the skill's own question generator produces "over the
+    last 30 days" from a label reading `Mean order size last 30 days`, and the statement that
+    answered it names the thirty days that were current when it ran.
+
+    The fix is the question, never the SQL. Anchoring the statement to `CURRENT_DATE` would also
+    clear the lint and would band a sliding window around one day's value; the edit asserted here
+    leaves the statement exactly as it ran, and the derived id follows the new wording — which is
+    the thing that makes the edit real rather than cosmetic.
+    """
+    relative = "What's the average order size over the last 30 days?"
+    named = "What's the average order size in August 2026?"
+    sql = (
+        "SELECT AVG(o.amount) AS avg_order_size FROM orders o "
+        "WHERE o.placed_at >= '2026-08-01' AND o.placed_at < '2026-09-01'"
+    )
+    item = _promotion_item(relative, sql, 84.5, AGREED_METHOD, column="avg_order_size")
+
+    refused_file = _write(tmp_path, "relative.json", json.dumps(item))
+    argv = ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item", refused_file]
+    code, payload = _run(tmp_path, monkeypatch, capsys, argv)
+    assert code == 2
+    assert payload is None
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+    edited_file = _write(tmp_path, "named.json", json.dumps({**item, "query": named}))
+    code, saved = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item", edited_file],
+    )
+    assert code == 0
+
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert res.ok, res.errors
+    (promoted,) = next(d.test_cases for d in datasets if d.name == RECONCILED)
+    # The edited question is what was written, its id was derived from the edit, and the statement
+    # is byte-for-byte the one that ran.
+    assert promoted.query == named
+    assert promoted.id == golden_author._slug(named)
+    assert promoted.id != golden_author._slug(relative)
+    assert promoted.expected.sql == sql
+
+
+def test_a_promotion_onto_an_existing_question_stops_until_it_is_confirmed(
+    tmp_path, monkeypatch, capsys
+):
+    """The append-only stop, reached the way a promotion reaches it.
+
+    The second write here is the resolution path — the same question, now vouched for as a
+    disagreement a person overruled — which is exactly the case where seeing the `before` matters:
+    the item being replaced says the dashboard agreed, and the one replacing it says it did not.
+    """
+    argv = ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item"]
+    first = _write(
+        tmp_path,
+        "agreed.json",
+        json.dumps(_promotion_item(Q3_REVENUE, Q3_REVENUE_SQL, Q3_ACTUAL, AGREED_METHOD)),
+    )
+    assert _run(tmp_path, monkeypatch, capsys, [*argv, first])[0] == 0
+
+    second = _write(
+        tmp_path,
+        "resolved.json",
+        json.dumps(_promotion_item(Q3_REVENUE, Q3_REVENUE_SQL, Q3_ACTUAL, RESOLVED_METHOD)),
+    )
+    stop_code, stop = _run(tmp_path, monkeypatch, capsys, [*argv, second])
+    assert stop_code == 1
+    (pending,) = stop["needs_confirmation"]
+    assert pending["id"] == golden_author._slug(Q3_REVENUE)
+    # Both sides, and the two provenance shapes are what tells them apart.
+    assert pending["before"]["confirmed_by"]["method"] == AGREED_METHOD
+    assert pending["after"]["confirmed_by"]["method"] == RESOLVED_METHOD
+    assert AGREED_METHOD != RESOLVED_METHOD
+
+    # Nothing was written by the stop: the file on disk still says the dashboard agreed.
+    datasets, _ = load_golden_datasets(PROFILE, tmp_path)
+    (still,) = next(d.test_cases for d in datasets if d.name == RECONCILED)
+    assert still.confirmed_by.method == AGREED_METHOD
+
+    replaced_code, replaced = _run(
+        tmp_path, monkeypatch, capsys, [*argv, second, "--confirm-replace"]
+    )
+    assert replaced_code == 0
+    assert replaced["summary"] == {"added": 0, "replaced": 1}
+
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert res.ok, res.errors
+    (resolved,) = next(d.test_cases for d in datasets if d.name == RECONCILED)
+    assert resolved.confirmed_by.method == RESOLVED_METHOD
+    # The tag survived only because the item repeated it — a replacement is wholesale.
+    assert resolved.tags == ["reconciled"]
