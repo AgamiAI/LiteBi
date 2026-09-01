@@ -355,7 +355,10 @@
 
     // How closely a run has to match the answer key, loosening left to right — the reader's own
     // list, and any other word is refused on the far side.
-    const MATCH_LEVELS = ['exact', 'values', 'shape', 'bounded', 'nonempty'];
+    // The five levels less `bounded`, which the reader is not offered: an item is bounded only
+    // together with the band it is held to, and this page carries no bounds and no way to type
+    // one. Offering it would queue a change the write door must refuse every time.
+    const MATCH_LEVELS = ['exact', 'values', 'shape', 'nonempty'];
 
     let activeTab = 'items';
     let searchQ = '';

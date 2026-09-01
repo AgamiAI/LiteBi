@@ -70,7 +70,7 @@ try:
     import agami_paths
     from semantic_model.golden import load_golden_datasets
     from semantic_model.golden_claims import read_claims
-    from semantic_model.sql_dialect import sqlglot_dialect
+    from semantic_model.sql_dialect import DialectUnresolved, sqlglot_dialect
 except ImportError as exc:
     # A fresh plugin install genuinely lacks these, and the traceback a bare ImportError prints
     # names an internal module rather than the thing to install.
@@ -127,6 +127,11 @@ def _last_run_verdicts(profile: str, art: Optional[Path]) -> dict[str, dict[str,
     file and nothing makes it unique across a profile, so a flat map would show one dataset's
     verdict beside another dataset's question.
 
+    One of that function's rules is deliberately not carried: it also skips a run that reached no
+    verdict at all, because an empty list of failures would read there as a clean sweep. This page
+    shows what each item did rather than deriving one answer from all of them, so such a run simply
+    contributes the verdicts it has.
+
     No result file at all returns `{}`, which the page renders as a dataset nobody has run yet —
     a normal state, and never an error.
     """
@@ -166,6 +171,11 @@ def _model_tables(manifest: dict) -> list[str]:
     Bare and folded because that is how `read_claims` renders a table it read, and the gap below is
     a set difference between the two. Excluded tables are left out: the runtime drops them, so a
     dataset that never asks about one has no gap to answer for.
+
+    Bare names mean two same-named tables in different subject areas fold together, so exercising
+    one marks the other covered. That is a limit of the claim this can make rather than something to
+    work around here: the claim reader returns the name the statement wrote, and a statement that
+    says `orders` does not say which area's it meant.
     """
     return sorted(
         {
@@ -190,15 +200,27 @@ def _coverage(manifest: dict, datasets: list) -> dict[str, Any]:
     matched by name against the statement's text — a weaker signal, and the page says so.
     """
     dialect = sqlglot_dialect(manifest["storage_type"])
-    statements = [
-        item.expected.sql
+    confirmed = [
+        (dataset.name, item)
         for dataset in datasets
         for item in dataset.test_cases
         if item.expected.sql_confirmed and item.expected.sql
     ]
+    statements = [item.expected.sql for _, item in confirmed]
+
     exercised: set[str] = set()
-    for sql in statements:
-        exercised |= read_claims(sql, dialect=dialect).tables
+    unreadable: list[dict[str, str]] = []
+    for dataset_name, item in confirmed:
+        claims = read_claims(item.expected.sql, dialect=dialect)
+        # A key the claim reader could not read contributes no tables, and saying nothing about that
+        # would turn its tables into the gap below — the page reporting that nothing holds a table a
+        # confirmed key demonstrably reads. That is the one direction this tab must not be wrong in,
+        # so the reason it already hands back is carried instead of dropped.
+        if claims.unreadable:
+            unreadable.append(
+                {"dataset": dataset_name, "id": item.id, "reason": claims.unreadable}
+            )
+        exercised |= claims.tables
 
     tables = _model_tables(manifest)
     text = "\n".join(statements)
@@ -216,6 +238,7 @@ def _coverage(manifest: dict, datasets: list) -> dict[str, Any]:
         # should produce the same page.
         "tables_exercised": sorted(exercised),
         "tables_untouched": [name for name in tables if name not in exercised],
+        "unreadable": unreadable,
         "metrics_named": sorted(named),
         "metrics_unnamed": [name for name in metrics if name not in named],
     }
@@ -312,9 +335,13 @@ def render(*, title: str, profile: str, payload: dict) -> str:
     logo_light_svg = LOGO_LIGHT_PATH.read_text(encoding="utf-8")
     theme_css = (SHARED_DIR / "theme.css").read_text(encoding="utf-8")
 
-    # Escape `</` so a `</script>` in a question or an answer key can't terminate the <script>
-    # block holding the payload (JS unescapes `<\/` → `</`).
-    datasets_json = json.dumps(payload).replace("</", "<\\/")
+    # Every `<` becomes a `<` escape, which JSON leaves meaning exactly `<` and the HTML
+    # tokenizer cannot read as the start of anything. Escaping only `</` is the obvious form and
+    # is not enough: an unbalanced `<!--` puts the tokenizer into script-escaped state, a later
+    # `<script` in any other item takes it to double-escaped, and there the template's own closing
+    # tag stops closing the element. The page then renders its chrome with no data and no error,
+    # which reads as a profile that has no datasets. A SQL comment produces that `<!--` by accident.
+    datasets_json = json.dumps(payload).replace("<", "\\u003c")
 
     # The payload goes in LAST, after every other placeholder, and that is deliberate rather than
     # incidental: it is somebody's question and somebody's SQL, so a case asking "how many
@@ -347,9 +374,29 @@ def main(argv: Optional[list] = None) -> int:
     args = p.parse_args(argv)
 
     art = Path(os.path.expanduser(args.artifacts_dir)).resolve() if args.artifacts_dir else None
-    payload = build_payload(args.profile, art)
+    try:
+        payload = build_payload(args.profile, art)
+    except DialectUnresolved as exc:
+        # A model that declares no storage connection cannot have its answer keys read, so the
+        # Coverage tab has nothing to say. Relayed verbatim, the way the runner relays it: the
+        # message is contractually value-free.
+        print(f"render_golden_datasets: {exc}", file=sys.stderr)
+        return 2
 
     out_path = Path(os.path.expanduser(args.out))
+    # This is the only rendered surface that carries confirmed answer keys in full, and the reason
+    # that is allowed is where it lands: the gitignored per-user half of the artifacts dir. One path
+    # component away is the committable half, so the sibling renderers' habit of writing wherever
+    # `--out` points would make the page's own licence depend on every caller remembering it.
+    local = agami_paths.local_dir(art)
+    if local not in out_path.resolve().parents:
+        print(
+            f"render_golden_datasets: --out must land under {local}, the gitignored half of the "
+            "artifacts dir. This page holds the answer key in full, so it is not written anywhere "
+            "that gets committed.",
+            file=sys.stderr,
+        )
+        return 2
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         render(

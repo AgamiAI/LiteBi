@@ -17,7 +17,7 @@ Input (stdin or --block-file):
 (value = everything up to `done`). Output (the standard contract):
 
     {"ok": true,
-     "data": {"profile": "<name>"|null, "ops": [ ...ops verbatim... ]},
+     "data": {"profile": "<name>"|null, "ops": [ ...op, dataset, id, value... ]},
      "anomalies": [...], "needs_judgment": {...}|null}
 
 The block names the profile it targets on its first line, and `data["profile"]`
@@ -44,6 +44,11 @@ _ALLOWED_OPS = frozenset(
 # lives here, at the parser, so a hand-edited page cannot route around it either.
 _CONFIRMING_FIELDS = ("sql_confirmed", "expected", "sql")
 
+# Every key an op may carry to the write door. The page builds exactly these, and an op is
+# projected onto them rather than forwarded whole, so a field the page never wrote cannot arrive
+# by way of somebody editing the block by hand.
+_OP_FIELDS = ("op", "dataset", "id", "value")
+
 
 def _key_of(line: str):
     low = line.strip().lower()
@@ -53,9 +58,15 @@ def _key_of(line: str):
     return None
 
 
-def _sections(text: str) -> dict:
-    """Split the block into {key: raw value text}, value spanning until the next key/done."""
+def _sections(text: str) -> tuple[dict, list[str]]:
+    """Split the block into {key: raw value text}, value spanning until the next key/done.
+
+    A key appearing twice keeps the last one, and says so. Silently dropping the first would let a
+    second `golden-ops:` suppress a refusal the first would have triggered, so the caller is told
+    which keys were overwritten rather than left to assume it read everything the block carried.
+    """
     out: dict = {}
+    repeated: list[str] = []
     cur_key = None
     cur_val: list[str] = []
     for raw in text.splitlines():
@@ -65,6 +76,8 @@ def _sections(text: str) -> dict:
         if k:
             if cur_key:
                 out[cur_key] = "\n".join(cur_val).strip()
+            if k in out:
+                repeated.append(k)
             cur_key = k
             cur_val = [raw.split(":", 1)[1]]
         elif cur_key:
@@ -72,12 +85,12 @@ def _sections(text: str) -> dict:
         # lines before the first key (headers) are ignored
     if cur_key:
         out[cur_key] = "\n".join(cur_val).strip()
-    return out
+    return out, repeated
 
 
 def parse(text: str) -> tuple[dict, list, dict | None]:
-    sec = _sections(text)
-    anomalies: list = []
+    sec, repeated = _sections(text)
+    anomalies: list = [{"kind": "key_repeated", "detail": key} for key in repeated]
     needs: dict | None = None
     ops: list = []
     data: dict = {"profile": None, "ops": ops}
@@ -103,6 +116,9 @@ def parse(text: str) -> tuple[dict, list, dict | None]:
         return data, anomalies, needs
 
     for op in parsed:
+        if not isinstance(op, dict):
+            anomalies.append({"kind": "op_not_an_object", "detail": type(op).__name__})
+            continue
         name = op.get("op")
         confirming = [f for f in _CONFIRMING_FIELDS if f in op]
         if confirming:
@@ -113,14 +129,33 @@ def parse(text: str) -> tuple[dict, list, dict | None]:
                 "means running it and accepting the result through the save door, not "
                 "editing the page; re-send the block without these fields",
             }
-            return data, anomalies, needs  # nothing applies from a block that tried this
-        if name not in _ALLOWED_OPS:
+            # Nothing applies from a block that tried this, including ops read before it: a block
+            # carrying one of these fields is evidence the page was hand-edited, and applying the
+            # half of it that looked well-behaved is worse than refusing the whole.
+            ops.clear()
+            return data, anomalies, needs
+        # The type is checked before the membership, not after: JSON may put a list or a dict here,
+        # and an unhashable value would raise out of the set lookup rather than be reported as the
+        # unknown op it is. This sits below the refusal above on purpose, so an op that is malformed
+        # AND carries a confirming field is still refused rather than merely dropped.
+        if not isinstance(name, str) or name not in _ALLOWED_OPS:
             anomalies.append({"kind": "unknown_op", "detail": str(name)})
             continue
         if not op.get("dataset") or not op.get("id"):
             anomalies.append({"kind": "op_missing_target", "detail": str(name)})
             continue
-        ops.append(op)
+        # `value` is what the reader typed, so it is a string or it is not a value. Refusing a
+        # structure here is what stops the field list above from being the only thing standing
+        # between a hand-edited page and a forged claim: `"value": {"sql_confirmed": true}` names
+        # none of those fields at the top level and would otherwise ride through untouched.
+        if "value" in op and not isinstance(op["value"], str):
+            anomalies.append({"kind": "op_value_not_text", "detail": str(name)})
+            continue
+        # Projected onto the keys the page emits rather than appended whole. The check above is a
+        # denylist and a denylist of three names cannot hold a rule this load-bearing — a field
+        # spelled `SQL_CONFIRMED`, or `sql_confirmed ` with a trailing space, or tucked under a key
+        # nobody thought of, passes it. What is not named here cannot reach the write door.
+        ops.append({key: op[key] for key in _OP_FIELDS if key in op})
 
     return data, anomalies, needs
 

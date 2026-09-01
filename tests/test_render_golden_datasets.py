@@ -69,7 +69,10 @@ def _model(root: Path) -> None:
                 "name": "sales",
                 "tables": [
                     {"storage_connection": "c", "schema": "SALES_DATA", "table": name}
-                    for name in ("orders", "customers", "channels")
+                    # CUSTOMERS is spelled in a different case than every answer key writes it,
+                    # so the fold in `_model_tables` is load-bearing: drop it and this table
+                    # reads as untouched while a confirmed key demonstrably joins it.
+                    for name in ("orders", "CUSTOMERS", "channels")
                 ],
             }
         )
@@ -82,7 +85,7 @@ def _model(root: Path) -> None:
             {"name": "placed_at", "type": "timestamp"},
             {"name": "total", "type": "decimal"},
         ],
-        "customers": [
+        "CUSTOMERS": [
             {"name": "id", "type": "integer", "primary_key": True},
             {"name": "name", "type": "string"},
         ],
@@ -394,9 +397,51 @@ def test_a_closing_script_tag_in_a_statement_cannot_end_the_block(artifacts):
     html = _rendered(artifacts)
 
     assert "</script><img" not in html
-    assert "<\\/script>" in html
+    # Every `<` in the payload, not only the ones that begin a closing tag — see the sibling test
+    # below for the case that forced the wider escape.
+    assert "\\u003c/script>" in html
     # …and the payload still round-trips, so the escape is reversible rather than lossy.
     assert _items(html)["escape-question"]["sql"] == "SELECT 1 -- </script>"
+
+
+def test_a_comment_opener_in_one_key_cannot_blank_the_page_via_a_tag_in_another(artifacts):
+    """The escape covers every `<`, and this is the case that requires it.
+
+    HTML's script-data tokenizer enters escaped state on an unbalanced `<!--` and double-escaped
+    state on a later `<script`; in double-escaped state the template's own closing tag stops
+    closing the element, so the page draws its chrome with no data and no error — which reads as a
+    profile that has no datasets. The two halves need not be in the same item, and a SQL comment
+    produces the `<!--` by accident."""
+    (artifacts / PROFILE / "golden_datasets" / "tokenizer.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "test_cases": [
+                    {
+                        "id": "opener",
+                        "query": "legacy report",
+                        "expected": {
+                            "sql": "SELECT 1 -- <!-- legacy pipeline",
+                            "sql_confirmed": True,
+                        },
+                    },
+                    {
+                        "id": "later-tag",
+                        "query": "does the <script tag column parse?",
+                        "expected": {"sql_confirmed": False},
+                    },
+                ]
+            }
+        )
+    )
+
+    html = _rendered(artifacts)
+
+    # Neither sequence survives into the script block, so the tokenizer never leaves script-data
+    # state and the closing tag still closes.
+    assert "<!--" not in html.split("const DATA =", 1)[1]
+    assert "<script" not in html.split("const DATA =", 1)[1]
+    assert _items(html)["opener"]["sql"] == "SELECT 1 -- <!-- legacy pipeline"
+    assert _items(html)["later-tag"]["question"] == "does the <script tag column parse?"
 
 
 # --- SC3: what the dataset never tests ------------------------------------
@@ -461,6 +506,54 @@ def test_the_tables_are_read_as_claims_and_not_as_the_author_declared_them(artif
 
     coverage = _payload(_rendered(artifacts))["coverage"]
 
+    assert coverage["tables_untouched"] == ["channels"]
+
+
+def test_an_answer_key_the_claim_reader_cannot_read_is_named_rather_than_counted(artifacts):
+    """`read_claims` returns no tables for a statement it cannot read, and silently unioning that
+    would turn the key's own tables into the gap — the page reporting that nothing holds a table a
+    confirmed key demonstrably reads. That is the one direction this tab must not be wrong in, so
+    the reason the reader hands back is carried onto the page beside the gap."""
+    (artifacts / PROFILE / "golden_datasets" / "union.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "test_cases": [
+                    {
+                        "id": "ids-across-both",
+                        "query": "Which ids appear in either table?",
+                        "expected": {
+                            "sql": "SELECT id FROM channels UNION ALL SELECT id FROM orders",
+                            "sql_confirmed": True,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    coverage = _payload(_rendered(artifacts))["coverage"]
+
+    assert [(u["dataset"], u["id"]) for u in coverage["unreadable"]] == [
+        ("union", "ids-across-both")
+    ]
+    assert coverage["unreadable"][0]["reason"]
+    # Still reported as a gap, because it genuinely is not held: the point is that the page says
+    # why rather than leaving the reader to believe a key was read when it was not.
+    assert "channels" in coverage["tables_untouched"]
+
+
+def test_a_readable_answer_key_leaves_the_unreadable_list_empty(artifacts):
+    """The empty case is the ordinary one, and a caveat that is always on says nothing."""
+    assert _payload(_rendered(artifacts))["coverage"]["unreadable"] == []
+
+
+def test_the_model_table_fold_survives_a_key_that_spells_it_differently(artifacts):
+    """The model declares CUSTOMERS and every answer key writes `customers`, because `read_claims`
+    returns the folded name. Without the fold on the model side the set difference compares two
+    spellings of one table and reports a gap that is not there."""
+    coverage = _payload(_rendered(artifacts))["coverage"]
+
+    assert "CUSTOMERS" not in coverage["tables_untouched"]
     assert coverage["tables_untouched"] == ["channels"]
 
 
@@ -687,6 +780,28 @@ def test_the_page_writes_nothing_a_rerun_would_read_as_a_run(artifacts, tmp_path
     assert sorted(p.name for p in out.iterdir()) == ["datasets-20260901-101500.html"]
 
 
+def test_the_page_is_refused_a_destination_outside_the_gitignored_half(artifacts, capsys):
+    """This is the only rendered surface carrying confirmed answer keys in full, and what licenses
+    that is where it lands. The committable half of the artifacts dir is one path component away,
+    so the licence is enforced here rather than left to each caller to remember."""
+    from render_golden_datasets import main
+
+    code = main(
+        [
+            "--profile",
+            PROFILE,
+            "--artifacts-dir",
+            str(artifacts),
+            "--out",
+            str(artifacts / PROFILE / "datasets.html"),
+        ]
+    )
+
+    assert code == 2
+    assert not (artifacts / PROFILE / "datasets.html").exists()
+    assert "gitignored" in capsys.readouterr().err
+
+
 # --- The back-channel, and the two things it may never do -----------------
 #
 # The queue lives in the browser, so what can be asserted here is the template's own markup: that
@@ -708,6 +823,16 @@ def test_exactly_the_six_queueable_actions_exist():
     """The contract's list, and a seventh verb would be a change to what this page may ask for
     rather than an implementation detail — the parser on the other side accepts these six."""
     assert set(re.findall(r"queueOp\('([a-z-]+)'", TEMPLATE)) == QUEUEABLE
+
+
+def test_the_page_never_offers_a_match_level_the_write_door_must_refuse():
+    """`bounded` is the one level that is not a level on its own: an item is bounded together with
+    the band it is held to, and this page carries no bounds and no way to type one. Offering it
+    would queue a change refused every time, which is a control whose only use is a no-op."""
+    levels = re.search(r"const MATCH_LEVELS = \[([^\]]*)\]", TEMPLATE).group(1)
+
+    assert "bounded" not in levels
+    assert set(re.findall(r"'([a-z]+)'", levels)) == {"exact", "values", "shape", "nonempty"}
 
 
 def test_no_control_grants_confirmation():

@@ -8,6 +8,7 @@ plus the anomaly / needs_judgment split for everything else.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -158,3 +159,111 @@ def test_the_page_never_emits_a_field_that_would_grant_confirmation():
     queued = re.search(r"function queueOp\(.*?\n    \}", template, re.S).group(0)
 
     assert "sql_confirmed" not in queued and "expected" not in queued
+
+
+# --- The routes around the confirmation rule ------------------------------
+#
+# The field check is a denylist of three names, and a denylist cannot hold a rule this
+# load-bearing on its own. What actually holds it is the projection below it: an op reaches the
+# write door as the four keys the page emits, so a field the page never wrote cannot arrive by
+# somebody editing the block. These are the variants that walked past the denylist.
+
+
+def _ops(*ops):
+    return "profile: demo\ngolden-ops:\n" + json.dumps(list(ops)) + "\ndone\n"
+
+
+def test_a_confirming_field_under_another_key_does_not_reach_the_write_door():
+    data, _, _ = F.parse(
+        _ops(
+            {
+                "op": "edit-question",
+                "dataset": "orders",
+                "id": "o1",
+                "value": "Why?",
+                "expected_patch": {"sql_confirmed": True, "sql": "SELECT 1"},
+            }
+        )
+    )
+
+    assert data["ops"] == [
+        {"op": "edit-question", "dataset": "orders", "id": "o1", "value": "Why?"}
+    ]
+
+
+def test_a_confirming_field_spelled_in_another_case_does_not_reach_the_write_door():
+    data, _, _ = F.parse(
+        _ops(
+            {
+                "op": "add-tag",
+                "dataset": "orders",
+                "id": "o1",
+                "value": "smoke",
+                "SQL_CONFIRMED": True,
+                "sql_confirmed ": True,
+                "confirmed_by": "you@example.com",
+            }
+        )
+    )
+
+    assert data["ops"] == [{"op": "add-tag", "dataset": "orders", "id": "o1", "value": "smoke"}]
+
+
+def test_a_value_that_is_not_text_is_refused_rather_than_carried():
+    """`"value": {"sql_confirmed": true}` names none of the denied fields at the top level. A value
+    is what somebody typed, so a structure here is not a value."""
+    data, anomalies, _ = F.parse(
+        _ops({"op": "set-match", "dataset": "orders", "id": "o1", "value": {"sql_confirmed": True}})
+    )
+
+    assert data["ops"] == []
+    assert [a["kind"] for a in anomalies] == ["op_value_not_text"]
+
+
+def test_the_refusal_discards_ops_read_before_it():
+    """A block carrying a confirming field is evidence the page was hand-edited, so applying the
+    half of it that looked well-behaved is worse than refusing the whole."""
+    data, _, needs = F.parse(
+        _ops(
+            {"op": "add-tag", "dataset": "orders", "id": "first", "value": "smoke"},
+            {"op": "add-tag", "dataset": "orders", "id": "second", "sql_confirmed": True},
+        )
+    )
+
+    assert needs["kind"] == "confirmation_cannot_be_granted"
+    assert data["ops"] == []
+
+
+def test_an_entry_that_is_not_an_object_is_an_anomaly_rather_than_a_traceback():
+    """The block is text somebody pasted, and every other malformation here degrades. A traceback
+    where the refusal is signalled is the wrong failure mode even when it fails closed."""
+    data, anomalies, _ = F.parse(
+        _ops({"op": "add-tag", "dataset": "orders", "id": "o1", "value": "smoke"}, 5, "x", None)
+    )
+
+    assert len(data["ops"]) == 1
+    assert [a["kind"] for a in anomalies] == ["op_not_an_object"] * 3
+
+
+def test_an_op_name_that_is_not_a_string_is_an_unknown_op_rather_than_a_traceback():
+    """A list is unhashable, so looking it up in the allowed set raises rather than reporting."""
+    data, anomalies, _ = F.parse(_ops({"op": ["add-tag"], "dataset": "orders", "id": "o1"}))
+
+    assert data["ops"] == []
+    assert [a["kind"] for a in anomalies] == ["unknown_op"]
+
+
+def test_a_repeated_key_is_reported_rather_than_silently_overwritten():
+    """A second `golden-ops:` keeps the last block, which means a first block that would have
+    tripped the refusal can be suppressed by appending a clean one. The last block still wins, but
+    the caller is told the earlier one existed."""
+    block = (
+        "profile: demo\n"
+        'golden-ops:\n[{"op":"add-tag","dataset":"o","id":"a","sql_confirmed":true}]\n'
+        'golden-ops:\n[{"op":"add-tag","dataset":"o","id":"b","value":"t"}]\ndone\n'
+    )
+
+    data, anomalies, _ = F.parse(block)
+
+    assert [a["kind"] for a in anomalies] == ["key_repeated"]
+    assert [o["id"] for o in data["ops"]] == ["b"]
