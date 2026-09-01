@@ -172,6 +172,24 @@
     .cov-group.gap .name-chip { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
     .cov-empty { font-size: 12px; color: var(--muted); font-style: italic; }
 
+    /* Lint */
+    .tab-note { font-size: 12px; color: var(--muted); margin: 0 0 16px; max-width: 760px; }
+    .lint-row {
+      border: 1px solid var(--border); border-left-width: 4px; border-radius: 10px;
+      background: var(--bg-elev); padding: 12px 16px; margin-bottom: 10px;
+      display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+    }
+    .lint-row.error { border-left-color: var(--bad-border); }
+    .lint-row.warning { border-left-color: var(--warn-fg); }
+    .pill.error { background: var(--bad-bg); color: var(--bad-fg); border: 1px solid var(--bad-border); }
+    .pill.warning { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg); }
+    .lint-locator { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+    .lint-code { font-size: 11px; color: var(--muted); }
+    .lint-message { flex-basis: 100%; font-size: 13px; }
+
+    .verdict { font-size: 13px; margin-top: 8px; }
+    .verdict .score { font-variant-numeric: tabular-nums; font-weight: 600; }
+
     .empty { color: var(--muted); padding: 48px; text-align: center; }
     footer.page-footer {
       margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
@@ -233,6 +251,7 @@
     const TABS = [
       { id: 'items', label: 'Items' },
       { id: 'coverage', label: 'Coverage' },
+      { id: 'lint', label: 'Lint' },
     ];
 
     let activeTab = 'items';
@@ -325,6 +344,26 @@
       ]);
     }
 
+    // What the last run decided about this case, when a run has left a result on disk. A case no
+    // run has covered says nothing here rather than reading as a pass.
+    function verdictLine(item) {
+      const v = item.verdict;
+      if (!v) return null;
+      const line = el('div', { class: 'verdict' });
+      line.appendChild(el('span', {
+        text: 'Last run: ' + (v.passed ? 'reproduced the answer key' : 'did not reproduce the answer key'),
+      }));
+      if (v.score !== null && v.score !== undefined) {
+        line.appendChild(el('span', { class: 'score', text: ' · accuracy ' + Number(v.score).toFixed(3) }));
+      }
+      if (v.gated) {
+        line.appendChild(el('span', {
+          text: ' · the dataset requires a filter that statement does not write',
+        }));
+      }
+      return line;
+    }
+
     function renderItem(item) {
       const head = el('div', { class: 'item-head' }, [
         el('span', { class: 'pill dataset', text: item.dataset }),
@@ -340,6 +379,7 @@
       return el('div', { class: 'item ' + statusOf(item) }, [
         head,
         factsLine(item),
+        verdictLine(item),
         statement(item),
       ]);
     }
@@ -348,6 +388,13 @@
       const all = DATA.items || [];
       const shown = all.filter(item => matchesSearch(item) && passesFilter(item));
       setSearchCounts(shown.length + ' of ' + plural(all.length, 'item'));
+      // A dataset nobody has run yet is the normal starting state, so it is said once here rather
+      // than left as a column of blanks a reader has to interpret.
+      if (!all.some(item => item.verdict)) {
+        root.appendChild(el('p', { class: 'tab-note',
+          text: 'No run has scored these cases yet, so no item carries a verdict. Run the dataset '
+            + 'and re-render this page to see one.' }));
+      }
       if (!shown.length) {
         root.appendChild(el('div', { class: 'empty', text: 'No item matches.' }));
         return;
@@ -402,6 +449,31 @@
         c.metrics_named));
     }
 
+    // ---- Lint ----
+    // The reader's own findings, then this page's two derivations. No row carries the statement it
+    // is about: the reader keeps the answer key out of a finding because a finding travels, and a
+    // row that quoted the key would stop matching what the reader reports.
+    function renderLintTab(root) {
+      const all = DATA.lint || [];
+      const shown = all.filter(row =>
+        !searchQ || (row.message + ' ' + row.code + ' ' + row.locator).toLowerCase().includes(searchQ));
+      setSearchCounts(shown.length + ' of ' + plural(all.length, 'finding'));
+      if (!all.length) {
+        root.appendChild(el('div', { class: 'empty', text: 'Nothing to report — every case reads cleanly.' }));
+        return;
+      }
+      root.appendChild(el('p', { class: 'tab-note',
+        text: 'What the dataset reader reports about these files, plus the two this page derives: '
+          + 'a confirmed answer key nobody signed for, and a case with no record of what the answer '
+          + 'looked like on the day.' }));
+      shown.forEach(row => root.appendChild(el('div', { class: 'lint-row ' + row.severity }, [
+        el('span', { class: 'pill ' + row.severity, text: row.severity }),
+        el('span', { class: 'lint-locator', text: row.locator }),
+        el('span', { class: 'lint-code', text: row.code }),
+        el('div', { class: 'lint-message', text: row.message }),
+      ])));
+    }
+
     // ---- Chrome ----
     function tabCount(id) {
       switch (id) {
@@ -409,6 +481,7 @@
         // The gap rather than the whole model: the count worth carrying on a tab label is the one
         // somebody has to act on.
         case 'coverage': return DATA.coverage.tables_untouched.length;
+        case 'lint':     return (DATA.lint || []).length;
         default:         return null;
       }
     }
@@ -466,6 +539,7 @@
       switch (activeTab) {
         case 'items': renderItemsTab(root); break;
         case 'coverage': renderCoverageTab(root); break;
+        case 'lint': renderLintTab(root); break;
       }
     }
     function renderAll() {

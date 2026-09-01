@@ -485,3 +485,203 @@ def test_metrics_are_reported_apart_from_the_tables(artifacts):
     assert coverage["metrics_unnamed"] == ["revenue_total"]
     # …and the page says which of the two a reader is looking at.
     assert "matched by name against the answer key" in TEMPLATE
+
+
+# --- SC5: the lint rows are the reader's own ------------------------------
+
+
+def test_the_lint_rows_match_what_the_reader_reports(artifacts):
+    """Both interpret the same file, and a page that disagreed with the validator would be worse
+    than no page: a reader would fix what the page named and the reader would still refuse it."""
+    from semantic_model.golden import load_golden_datasets
+
+    _, res = load_golden_datasets(PROFILE, artifacts)
+    rows = _payload(_rendered(artifacts))["lint"]
+
+    assert res.findings, "the fixture is meant to carry a relativity fault"
+    for finding in res.findings:
+        assert {
+            "severity": finding.severity,
+            "code": finding.code,
+            "message": finding.message,
+            "locator": finding.locator or "",
+        } in rows
+
+
+def test_no_lint_row_carries_the_statement_it_is_about(artifacts):
+    """`golden.py` deliberately keeps the answer key out of a finding, because a finding travels
+    wherever its caller sends it. This page renders the key elsewhere; the lint rows have to keep
+    matching what the reader reports, so they carry none of it."""
+    rows = json.dumps(_payload(_rendered(artifacts))["lint"])
+
+    for sql in (ORDERS_COUNT_SQL, ORDERS_BY_CUSTOMER_SQL, REVENUE_LAST_QUARTER_SQL):
+        assert sql not in rows
+    assert "SUM(total)" not in rows and "'2024-01-01'" not in rows
+
+
+def test_the_relativity_fault_reaches_the_page(artifacts):
+    """The one fault AH-100 reports on this fixture: a question asked against today over an answer
+    key pinned to a fixed date. The two agree today and drift apart on their own."""
+    codes = {row["code"]: row for row in _payload(_rendered(artifacts))["lint"]}
+
+    assert codes["golden_relative_question_frozen_sql"]["severity"] == "error"
+    assert codes["golden_relative_question_frozen_sql"]["locator"] == (
+        "revenue.yaml[revenue-last-quarter]"
+    )
+
+
+def test_the_page_adds_its_own_two_derivations(artifacts):
+    """A confirmed key nobody signed for, and a case with no receipt of what the answer looked like
+    on the day. Neither is a fault the reader reports — both are warnings rather than errors,
+    because the case still gates correctly."""
+    rows = _payload(_rendered(artifacts))["lint"]
+    by_code = {}
+    for row in rows:
+        by_code.setdefault(row["code"], []).append(row["locator"])
+
+    assert by_code["golden_confirmed_without_confirmed_by"] == ["orders.yaml[orders-by-customer]"]
+    assert by_code["golden_no_recorded_receipt"] == [
+        "orders.yaml[orders-draft]",
+        "revenue.yaml[revenue-last-quarter]",
+    ]
+    assert {
+        row["severity"] for row in rows if row["code"] != "golden_relative_question_frozen_sql"
+    } == {"warning"}
+
+
+# --- SC4: the last run's verdict, and no run at all -----------------------
+
+
+def _outcome(item_key: str, **overrides: Any) -> dict[str, Any]:
+    """One case as a run's artifact records it."""
+    return {
+        "item_key": item_key,
+        "question": "recorded by the run",
+        "expected_sql": "",
+        "generated_sql": "",
+        "confirmed": True,
+        "passed": True,
+        "gated": False,
+        "score": {"status": "scored", "accuracy": 1.0, "reason": "every row matched"},
+        "claims": None,
+        "section": "pass",
+        **overrides,
+    }
+
+
+def _write_run(artifacts: Path, stamp: str, dataset: str, items: list, selection=None) -> None:
+    out = artifacts / "local" / "eval" / PROFILE
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{stamp}.json").write_text(
+        json.dumps(
+            {
+                "run_id": stamp,
+                "profile": PROFILE,
+                "dataset": dataset,
+                "selection": selection,
+                "summary": {"total": len(items), "completed": True},
+                "items": items,
+                "findings": [],
+            }
+        )
+    )
+
+
+def test_an_items_last_verdict_renders_when_a_run_left_one(artifacts):
+    """After a run, the question is which cases stopped matching — so the verdict is on the item
+    rather than one page away."""
+    _write_run(
+        artifacts,
+        "20260901-101500",
+        "orders",
+        [
+            _outcome("orders-count"),
+            _outcome(
+                "orders-by-customer",
+                passed=False,
+                gated=True,
+                section="failure",
+                score={"status": "scored", "accuracy": 0.5, "reason": "half the rows matched"},
+            ),
+        ],
+    )
+
+    items = _items(_rendered(artifacts))
+
+    assert items["orders-count"]["verdict"] == {
+        "passed": True,
+        "gated": False,
+        "confirmed": True,
+        "section": "pass",
+        "score": 1.0,
+    }
+    assert items["orders-by-customer"]["verdict"]["passed"] is False
+    assert items["orders-by-customer"]["verdict"]["gated"] is True
+    # A case the run never covered says nothing rather than saying it passed.
+    assert items["orders-draft"]["verdict"] is None
+
+
+def test_a_dataset_nobody_has_run_is_not_an_error_state(artifacts):
+    """The normal starting state. Every verdict is absent, the page still renders, and it says so
+    in its own words rather than leaving a column of blanks."""
+    html = _rendered(artifacts)
+
+    assert all(item["verdict"] is None for item in _payload(html)["items"])
+    assert PLACEHOLDER_RE.findall(html) == []
+    assert "No run has scored these cases yet" in TEMPLATE
+
+
+def test_a_verdict_never_crosses_from_one_dataset_to_another(artifacts):
+    """An item id is unique within its file and nothing makes it unique across a profile, so the
+    verdicts are keyed per dataset — otherwise one dataset's run would answer for another's case."""
+    _write_run(artifacts, "20260901-101500", "revenue", [_outcome("orders-count", passed=False)])
+
+    items = _items(_rendered(artifacts))
+
+    assert items["orders-count"]["verdict"] is None
+
+
+def test_a_run_that_was_a_selection_is_not_read_as_the_last_run(artifacts):
+    """AH-110's rule, mirrored: a `--tag` slice or a re-run of the failures describes only some of
+    the dataset, so reading it would report a narrower run as the whole one."""
+    _write_run(artifacts, "20260901-090000", "orders", [_outcome("orders-count")])
+    _write_run(
+        artifacts,
+        "20260901-101500",
+        "orders",
+        [_outcome("orders-count", passed=False, section="failure")],
+        selection="tag=smoke",
+    )
+
+    assert _items(_rendered(artifacts))["orders-count"]["verdict"]["passed"] is True
+
+
+def test_an_unreadable_record_costs_that_record_and_not_the_page(artifacts):
+    """A hand-edited artifact, or one written before the verdict fields existed. The page shows no
+    verdict rather than a wrong one, and falls back to the newest record it can read."""
+    _write_run(artifacts, "20260901-090000", "orders", [_outcome("orders-count")])
+    out = artifacts / "local" / "eval" / PROFILE
+    (out / "20260901-101500.json").write_text("{not json at all")
+
+    assert _items(_rendered(artifacts))["orders-count"]["verdict"]["passed"] is True
+
+
+def test_the_page_writes_nothing_a_rerun_would_read_as_a_run(artifacts, tmp_path):
+    """The page lands in the directory AH-110 globs for `*.json` to find the previous run, so a
+    manifest dropped beside it would be read back as a run record — of a run that never happened."""
+    from render_golden_datasets import main
+
+    out = artifacts / "local" / "eval" / PROFILE
+    code = main(
+        [
+            "--profile",
+            PROFILE,
+            "--artifacts-dir",
+            str(artifacts),
+            "--out",
+            str(out / "datasets-20260901-101500.html"),
+        ]
+    )
+
+    assert code == 0
+    assert sorted(p.name for p in out.iterdir()) == ["datasets-20260901-101500.html"]
