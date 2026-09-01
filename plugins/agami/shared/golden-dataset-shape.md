@@ -69,7 +69,7 @@ test_cases:
       chart_type: bar
       data_shape: category_value
       validation_notes: Counted at order grain, so nothing joins in to fan the count out.
-    match: values
+    match: exact
     must_filter: [status]
     recorded:
       columns: [channel, order_count]
@@ -117,7 +117,12 @@ Alongside `expected`, an item takes six optional fields:
 - `match` — how closely the run has to match the answer key, loosening left to
   right: `exact`, `values`, `shape`, `bounded`, `nonempty`. **Defaults to
   `exact`**, so an item that says nothing is held to the strictest reading. Any
-  other word is refused.
+  other word is refused. Loosen only for a reason the answer itself gives:
+  columns pair by value at every level, so differing names or order never call
+  for it. `values` forgives a floating-point tail **and an extra column**, which
+  makes it right for a result carrying a real float and wrong for a count — the
+  extra column it waves through is the most common way a generated statement is
+  wrong.
 - `bounds` — the band `match: bounded` is judged against: `min_rows` /
   `max_rows` on the number of rows, and `min_value` / `max_value` on a
   single-cell numeric answer. All four keys are optional but at least one has to

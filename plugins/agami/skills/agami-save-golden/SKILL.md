@@ -144,15 +144,14 @@ Write the item with the **Write tool** as JSON — the same rule as any JSON fil
   "sql": "SELECT channel, COUNT(*) AS order_count FROM orders WHERE status = 'paid' AND placed_at >= '2024-01-01' AND placed_at < '2025-01-01' GROUP BY channel",
   "recorded": { "columns": ["channel", "order_count"], "rows": [["web", 812], ["mobile", 517]] },
   "confirmed_by": { "method": "read on screen and accepted by the analyst who asked" },
-  "tags": ["orders"],
-  "match": "values"
+  "tags": ["orders"]
 }
 ```
 
 - `id` is optional — derived from the question when absent, the same way the import door derives it, so saving an answer to an imported question lands on that item rather than beside it.
 - `recorded` is the **receipt**: what the answer looked like on the day. It is never the comparison target; a run is judged against `expected`. Take the columns and rows from the result the user just looked at.
 - `confirmed_by.method` is free text and is **required** — an answer key whose provenance is blank cannot be audited later, and the script refuses without it. Say how it was checked ("read on screen and accepted", "cross-checked against the finance close"), not who in a way that names a person.
-- `match` is optional and defaults to `exact`. Reach for `values` when column order or naming shouldn't matter, or `bounded` **with** a `bounds` block for an answer that legitimately moves — see [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md). `bounded` with no band is refused with exit `2`: a level with nothing to consult would keep passing forever.
+- `match` is optional and **defaults to `exact`, which is almost always the right answer**. Column pairing is by value at every level — neither a column's name nor its position is ever consulted — so "the names or the order might differ" is never a reason to loosen. `values` forgives exactly two things: a floating-point tail, and an extra column the question did not ask for. Reach for it when the answer carries a real float, and **not for a count or a result whose columns the question already names** — over-answering is the most common way a generated statement is wrong, and `values` is the level that forgives it. `bounded` takes a `bounds` block, for an answer that legitimately moves — see [`shared/golden-dataset-shape.md`](../../shared/golden-dataset-shape.md). `bounded` with no band is refused with exit `2`: a level with nothing to consult would keep passing forever.
 - `must_filter` gates *how* the answer was reached. Add it when the question only means what it says with a filter in place (`must_filter: [status]`).
 
 `match`, `bounds` and `must_filter` all reach the written item exactly as sent — which is why a replacement has to repeat whatever the existing item carried (Phase 4).
