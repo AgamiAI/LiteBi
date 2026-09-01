@@ -246,7 +246,11 @@ def _parse_rows(header: list[str], body: list[list[str]]) -> dict[str, Any]:
     # here would turn a clash they need to see into two rows that both look fine.
     derived: dict[str, int] = {}
 
-    for number, row in enumerate(body, start=1):
+    # From 2, not 1: `body` is everything after the header, and a header is mandatory, so the
+    # first data row is the sheet's second line. Numbering from 1 here would report a number one
+    # short of the row a person opens, which is worse than no number at all — they look at a line
+    # that holds a perfectly good question and cannot see what was wrong with it.
+    for number, row in enumerate(body, start=2):
         query = _cell(row, columns.get("query"))
         if not query:
             skipped.append({"row": number, "reason": "empty question"})
@@ -670,7 +674,10 @@ def _save(
             fields[key] = payload[key]
 
     return _write_items(
-        profile, stem, [GoldenItem(**fields)], confirm_replace=confirm_replace,
+        profile,
+        stem,
+        [GoldenItem(**fields)],
+        confirm_replace=confirm_replace,
         description=description,
     )
 

@@ -128,7 +128,8 @@ def test_an_empty_question_is_skipped_and_counted(tmp_path, monkeypatch, capsys)
     )
     assert code == 0
     assert payload["summary"] == {"parsed": 2, "skipped": 1}
-    assert payload["skipped"] == [{"row": 2, "reason": "empty question"}]
+    # Sheet row 3: the header is row 1 and the blank sits under the first question.
+    assert payload["skipped"] == [{"row": 3, "reason": "empty question"}]
     assert [row["query"] for row in payload["rows"]] == [QUERY, "How many customers are on file?"]
 
 
@@ -141,7 +142,8 @@ def test_a_question_of_only_punctuation_is_skipped_and_counted(tmp_path, monkeyp
     code, payload, _ = _parse(tmp_path, monkeypatch, capsys, f"question\n???\n{QUERY}\n")
     assert code == 0
     assert payload["summary"] == {"parsed": 1, "skipped": 1}
-    assert payload["skipped"] == [{"row": 1, "reason": "question has no usable characters"}]
+    # Sheet row 2 — the first line under the header.
+    assert payload["skipped"] == [{"row": 2, "reason": "question has no usable characters"}]
 
 
 def test_two_questions_that_slug_alike_get_distinct_ids(tmp_path, monkeypatch, capsys):
@@ -435,9 +437,7 @@ def test_a_failed_reread_on_a_new_dataset_leaves_nothing_behind(tmp_path, monkey
 METHOD = "read on screen and accepted"
 RELATIVE = "How many orders were placed in the last 7 days?"
 FROZEN_SQL = "SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= '2026-01-01'"
-ANCHORED_SQL = (
-    "SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= CURRENT_DATE - 7"
-)
+ANCHORED_SQL = "SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= CURRENT_DATE - 7"
 
 
 def _item_file(tmp_path, **kw) -> str:
@@ -520,7 +520,10 @@ def test_a_duplicate_save_confirmed_replaces_the_item_in_place(tmp_path, monkeyp
     assert _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, rows)))[0] == 0
 
     code, payload, _ = _run(
-        tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path), "orders", "--confirm-replace")
+        tmp_path,
+        monkeypatch,
+        capsys,
+        _save_argv(_item_file(tmp_path), "orders", "--confirm-replace"),
     )
     assert code == 0
     assert payload["replaced"] == ["how-many-orders-have-been-placed"]
@@ -689,9 +692,7 @@ def _json_file(tmp_path, name: str, body) -> str:
 
 def test_an_item_missing_its_statement_refuses_rather_than_crashing(tmp_path, monkeypatch, capsys):
     """A save-door item with no `sql` key: ordinary input, and a `KeyError` before the fix."""
-    item = _json_file(
-        tmp_path, "item.json", {"query": QUERY, "confirmed_by": {"method": METHOD}}
-    )
+    item = _json_file(tmp_path, "item.json", {"query": QUERY, "confirmed_by": {"method": METHOD}})
     code, _, err = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
     assert code == 2
     assert golden_author._PREFIX in err
@@ -867,9 +868,15 @@ def test_a_duplicated_id_never_reports_more_items_than_it_wrote(tmp_path, monkey
     `--confirm-replace` the duplicate lands: exit 0, `replaced: [q1, q1]`, and one item on disk with
     the first row's question gone and nothing said about it.
     """
-    assert _run(
-        tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, [_row(QUERY, id="q1")]))
-    )[0] == 0
+    assert (
+        _run(
+            tmp_path,
+            monkeypatch,
+            capsys,
+            _import_argv(_rows_file(tmp_path, [_row(QUERY, id="q1")])),
+        )[0]
+        == 0
+    )
     code, payload, err = _run(
         tmp_path,
         monkeypatch,
