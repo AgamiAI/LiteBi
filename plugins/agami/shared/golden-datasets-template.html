@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<!--
+  agami · golden dataset explorer — used by the agami-eval / golden-authoring skills via
+  scripts/render_golden_datasets.py.
+
+  A run report says what broke. This page says what the dataset IS: every case, what can
+  actually gate a run, what the model defines that no answer key exercises, and what the
+  reader has already reported a fault on. Self-contained: opens from file:// in any
+  browser, no server, no relative-path dependencies.
+
+  Two rules this page keeps, both asserted by tests/test_render_golden_datasets.py:
+    * NO control grants confirmation. Withdrawing it needs no evidence; granting it from
+      a browser is forging ground truth, and the fastest possible way to make a failing
+      suite green. Confirming happens by running the case and accepting the result.
+    * NO statement is editable. A SQL box beside a failing item is a one-click path to
+      making the answer key agree with the bug.
+
+  NOTE: the placeholder names below are written WITHOUT their double-brace wrappers on
+  purpose — the renderer does a blanket string replace, and a real "{{...}}" token inside
+  this comment would catch it.
+
+  Renderer fills:
+    REPORT_TITLE          — "Golden datasets · <profile>"
+    GENERATED_AT          — ISO8601 UTC timestamp
+    PROFILE               — the active profile name
+    DATASETS_JSON         — the payload (see render_golden_datasets.py::build_payload):
+                            { profile, totals:{datasets,total,gating},
+                              datasets:[{name,description,category,total,gating}],
+                              items:[{id,dataset,question,confirmed,match,tags,must_filter,
+                                      has_recorded,has_confirmed_by,sql,verdict}],
+                              coverage:{dialect,tables_exercised,tables_untouched,
+                                        metrics_named,metrics_unnamed},
+                              lint:[{severity,code,message,locator}] }
+    AGAMI_LOGO_DARK_TEXT  — full SVG content of agami-logo-dark.svg
+    AGAMI_LOGO_LIGHT_TEXT — full SVG content of agami-logo-light.svg
+    THEME_CSS             — shared/theme.css, the one palette
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{REPORT_TITLE}} — agami</title>
+  <style>
+{{THEME_CSS}}
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px 32px 48px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--fg); line-height: 1.5;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; }
+
+    header.dashboard-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 24px; margin-bottom: 12px;
+    }
+    .logo a { display: inline-block; line-height: 0; text-decoration: none; }
+    .logo svg { display: block; height: 26px; width: auto; }
+    .logo-light-mode { display: inline-block; }
+    .logo-dark-mode { display: none; }
+    @media (prefers-color-scheme: dark) {
+      .logo-light-mode { display: none; }
+      .logo-dark-mode { display: inline-block; }
+    }
+    h1.dashboard-title { font-size: 20px; font-weight: 600; margin: 0; flex: 1; text-align: right; }
+    .meta { font-size: 12px; color: var(--muted); margin-bottom: 18px;
+            display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .meta code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+    /* The header's counts */
+    .counts { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 8px; }
+    .count-tile {
+      border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elev);
+      padding: 12px 18px; min-width: 150px;
+    }
+    .count-tile .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .count-tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.04em; }
+    .count-tile.gating .n { color: var(--ok-fg); }
+    .count-tile.gap .n { color: var(--warn-fg); }
+    .counts-note { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+
+    /* Toolbar: search + tabs + status filter */
+    .toolbar {
+      position: sticky; top: 0; z-index: 50;
+      background: var(--bg); padding: 12px 0 0;
+      border-bottom: 1px solid var(--border); margin-bottom: 20px;
+    }
+    .search-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .search-input {
+      flex: 1; min-width: 260px; font: inherit; font-size: 15px; padding: 10px 14px;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--bg-elev); color: var(--fg);
+    }
+    .search-input:focus { outline: 2px solid var(--accent); outline-offset: -2px; border-color: var(--accent); }
+    .search-counts { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .tab-bar { display: flex; gap: 2px; align-items: flex-end; flex-wrap: wrap; margin-top: 12px; }
+    .tab-bar button {
+      font: inherit; font-size: 13px; font-weight: 500; padding: 9px 16px; cursor: pointer;
+      background: transparent; color: var(--muted);
+      border: none; border-bottom: 2px solid transparent;
+      display: flex; align-items: center; gap: 7px;
+    }
+    .tab-bar button:hover { color: var(--fg); }
+    .tab-bar button.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-bar button .tab-count {
+      font-size: 11px; font-weight: 600; background: var(--code-bg); color: var(--muted);
+      padding: 1px 7px; border-radius: 999px; min-width: 18px; text-align: center;
+    }
+    .tab-bar button.active .tab-count { background: var(--accent); color: #fff; }
+    .filter-chips { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 12px 0 4px; }
+    .filter-chips .filter-label {
+      font-size: 11px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.04em; margin-right: 4px;
+    }
+    .filter-chips button {
+      font: inherit; font-size: 12px; font-weight: 500; padding: 5px 12px; border-radius: 999px;
+      cursor: pointer; background: var(--bg-elev); color: var(--muted); border: 1px solid var(--border);
+    }
+    .filter-chips button:hover { color: var(--fg); }
+    .filter-chips button.active { color: var(--accent); border-color: var(--accent); background: var(--bg); }
+    .hl { background: var(--hi-bg); padding: 0 2px; border-radius: 2px; }
+
+    /* One case */
+    .item {
+      border: 1px solid var(--border); border-left-width: 4px; border-radius: 12px;
+      background: var(--bg-elev); margin-bottom: 14px; padding: 16px 18px;
+    }
+    .item.confirmed { border-left-color: var(--ok-border); }
+    .item.unconfirmed { border-left-color: var(--info-border); }
+    .item.failing { border-left-color: var(--bad-border); }
+    .item-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .question { font-size: 15px; font-weight: 600; flex: 1; min-width: 260px; }
+    .item-key { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px; color: var(--muted); }
+    .pill {
+      font-size: 10px; padding: 2px 9px; border-radius: 999px; letter-spacing: 0.04em;
+      text-transform: uppercase; font-weight: 600; white-space: nowrap;
+    }
+    .pill.confirmed { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid var(--ok-border); }
+    .pill.unconfirmed { background: var(--info-bg); color: var(--accent); border: 1px solid var(--info-border); }
+    .pill.dataset { background: var(--code-bg); color: var(--muted); border: 1px solid var(--border); }
+    .facts { font-size: 12px; color: var(--muted); margin-top: 8px;
+             display: flex; gap: 14px; flex-wrap: wrap; }
+    .facts code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; color: var(--fg); }
+
+    .statement { border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      background: var(--bg); margin-top: 12px; }
+    .statement .label {
+      font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 7px 12px; border-bottom: 1px solid var(--border); background: var(--bg-elev);
+    }
+    .statement pre {
+      margin: 0; padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.5;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .statement pre.absent { color: var(--muted); font-style: italic; }
+
+    .empty { color: var(--muted); padding: 48px; text-align: center; }
+    footer.page-footer {
+      margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
+      font-size: 12px; color: var(--muted);
+    }
+    footer.page-footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="dashboard-header">
+      <div class="logo">
+        <a href="https://agami.ai" target="_blank" rel="noopener">
+          <span class="logo-light-mode">{{AGAMI_LOGO_DARK_TEXT}}</span>
+          <span class="logo-dark-mode">{{AGAMI_LOGO_LIGHT_TEXT}}</span>
+        </a>
+      </div>
+      <h1 class="dashboard-title">{{REPORT_TITLE}}</h1>
+    </header>
+    <div class="meta">
+      <span>Generated <span id="generated-at">{{GENERATED_AT}}</span></span>
+      <span>· profile <code>{{PROFILE}}</code></span>
+      <span>· <span id="totals-meta"></span></span>
+    </div>
+
+    <div class="counts" id="counts"></div>
+    <p class="counts-note" id="counts-note"></p>
+
+    <div class="toolbar">
+      <div class="search-row">
+        <input class="search-input" id="search" type="search"
+          placeholder="Search the current tab…" autocomplete="off" />
+        <span class="search-counts" id="search-counts"></span>
+      </div>
+      <div class="tab-bar" id="tab-bar"></div>
+      <div class="filter-chips" id="filter-chips">
+        <span class="filter-label">Status</span>
+        <button type="button" data-filter="all" class="active">All</button>
+        <button type="button" data-filter="confirmed">Confirmed</button>
+        <button type="button" data-filter="unconfirmed">Unconfirmed</button>
+        <button type="button" data-filter="failing">Failing</button>
+      </div>
+    </div>
+
+    <div id="tab-content"></div>
+
+    <footer class="page-footer">
+      Rendered by agami from the dataset files themselves — nothing here was run, and nothing
+      here was decided by a model. This page is written under your artifacts directory and is not
+      committed.
+      <a href="https://agami.ai" target="_blank" rel="noopener">agami.ai</a>
+    </footer>
+  </div>
+
+  <script>
+    "use strict";
+    const DATA = {{DATASETS_JSON}};
+
+    const TABS = [
+      { id: 'items', label: 'Items' },
+    ];
+
+    let activeTab = 'items';
+    let searchQ = '';
+    let activeFilter = 'all';
+
+    // Every value from the payload is written with textContent — it is somebody's question and
+    // somebody's SQL. The only innerHTML on the page clears a container before a redraw.
+    function el(tag, attrs, kids) {
+      const n = document.createElement(tag);
+      if (attrs) for (const k in attrs) {
+        const v = attrs[k];
+        if (v === null || v === undefined || v === false) continue;
+        if (k === 'class') n.className = v;
+        else if (k === 'text') n.textContent = String(v);
+        else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
+        else n.setAttribute(k, v);
+      }
+      (kids || []).forEach(c => c && n.appendChild(c));
+      return n;
+    }
+
+    function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    // The search hit, marked in the text it was found in. Builds text nodes and spans rather than
+    // markup, so a question containing a tag is still shown as the text somebody typed.
+    function highlight(text, q) {
+      const span = document.createElement('span');
+      if (!q || !text) { span.textContent = text || ''; return span; }
+      const re = new RegExp(escapeRegex(q), 'gi');
+      let last = 0, m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) span.appendChild(document.createTextNode(text.slice(last, m.index)));
+        span.appendChild(el('span', { class: 'hl', text: m[0] }));
+        last = re.lastIndex;
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+      if (last < text.length) span.appendChild(document.createTextNode(text.slice(last)));
+      return span;
+    }
+    const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+
+    // ---- Search / filter ----
+    function haystack(item) {
+      return [item.question, item.id, item.dataset, item.sql, (item.tags || []).join(' ')]
+        .join(' ').toLowerCase();
+    }
+    function matchesSearch(item) { return !searchQ || haystack(item).includes(searchQ); }
+    function passesFilter(item) {
+      switch (activeFilter) {
+        case 'confirmed':   return item.confirmed === true;
+        case 'unconfirmed': return item.confirmed !== true;
+        case 'failing':     return !!item.verdict && item.verdict.passed === false;
+        default:            return true;
+      }
+    }
+
+    // ---- Items ----
+    function statusOf(item) {
+      if (item.verdict && item.verdict.passed === false) return 'failing';
+      return item.confirmed ? 'confirmed' : 'unconfirmed';
+    }
+
+    function factsLine(item) {
+      const line = el('div', { class: 'facts' });
+      line.appendChild(el('span', { text: 'match: ' + item.match }));
+      line.appendChild(el('span', {
+        text: 'tags: ' + ((item.tags || []).length ? item.tags.join(', ') : 'none'),
+      }));
+      line.appendChild(el('span', {
+        text: 'must_filter: ' + ((item.must_filter || []).length ? item.must_filter.join(', ') : 'none'),
+      }));
+      line.appendChild(el('span', {
+        text: item.has_recorded ? 'has a recorded receipt' : 'no recorded receipt',
+      }));
+      line.appendChild(el('span', {
+        text: item.has_confirmed_by ? 'signed for' : 'nobody signed for it',
+      }));
+      return line;
+    }
+
+    // The answer key, shown and never editable. Changing one goes through a file and a diff:
+    // a SQL box beside a failing case is a one-click path to making the test agree with the bug.
+    function statement(item) {
+      const body = item.sql
+        ? el('pre', { text: item.sql })
+        : el('pre', { class: 'absent', text: 'this case has no answer key yet, so it cannot gate a run' });
+      return el('div', { class: 'statement' }, [
+        el('div', { class: 'label', text: 'Answer key — read-only' }),
+        body,
+      ]);
+    }
+
+    function renderItem(item) {
+      const head = el('div', { class: 'item-head' }, [
+        el('span', { class: 'pill dataset', text: item.dataset }),
+        el('span', {
+          class: 'pill ' + (item.confirmed ? 'confirmed' : 'unconfirmed'),
+          text: item.confirmed ? 'confirmed' : 'unconfirmed',
+        }),
+        el('span', { class: 'item-key', text: item.id }),
+      ]);
+      const question = el('div', { class: 'question' });
+      question.appendChild(highlight(item.question, searchQ));
+      head.insertBefore(question, head.firstChild);
+      return el('div', { class: 'item ' + statusOf(item) }, [
+        head,
+        factsLine(item),
+        statement(item),
+      ]);
+    }
+
+    function renderItemsTab(root) {
+      const all = DATA.items || [];
+      const shown = all.filter(item => matchesSearch(item) && passesFilter(item));
+      setSearchCounts(shown.length + ' of ' + plural(all.length, 'item'));
+      if (!shown.length) {
+        root.appendChild(el('div', { class: 'empty', text: 'No item matches.' }));
+        return;
+      }
+      shown.forEach(item => root.appendChild(renderItem(item)));
+    }
+
+    // ---- Chrome ----
+    function tabCount(id) {
+      switch (id) {
+        case 'items': return (DATA.items || []).length;
+        default:      return null;
+      }
+    }
+    function renderTabBar() {
+      const bar = document.getElementById('tab-bar');
+      bar.innerHTML = '';
+      TABS.forEach(t => {
+        const b = el('button', {
+          type: 'button',
+          class: t.id === activeTab ? 'active' : '',
+          text: t.label,
+          onclick: () => {
+            activeTab = t.id;
+            document.getElementById('search').value = '';
+            searchQ = '';
+            renderAll();
+          },
+        });
+        const n = tabCount(t.id);
+        if (n !== null) b.appendChild(el('span', { class: 'tab-count', text: String(n) }));
+        bar.appendChild(b);
+      });
+      // The status chips read an item's own state, so they are for the Items tab only.
+      document.getElementById('filter-chips').style.display = activeTab === 'items' ? 'flex' : 'none';
+    }
+    function setSearchCounts(text) { document.getElementById('search-counts').textContent = text || ''; }
+
+    function renderCounts() {
+      const counts = document.getElementById('counts');
+      counts.innerHTML = '';
+      const t = DATA.totals;
+      // The two counts side by side, labelled apart. A dataset of forty items with three confirmed
+      // gates on three, and one number here would read as forty items of coverage.
+      [
+        [t.datasets, 'Datasets', ''],
+        [t.total, 'Items in the datasets', ''],
+        [t.gating, 'Items that can gate a run', 'gating'],
+      ].forEach(([n, label, cls]) => {
+        counts.appendChild(el('div', { class: 'count-tile ' + cls }, [
+          el('div', { class: 'n', text: String(n) }),
+          el('div', { class: 'label', text: label }),
+        ]));
+      });
+      document.getElementById('counts-note').textContent =
+        t.gating + ' of ' + plural(t.total, 'item') + ' can fail a run. The rest have no confirmed '
+        + 'answer key, so they are reported and gate nothing.';
+      document.getElementById('totals-meta').textContent =
+        plural(t.datasets, 'dataset') + ' · ' + plural(t.total, 'item');
+    }
+
+    function renderBody() {
+      const root = document.getElementById('tab-content');
+      root.innerHTML = '';
+      switch (activeTab) {
+        case 'items': renderItemsTab(root); break;
+      }
+    }
+    function renderAll() {
+      renderTabBar();
+      renderBody();
+    }
+
+    document.getElementById('search').addEventListener('input', ev => {
+      searchQ = ev.target.value.trim().toLowerCase();
+      renderBody();
+    });
+    document.querySelectorAll('#filter-chips button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        activeFilter = btn.getAttribute('data-filter');
+        document.querySelectorAll('#filter-chips button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderBody();
+      });
+    });
+
+    renderCounts();
+    renderAll();
+  </script>
+</body>
+</html>
