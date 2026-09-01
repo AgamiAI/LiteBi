@@ -397,3 +397,91 @@ def test_a_closing_script_tag_in_a_statement_cannot_end_the_block(artifacts):
     assert "<\\/script>" in html
     # …and the payload still round-trips, so the escape is reversible rather than lossy.
     assert _items(html)["escape-question"]["sql"] == "SELECT 1 -- </script>"
+
+
+# --- SC3: what the dataset never tests ------------------------------------
+
+
+def test_coverage_names_a_model_table_no_item_touches(artifacts):
+    """The reason this page exists. A dataset of forty questions that never touches one table gives
+    a false sense of coverage, and the model change that breaks that table passes cleanly — so the
+    gap is computed rather than left to a reader to notice."""
+    coverage = _payload(_rendered(artifacts))["coverage"]
+
+    assert coverage["tables_untouched"] == ["channels"]
+    assert coverage["tables_exercised"] == ["customers", "orders"]
+
+
+def test_only_a_confirmed_answer_key_counts_as_coverage(artifacts):
+    """An unconfirmed case cannot fail a run, so a table only it reads is a table nothing holds the
+    model to. Counting it would report coverage that gates on nothing."""
+    (artifacts / PROFILE / "golden_datasets" / "channels.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "test_cases": [
+                    {
+                        "id": "channels-count",
+                        "query": "How many channels are there?",
+                        "expected": {
+                            "sql": "SELECT COUNT(*) FROM channels",
+                            "sql_confirmed": False,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    coverage = _payload(_rendered(artifacts))["coverage"]
+
+    assert coverage["tables_untouched"] == ["channels"]
+
+
+def test_the_tables_are_read_as_claims_and_not_as_the_author_declared_them(artifacts):
+    """Coverage reads `read_claims`, the one reader of a statement in this repository. What the
+    author wrote under `expected.tables_used` is exactly the blind spot the tab exists to catch, so
+    a case that declares a table its statement never reads must not close the gap."""
+    (artifacts / PROFILE / "golden_datasets" / "declared.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "test_cases": [
+                    {
+                        "id": "declared-channels",
+                        "query": "How many orders have been placed, again?",
+                        "expected": {
+                            "sql": "SELECT COUNT(*) FROM orders",
+                            "sql_confirmed": True,
+                            "tables_used": ["channels"],
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    coverage = _payload(_rendered(artifacts))["coverage"]
+
+    assert coverage["tables_untouched"] == ["channels"]
+
+
+def test_the_dialect_comes_from_the_model_rather_than_a_default(artifacts):
+    """A statement read in the wrong grammar describes a different statement, and on some engines
+    parses to no tables at all — which would report every table as untouched."""
+    storage = artifacts / PROFILE / "datasources" / "c" / "storage.yaml"
+
+    assert _payload(_rendered(artifacts))["coverage"]["dialect"] == "postgres"
+
+    storage.write_text(yaml.safe_dump({"name": "c", "storage_type": "Snowflake"}))
+    assert _payload(_rendered(artifacts))["coverage"]["dialect"] == "snowflake"
+
+
+def test_metrics_are_reported_apart_from_the_tables(artifacts):
+    """A metric is not one of the seven claims a statement is read into, so it is matched by name
+    against the statement text — weaker evidence than a table claim, kept under its own key so the
+    tab cannot present the two as the same thing."""
+    coverage = _payload(_rendered(artifacts))["coverage"]
+
+    assert coverage["metrics_named"] == ["order_count"]
+    assert coverage["metrics_unnamed"] == ["revenue_total"]
+    # …and the page says which of the two a reader is looking at.
+    assert "matched by name against the answer key" in TEMPLATE

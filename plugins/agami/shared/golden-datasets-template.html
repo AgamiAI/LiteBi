@@ -157,6 +157,21 @@
     }
     .statement pre.absent { color: var(--muted); font-style: italic; }
 
+    /* Coverage */
+    .cov-group { margin-bottom: 26px; }
+    .cov-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 4px; }
+    .cov-head h2 { font-size: 15px; margin: 0; font-weight: 600; }
+    .cov-head .n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .cov-note { font-size: 12px; color: var(--muted); margin: 0 0 10px; max-width: 760px; }
+    .name-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+    .name-chip {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+      padding: 4px 10px; border-radius: 999px;
+      background: var(--code-bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .cov-group.gap .name-chip { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
+    .cov-empty { font-size: 12px; color: var(--muted); font-style: italic; }
+
     .empty { color: var(--muted); padding: 48px; text-align: center; }
     footer.page-footer {
       margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
@@ -217,6 +232,7 @@
 
     const TABS = [
       { id: 'items', label: 'Items' },
+      { id: 'coverage', label: 'Coverage' },
     ];
 
     let activeTab = 'items';
@@ -339,11 +355,61 @@
       shown.forEach(item => root.appendChild(renderItem(item)));
     }
 
+    // ---- Coverage ----
+    // A named group of tables or metrics. `note` is what the reader has to know to read the list
+    // correctly — how strong the evidence under it is — and it is per-group because the two kinds
+    // of evidence on this tab are not the same strength.
+    function coverageGroup(title, note, names, cls) {
+      const shown = names.filter(name => !searchQ || name.toLowerCase().includes(searchQ));
+      const group = el('div', { class: 'cov-group ' + (cls || '') }, [
+        el('div', { class: 'cov-head' }, [
+          el('h2', { text: title }),
+          el('span', { class: 'n', text: String(names.length) }),
+        ]),
+        el('p', { class: 'cov-note', text: note }),
+      ]);
+      const list = el('div', { class: 'name-grid' });
+      if (!shown.length) {
+        list.appendChild(el('span', { class: 'cov-empty', text: names.length ? 'nothing matches the search' : 'none' }));
+      }
+      shown.forEach(name => list.appendChild(el('span', { class: 'name-chip', text: name })));
+      group.appendChild(list);
+      return group;
+    }
+
+    function renderCoverageTab(root) {
+      const c = DATA.coverage;
+      setSearchCounts('read in ' + c.dialect);
+      root.appendChild(coverageGroup(
+        'Model tables no confirmed answer key reads',
+        'The gap. Nothing here is held to anything, so a model change that breaks one of these '
+          + 'tables passes every case in these datasets.',
+        c.tables_untouched, 'gap'));
+      root.appendChild(coverageGroup(
+        'Tables the confirmed answer keys read',
+        'Read out of each statement itself — one of the seven claims a statement is read into — '
+          + 'rather than from what the author declared it uses.',
+        c.tables_exercised));
+      root.appendChild(coverageGroup(
+        'Metrics no confirmed answer key names',
+        'Weaker evidence than the tables above: a metric is not one of those seven claims, so this '
+          + 'is matched by name against the answer key text. A metric spelled out by hand in a '
+          + 'statement reads as absent here.',
+        c.metrics_unnamed, 'gap'));
+      root.appendChild(coverageGroup(
+        'Metrics a confirmed answer key names',
+        'Also matched by name against the answer key text, and not a claim about the statement.',
+        c.metrics_named));
+    }
+
     // ---- Chrome ----
     function tabCount(id) {
       switch (id) {
-        case 'items': return (DATA.items || []).length;
-        default:      return null;
+        case 'items':    return (DATA.items || []).length;
+        // The gap rather than the whole model: the count worth carrying on a tab label is the one
+        // somebody has to act on.
+        case 'coverage': return DATA.coverage.tables_untouched.length;
+        default:         return null;
       }
     }
     function renderTabBar() {
@@ -380,6 +446,7 @@
         [t.datasets, 'Datasets', ''],
         [t.total, 'Items in the datasets', ''],
         [t.gating, 'Items that can gate a run', 'gating'],
+        [DATA.coverage.tables_untouched.length, 'Model tables no item reads', 'gap'],
       ].forEach(([n, label, cls]) => {
         counts.appendChild(el('div', { class: 'count-tile ' + cls }, [
           el('div', { class: 'n', text: String(n) }),
@@ -398,6 +465,7 @@
       root.innerHTML = '';
       switch (activeTab) {
         case 'items': renderItemsTab(root); break;
+        case 'coverage': renderCoverageTab(root); break;
       }
     }
     function renderAll() {
