@@ -44,7 +44,7 @@
 {{THEME_CSS}}
     * { box-sizing: border-box; }
     body {
-      margin: 0; padding: 24px 32px 48px;
+      margin: 0; padding: 24px 32px 110px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       background: var(--bg); color: var(--fg); line-height: 1.5;
     }
@@ -190,6 +190,74 @@
     .verdict { font-size: 13px; margin-top: 8px; }
     .verdict .score { font-variant-numeric: tabular-nums; font-weight: 600; }
 
+    /* Queueing a change */
+    .actions-row {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border);
+    }
+    .chip-btn {
+      font: inherit; font-size: 12px; font-weight: 500; padding: 5px 12px; border-radius: 999px;
+      cursor: pointer; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .chip-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .chip-btn.danger:hover { border-color: var(--bad-border); color: var(--bad-fg); }
+    .mini-input {
+      font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 8px;
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .mini-input.wide { flex: 1; min-width: 240px; }
+    .hint { font-size: 12px; color: var(--muted); }
+    .item.removed .question, .item.removed .facts { text-decoration: line-through; }
+    .pill.removal { background: var(--bad-bg); color: var(--bad-fg); border: 1px solid var(--bad-border); }
+    .queue-row {
+      border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev);
+      padding: 10px 14px; margin-bottom: 8px;
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    }
+    .queue-value { font-size: 12px; color: var(--fg); background: var(--code-bg);
+      padding: 2px 8px; border-radius: 6px; }
+    .queue-row .chip-btn { margin-left: auto; }
+
+    .sticky-footer {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: var(--bg-elev); border-top: 1px solid var(--border);
+      padding: 14px 32px; z-index: 100;
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    }
+    .sticky-footer .pending-summary { font-size: 13px; color: var(--fg); }
+    .sticky-footer .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    .sticky-footer button {
+      font: inherit; font-size: 14px; font-weight: 500; padding: 8px 16px; border-radius: 6px;
+      cursor: pointer; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .sticky-footer button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    .sticky-footer button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .modal {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
+      display: flex; align-items: center; justify-content: center; z-index: 200; padding: 20px;
+    }
+    .modal[hidden] { display: none; }
+    .modal-card {
+      background: var(--bg); border-radius: 12px; padding: 24px; max-width: 720px; width: 100%;
+      max-height: 80vh; overflow: auto; border: 1px solid var(--border);
+    }
+    .modal-card h2 { margin: 0 0 8px; font-size: 18px; }
+    .modal-card .modal-hint { font-size: 13px; color: var(--muted); margin: 0 0 14px; }
+    .modal-card textarea {
+      width: 100%; min-height: 200px; font: inherit; font-size: 13px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--code-bg); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; padding: 12px; resize: vertical;
+    }
+    .modal-card .modal-actions { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+    .modal-card .modal-actions button {
+      font: inherit; font-size: 14px; font-weight: 500; padding: 8px 14px; border-radius: 6px;
+      cursor: pointer; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .modal-card .modal-actions button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    .modal-card .modal-actions .modal-status { margin-left: auto; font-size: 12px; color: var(--muted); }
+
     .empty { color: var(--muted); padding: 48px; text-align: center; }
     footer.page-footer {
       margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
@@ -244,6 +312,36 @@
     </footer>
   </div>
 
+  <div class="sticky-footer">
+    <div class="pending-summary" id="pending-summary">
+      Nothing queued yet — tag, retag, loosen a match, reword a question, remove a case, or
+      withdraw a confirmation.
+    </div>
+    <div class="actions">
+      <button type="button" id="btn-reset">Reset all</button>
+      <button type="button" id="btn-generate" class="primary" disabled>
+        Generate feedback for Claude
+      </button>
+    </div>
+  </div>
+
+  <div class="modal" id="modal" hidden>
+    <div class="modal-card">
+      <h2>Send to Claude</h2>
+      <p class="modal-hint">
+        Copy this block and paste it back into Claude — agami applies each change through the
+        golden-dataset write door, which re-reads the file and refuses anything the validator
+        refuses. Nothing here confirms an answer key: that happens by running the case.
+      </p>
+      <textarea id="modal-text" readonly></textarea>
+      <div class="modal-actions">
+        <button type="button" id="modal-copy" class="primary">Copy to clipboard</button>
+        <button type="button" id="modal-close">Close</button>
+        <span class="modal-status" id="modal-status"></span>
+      </div>
+    </div>
+  </div>
+
   <script>
     "use strict";
     const DATA = {{DATASETS_JSON}};
@@ -252,11 +350,27 @@
       { id: 'items', label: 'Items' },
       { id: 'coverage', label: 'Coverage' },
       { id: 'lint', label: 'Lint' },
+      { id: 'queued', label: 'Queued' },
     ];
+
+    // How closely a run has to match the answer key, loosening left to right — the reader's own
+    // list, and any other word is refused on the far side.
+    const MATCH_LEVELS = ['exact', 'values', 'shape', 'bounded', 'nonempty'];
 
     let activeTab = 'items';
     let searchQ = '';
     let activeFilter = 'all';
+
+    // What the reader has asked for, in memory and nowhere else: nothing queued has happened yet,
+    // and it stays a proposal until Claude applies it through the write door that re-reads the file
+    // and runs the validator.
+    const queue = [];
+    function queueOp(op, item, value) {
+      const entry = { op: op, dataset: item.dataset, id: item.id };
+      if (value !== undefined) entry.value = value;
+      queue.push(entry);
+      renderAll();
+    }
 
     // Every value from the payload is written with textContent — it is somebody's question and
     // somebody's SQL. The only innerHTML on the page clears a container before a redraw.
@@ -309,6 +423,25 @@
     }
 
     // ---- Items ----
+    // The case as it would read once the queue is applied. Folded rather than written into the
+    // payload, so the page can always say what is on disk and what is only asked for — and so
+    // Undo is a splice rather than a repair.
+    function effItem(item) {
+      const out = Object.assign({}, item, { tags: (item.tags || []).slice() });
+      queue.forEach(entry => {
+        if (entry.dataset !== item.dataset || entry.id !== item.id) return;
+        if (entry.op === 'add-tag') { if (out.tags.indexOf(entry.value) === -1) out.tags.push(entry.value); }
+        else if (entry.op === 'remove-tag') out.tags = out.tags.filter(t => t !== entry.value);
+        else if (entry.op === 'set-match') out.match = entry.value;
+        else if (entry.op === 'edit-question') out.question = entry.value;
+        else if (entry.op === 'remove-item') out.removed = true;
+        // Only ever downward: there is no op that sets this the other way, and the parser refuses
+        // one even if this page were hand-edited.
+        else if (entry.op === 'withdraw-confirmation') out.confirmed = false;
+      });
+      return out;
+    }
+
     function statusOf(item) {
       if (item.verdict && item.verdict.passed === false) return 'failing';
       return item.confirmed ? 'confirmed' : 'unconfirmed';
@@ -364,6 +497,59 @@
       return line;
     }
 
+    // What may be asked for on one case. Every one of these WEAKENS or restates a claim; there is
+    // deliberately no control here that strengthens one, and none that touches the statement.
+    function actionsRow(item) {
+      const row = el('div', { class: 'actions-row' });
+      (item.tags || []).forEach(tag => row.appendChild(el('button', {
+        type: 'button', class: 'chip-btn', text: tag + ' ×',
+        title: 'Queue removing this tag',
+        onclick: () => queueOp('remove-tag', item, tag),
+      })));
+
+      const tagInput = el('input', { type: 'text', class: 'mini-input', placeholder: 'add a tag…' });
+      // `change` rather than `input`: the row is redrawn on every queued op, and queueing per
+      // keystroke would take the field out from under whoever is typing in it.
+      tagInput.addEventListener('change', () => {
+        const value = tagInput.value.trim();
+        if (value) queueOp('add-tag', item, value);
+      });
+      row.appendChild(tagInput);
+
+      const match = el('select', { class: 'mini-input', title: 'How closely a run must match' });
+      MATCH_LEVELS.forEach(level => {
+        const option = el('option', { value: level, text: level });
+        if (level === item.match) option.selected = true;
+        match.appendChild(option);
+      });
+      match.addEventListener('change', () => queueOp('set-match', item, match.value));
+      row.appendChild(match);
+
+      const question = el('input', { type: 'text', class: 'mini-input wide', value: item.question });
+      question.addEventListener('change', () => {
+        if (question.value !== item.question) queueOp('edit-question', item, question.value);
+      });
+      row.appendChild(question);
+
+      row.appendChild(el('button', {
+        type: 'button', class: 'chip-btn danger', text: 'Remove case',
+        onclick: () => queueOp('remove-item', item),
+      }));
+      if (item.confirmed) {
+        row.appendChild(el('button', {
+          type: 'button', class: 'chip-btn', text: 'Withdraw confirmation',
+          onclick: () => queueOp('withdraw-confirmation', item),
+        }));
+      } else {
+        row.appendChild(el('span', {
+          class: 'hint',
+          text: 'This page cannot confirm a case — run the case and accept the result, which is '
+            + 'the only door an answer key gets confirmed through.',
+        }));
+      }
+      return row;
+    }
+
     function renderItem(item) {
       const head = el('div', { class: 'item-head' }, [
         el('span', { class: 'pill dataset', text: item.dataset }),
@@ -372,20 +558,24 @@
           text: item.confirmed ? 'confirmed' : 'unconfirmed',
         }),
         el('span', { class: 'item-key', text: item.id }),
+        // A queued removal keeps drawing the case: agreeing to delete something you can no longer
+        // read is what the append-only rule objects to.
+        item.removed ? el('span', { class: 'pill removal', text: 'queued for removal' }) : null,
       ]);
       const question = el('div', { class: 'question' });
       question.appendChild(highlight(item.question, searchQ));
       head.insertBefore(question, head.firstChild);
-      return el('div', { class: 'item ' + statusOf(item) }, [
+      return el('div', { class: 'item ' + statusOf(item) + (item.removed ? ' removed' : '') }, [
         head,
         factsLine(item),
         verdictLine(item),
         statement(item),
+        actionsRow(item),
       ]);
     }
 
     function renderItemsTab(root) {
-      const all = DATA.items || [];
+      const all = (DATA.items || []).map(effItem);
       const shown = all.filter(item => matchesSearch(item) && passesFilter(item));
       setSearchCounts(shown.length + ' of ' + plural(all.length, 'item'));
       // A dataset nobody has run yet is the normal starting state, so it is said once here rather
@@ -474,6 +664,55 @@
       ])));
     }
 
+    // ---- Queued ----
+    function renderQueuedTab(root) {
+      setSearchCounts('');
+      if (!queue.length) {
+        root.appendChild(el('div', { class: 'empty',
+          text: 'Nothing queued. Queue changes on the Items tab, then come back here to read them '
+            + 'before you send them.' }));
+        return;
+      }
+      root.appendChild(el('p', { class: 'tab-note',
+        text: 'Nothing here has happened yet. Send the block below to Claude and each change goes '
+          + 'through the write door, which re-reads the file and refuses what the validator '
+          + 'refuses.' }));
+      queue.forEach((entry, index) => {
+        root.appendChild(el('div', { class: 'queue-row' }, [
+          el('span', { class: 'pill dataset', text: entry.op }),
+          el('span', { class: 'item-key', text: entry.dataset + ' / ' + entry.id }),
+          entry.value === undefined ? null : el('span', { class: 'queue-value', text: entry.value }),
+          el('button', {
+            type: 'button', class: 'chip-btn', text: 'Undo',
+            onclick: () => { queue.splice(index, 1); renderAll(); },
+          }),
+        ]));
+      });
+    }
+
+    function updateFooter() {
+      const summary = document.getElementById('pending-summary');
+      const generate = document.getElementById('btn-generate');
+      generate.disabled = queue.length === 0;
+      summary.textContent = queue.length
+        ? plural(queue.length, 'change') + ' queued — none of them applied yet.'
+        : 'Nothing queued yet — tag, retag, loosen a match, reword a question, remove a case, or '
+          + 'withdraw a confirmation.';
+    }
+
+    // The block Claude reads back. `profile:` first so the apply step never falls back to whichever
+    // profile happens to be active, the ops under a bare header with the array on its own line, and
+    // `done` last — the model explorer's format, unchanged.
+    function generateFeedback() {
+      const lines = [];
+      if (queue.length) { lines.push('golden-ops:'); lines.push(JSON.stringify(queue)); }
+      if (lines.length) lines.unshift('profile: ' + (DATA.profile || ''));
+      if (lines.length) lines.push('done');
+      document.getElementById('modal-text').value = lines.join('\n') + '\n';
+      document.getElementById('modal').hidden = false;
+      document.getElementById('modal-status').textContent = '';
+    }
+
     // ---- Chrome ----
     function tabCount(id) {
       switch (id) {
@@ -482,6 +721,7 @@
         // somebody has to act on.
         case 'coverage': return DATA.coverage.tables_untouched.length;
         case 'lint':     return (DATA.lint || []).length;
+        case 'queued':   return queue.length;
         default:         return null;
       }
     }
@@ -506,6 +746,7 @@
       });
       // The status chips read an item's own state, so they are for the Items tab only.
       document.getElementById('filter-chips').style.display = activeTab === 'items' ? 'flex' : 'none';
+      document.getElementById('search').style.display = activeTab === 'queued' ? 'none' : '';
     }
     function setSearchCounts(text) { document.getElementById('search-counts').textContent = text || ''; }
 
@@ -540,11 +781,13 @@
         case 'items': renderItemsTab(root); break;
         case 'coverage': renderCoverageTab(root); break;
         case 'lint': renderLintTab(root); break;
+        case 'queued': renderQueuedTab(root); break;
       }
     }
     function renderAll() {
       renderTabBar();
       renderBody();
+      updateFooter();
     }
 
     document.getElementById('search').addEventListener('input', ev => {
@@ -558,6 +801,25 @@
         btn.classList.add('active');
         renderBody();
       });
+    });
+
+    document.getElementById('btn-reset').addEventListener('click', () => {
+      queue.length = 0;
+      renderAll();
+    });
+    document.getElementById('btn-generate').addEventListener('click', generateFeedback);
+    document.getElementById('modal-close').addEventListener('click', () => {
+      document.getElementById('modal').hidden = true;
+    });
+    document.getElementById('modal-copy').addEventListener('click', async () => {
+      const status = document.getElementById('modal-status');
+      try {
+        await navigator.clipboard.writeText(document.getElementById('modal-text').value);
+        status.textContent = '✓ Copied — paste it back in Claude.';
+      } catch (e) {
+        document.getElementById('modal-text').select();
+        status.textContent = '⚠ Clipboard blocked — the text is selected; press ⌘/Ctrl+C.';
+      }
     });
 
     renderCounts();

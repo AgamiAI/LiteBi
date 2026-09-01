@@ -685,3 +685,73 @@ def test_the_page_writes_nothing_a_rerun_would_read_as_a_run(artifacts, tmp_path
 
     assert code == 0
     assert sorted(p.name for p in out.iterdir()) == ["datasets-20260901-101500.html"]
+
+
+# --- The back-channel, and the two things it may never do -----------------
+#
+# The queue lives in the browser, so what can be asserted here is the template's own markup: that
+# each call site is there, and that the ones whose absence is the point are absent. It is not a
+# substitute for a rendered DOM; it is the check that fails when the drawing is gutted — the same
+# ceiling `test_render_golden_run.py` names.
+
+QUEUEABLE = {
+    "add-tag",
+    "remove-tag",
+    "set-match",
+    "edit-question",
+    "remove-item",
+    "withdraw-confirmation",
+}
+
+
+def test_exactly_the_six_queueable_actions_exist():
+    """The contract's list, and a seventh verb would be a change to what this page may ask for
+    rather than an implementation detail — the parser on the other side accepts these six."""
+    assert set(re.findall(r"queueOp\('([a-z-]+)'", TEMPLATE)) == QUEUEABLE
+
+
+def test_no_control_grants_confirmation():
+    """The page may weaken a claim and may never strengthen one. Granting confirmation from a
+    checkbox is forging ground truth and the easiest possible way to make a failing suite green:
+    tick the box, and a statement nobody verified becomes what every future run is measured
+    against. Withdrawing it needs no evidence, so that one is here."""
+    assert "withdraw-confirmation" in TEMPLATE
+    assert "sql_confirmed" not in TEMPLATE
+    # …and the request is answered rather than ignored: an unconfirmed case says how confirming
+    # actually happens, which is by running it and accepting the result.
+    assert "run the case and accept the result" in TEMPLATE
+
+
+def test_no_statement_is_editable_in_the_browser():
+    """A SQL box beside a failing item is a one-click path to making the answer key agree with the
+    bug. The key is drawn into a `pre`, and the page's one text area is the feedback block."""
+    assert "el('pre', { text: item.sql })" in TEMPLATE
+    assert TEMPLATE.count("<textarea") == 1
+    assert 'id="modal-text"' in TEMPLATE
+
+
+def test_the_feedback_block_names_its_profile_first_and_ends_with_done():
+    """The model explorer's format, unchanged: the profile pins the target so the apply step never
+    falls back to whichever profile happens to be active, and `done` closes the block. The ops ride
+    under a bare `golden-ops:` header with the JSON array on the NEXT line."""
+    header = TEMPLATE.index("lines.push('golden-ops:')")
+    payload = TEMPLATE.index("lines.push(JSON.stringify(queue))")
+    profile = TEMPLATE.index("lines.unshift('profile: '")
+    done = TEMPLATE.index("lines.push('done')")
+
+    assert header < payload < profile < done
+
+
+def test_the_queue_is_folded_over_the_payload_and_never_persisted():
+    """Nothing queued has happened yet: it is a proposal until Claude applies it through the write
+    door. So the page folds the queue over the payload to draw a row, and stores it nowhere."""
+    assert "function effItem(" in TEMPLATE
+    assert "localStorage" not in TEMPLATE
+
+
+def test_a_queued_row_can_be_undone_and_a_removal_still_shows_its_item():
+    """Per-row Undo, because a queue you cannot walk back is one people stop using — and a queued
+    removal keeps drawing the case, since agreeing to delete something you can no longer read is
+    the append-only rule's whole objection."""
+    assert "queue.splice(" in TEMPLATE and "Undo" in TEMPLATE
+    assert "queued for removal" in TEMPLATE
