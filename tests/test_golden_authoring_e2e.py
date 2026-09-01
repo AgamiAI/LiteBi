@@ -519,8 +519,14 @@ def test_a_queued_tag_change_round_trips_from_the_page_to_the_file(tmp_path, mon
     assert anomalies == [] and needs is None
     assert data["profile"] == PROFILE
 
-    # --- 2. The parsed ops go through the write door.
-    ops_path = _write(tmp_path, "ops.json", json.dumps({"ops": data["ops"]}))
+    # --- 2. The parser's own document goes through the write door, byte for byte as the skill
+    # redirects it. Re-wrapping it here would test a shape nothing produces, and would have hidden
+    # the door reading `ops` from the top level while the parser puts it under `data`.
+    ops_path = _write(
+        tmp_path,
+        "ops.json",
+        json.dumps({"ok": True, "data": data, "anomalies": anomalies, "needs_judgment": needs}),
+    )
     code, payload = _run(
         tmp_path,
         monkeypatch,
@@ -604,3 +610,56 @@ def test_the_page_cannot_confirm_an_item_through_this_door_either(tmp_path, monk
     assert "sql_confirmed" not in golden_author._QUEUEABLE
     for verb in golden_author._QUEUEABLE:
         assert verb != "confirm"
+
+
+def test_a_block_the_parser_refused_applies_nothing_at_the_door_either(
+    tmp_path, monkeypatch, capsys
+):
+    """The parser refuses at the block level, and the door reads that verdict rather than the ops
+    beside it. A caller who piped the refusal straight through would otherwise apply the neighbours
+    of the op that was refused."""
+    import parse_golden_feedback
+
+    _seed(tmp_path, monkeypatch, capsys)
+    data, anomalies, needs = parse_golden_feedback.parse(
+        _block(
+            {"op": "add-tag", "dataset": DATASET, "id": "orders-count", "value": "keep"},
+            {
+                "op": "add-tag",
+                "dataset": DATASET,
+                "id": "orders-count",
+                "value": "x",
+                "sql_confirmed": True,
+            },
+        )
+    )
+    assert needs["kind"] == "confirmation_cannot_be_granted"
+    ops_path = _write(
+        tmp_path,
+        "ops.json",
+        json.dumps({"ok": True, "data": data, "anomalies": anomalies, "needs_judgment": needs}),
+    )
+
+    code, _ = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        [
+            "apply",
+            "--profile",
+            PROFILE,
+            "--dataset",
+            DATASET,
+            "--ops",
+            ops_path,
+            "--confirm-replace",
+        ],
+    )
+
+    assert code == 2
+    item = next(
+        i
+        for i in load_golden_datasets(PROFILE, tmp_path)[0][0].test_cases
+        if i.id == "orders-count"
+    )
+    assert "keep" not in item.tags

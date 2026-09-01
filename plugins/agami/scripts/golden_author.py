@@ -754,7 +754,24 @@ def _apply(
     it costs to keep it here as well.
     """
     payload = json.loads(Path(ops_path).expanduser().read_text(encoding="utf-8"))
-    ops = payload["ops"] if isinstance(payload, dict) else payload
+    # The parser's whole document, its `data` block, or a bare list. The first is what the skill
+    # actually pipes in, because redirecting the parser's stdout is the obvious thing to do and
+    # asking a caller to unwrap it first is a step nobody would remember.
+    if isinstance(payload, dict):
+        inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        ops = inner["ops"]
+    else:
+        ops = payload
+
+    # A block the parser refused applies nothing, whichever door reads it next. It refuses at the
+    # block level rather than per op, so half of one is not a smaller version of it.
+    needs = payload.get("needs_judgment") if isinstance(payload, dict) else None
+    if needs:
+        _stop(
+            f"the parser refused this block ({needs.get('kind')}), so none of it may be applied: "
+            f"{needs.get('ask', '')}"
+        )
+        return _CANNOT_START
 
     datasets, res = load_golden_datasets(profile)
     prior = _our_faults(res, stem)
