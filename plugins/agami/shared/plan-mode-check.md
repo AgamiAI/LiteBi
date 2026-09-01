@@ -83,6 +83,12 @@ Stay-in-plan-mode → **refuse to proceed. Do not write a plan file. Do not call
 
 > I can't run an eval in plan mode — every case executes live SQL and the run writes a report. Switch to **Auto** or **Edit Automatically** mode (Shift+Tab to cycle) and re-invoke me with the dataset name.
 
+### `agami-save-golden`
+
+Stay-in-plan-mode → **refuse to proceed. Do not write a plan file. Do not call ExitPlanMode.** Both doors write: the import door writes the parsed rows into the profile's dataset, the save door writes one confirmed answer with its receipt, and a pasted table is written out as a CSV first — Write throughout, plus Bash for the helper itself. Surface ONLY this:
+
+> I can't save a golden item in plan mode — every door here writes to the model tree. Switch to **Auto** or **Edit Automatically** mode (Shift+Tab to cycle) and re-invoke me with the dataset name.
+
 ## When the system context is silent
 
 If neither signal 1 nor signal 2 confirms plan mode is active, **skip this phase silently** and go to Phase 0 of the skill. Don't pop a modal asking "are you in plan mode?" — that's noise for the 95% of users who aren't. The probe-on-Bash-failure path catches the rest naturally.

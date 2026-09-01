@@ -69,7 +69,7 @@ test_cases:
       chart_type: bar
       data_shape: category_value
       validation_notes: Counted at order grain, so nothing joins in to fan the count out.
-    match: values
+    match: exact
     must_filter: [status]
     recorded:
       columns: [channel, order_count]
@@ -117,7 +117,12 @@ Alongside `expected`, an item takes six optional fields:
 - `match` — how closely the run has to match the answer key, loosening left to
   right: `exact`, `values`, `shape`, `bounded`, `nonempty`. **Defaults to
   `exact`**, so an item that says nothing is held to the strictest reading. Any
-  other word is refused.
+  other word is refused. Loosen only for a reason the answer itself gives:
+  columns pair by value at every level, so differing names or order never call
+  for it. `values` forgives a floating-point tail **and an extra column**, which
+  makes it right for a result carrying a real float and wrong for a count — the
+  extra column it waves through is the most common way a generated statement is
+  wrong.
 - `bounds` — the band `match: bounded` is judged against: `min_rows` /
   `max_rows` on the number of rows, and `min_value` / `max_value` on a
   single-cell numeric answer. All four keys are optional but at least one has to
@@ -160,9 +165,20 @@ wrong thing.
 
 ## How to write them
 
-Write the file by hand, one dataset per question area, and read it back before
-relying on it — the reader reports per-file and per-case, so one bad case costs
-one case rather than the suite:
+Two supported ways in, and both land the same shape.
+
+**`/agami-save-golden` is the skill that writes these.** It has two doors: a
+question bank (a CSV, or a table pasted into chat) imports as items written
+`sql_confirmed: false`, after the parsed rows have been shown and agreed to; and
+one question with the statement that answered it and the result somebody
+accepted saves as a confirmed item with its `recorded` receipt and its
+`confirmed_by`. It is append-only — a write that would change an item that
+already exists stops and shows the before and the after — and every write is
+re-read through the reader below before it is kept.
+
+**Or write the file by hand**, one dataset per question area, and read it back
+before relying on it — the reader reports per-file and per-case, so one bad case
+costs one case rather than the suite:
 
 ```bash
 python -c "from semantic_model.golden import load_golden_datasets; \
