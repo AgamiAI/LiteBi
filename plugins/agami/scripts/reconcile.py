@@ -19,6 +19,7 @@ Usage:
 
     # Diff two numbers (expected vs actual) with optional tolerance:
     python3 reconcile.py diff --expected 47238221 --actual 47200000 --tolerance 0.01
+    #   (--tolerance also takes a percentage: `--tolerance 1%` is the same band)
 
     # Band an observed number, ready to paste as a golden item's `bounds`:
     python3 reconcile.py band --value 47238221 --tolerance 0.01
@@ -42,18 +43,18 @@ CURRENCY_SYMBOLS = ("$", "€", "£", "¥", "₹", "₩", "₽", "₿")
 # Magnitude suffixes. Indian numbering (Lakh / Crore) is included because
 # dashboards from Indian deployments commonly use it.
 SUFFIXES: dict[str, float] = {
-    "k":  1_000,
-    "K":  1_000,
-    "m":  1_000_000,
-    "M":  1_000_000,
-    "b":  1_000_000_000,
-    "B":  1_000_000_000,
+    "k": 1_000,
+    "K": 1_000,
+    "m": 1_000_000,
+    "M": 1_000_000,
+    "b": 1_000_000_000,
+    "B": 1_000_000_000,
     "bn": 1_000_000_000,
     "Bn": 1_000_000_000,
     "BN": 1_000_000_000,
-    "L":  100_000,         # Lakh
-    "l":  100_000,
-    "Cr": 10_000_000,      # Crore
+    "L": 100_000,  # Lakh
+    "l": 100_000,
+    "Cr": 10_000_000,  # Crore
     "cr": 10_000_000,
     "CR": 10_000_000,
 }
@@ -102,22 +103,24 @@ def parse_value(s: Any) -> float | None:
     # Strip leading currency symbols + ISO codes (USD / INR / EUR / etc.).
     for sym in CURRENCY_SYMBOLS:
         if raw.startswith(sym):
-            raw = raw[len(sym):].strip()
+            raw = raw[len(sym) :].strip()
             break
     iso = re.match(r"^[A-Z]{3}\s+", raw)
     if iso:
-        raw = raw[iso.end():].strip()
+        raw = raw[iso.end() :].strip()
 
     # Look for a magnitude suffix (longest-match: handle "Cr" before "C").
     suffix_multiplier = 1.0
     sorted_suffixes = sorted(SUFFIXES.keys(), key=len, reverse=True)
     for suf in sorted_suffixes:
         if raw.endswith(suf) and len(raw) > len(suf):
-            head = raw[:-len(suf)].strip()
+            head = raw[: -len(suf)].strip()
             # Only treat as a suffix if what's before is a clean number.
-            if re.fullmatch(r"-?\d+(\.\d+)?(\s*[,\s]\s*\d{3})*", head) or \
-               re.fullmatch(r"-?\d+(?:[,_]\d{3})*(?:\.\d+)?", head) or \
-               re.fullmatch(r"-?\d+(?:\.\d+)?", head):
+            if (
+                re.fullmatch(r"-?\d+(\.\d+)?(\s*[,\s]\s*\d{3})*", head)
+                or re.fullmatch(r"-?\d+(?:[,_]\d{3})*(?:\.\d+)?", head)
+                or re.fullmatch(r"-?\d+(?:\.\d+)?", head)
+            ):
                 raw = head
                 suffix_multiplier = SUFFIXES[suf]
                 break
@@ -141,6 +144,7 @@ def parse_value(s: Any) -> float | None:
 
 
 # --- CSV parsing ----------------------------------------------------------
+
 
 # Heuristic header detection. The first cell is the label and is *always*
 # non-numeric (the metric name). The second cell is the value: if it parses
@@ -188,16 +192,19 @@ def parse_csv(path: str) -> list[dict]:
         extras = [c.strip() for c in r[2:] if c.strip()]
         if extras:
             label = f"{label} ({', '.join(extras)})"
-        rows.append({
-            "label": label,
-            "expected_value": parse_value(raw_value),
-            "raw_value": raw_value,
-        })
+        rows.append(
+            {
+                "label": label,
+                "expected_value": parse_value(raw_value),
+                "raw_value": raw_value,
+            }
+        )
 
     return rows
 
 
 # --- Diff -----------------------------------------------------------------
+
 
 def diff(
     expected: float | None,
@@ -216,11 +223,9 @@ def diff(
       }
     """
     if expected is None:
-        return {"match": False, "delta": None, "delta_pct": None,
-                "reason": "missing_expected"}
+        return {"match": False, "delta": None, "delta_pct": None, "reason": "missing_expected"}
     if actual is None:
-        return {"match": False, "delta": None, "delta_pct": None,
-                "reason": "missing_actual"}
+        return {"match": False, "delta": None, "delta_pct": None, "reason": "missing_actual"}
 
     delta = actual - expected
     delta_pct: float | None = None
@@ -229,7 +234,7 @@ def diff(
         match = abs(delta_pct) <= tolerance
     else:
         # Expected is exactly 0 — exact match required (no relative tolerance possible).
-        match = (actual == 0)
+        match = actual == 0
 
     return {
         "match": match,
@@ -240,6 +245,7 @@ def diff(
 
 
 # --- Band -----------------------------------------------------------------
+
 
 def band(value: float, *, tolerance: float = 0.01) -> dict:
     """The band a single observed number is allowed to land in, as `GoldenBounds` keys.
@@ -266,6 +272,7 @@ def band(value: float, *, tolerance: float = 0.01) -> dict:
 
 # --- CLI ------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Reconciliation helper for agami-reconcile.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -273,14 +280,19 @@ def main(argv: list[str] | None = None) -> int:
     p_parse = sub.add_parser("parse", help="Parse a reconciliation CSV.")
     p_parse.add_argument("--csv", required=True)
 
+    # `--tolerance` is read the way every other number on this CLI is read, rather than by
+    # argparse's float: the skill's own prose says a tolerance out loud as `±1%` in a dozen places
+    # and then tells the caller to pass the run's tolerance, so `1%` is the form that actually
+    # arrives. `parse_value` folds it to 0.01 and leaves 0.01 alone, so the decimal form every
+    # existing caller passes is untouched.
     p_diff = sub.add_parser("diff", help="Diff two numbers.")
     p_diff.add_argument("--expected", required=True)
     p_diff.add_argument("--actual", required=True)
-    p_diff.add_argument("--tolerance", type=float, default=0.01)
+    p_diff.add_argument("--tolerance", default="0.01")
 
     p_band = sub.add_parser("band", help="Band an observed number for a golden item's bounds.")
     p_band.add_argument("--value", required=True)
-    p_band.add_argument("--tolerance", type=float, default=0.01)
+    p_band.add_argument("--tolerance", default="0.01")
 
     args = p.parse_args(argv)
 
@@ -289,10 +301,23 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(rows, indent=2))
         return 0
 
+    if args.cmd in ("diff", "band"):
+        # Refused rather than defaulted. A tolerance nobody can read is not a reason to fall back
+        # to ±1%: the caller asked for a band of some other width, and silently returning the
+        # default one would answer a question they did not ask.
+        tolerance = parse_value(args.tolerance)
+        if tolerance is None or tolerance < 0:
+            print(
+                f"reconcile {args.cmd}: could not read a tolerance from --tolerance "
+                f"{args.tolerance!r}; pass a fraction (0.01) or a percentage (1%).",
+                file=sys.stderr,
+            )
+            return 2
+
     if args.cmd == "diff":
         e = parse_value(args.expected)
         a = parse_value(args.actual)
-        result = diff(e, a, tolerance=args.tolerance)
+        result = diff(e, a, tolerance=tolerance)
         print(json.dumps(result, indent=2))
         return 0
 
@@ -308,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        print(json.dumps(band(value, tolerance=args.tolerance), indent=2))
+        print(json.dumps(band(value, tolerance=tolerance), indent=2))
         return 0
 
     return 2

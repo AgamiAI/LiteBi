@@ -24,6 +24,7 @@ from reconcile import band, diff, parse_csv, parse_value  # noqa: E402
 
 # --- parse_value ---------------------------------------------------------
 
+
 class TestParseValue:
     def test_plain_int(self):
         assert parse_value("47238221") == 47238221.0
@@ -108,6 +109,7 @@ class TestParseValue:
 
 # --- diff ----------------------------------------------------------------
 
+
 class TestDiff:
     def test_exact_match(self):
         r = diff(100.0, 100.0)
@@ -158,6 +160,7 @@ class TestDiff:
 
 
 # --- band ----------------------------------------------------------------
+
 
 class TestBand:
     def test_default_tolerance_positive_value(self):
@@ -213,6 +216,7 @@ def test_band_output_is_accepted_by_the_bounds_model():
 
 # --- the band verb, at the CLI -------------------------------------------
 
+
 class TestBandCli:
     """`parse_value` returns None for anything it cannot read, and `band` takes a float. The verb
     is what stands between them, and the exit code it refuses with is the whole point: on this
@@ -237,7 +241,46 @@ class TestBandCli:
             assert "reconcile band:" in capsys.readouterr().err
 
 
+class TestToleranceIsReadTheWayTheSkillWritesIt:
+    """The skill says a tolerance out loud as `±1%` a dozen times and then tells the caller to pass
+    the run's tolerance, so `1%` is the form that actually arrives at the flag. Both verbs read it
+    through `parse_value`, the same reader every other number on this CLI goes through, so the two
+    spellings are one tolerance and the decimal every existing caller passes is untouched.
+    """
+
+    def test_a_percentage_and_its_fraction_are_the_same_band(self, capsys):
+        assert reconcile.main(["band", "--value", "1000", "--tolerance", "1%"]) == 0
+        percent = capsys.readouterr().out
+        assert reconcile.main(["band", "--value", "1000", "--tolerance", "0.01"]) == 0
+
+        assert percent == capsys.readouterr().out
+
+    def test_diff_reads_a_percentage_too(self, capsys):
+        assert (
+            reconcile.main(["diff", "--expected", "1000", "--actual", "1005", "--tolerance", "1%"])
+            == 0
+        )
+        assert '"match": true' in capsys.readouterr().out
+
+    def test_an_unreadable_tolerance_is_refused_rather_than_defaulted(self, capsys):
+        """Falling back to ±1% would answer a question the caller did not ask: they named a band of
+        some other width, and a silent default returns the wrong one under the right name."""
+        for verb in (["band", "--value", "1000"], ["diff", "--expected", "1", "--actual", "1"]):
+            code = reconcile.main([*verb, "--tolerance", "wide-ish"])
+            assert code == 2
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "could not read a tolerance" in captured.err
+
+    def test_a_negative_tolerance_is_refused_rather_than_silently_absolute(self, capsys):
+        """`band` sorts its two ends, so a negative tolerance used to produce the same band as its
+        positive twin — a typo answered with a plausible number instead of a refusal."""
+        assert reconcile.main(["band", "--value", "1000", "--tolerance", "-0.5"]) == 2
+        assert "could not read a tolerance" in capsys.readouterr().err
+
+
 # --- parse_csv -----------------------------------------------------------
+
 
 class TestParseCsv:
     def test_simple_two_column_with_header(self):
