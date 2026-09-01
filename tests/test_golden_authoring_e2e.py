@@ -351,11 +351,11 @@ def test_a_promotion_onto_an_existing_question_stops_until_it_is_confirmed(
     )
     assert _run(tmp_path, monkeypatch, capsys, [*argv, first])[0] == 0
 
-    second = _write(
-        tmp_path,
-        "resolved.json",
-        json.dumps(_promotion_item(Q3_REVENUE, Q3_REVENUE_SQL, Q3_ACTUAL, RESOLVED_METHOD)),
-    )
+    # The tag is deliberately NOT repeated on the replacement. A replacement is wholesale — the
+    # item sent is the item written — and an item that repeated it could not show that.
+    resolution = _promotion_item(Q3_REVENUE, Q3_REVENUE_SQL, Q3_ACTUAL, RESOLVED_METHOD)
+    del resolution["tags"]
+    second = _write(tmp_path, "resolved.json", json.dumps(resolution))
     stop_code, stop = _run(tmp_path, monkeypatch, capsys, [*argv, second])
     assert stop_code == 1
     (pending,) = stop["needs_confirmation"]
@@ -380,5 +380,71 @@ def test_a_promotion_onto_an_existing_question_stops_until_it_is_confirmed(
     assert res.ok, res.errors
     (resolved,) = next(d.test_cases for d in datasets if d.name == RECONCILED)
     assert resolved.confirmed_by.method == RESOLVED_METHOD
-    # The tag survived only because the item repeated it — a replacement is wholesale.
-    assert resolved.tags == ["reconciled"]
+    # …and the tag the first item carried is GONE, because the second one did not repeat it. This
+    # is why the skill is told to read the `before` and carry forward what still applies: a
+    # replacement that forgets a key does not merge it, it drops it.
+    assert resolved.tags == []
+
+
+# The keys `_save` actually reads off a promotion payload. A documented key outside this set is a
+# key the door drops in silence, which is the drift the test below exists to catch.
+_KEYS_THE_DOOR_READS = {
+    "id", "query", "sql", "match", "bounds", "must_filter", "recorded", "tags", "confirmed_by",
+}
+
+RECONCILE_SKILL = (
+    REPO_ROOT / "plugins" / "agami" / "skills" / "agami-reconcile" / "SKILL.md"
+).read_text(encoding="utf-8")
+
+
+def _documented_promotion_item() -> dict:
+    """The skill's own item block, with the two placeholders filled the way a run fills them."""
+    section = RECONCILE_SKILL.split("#### What gets written, per kept row")[1]
+    item = json.loads(section.split("```json")[1].split("```")[0])
+    item["sql"] = Q3_REVENUE_SQL
+    item["confirmed_by"]["method"] = item["confirmed_by"]["method"].replace(
+        "<the run's tolerance>", "1%"
+    )
+    return item
+
+
+def test_the_item_the_skill_documents_is_the_item_the_save_door_reads(
+    tmp_path, monkeypatch, capsys
+):
+    """The skill's JSON block, run through the real door instead of re-typed beside it.
+
+    Every other test in this file builds the promotion payload by hand, which means the shape the
+    skill tells a model to write and the shape `_save` reads could drift apart without one of them
+    failing. This is the only place the two are the same bytes.
+    """
+    item = _documented_promotion_item()
+    assert set(item) <= _KEYS_THE_DOOR_READS, set(item) - _KEYS_THE_DOOR_READS
+    # The band in the block is the helper's own output, not arithmetic somebody wrote in prose.
+    assert item["bounds"] == reconcile.band(item["recorded"]["rows"][0][0], tolerance=TOLERANCE)
+
+    code, saved = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item",
+         _write(tmp_path, "documented.json", json.dumps(item))],
+    )
+    assert code == 0
+    assert saved["summary"] == {"added": 1, "replaced": 0}
+
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert res.ok, res.errors
+    (promoted,) = next(d.test_cases for d in datasets if d.name == RECONCILED)
+
+    # Each documented key arrived where the door puts it — `id` derived from the question the
+    # block carries, which is what makes the omission in the block deliberate rather than lossy.
+    assert promoted.id == golden_author._slug(item["query"])
+    assert promoted.query == item["query"]
+    assert promoted.expected.sql == item["sql"]
+    assert promoted.expected.sql_confirmed is True
+    assert promoted.match == item["match"]
+    assert promoted.bounds.model_dump(exclude_none=True) == item["bounds"]
+    assert promoted.recorded.columns == item["recorded"]["columns"]
+    assert promoted.recorded.rows == [list(row) for row in item["recorded"]["rows"]]
+    assert promoted.tags == item["tags"]
+    assert promoted.confirmed_by.method == item["confirmed_by"]["method"]
