@@ -1,6 +1,6 @@
 # Invocation conventions — read this BEFORE telling the user to invoke a skill
 
-agami ships eight skills, all prefixed `agami-` to avoid colliding with Claude Code's built-in slash commands (e.g. `/init`) and with other plugins:
+agami ships nine skills, all prefixed `agami-` to avoid colliding with Claude Code's built-in slash commands (e.g. `/init`) and with other plugins:
 
 | Skill | Slash command | Natural-language triggers (via `when_to_use`) |
 |---|---|---|
@@ -8,8 +8,9 @@ agami ships eight skills, all prefixed `agami-` to avoid colliding with Claude C
 | agami-query | `/agami-query` | any data question — "how many", "show me", "top N", "trend over time", etc. |
 | agami-model | `/agami-model` | "open the model explorer", "show me the model", "exclude a table", "remove this column" — AND review/sign-off: "open the review dashboard", "review my model", "sign off the metrics", "approve N", "walk the review queue" (its Review tab absorbed the former `/agami-review`) |
 | agami-save-correction | `/agami-save-correction` | "save this as a correction", "remember this", "use this SQL next time" |
-| agami-reconcile | `/agami-reconcile` | "reconcile against my dashboard", "verify these numbers against agami" |
+| agami-reconcile | `/agami-reconcile` | "reconcile against this dashboard", "do these numbers match?", "validate against my Tableau export" — and after a run: "keep these as golden questions", "promote these to a golden dataset" |
 | agami-eval | `/agami-eval` | "run the evals", "run the golden dataset", "score the model against my golden questions", "did anything regress?", "how accurate is agami on my data?" |
+| agami-save-golden | `/agami-save-golden` | "save this as a golden question", "add this to the golden dataset", "import my question bank", "turn this spreadsheet into a golden dataset" |
 | agami-serve | `/agami-serve` | "set up agami for Claude Desktop", "use agami in the Claude app", "hook up the MCP server", "let me test what my end users would see" |
 | agami-deploy | `/agami-deploy` | "deploy agami", "self-host agami", "set up the agami server for my team", "host agami on a VM" (early access — in testing) |
 

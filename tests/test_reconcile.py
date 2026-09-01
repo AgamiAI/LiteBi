@@ -5,6 +5,7 @@ Covers the deterministic parts of the reconciliation harness:
 - Number-string parsing (currency, magnitudes, percentages, accounting parens)
 - CSV parsing (header detection, multi-column labels)
 - Diff with tolerance
+- The band a promoted observation is allowed to land in (AH-111)
 """
 
 from __future__ import annotations
@@ -18,9 +19,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
 
-from reconcile import diff, parse_csv, parse_value  # noqa: E402
+import reconcile  # noqa: E402
+from reconcile import band, diff, parse_csv, parse_value  # noqa: E402
 
 # --- parse_value ---------------------------------------------------------
+
 
 class TestParseValue:
     def test_plain_int(self):
@@ -106,6 +109,7 @@ class TestParseValue:
 
 # --- diff ----------------------------------------------------------------
 
+
 class TestDiff:
     def test_exact_match(self):
         r = diff(100.0, 100.0)
@@ -155,7 +159,128 @@ class TestDiff:
         assert r["reason"] == "missing_actual"
 
 
+# --- band ----------------------------------------------------------------
+
+
+class TestBand:
+    def test_default_tolerance_positive_value(self):
+        # ±1%, the same default diff rides on.
+        b = band(100.0)
+        assert pytest.approx(b["min_value"], abs=1e-9) == 99.0
+        assert pytest.approx(b["max_value"], abs=1e-9) == 101.0
+
+    def test_custom_tolerance(self):
+        b = band(100.0, tolerance=0.05)
+        assert pytest.approx(b["min_value"], abs=1e-9) == 95.0
+        assert pytest.approx(b["max_value"], abs=1e-9) == 105.0
+
+    def test_zero_value_is_a_zero_band(self):
+        # Mirrors diff's rule that a zero expected requires exact equality — a relative
+        # tolerance around zero bounds nothing.
+        b = band(0.0)
+        assert b["min_value"] == 0.0
+        assert b["max_value"] == 0.0
+
+    def test_negative_value_keeps_the_floor_below_the_ceiling(self):
+        # Multiplying by 1-tol / 1+tol inverts the order for a negative observation, and
+        # GoldenBounds refuses a floor above its ceiling.
+        b = band(-100.0)
+        assert b["min_value"] <= b["max_value"]
+        assert pytest.approx(b["min_value"], abs=1e-9) == -101.0
+        assert pytest.approx(b["max_value"], abs=1e-9) == -99.0
+
+    def test_value_parsed_from_a_string(self):
+        b = band(parse_value("$1.2M"))
+        assert pytest.approx(b["min_value"], abs=1e-3) == 1_188_000.0
+        assert pytest.approx(b["max_value"], abs=1e-3) == 1_212_000.0
+
+    def test_emits_exactly_the_four_bounds_keys(self):
+        b = band(100.0)
+        assert set(b) == {"min_rows", "max_rows", "min_value", "max_value"}
+        # A reconciled number is one cell, so the row band is pinned at exactly one row.
+        assert b["min_rows"] == 1
+        assert b["max_rows"] == 1
+
+
+def test_band_output_is_accepted_by_the_bounds_model():
+    # The point of the four keys is that a caller pastes them into an item with no arithmetic
+    # of its own, so the model itself is the assertion. pydantic isn't otherwise needed here.
+    pytest.importorskip("pydantic")
+    from semantic_model.golden import GoldenBounds
+
+    for value in (100.0, 0.0, -100.0):
+        bounds = GoldenBounds(**band(value))
+        assert bounds.min_rows == 1
+        assert bounds.min_value <= bounds.max_value
+
+
+# --- the band verb, at the CLI -------------------------------------------
+
+
+class TestBandCli:
+    """`parse_value` returns None for anything it cannot read, and `band` takes a float. The verb
+    is what stands between them, and the exit code it refuses with is the whole point: on this
+    path exit `1` is the save door's `needs_confirmation`, so a value nobody could read has to
+    come back as `2` — cannot start — rather than as a traceback landing on whatever code it likes.
+    """
+
+    def test_a_readable_value_bands_and_exits_zero(self, capsys):
+        assert reconcile.main(["band", "--value", "$4.2M", "--tolerance", "0.01"]) == 0
+        assert '"min_value"' in capsys.readouterr().out
+
+    def test_an_unreadable_value_is_refused_and_not_crashed(self, capsys):
+        code = reconcile.main(["band", "--value", "n/a"])
+        assert code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "could not read a number from --value" in captured.err
+
+    def test_the_sentinels_the_parser_knows_are_all_refused_the_same_way(self, capsys):
+        for value in ("n/a", "—", "", "not a number"):
+            assert reconcile.main(["band", "--value", value]) == 2
+            assert "reconcile band:" in capsys.readouterr().err
+
+
+class TestToleranceIsReadTheWayTheSkillWritesIt:
+    """The skill says a tolerance out loud as `±1%` a dozen times and then tells the caller to pass
+    the run's tolerance, so `1%` is the form that actually arrives at the flag. Both verbs read it
+    through `parse_value`, the same reader every other number on this CLI goes through, so the two
+    spellings are one tolerance and the decimal every existing caller passes is untouched.
+    """
+
+    def test_a_percentage_and_its_fraction_are_the_same_band(self, capsys):
+        assert reconcile.main(["band", "--value", "1000", "--tolerance", "1%"]) == 0
+        percent = capsys.readouterr().out
+        assert reconcile.main(["band", "--value", "1000", "--tolerance", "0.01"]) == 0
+
+        assert percent == capsys.readouterr().out
+
+    def test_diff_reads_a_percentage_too(self, capsys):
+        assert (
+            reconcile.main(["diff", "--expected", "1000", "--actual", "1005", "--tolerance", "1%"])
+            == 0
+        )
+        assert '"match": true' in capsys.readouterr().out
+
+    def test_an_unreadable_tolerance_is_refused_rather_than_defaulted(self, capsys):
+        """Falling back to ±1% would answer a question the caller did not ask: they named a band of
+        some other width, and a silent default returns the wrong one under the right name."""
+        for verb in (["band", "--value", "1000"], ["diff", "--expected", "1", "--actual", "1"]):
+            code = reconcile.main([*verb, "--tolerance", "wide-ish"])
+            assert code == 2
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "could not read a tolerance" in captured.err
+
+    def test_a_negative_tolerance_is_refused_rather_than_silently_absolute(self, capsys):
+        """`band` sorts its two ends, so a negative tolerance used to produce the same band as its
+        positive twin — a typo answered with a plausible number instead of a refusal."""
+        assert reconcile.main(["band", "--value", "1000", "--tolerance", "-0.5"]) == 2
+        assert "could not read a tolerance" in capsys.readouterr().err
+
+
 # --- parse_csv -----------------------------------------------------------
+
 
 class TestParseCsv:
     def test_simple_two_column_with_header(self):
