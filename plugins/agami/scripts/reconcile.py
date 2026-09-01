@@ -8,6 +8,7 @@ this helper handles the deterministic parts:
 - CSV parsing (header / no-header, common dialects)
 - Number-string parsing ($4.2M, ₹2.16Cr, "47,238,221.00", "42%", etc.)
 - Diff logic with tolerance
+- The tolerance band around an observed number, in a golden item's own bounds keys
 
 Stdlib only.
 
@@ -18,6 +19,9 @@ Usage:
 
     # Diff two numbers (expected vs actual) with optional tolerance:
     python3 reconcile.py diff --expected 47238221 --actual 47200000 --tolerance 0.01
+
+    # Band an observed number, ready to paste as a golden item's `bounds`:
+    python3 reconcile.py band --value 47238221 --tolerance 0.01
 """
 
 from __future__ import annotations
@@ -235,6 +239,31 @@ def diff(
     }
 
 
+# --- Band -----------------------------------------------------------------
+
+def band(value: float, *, tolerance: float = 0.01) -> dict:
+    """The band a single observed number is allowed to land in, as `GoldenBounds` keys.
+
+    `tolerance` is fractional (0.01 = ±1%), the same shape and default `diff` uses. The four
+    keys are exactly the ones `semantic_model.golden.GoldenBounds` accepts, so a caller pastes
+    the output into an item and does no arithmetic of its own.
+
+    Returns:
+      {"min_rows": 1, "max_rows": 1, "min_value": <float>, "max_value": <float>}
+    """
+    low, high = value * (1 - tolerance), value * (1 + tolerance)
+    # A negative observation inverts the two — and GoldenBounds refuses a floor above its
+    # ceiling, so the band would be rejected rather than merely read oddly. A zero value falls
+    # out of this as a zero band, which matches diff's rule that a zero expected is only ever
+    # matched exactly: there is no relative tolerance around nothing.
+    return {
+        "min_rows": 1,
+        "max_rows": 1,
+        "min_value": min(low, high),
+        "max_value": max(low, high),
+    }
+
+
 # --- CLI ------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -249,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("--actual", required=True)
     p_diff.add_argument("--tolerance", type=float, default=0.01)
 
+    p_band = sub.add_parser("band", help="Band an observed number for a golden item's bounds.")
+    p_band.add_argument("--value", required=True)
+    p_band.add_argument("--tolerance", type=float, default=0.01)
+
     args = p.parse_args(argv)
 
     if args.cmd == "parse":
@@ -261,6 +294,10 @@ def main(argv: list[str] | None = None) -> int:
         a = parse_value(args.actual)
         result = diff(e, a, tolerance=args.tolerance)
         print(json.dumps(result, indent=2))
+        return 0
+
+    if args.cmd == "band":
+        print(json.dumps(band(parse_value(args.value), tolerance=args.tolerance), indent=2))
         return 0
 
     return 2

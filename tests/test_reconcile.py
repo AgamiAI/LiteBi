@@ -5,6 +5,7 @@ Covers the deterministic parts of the reconciliation harness:
 - Number-string parsing (currency, magnitudes, percentages, accounting parens)
 - CSV parsing (header detection, multi-column labels)
 - Diff with tolerance
+- The band a promoted observation is allowed to land in (AH-111)
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "agami" / "scripts"))
 
-from reconcile import diff, parse_csv, parse_value  # noqa: E402
+from reconcile import band, diff, parse_csv, parse_value  # noqa: E402
 
 # --- parse_value ---------------------------------------------------------
 
@@ -153,6 +154,60 @@ class TestDiff:
         r = diff(100.0, None)
         assert r["match"] is False
         assert r["reason"] == "missing_actual"
+
+
+# --- band ----------------------------------------------------------------
+
+class TestBand:
+    def test_default_tolerance_positive_value(self):
+        # ±1%, the same default diff rides on.
+        b = band(100.0)
+        assert pytest.approx(b["min_value"], abs=1e-9) == 99.0
+        assert pytest.approx(b["max_value"], abs=1e-9) == 101.0
+
+    def test_custom_tolerance(self):
+        b = band(100.0, tolerance=0.05)
+        assert pytest.approx(b["min_value"], abs=1e-9) == 95.0
+        assert pytest.approx(b["max_value"], abs=1e-9) == 105.0
+
+    def test_zero_value_is_a_zero_band(self):
+        # Mirrors diff's rule that a zero expected requires exact equality — a relative
+        # tolerance around zero bounds nothing.
+        b = band(0.0)
+        assert b["min_value"] == 0.0
+        assert b["max_value"] == 0.0
+
+    def test_negative_value_keeps_the_floor_below_the_ceiling(self):
+        # Multiplying by 1-tol / 1+tol inverts the order for a negative observation, and
+        # GoldenBounds refuses a floor above its ceiling.
+        b = band(-100.0)
+        assert b["min_value"] <= b["max_value"]
+        assert pytest.approx(b["min_value"], abs=1e-9) == -101.0
+        assert pytest.approx(b["max_value"], abs=1e-9) == -99.0
+
+    def test_value_parsed_from_a_string(self):
+        b = band(parse_value("$1.2M"))
+        assert pytest.approx(b["min_value"], abs=1e-3) == 1_188_000.0
+        assert pytest.approx(b["max_value"], abs=1e-3) == 1_212_000.0
+
+    def test_emits_exactly_the_four_bounds_keys(self):
+        b = band(100.0)
+        assert set(b) == {"min_rows", "max_rows", "min_value", "max_value"}
+        # A reconciled number is one cell, so the row band is pinned at exactly one row.
+        assert b["min_rows"] == 1
+        assert b["max_rows"] == 1
+
+
+def test_band_output_is_accepted_by_the_bounds_model():
+    # The point of the four keys is that a caller pastes them into an item with no arithmetic
+    # of its own, so the model itself is the assertion. pydantic isn't otherwise needed here.
+    pytest.importorskip("pydantic")
+    from semantic_model.golden import GoldenBounds
+
+    for value in (100.0, 0.0, -100.0):
+        bounds = GoldenBounds(**band(value))
+        assert bounds.min_rows == 1
+        assert bounds.min_value <= bounds.max_value
 
 
 # --- parse_csv -----------------------------------------------------------
