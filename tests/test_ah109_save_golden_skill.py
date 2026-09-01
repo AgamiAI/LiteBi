@@ -139,3 +139,14 @@ def test_the_page_is_written_only_to_the_gitignored_half():
 
     assert "local/eval/" in body
     assert "gitignored" in body
+
+
+def test_a_pasted_block_routes_here_without_the_user_naming_the_skill():
+    """The page's whole hand-off is `copy this and paste it back`, so the block itself has to be
+    the trigger. The model explorer's skill names its own block format for exactly this reason; a
+    skill that only listed prose triggers would leave a bare paste with nowhere to go."""
+    frontmatter = SKILL.split("---")[1]
+
+    assert "golden-ops:" in frontmatter
+    assert "profile:" in frontmatter
+    assert "done" in frontmatter
