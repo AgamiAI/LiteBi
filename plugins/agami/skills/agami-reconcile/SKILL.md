@@ -99,6 +99,8 @@ Invoke the same SQL-generation + execution path agami-query uses (Phases 2 + 3 o
 - The full chart-template HTML report (so the user can drill in for mismatches)
 - The trust receipt (with confidence, signed-off-by, etc.)
 
+The SQL you capture here is the one that lands in the row record (Phase 2d) — keep it verbatim. It is the only place the statement survives the run: the chart report at `report_path` is HTML, and nothing re-derives the statement from it afterwards.
+
 If the SQL fails OR the result isn't a single scalar (e.g., the LLM-generated question returned a multi-row table), capture an error: `Could not extract a single scalar from the result.` These rows show up as `error` status in the report.
 
 ### 2c — Diff
@@ -128,11 +130,17 @@ Per row:
   "match":        true | false,
   "status":       "match" | "mismatch" | "error",
   "report_path":  "<artifacts_dir>/local/charts/<profile>/<ts>.html",  // the full chart report for this query
+  "sql":          "<the statement that produced actual, or null on an error row>",
+  "recorded":     {"columns": ["<column name>"], "rows": [[<value>]]},  // what the query actually returned
   "error":        "<message if status=error, else null>"
 }
 ```
 
-Append all records to `/tmp/agami-reconcile-results-<ts>.jsonl` so the user can inspect later.
+`sql` is the statement captured in Phase 2b, written down verbatim. `recorded` is the result it returned, shaped as `columns` + `rows` — the same two keys the golden-dataset receipt uses — so whoever picks this row up later forwards it as-is instead of rebuilding it from a number and guessing at a column name.
+
+**On a `status: "error"` row both `sql` and `recorded` are `null`.** There is no statement to keep: either none was generated, or the one that was didn't produce a scalar anyone read. An error row therefore carries nothing a later reader could mistake for a verified answer.
+
+Append all records to `/tmp/agami-reconcile-results-<ts>.jsonl` so the user can inspect later. The two keys are additive — a reader that only knows the older shape keeps working.
 
 ---
 
