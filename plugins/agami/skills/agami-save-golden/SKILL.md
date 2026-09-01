@@ -1,7 +1,7 @@
 ---
 name: agami-save-golden
-description: "Writes golden-dataset items for a profile through two doors. The import door turns a question bank — a CSV, or a table pasted into chat — into items written unconfirmed, after the parsed rows have been shown and agreed to. The save door writes one question, the statement that answered it and the result the person accepted, as a confirmed item with its receipt. Every write goes through agami-core's writer, is re-read by the runner's own reader before it is kept, and is append-only: a write that would change an item that already exists stops and shows the before and the after. This skill writes only; it never runs or scores a dataset."
-when_to_use: "Use when the user says 'save this as a golden question', 'add this to the golden dataset', 'import my question bank', 'turn this spreadsheet into a golden dataset', 'this answer is correct — remember it as ground truth', or '/agami-save-golden <dataset>' — any ask to record a question, or a bank of questions, that the model should be scored against later. Requires agami-connect to have been run first (needs a profile with a semantic model). To RUN a dataset and see the verdicts, use `/agami-eval` instead: that skill reads and scores, this one writes and never runs or scores."
+description: "Writes golden-dataset items for a profile through two doors. The import door turns a question bank — a CSV, or a table pasted into chat — into items written unconfirmed, after the parsed rows have been shown and agreed to. The save door writes one question, the statement that answered it and the result the person accepted, as a confirmed item with its receipt. The curation door applies the changes queued on the golden-dataset explorer page, which may weaken a claim and may never grant one. Every write goes through agami-core's writer, is re-read by the runner's own reader before it is kept, and is append-only: a write that would change an item that already exists stops and shows the before and the after. This skill writes only; it never runs or scores a dataset."
+when_to_use: "Use when the user says 'save this as a golden question', 'add this to the golden dataset', 'import my question bank', 'turn this spreadsheet into a golden dataset', 'this answer is correct — remember it as ground truth', 'show me the golden datasets', 'what does this dataset not test', 'apply my queued changes', or '/agami-save-golden <dataset>' — any ask to record a question, or a bank of questions, that the model should be scored against later. Requires agami-connect to have been run first (needs a profile with a semantic model). To RUN a dataset and see the verdicts, use `/agami-eval` instead: that skill reads and scores, this one writes and never runs or scores."
 argument-hint: "[dataset-name]"
 ---
 
@@ -9,7 +9,7 @@ argument-hint: "[dataset-name]"
 
 You are writing to the answer key. Goal: get a question — or a bank of them — into the profile's golden dataset in the state it has actually earned, and never in a better one. A dataset is what `/agami-eval` gates on, so an item that claims to be confirmed when nobody looked at a result turns the whole suite green on nothing.
 
-**This skill has two doors and they write different things.** Everything below is organized around them, because confusing them is the one failure that matters:
+**This skill has three doors and they write different things.** Everything below is organized around them, because confusing them is the one failure that matters:
 
 | Door | Input | What it writes | Can it gate a run? |
 |---|---|---|---|
@@ -164,6 +164,45 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
 ```
 
 **A relative question over a frozen answer key is refused here**, with exit `2`: *"how many orders in the last 7 days?"* names a window that slides forward and SQL pinned to a fixed date does not. Either anchor the statement to the current date (`CURRENT_DATE - INTERVAL '7 days'`, the dialect's spelling) or rewrite the question to name the window it means (`…in Q1 2024?`), then re-invoke. Do not save it and plan to fix it later — the whole point of refusing at save time is that the one person who can still fix it is here.
+
+---
+
+## Phase 3b: The curation door — the explorer page's queued actions
+
+The explorer page (`/agami-eval`, or rendered directly) shows a profile's datasets and lets the reader queue changes against them. It writes nothing itself; it hands back one block. This is the door that applies it.
+
+**Render the page:**
+
+```bash
+python3 "$AGAMI_PLUGIN_ROOT/scripts/render_golden_datasets.py" \
+  --profile <profile> \
+  --out "<artifacts_dir>/local/eval/<profile>/datasets-<ts>.html"
+```
+
+`--out` must land under `local/`, the gitignored half — the page carries every confirmed answer key in full, and that is only safe where it is not committed. The script refuses any other destination.
+
+**When the user pastes the block back**, parse it before you read it:
+
+```bash
+python3 "$AGAMI_PLUGIN_ROOT/scripts/parse_golden_feedback.py" \
+  --block-file /tmp/agami-golden-block-<ts>.txt \
+  > /tmp/agami-golden-ops-<ts>.json
+```
+
+**Read `needs_judgment` first.** If it is `confirmation_cannot_be_granted`, the block tried to set an answer key from the page. Nothing in it applies — not the offending op and not its neighbours. Tell the user what it names and stop; confirming an item means running it and accepting the result through the save door above, never editing a page. `anomalies` is the softer list: ops that were dropped and the rest carried on.
+
+**Then apply, one dataset at a time.** The block's `profile:` line names its target — use that, not the active profile, or a page rendered for one model applies to another:
+
+```bash
+python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" apply \
+  --profile <the block's own profile> --dataset <stem> \
+  --ops /tmp/agami-golden-ops-<ts>.json \
+  > /tmp/agami-golden-apply-<ts>.json
+```
+
+Exit codes are Phase 4's, unchanged. On `1` the payload carries `needs_confirmation` for the edits **and `needs_confirmation_removals` for the deletions** — the latter has a `before` and no `after`, because the whole of what somebody is agreeing to is what disappears. **Render the removals' questions and answer keys, not their ids.** An id is a slug; nobody can decide from it.
+
+**What may be queued, and the one thing that may not.** Six actions: add or remove a tag, set `match`, edit the question, remove the item, and withdraw confirmation. **Nothing here grants confirmation.** The page has no control for it, the parser refuses a block that asks for it, and this door knows no verb that does — three layers, because a queued action that could confirm an item is the cheapest possible way to make a failing suite green.
 
 ---
 

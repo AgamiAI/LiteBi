@@ -105,7 +105,37 @@ def test_the_author_script_registers_no_mcp_tool():
     authored golden items would let one write the thing its own model is scored against. Authoring
     is a local, human-confirmed flow behind a skill; asserting the script's name appears nowhere in
     `tools.py` is what keeps a future registration from being a quiet one."""
-    tools = (REPO_ROOT / "packages" / "agami-core" / "src" / "tools.py").read_text(
-        encoding="utf-8"
-    )
+    tools = (REPO_ROOT / "packages" / "agami-core" / "src" / "tools.py").read_text(encoding="utf-8")
     assert "golden_author" not in tools
+
+
+def test_the_curation_door_routes_the_page_through_the_parser_before_the_write():
+    """AH-112. The page hands back text somebody pasted, so the skill may not read it as ops: the
+    parser is what refuses a block that tried to confirm an item, and a skill that applied the raw
+    block would be the layer that made the refusal skippable."""
+    body = SKILL
+
+    assert "render_golden_datasets.py" in body
+    assert "parse_golden_feedback.py" in body
+    assert "golden_author.py" in body
+    # The order the doors are used in, not merely their presence.
+    assert body.index("parse_golden_feedback.py") < body.index("apply \\")
+    assert "needs_judgment" in body
+    assert "confirmation_cannot_be_granted" in body
+
+
+def test_the_curation_door_shows_a_removal_before_it_applies_one():
+    """A removal's `before` is the whole of what somebody agrees to lose, and an id is a slug."""
+    body = SKILL
+
+    assert "needs_confirmation_removals" in body
+    assert "not their ids" in body
+
+
+def test_the_page_is_written_only_to_the_gitignored_half():
+    """It carries every confirmed answer key in full, which is safe exactly where it is not
+    committed. The renderer refuses any other destination; the skill has to ask for the right one."""
+    body = SKILL
+
+    assert "local/eval/" in body
+    assert "gitignored" in body

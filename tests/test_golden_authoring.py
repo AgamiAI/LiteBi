@@ -296,7 +296,7 @@ def test_imported_items_read_back_through_the_reader(tmp_path, monkeypatch, caps
     assert code == 0
     assert payload["added"] == ["how-many-orders-have-been-placed", "what-is-our-total-revenue"]
     assert payload["replaced"] == []
-    assert payload["summary"] == {"added": 2, "replaced": 0}
+    assert payload["summary"] == {"added": 2, "replaced": 0, "removed": 0}
     assert [item.query for item in _items(tmp_path)] == [QUERY, REVENUE]
 
 
@@ -979,3 +979,143 @@ def test_an_empty_sheet_refuses_and_says_what_is_missing(tmp_path, monkeypatch, 
     assert code == 2
     assert payload is None
     assert "empty" in err
+
+
+# --- The explorer page's door -------------------------------------------
+#
+# `apply` is the third door and the only one that deletes. Its ops come from the page's
+# back-channel, which is text somebody pasted, so every one of them is checked here as well.
+
+
+def _seeded(tmp_path, monkeypatch, capsys, stem="orders"):
+    rows = [_row(QUERY, id="orders-count"), _row("An old one", id="orders-stale")]
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _import_argv(_rows_file(tmp_path, rows), stem))
+    assert code == 0
+
+
+def _apply_argv(ops_path, stem="orders", *extra):
+    return ["apply", "--profile", PROFILE, "--dataset", stem, "--ops", ops_path, *extra]
+
+
+def _ops_file(tmp_path, *ops):
+    return _json_file(tmp_path, "ops.json", json.dumps({"ops": list(ops)}))
+
+
+def _op(op, item_id="orders-count", value=None):
+    entry = {"op": op, "dataset": "orders", "id": item_id}
+    if value is not None:
+        entry["value"] = value
+    return entry
+
+
+def test_each_queueable_action_lands(tmp_path, monkeypatch, capsys):
+    """The five that edit, all in one batch, because the page queues them that way."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    ops = _ops_file(
+        tmp_path,
+        _op("add-tag", value="nightly"),
+        _op("set-match", value="values"),
+        _op("edit-question", value="How many orders were placed?"),
+    )
+
+    code, payload, _ = _run(
+        tmp_path, monkeypatch, capsys, _apply_argv(ops, "orders", "--confirm-replace")
+    )
+
+    assert code == 0 and payload["summary"]["replaced"] == 1
+    item = next(i for i in _items(tmp_path) if i.id == "orders-count")
+    assert "nightly" in item.tags
+    assert item.match == "values"
+    assert item.query == "How many orders were placed?"
+
+
+def test_withdrawing_confirmation_clears_the_signature_and_keeps_the_statement(
+    tmp_path, monkeypatch, capsys
+):
+    """The claim being withdrawn is that somebody verified it, not that the statement existed. A
+    signature left on an unconfirmed item names a person for a claim the file no longer makes."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    item_path = _item_file(tmp_path, query=QUERY, sql=SQL)
+    _run(tmp_path, monkeypatch, capsys, _save_argv(item_path, "orders", "--confirm-replace"))
+    ops = _ops_file(tmp_path, _op("withdraw-confirmation", item_id=golden_author._slug(QUERY)))
+
+    code, _, _ = _run(
+        tmp_path, monkeypatch, capsys, _apply_argv(ops, "orders", "--confirm-replace")
+    )
+
+    assert code == 0
+    item = next(i for i in _items(tmp_path) if i.id == golden_author._slug(QUERY))
+    assert item.expected.sql_confirmed is False
+    assert item.confirmed_by is None
+    assert item.expected.sql == SQL
+
+
+def test_two_ops_on_one_item_both_land(tmp_path, monkeypatch, capsys):
+    """Folded onto the running edit rather than the file's copy, or the second would overwrite the
+    first with a version of the item that never saw it."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    ops = _ops_file(tmp_path, _op("add-tag", value="a"), _op("add-tag", value="b"))
+
+    code, _, _ = _run(
+        tmp_path, monkeypatch, capsys, _apply_argv(ops, "orders", "--confirm-replace")
+    )
+
+    assert code == 0
+    item = next(i for i in _items(tmp_path) if i.id == "orders-count")
+    assert {"a", "b"} <= set(item.tags)
+
+
+def test_an_op_naming_an_id_the_file_does_not_hold_is_refused(tmp_path, monkeypatch, capsys):
+    """A page rendered against a dataset that has since moved. Succeeding quietly would report an
+    edit that never happened."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    ops = _ops_file(tmp_path, _op("add-tag", item_id="never-existed", value="t"))
+
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _apply_argv(ops))
+
+    assert code == 2
+    assert "never-existed" in err
+
+
+def test_a_verb_the_page_may_not_queue_is_refused(tmp_path, monkeypatch, capsys):
+    """The parser refuses this too. Kept here because this is the layer that writes."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    ops = _ops_file(tmp_path, {"op": "confirm", "dataset": "orders", "id": "orders-count"})
+
+    code, _, err = _run(tmp_path, monkeypatch, capsys, _apply_argv(ops))
+
+    assert code == 2
+    assert "confirm" in err
+    assert [i.expected.sql_confirmed for i in _items(tmp_path)] == [False, False]
+
+
+def test_an_item_queued_for_both_an_edit_and_a_removal_is_refused(tmp_path, monkeypatch, capsys):
+    """Neither order is obviously right, so neither is chosen for them."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    ops = _ops_file(tmp_path, _op("add-tag", value="t"), _op("remove-item"))
+
+    code, _, err = _run(
+        tmp_path, monkeypatch, capsys, _apply_argv(ops, "orders", "--confirm-replace")
+    )
+
+    assert code == 2
+    assert "orders-count" in err
+    assert len(_items(tmp_path)) == 2
+
+
+def test_a_dataset_name_carrying_a_separator_is_refused_by_this_door_too(
+    tmp_path, monkeypatch, capsys
+):
+    """`apply` builds a path from the stem exactly as the other two doors do, so it is guarded
+    exactly as they are — and it is the door that deletes."""
+    _seeded(tmp_path, monkeypatch, capsys)
+    neighbour = _neighbour(tmp_path)
+    ops = _ops_file(tmp_path, _op("remove-item"))
+
+    code, _, err = _run(
+        tmp_path, monkeypatch, capsys, _apply_argv(ops, "../datasource", "--confirm-replace")
+    )
+
+    assert code == 2
+    assert "dataset" in err
+    assert neighbour.exists()
