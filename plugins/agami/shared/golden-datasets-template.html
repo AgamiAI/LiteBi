@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<!--
+  agami · golden dataset explorer — used by the agami-eval / golden-authoring skills via
+  scripts/render_golden_datasets.py.
+
+  A run report says what broke. This page says what the dataset IS: every case, what can
+  actually gate a run, what the model defines that no answer key exercises, and what the
+  reader has already reported a fault on. Self-contained: opens from file:// in any
+  browser, no server, no relative-path dependencies.
+
+  Two rules this page keeps, both asserted by tests/test_render_golden_datasets.py:
+    * NO control grants confirmation. Withdrawing it needs no evidence; granting it from
+      a browser is forging ground truth, and the fastest possible way to make a failing
+      suite green. Confirming happens by running the case and accepting the result.
+    * NO statement is editable. A SQL box beside a failing item is a one-click path to
+      making the answer key agree with the bug.
+
+  NOTE: the placeholder names below are written WITHOUT their double-brace wrappers on
+  purpose — the renderer does a blanket string replace, and a real "{{...}}" token inside
+  this comment would catch it.
+
+  Renderer fills:
+    REPORT_TITLE          — "Golden datasets · <profile>"
+    GENERATED_AT          — ISO8601 UTC timestamp
+    PROFILE               — the active profile name
+    DATASETS_JSON         — the payload (see render_golden_datasets.py::build_payload):
+                            { profile, totals:{datasets,total,gating},
+                              datasets:[{name,description,category,total,gating}],
+                              items:[{id,dataset,question,confirmed,match,tags,must_filter,
+                                      has_recorded,has_confirmed_by,sql,verdict}],
+                              coverage:{dialect,tables_exercised,tables_untouched,
+                                        metrics_named,metrics_unnamed,
+                                        unreadable:[{dataset,id,reason}]},
+                              lint:[{severity,code,message,locator}] }
+    AGAMI_LOGO_DARK_TEXT  — full SVG content of agami-logo-dark.svg
+    AGAMI_LOGO_LIGHT_TEXT — full SVG content of agami-logo-light.svg
+    THEME_CSS             — shared/theme.css, the one palette
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{REPORT_TITLE}} — agami</title>
+  <style>
+{{THEME_CSS}}
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px 32px 110px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--fg); line-height: 1.5;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; }
+
+    header.dashboard-header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 24px; margin-bottom: 12px;
+    }
+    .logo a { display: inline-block; line-height: 0; text-decoration: none; }
+    .logo svg { display: block; height: 26px; width: auto; }
+    .logo-light-mode { display: inline-block; }
+    .logo-dark-mode { display: none; }
+    @media (prefers-color-scheme: dark) {
+      .logo-light-mode { display: none; }
+      .logo-dark-mode { display: inline-block; }
+    }
+    h1.dashboard-title { font-size: 20px; font-weight: 600; margin: 0; flex: 1; text-align: right; }
+    .meta { font-size: 12px; color: var(--muted); margin-bottom: 18px;
+            display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .meta code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+    /* The header's counts */
+    .counts { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 8px; }
+    .count-tile {
+      border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elev);
+      padding: 12px 18px; min-width: 150px;
+    }
+    .count-tile .n { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .count-tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.04em; }
+    .count-tile.gating .n { color: var(--ok-fg); }
+    .count-tile.gap .n { color: var(--warn-fg); }
+    .counts-note { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+
+    /* Toolbar: search + tabs + status filter */
+    .toolbar {
+      position: sticky; top: 0; z-index: 50;
+      background: var(--bg); padding: 12px 0 0;
+      border-bottom: 1px solid var(--border); margin-bottom: 20px;
+    }
+    .search-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .search-input {
+      flex: 1; min-width: 260px; font: inherit; font-size: 15px; padding: 10px 14px;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--bg-elev); color: var(--fg);
+    }
+    .search-input:focus { outline: 2px solid var(--accent); outline-offset: -2px; border-color: var(--accent); }
+    .search-counts { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .tab-bar { display: flex; gap: 2px; align-items: flex-end; flex-wrap: wrap; margin-top: 12px; }
+    .tab-bar button {
+      font: inherit; font-size: 13px; font-weight: 500; padding: 9px 16px; cursor: pointer;
+      background: transparent; color: var(--muted);
+      border: none; border-bottom: 2px solid transparent;
+      display: flex; align-items: center; gap: 7px;
+    }
+    .tab-bar button:hover { color: var(--fg); }
+    .tab-bar button.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-bar button .tab-count {
+      font-size: 11px; font-weight: 600; background: var(--code-bg); color: var(--muted);
+      padding: 1px 7px; border-radius: 999px; min-width: 18px; text-align: center;
+    }
+    .tab-bar button.active .tab-count { background: var(--accent); color: #fff; }
+    .filter-chips { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 12px 0 4px; }
+    .filter-chips .filter-label {
+      font-size: 11px; color: var(--muted); text-transform: uppercase;
+      letter-spacing: 0.04em; margin-right: 4px;
+    }
+    .filter-chips button {
+      font: inherit; font-size: 12px; font-weight: 500; padding: 5px 12px; border-radius: 999px;
+      cursor: pointer; background: var(--bg-elev); color: var(--muted); border: 1px solid var(--border);
+    }
+    .filter-chips button:hover { color: var(--fg); }
+    .filter-chips button.active { color: var(--accent); border-color: var(--accent); background: var(--bg); }
+    .hl { background: var(--hi-bg); padding: 0 2px; border-radius: 2px; }
+
+    /* One case */
+    .item {
+      border: 1px solid var(--border); border-left-width: 4px; border-radius: 12px;
+      background: var(--bg-elev); margin-bottom: 14px; padding: 16px 18px;
+    }
+    .item.confirmed { border-left-color: var(--ok-border); }
+    .item.unconfirmed { border-left-color: var(--info-border); }
+    .item.failing { border-left-color: var(--bad-border); }
+    .item-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .question { font-size: 15px; font-weight: 600; flex: 1; min-width: 260px; }
+    .item-key { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px; color: var(--muted); }
+    .pill {
+      font-size: 10px; padding: 2px 9px; border-radius: 999px; letter-spacing: 0.04em;
+      text-transform: uppercase; font-weight: 600; white-space: nowrap;
+    }
+    .pill.confirmed { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid var(--ok-border); }
+    .pill.unconfirmed { background: var(--info-bg); color: var(--accent); border: 1px solid var(--info-border); }
+    .pill.dataset { background: var(--code-bg); color: var(--muted); border: 1px solid var(--border); }
+    .facts { font-size: 12px; color: var(--muted); margin-top: 8px;
+             display: flex; gap: 14px; flex-wrap: wrap; }
+    .facts code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; color: var(--fg); }
+
+    .statement { border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      background: var(--bg); margin-top: 12px; }
+    .statement .label {
+      font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 7px 12px; border-bottom: 1px solid var(--border); background: var(--bg-elev);
+    }
+    .statement pre {
+      margin: 0; padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.5;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .statement pre.absent { color: var(--muted); font-style: italic; }
+
+    /* Coverage */
+    .cov-group { margin-bottom: 26px; }
+    .cov-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 4px; }
+    .cov-head h2 { font-size: 15px; margin: 0; font-weight: 600; }
+    .cov-head .n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .cov-note { font-size: 12px; color: var(--muted); margin: 0 0 10px; max-width: 760px; }
+    .name-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+    .name-chip {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px;
+      padding: 4px 10px; border-radius: 999px;
+      background: var(--code-bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .cov-group.gap .name-chip { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
+    .cov-empty { font-size: 12px; color: var(--muted); font-style: italic; }
+
+    /* Lint */
+    .tab-note { font-size: 12px; color: var(--muted); margin: 0 0 16px; max-width: 760px; }
+    .lint-row {
+      border: 1px solid var(--border); border-left-width: 4px; border-radius: 10px;
+      background: var(--bg-elev); padding: 12px 16px; margin-bottom: 10px;
+      display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+    }
+    .lint-row.error { border-left-color: var(--bad-border); }
+    .lint-row.warning { border-left-color: var(--warn-fg); }
+    .pill.error { background: var(--bad-bg); color: var(--bad-fg); border: 1px solid var(--bad-border); }
+    .pill.warning { background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-fg); }
+    .lint-locator { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+    .lint-code { font-size: 11px; color: var(--muted); }
+    .lint-message { flex-basis: 100%; font-size: 13px; }
+
+    .verdict { font-size: 13px; margin-top: 8px; }
+    .verdict .score { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+    /* Queueing a change */
+    .actions-row {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border);
+    }
+    .chip-btn {
+      font: inherit; font-size: 12px; font-weight: 500; padding: 5px 12px; border-radius: 999px;
+      cursor: pointer; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .chip-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .chip-btn.danger:hover { border-color: var(--bad-border); color: var(--bad-fg); }
+    .mini-input {
+      font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 8px;
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .mini-input.wide { flex: 1; min-width: 240px; }
+    .hint { font-size: 12px; color: var(--muted); }
+    .item.removed .question, .item.removed .facts { text-decoration: line-through; }
+    .pill.removal { background: var(--bad-bg); color: var(--bad-fg); border: 1px solid var(--bad-border); }
+    .queue-row {
+      border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev);
+      padding: 10px 14px; margin-bottom: 8px;
+      display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    }
+    .queue-value { font-size: 12px; color: var(--fg); background: var(--code-bg);
+      padding: 2px 8px; border-radius: 6px; }
+    .queue-row .chip-btn { margin-left: auto; }
+
+    .sticky-footer {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: var(--bg-elev); border-top: 1px solid var(--border);
+      padding: 14px 32px; z-index: 100;
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    }
+    .sticky-footer .pending-summary { font-size: 13px; color: var(--fg); }
+    .sticky-footer .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+    .sticky-footer button {
+      font: inherit; font-size: 14px; font-weight: 500; padding: 8px 16px; border-radius: 6px;
+      cursor: pointer; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .sticky-footer button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    .sticky-footer button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .modal {
+      position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
+      display: flex; align-items: center; justify-content: center; z-index: 200; padding: 20px;
+    }
+    .modal[hidden] { display: none; }
+    .modal-card {
+      background: var(--bg); border-radius: 12px; padding: 24px; max-width: 720px; width: 100%;
+      max-height: 80vh; overflow: auto; border: 1px solid var(--border);
+    }
+    .modal-card h2 { margin: 0 0 8px; font-size: 18px; }
+    .modal-card .modal-hint { font-size: 13px; color: var(--muted); margin: 0 0 14px; }
+    .modal-card textarea {
+      width: 100%; min-height: 200px; font: inherit; font-size: 13px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: var(--code-bg); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 6px; padding: 12px; resize: vertical;
+    }
+    .modal-card .modal-actions { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+    .modal-card .modal-actions button {
+      font: inherit; font-size: 14px; font-weight: 500; padding: 8px 14px; border-radius: 6px;
+      cursor: pointer; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    }
+    .modal-card .modal-actions button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    .modal-card .modal-actions .modal-status { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+    .empty { color: var(--muted); padding: 48px; text-align: center; }
+    footer.page-footer {
+      margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
+      font-size: 12px; color: var(--muted);
+    }
+    footer.page-footer a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="dashboard-header">
+      <div class="logo">
+        <a href="https://agami.ai" target="_blank" rel="noopener">
+          <span class="logo-light-mode">{{AGAMI_LOGO_DARK_TEXT}}</span>
+          <span class="logo-dark-mode">{{AGAMI_LOGO_LIGHT_TEXT}}</span>
+        </a>
+      </div>
+      <h1 class="dashboard-title">{{REPORT_TITLE}}</h1>
+    </header>
+    <div class="meta">
+      <span>Generated <span id="generated-at">{{GENERATED_AT}}</span></span>
+      <span>· profile <code>{{PROFILE}}</code></span>
+      <span>· <span id="totals-meta"></span></span>
+    </div>
+
+    <div class="counts" id="counts"></div>
+    <p class="counts-note" id="counts-note"></p>
+
+    <div class="toolbar">
+      <div class="search-row">
+        <input class="search-input" id="search" type="search"
+          placeholder="Search the current tab…" autocomplete="off" />
+        <span class="search-counts" id="search-counts"></span>
+      </div>
+      <div class="tab-bar" id="tab-bar"></div>
+      <div class="filter-chips" id="filter-chips">
+        <span class="filter-label">Status</span>
+        <button type="button" data-filter="all" class="active">All</button>
+        <button type="button" data-filter="confirmed">Confirmed</button>
+        <button type="button" data-filter="unconfirmed">Unconfirmed</button>
+        <button type="button" data-filter="failing">Failing</button>
+      </div>
+    </div>
+
+    <div id="tab-content"></div>
+
+    <footer class="page-footer">
+      Rendered by agami from the dataset files themselves — nothing here was run, and nothing
+      here was decided by a model. This page is written under your artifacts directory and is not
+      committed.
+      <a href="https://agami.ai" target="_blank" rel="noopener">agami.ai</a>
+    </footer>
+  </div>
+
+  <div class="sticky-footer">
+    <div class="pending-summary" id="pending-summary">
+      Nothing queued yet — tag, retag, loosen a match, reword a question, remove a case, or
+      withdraw a confirmation.
+    </div>
+    <div class="actions">
+      <button type="button" id="btn-reset">Reset all</button>
+      <button type="button" id="btn-generate" class="primary" disabled>
+        Generate feedback for Claude
+      </button>
+    </div>
+  </div>
+
+  <div class="modal" id="modal" hidden>
+    <div class="modal-card">
+      <h2>Send to Claude</h2>
+      <p class="modal-hint">
+        Copy this block and paste it back into Claude — agami applies each change through the
+        golden-dataset write door, which re-reads the file and refuses anything the validator
+        refuses. Nothing here confirms an answer key: that happens by running the case.
+      </p>
+      <textarea id="modal-text" readonly></textarea>
+      <div class="modal-actions">
+        <button type="button" id="modal-copy" class="primary">Copy to clipboard</button>
+        <button type="button" id="modal-close">Close</button>
+        <span class="modal-status" id="modal-status"></span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    "use strict";
+    const DATA = {{DATASETS_JSON}};
+
+    const TABS = [
+      { id: 'items', label: 'Items' },
+      { id: 'coverage', label: 'Coverage' },
+      { id: 'lint', label: 'Lint' },
+      { id: 'queued', label: 'Queued' },
+    ];
+
+    // How closely a run has to match the answer key, loosening left to right — the reader's own
+    // list, and any other word is refused on the far side.
+    // The five levels less `bounded`, which the reader is not offered: an item is bounded only
+    // together with the band it is held to, and this page carries no bounds and no way to type
+    // one. Offering it would queue a change the write door must refuse every time.
+    const MATCH_LEVELS = ['exact', 'values', 'shape', 'nonempty'];
+
+    let activeTab = 'items';
+    let searchQ = '';
+    let activeFilter = 'all';
+
+    // What the reader has asked for, in memory and nowhere else: nothing queued has happened yet,
+    // and it stays a proposal until Claude applies it through the write door that re-reads the file
+    // and runs the validator.
+    const queue = [];
+    function queueOp(op, item, value) {
+      const entry = { op: op, dataset: item.dataset, id: item.id };
+      if (value !== undefined) entry.value = value;
+      queue.push(entry);
+      renderAll();
+    }
+
+    // Every value from the payload is written with textContent — it is somebody's question and
+    // somebody's SQL. The only innerHTML on the page clears a container before a redraw.
+    function el(tag, attrs, kids) {
+      const n = document.createElement(tag);
+      if (attrs) for (const k in attrs) {
+        const v = attrs[k];
+        if (v === null || v === undefined || v === false) continue;
+        if (k === 'class') n.className = v;
+        else if (k === 'text') n.textContent = String(v);
+        else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2), v);
+        else n.setAttribute(k, v);
+      }
+      (kids || []).forEach(c => c && n.appendChild(c));
+      return n;
+    }
+
+    function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    // The search hit, marked in the text it was found in. Builds text nodes and spans rather than
+    // markup, so a question containing a tag is still shown as the text somebody typed.
+    function highlight(text, q) {
+      const span = document.createElement('span');
+      if (!q || !text) { span.textContent = text || ''; return span; }
+      const re = new RegExp(escapeRegex(q), 'gi');
+      let last = 0, m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) span.appendChild(document.createTextNode(text.slice(last, m.index)));
+        span.appendChild(el('span', { class: 'hl', text: m[0] }));
+        last = re.lastIndex;
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+      if (last < text.length) span.appendChild(document.createTextNode(text.slice(last)));
+      return span;
+    }
+    const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+
+    // ---- Search / filter ----
+    function haystack(item) {
+      return [item.question, item.id, item.dataset, item.sql, (item.tags || []).join(' ')]
+        .join(' ').toLowerCase();
+    }
+    function matchesSearch(item) { return !searchQ || haystack(item).includes(searchQ); }
+    function passesFilter(item) {
+      switch (activeFilter) {
+        case 'confirmed':   return item.confirmed === true;
+        case 'unconfirmed': return item.confirmed !== true;
+        case 'failing':     return !!item.verdict && item.verdict.passed === false;
+        default:            return true;
+      }
+    }
+
+    // ---- Items ----
+    // The case as it would read once the queue is applied. Folded rather than written into the
+    // payload, so the page can always say what is on disk and what is only asked for — and so
+    // Undo is a splice rather than a repair.
+    function effItem(item) {
+      const out = Object.assign({}, item, { tags: (item.tags || []).slice() });
+      queue.forEach(entry => {
+        if (entry.dataset !== item.dataset || entry.id !== item.id) return;
+        if (entry.op === 'add-tag') { if (out.tags.indexOf(entry.value) === -1) out.tags.push(entry.value); }
+        else if (entry.op === 'remove-tag') out.tags = out.tags.filter(t => t !== entry.value);
+        else if (entry.op === 'set-match') out.match = entry.value;
+        else if (entry.op === 'edit-question') out.question = entry.value;
+        else if (entry.op === 'remove-item') out.removed = true;
+        // Only ever downward: there is no op that sets this the other way, and the parser refuses
+        // one even if this page were hand-edited.
+        else if (entry.op === 'withdraw-confirmation') out.confirmed = false;
+      });
+      return out;
+    }
+
+    function statusOf(item) {
+      if (item.verdict && item.verdict.passed === false) return 'failing';
+      return item.confirmed ? 'confirmed' : 'unconfirmed';
+    }
+
+    function factsLine(item) {
+      const line = el('div', { class: 'facts' });
+      line.appendChild(el('span', { text: 'match: ' + item.match }));
+      line.appendChild(el('span', {
+        text: 'tags: ' + ((item.tags || []).length ? item.tags.join(', ') : 'none'),
+      }));
+      line.appendChild(el('span', {
+        text: 'must_filter: ' + ((item.must_filter || []).length ? item.must_filter.join(', ') : 'none'),
+      }));
+      line.appendChild(el('span', {
+        text: item.has_recorded ? 'has a recorded receipt' : 'no recorded receipt',
+      }));
+      line.appendChild(el('span', {
+        text: item.has_confirmed_by ? 'signed for' : 'nobody signed for it',
+      }));
+      return line;
+    }
+
+    // The answer key, shown and never editable. Changing one goes through a file and a diff:
+    // a SQL box beside a failing case is a one-click path to making the test agree with the bug.
+    function statement(item) {
+      const body = item.sql
+        ? el('pre', { text: item.sql })
+        : el('pre', { class: 'absent', text: 'this case has no answer key yet, so it cannot gate a run' });
+      return el('div', { class: 'statement' }, [
+        el('div', { class: 'label', text: 'Answer key — read-only' }),
+        body,
+      ]);
+    }
+
+    // What the last run decided about this case, when a run has left a result on disk. A case no
+    // run has covered says nothing here rather than reading as a pass.
+    function verdictLine(item) {
+      const v = item.verdict;
+      if (!v) return null;
+      const line = el('div', { class: 'verdict' });
+      line.appendChild(el('span', {
+        text: 'Last run: ' + (v.passed ? 'reproduced the answer key' : 'did not reproduce the answer key'),
+      }));
+      if (v.score !== null && v.score !== undefined) {
+        line.appendChild(el('span', { class: 'score', text: ' · accuracy ' + Number(v.score).toFixed(3) }));
+      }
+      if (v.gated) {
+        line.appendChild(el('span', {
+          text: ' · the dataset requires a filter that statement does not write',
+        }));
+      }
+      return line;
+    }
+
+    // What may be asked for on one case. Every one of these WEAKENS or restates a claim; there is
+    // deliberately no control here that strengthens one, and none that touches the statement.
+    function actionsRow(item) {
+      const row = el('div', { class: 'actions-row' });
+      (item.tags || []).forEach(tag => row.appendChild(el('button', {
+        type: 'button', class: 'chip-btn', text: tag + ' ×',
+        title: 'Queue removing this tag',
+        onclick: () => queueOp('remove-tag', item, tag),
+      })));
+
+      const tagInput = el('input', { type: 'text', class: 'mini-input', placeholder: 'add a tag…' });
+      // `change` rather than `input`: the row is redrawn on every queued op, and queueing per
+      // keystroke would take the field out from under whoever is typing in it.
+      tagInput.addEventListener('change', () => {
+        const value = tagInput.value.trim();
+        if (value) queueOp('add-tag', item, value);
+      });
+      row.appendChild(tagInput);
+
+      const match = el('select', { class: 'mini-input', title: 'How closely a run must match' });
+      MATCH_LEVELS.forEach(level => {
+        const option = el('option', { value: level, text: level });
+        if (level === item.match) option.selected = true;
+        match.appendChild(option);
+      });
+      match.addEventListener('change', () => queueOp('set-match', item, match.value));
+      row.appendChild(match);
+
+      const question = el('input', { type: 'text', class: 'mini-input wide', value: item.question });
+      question.addEventListener('change', () => {
+        if (question.value !== item.question) queueOp('edit-question', item, question.value);
+      });
+      row.appendChild(question);
+
+      row.appendChild(el('button', {
+        type: 'button', class: 'chip-btn danger', text: 'Remove case',
+        onclick: () => queueOp('remove-item', item),
+      }));
+      if (item.confirmed) {
+        row.appendChild(el('button', {
+          type: 'button', class: 'chip-btn', text: 'Withdraw confirmation',
+          onclick: () => queueOp('withdraw-confirmation', item),
+        }));
+      } else {
+        row.appendChild(el('span', {
+          class: 'hint',
+          text: 'This page cannot confirm a case — run the case and accept the result, which is '
+            + 'the only door an answer key gets confirmed through.',
+        }));
+      }
+      return row;
+    }
+
+    function renderItem(item) {
+      const head = el('div', { class: 'item-head' }, [
+        el('span', { class: 'pill dataset', text: item.dataset }),
+        el('span', {
+          class: 'pill ' + (item.confirmed ? 'confirmed' : 'unconfirmed'),
+          text: item.confirmed ? 'confirmed' : 'unconfirmed',
+        }),
+        el('span', { class: 'item-key', text: item.id }),
+        // A queued removal keeps drawing the case: agreeing to delete something you can no longer
+        // read is what the append-only rule objects to.
+        item.removed ? el('span', { class: 'pill removal', text: 'queued for removal' }) : null,
+      ]);
+      const question = el('div', { class: 'question' });
+      question.appendChild(highlight(item.question, searchQ));
+      head.insertBefore(question, head.firstChild);
+      return el('div', { class: 'item ' + statusOf(item) + (item.removed ? ' removed' : '') }, [
+        head,
+        factsLine(item),
+        verdictLine(item),
+        statement(item),
+        actionsRow(item),
+      ]);
+    }
+
+    function renderItemsTab(root) {
+      const all = (DATA.items || []).map(effItem);
+      const shown = all.filter(item => matchesSearch(item) && passesFilter(item));
+      setSearchCounts(shown.length + ' of ' + plural(all.length, 'item'));
+      // A dataset nobody has run yet is the normal starting state, so it is said once here rather
+      // than left as a column of blanks a reader has to interpret.
+      if (!all.some(item => item.verdict)) {
+        root.appendChild(el('p', { class: 'tab-note',
+          text: 'No run has scored these cases yet, so no item carries a verdict. Run the dataset '
+            + 'and re-render this page to see one.' }));
+      }
+      if (!shown.length) {
+        root.appendChild(el('div', { class: 'empty', text: 'No item matches.' }));
+        return;
+      }
+      shown.forEach(item => root.appendChild(renderItem(item)));
+    }
+
+    // ---- Coverage ----
+    // A named group of tables or metrics. `note` is what the reader has to know to read the list
+    // correctly — how strong the evidence under it is — and it is per-group because the two kinds
+    // of evidence on this tab are not the same strength.
+    function coverageGroup(title, note, names, cls) {
+      const shown = names.filter(name => !searchQ || name.toLowerCase().includes(searchQ));
+      const group = el('div', { class: 'cov-group ' + (cls || '') }, [
+        el('div', { class: 'cov-head' }, [
+          el('h2', { text: title }),
+          el('span', { class: 'n', text: String(names.length) }),
+        ]),
+        el('p', { class: 'cov-note', text: note }),
+      ]);
+      const list = el('div', { class: 'name-grid' });
+      if (!shown.length) {
+        list.appendChild(el('span', { class: 'cov-empty', text: names.length ? 'nothing matches the search' : 'none' }));
+      }
+      shown.forEach(name => list.appendChild(el('span', { class: 'name-chip', text: name })));
+      group.appendChild(list);
+      return group;
+    }
+
+    function renderCoverageTab(root) {
+      const c = DATA.coverage;
+      setSearchCounts('read in ' + c.dialect);
+      root.appendChild(coverageGroup(
+        'Model tables no confirmed answer key reads',
+        'The gap. Nothing here is held to anything, so a model change that breaks one of these '
+          + 'tables passes every case in these datasets.',
+        c.tables_untouched, 'gap'));
+      root.appendChild(coverageGroup(
+        'Tables the confirmed answer keys read',
+        'Read out of each statement itself — one of the seven claims a statement is read into — '
+          + 'rather than from what the author declared it uses.',
+        c.tables_exercised));
+      root.appendChild(coverageGroup(
+        'Metrics no confirmed answer key names',
+        'Weaker evidence than the tables above: a metric is not one of those seven claims, so this '
+          + 'is matched by name against the answer key text. A metric spelled out by hand in a '
+          + 'statement reads as absent here.',
+        c.metrics_unnamed, 'gap'));
+      root.appendChild(coverageGroup(
+        'Metrics a confirmed answer key names',
+        'Also matched by name against the answer key text, and not a claim about the statement.',
+        c.metrics_named));
+    }
+
+    // ---- Lint ----
+    // The reader's own findings, then this page's two derivations. No row carries the statement it
+    // is about: the reader keeps the answer key out of a finding because a finding travels, and a
+    // row that quoted the key would stop matching what the reader reports.
+    function renderLintTab(root) {
+      const all = DATA.lint || [];
+      const shown = all.filter(row =>
+        !searchQ || (row.message + ' ' + row.code + ' ' + row.locator).toLowerCase().includes(searchQ));
+      setSearchCounts(shown.length + ' of ' + plural(all.length, 'finding'));
+      if (!all.length) {
+        root.appendChild(el('div', { class: 'empty', text: 'Nothing to report — every case reads cleanly.' }));
+        return;
+      }
+      root.appendChild(el('p', { class: 'tab-note',
+        text: 'What the dataset reader reports about these files, plus the two this page derives: '
+          + 'a confirmed answer key nobody signed for, and a case with no record of what the answer '
+          + 'looked like on the day.' }));
+      shown.forEach(row => root.appendChild(el('div', { class: 'lint-row ' + row.severity }, [
+        el('span', { class: 'pill ' + row.severity, text: row.severity }),
+        el('span', { class: 'lint-locator', text: row.locator }),
+        el('span', { class: 'lint-code', text: row.code }),
+        el('div', { class: 'lint-message', text: row.message }),
+      ])));
+    }
+
+    // ---- Queued ----
+    function renderQueuedTab(root) {
+      setSearchCounts('');
+      if (!queue.length) {
+        root.appendChild(el('div', { class: 'empty',
+          text: 'Nothing queued. Queue changes on the Items tab, then come back here to read them '
+            + 'before you send them.' }));
+        return;
+      }
+      root.appendChild(el('p', { class: 'tab-note',
+        text: 'Nothing here has happened yet. Send the block below to Claude and each change goes '
+          + 'through the write door, which re-reads the file and refuses what the validator '
+          + 'refuses.' }));
+      queue.forEach((entry, index) => {
+        root.appendChild(el('div', { class: 'queue-row' }, [
+          el('span', { class: 'pill dataset', text: entry.op }),
+          el('span', { class: 'item-key', text: entry.dataset + ' / ' + entry.id }),
+          entry.value === undefined ? null : el('span', { class: 'queue-value', text: entry.value }),
+          el('button', {
+            type: 'button', class: 'chip-btn', text: 'Undo',
+            onclick: () => { queue.splice(index, 1); renderAll(); },
+          }),
+        ]));
+      });
+    }
+
+    function updateFooter() {
+      const summary = document.getElementById('pending-summary');
+      const generate = document.getElementById('btn-generate');
+      generate.disabled = queue.length === 0;
+      summary.textContent = queue.length
+        ? plural(queue.length, 'change') + ' queued — none of them applied yet.'
+        : 'Nothing queued yet — tag, retag, loosen a match, reword a question, remove a case, or '
+          + 'withdraw a confirmation.';
+    }
+
+    // The block Claude reads back. `profile:` first so the apply step never falls back to whichever
+    // profile happens to be active, the ops under a bare header with the array on its own line, and
+    // `done` last — the model explorer's format, unchanged.
+    function generateFeedback() {
+      const lines = [];
+      if (queue.length) { lines.push('golden-ops:'); lines.push(JSON.stringify(queue)); }
+      if (lines.length) lines.unshift('profile: ' + (DATA.profile || ''));
+      if (lines.length) lines.push('done');
+      document.getElementById('modal-text').value = lines.join('\n') + '\n';
+      document.getElementById('modal').hidden = false;
+      document.getElementById('modal-status').textContent = '';
+    }
+
+    // ---- Chrome ----
+    function tabCount(id) {
+      switch (id) {
+        case 'items':    return (DATA.items || []).length;
+        // The gap rather than the whole model: the count worth carrying on a tab label is the one
+        // somebody has to act on.
+        case 'coverage': return DATA.coverage.tables_untouched.length;
+        case 'lint':     return (DATA.lint || []).length;
+        case 'queued':   return queue.length;
+        default:         return null;
+      }
+    }
+    function renderTabBar() {
+      const bar = document.getElementById('tab-bar');
+      bar.innerHTML = '';
+      TABS.forEach(t => {
+        const b = el('button', {
+          type: 'button',
+          class: t.id === activeTab ? 'active' : '',
+          text: t.label,
+          onclick: () => {
+            activeTab = t.id;
+            document.getElementById('search').value = '';
+            searchQ = '';
+            renderAll();
+          },
+        });
+        const n = tabCount(t.id);
+        if (n !== null) b.appendChild(el('span', { class: 'tab-count', text: String(n) }));
+        bar.appendChild(b);
+      });
+      // The status chips read an item's own state, so they are for the Items tab only.
+      document.getElementById('filter-chips').style.display = activeTab === 'items' ? 'flex' : 'none';
+      document.getElementById('search').style.display = activeTab === 'queued' ? 'none' : '';
+    }
+    function setSearchCounts(text) { document.getElementById('search-counts').textContent = text || ''; }
+
+    function renderCounts() {
+      const counts = document.getElementById('counts');
+      counts.innerHTML = '';
+      const t = DATA.totals;
+      // The two counts side by side, labelled apart. A dataset of forty items with three confirmed
+      // gates on three, and one number here would read as forty items of coverage.
+      [
+        [t.datasets, 'Datasets', ''],
+        [t.total, 'Items in the datasets', ''],
+        [t.gating, 'Items that can gate a run', 'gating'],
+        [DATA.coverage.tables_untouched.length, 'Model tables no confirmed answer key reads', 'gap'],
+      ].forEach(([n, label, cls]) => {
+        counts.appendChild(el('div', { class: 'count-tile ' + cls }, [
+          el('div', { class: 'n', text: String(n) }),
+          el('div', { class: 'label', text: label }),
+        ]));
+      });
+      document.getElementById('counts-note').textContent =
+        t.gating + ' of ' + plural(t.total, 'item') + ' can fail a run. The rest have no confirmed '
+        + 'answer key, so they are reported and gate nothing.';
+      document.getElementById('totals-meta').textContent =
+        plural(t.datasets, 'dataset') + ' · ' + plural(t.total, 'item');
+    }
+
+    function renderBody() {
+      const root = document.getElementById('tab-content');
+      root.innerHTML = '';
+      switch (activeTab) {
+        case 'items': renderItemsTab(root); break;
+        case 'coverage': renderCoverageTab(root); break;
+        case 'lint': renderLintTab(root); break;
+        case 'queued': renderQueuedTab(root); break;
+      }
+    }
+    function renderAll() {
+      renderTabBar();
+      renderBody();
+      updateFooter();
+    }
+
+    document.getElementById('search').addEventListener('input', ev => {
+      searchQ = ev.target.value.trim().toLowerCase();
+      renderBody();
+    });
+    document.querySelectorAll('#filter-chips button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        activeFilter = btn.getAttribute('data-filter');
+        document.querySelectorAll('#filter-chips button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        renderBody();
+      });
+    });
+
+    document.getElementById('btn-reset').addEventListener('click', () => {
+      queue.length = 0;
+      renderAll();
+    });
+    document.getElementById('btn-generate').addEventListener('click', generateFeedback);
+    document.getElementById('modal-close').addEventListener('click', () => {
+      document.getElementById('modal').hidden = true;
+    });
+    document.getElementById('modal-copy').addEventListener('click', async () => {
+      const status = document.getElementById('modal-status');
+      try {
+        await navigator.clipboard.writeText(document.getElementById('modal-text').value);
+        status.textContent = '✓ Copied — paste it back in Claude.';
+      } catch (e) {
+        document.getElementById('modal-text').select();
+        status.textContent = '⚠ Clipboard blocked — the text is selected; press ⌘/Ctrl+C.';
+      }
+    });
+
+    renderCounts();
+    renderAll();
+  </script>
+</body>
+</html>

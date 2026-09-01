@@ -43,7 +43,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 # Sibling scripts are imported plainly, and this is what makes that work in every layout the
 # plugin ships in — the marketplace cache invokes these scripts by absolute path, where the
@@ -444,11 +444,14 @@ def _write_items(
     *,
     confirm_replace: bool,
     description: Optional[str] = None,
+    remove: Sequence[str] = (),
 ) -> int:
     """Merge `items` into a profile's dataset, print what happened, and return the exit code.
 
-    THE write path. Both doors call it and AH-111 will too, so the append-only rule is enforced
-    once rather than remembered by each caller. The order of the steps is the contract: the names
+    THE write path. Every door calls it, so the append-only rule is enforced once rather than
+    remembered by each caller. `remove` deletes by id and comes through here for that reason: a
+    deletion is the most destructive thing any door can ask for, and a write path of its own would
+    be a second copy of the re-read gate and the rollback, free to drift from this one. The order of the steps is the contract: the names
     are checked before any path is built from them, the batch is checked before any of it is
     written, nothing is written until the person has agreed to every replacement, and nothing
     survives a re-read the runner's own reader would refuse.
@@ -522,7 +525,18 @@ def _write_items(
     added = [item for item in items if item.id not in by_id]
     replaced = [item for item in items if item.id in by_id]
 
-    if replaced and not confirm_replace:
+    missing = [item_id for item_id in remove if item_id not in by_id]
+    if missing:
+        # Refused rather than skipped. A removal naming an id this file does not hold is a page
+        # rendered against a dataset that has since moved, and quietly succeeding would report a
+        # deletion that never happened.
+        _stop(
+            f"{stem}.yaml holds no item with the id {missing[0]!r}, so there is nothing to remove "
+            "there — re-render the page and queue it again"
+        )
+        return _CANNOT_START
+
+    if (replaced or remove) and not confirm_replace:
         # The before AND the after, because "this id already exists" is not enough for a person to
         # decide with: an answer key is the thing being overwritten, and they have to see both.
         print(
@@ -539,16 +553,23 @@ def _write_items(
                         }
                         for item in replaced
                     ],
+                    # A removal has no `after`, so `before` is the whole of what the person agrees
+                    # to lose: the question, the answer key and the receipt. Deciding from an id
+                    # alone is deciding from a slug.
+                    "needs_confirmation_removals": [
+                        {"id": item_id, "before": _item_doc(by_id[item_id])} for item_id in remove
+                    ],
                 },
                 indent=2,
             )
         )
         return _NEEDS_CONFIRMATION
 
+    dropped = set(remove)
     incoming = {item.id: item for item in items}
     # A replacement lands in place: the id is the key results are already stored under, and moving
     # a case to the end of the file would reorder a diff for no reason anyone asked for.
-    merged = [incoming.get(item.id, item) for item in existing] + added
+    merged = [incoming.get(item.id, item) for item in existing if item.id not in dropped] + added
     if description is not None:
         fields["description"] = description
     doc = _dataset_doc(GoldenDataset(name=stem, test_cases=merged, **fields))
@@ -577,7 +598,12 @@ def _write_items(
                 "path": str(path),
                 "added": [item.id for item in added],
                 "replaced": [item.id for item in replaced],
-                "summary": {"added": len(added), "replaced": len(replaced)},
+                "removed": list(remove),
+                "summary": {
+                    "added": len(added),
+                    "replaced": len(replaced),
+                    "removed": len(remove),
+                },
             },
             indent=2,
         )
@@ -682,6 +708,116 @@ def _save(
     )
 
 
+# What the explorer page may ask for. The page enforces this too, and the parser beside it enforces
+# it again, and this is the third place on purpose: it is the only one of the three that writes.
+_QUEUEABLE = frozenset(
+    {"add-tag", "remove-tag", "set-match", "edit-question", "remove-item", "withdraw-confirmation"}
+)
+
+
+def _mutate(item: GoldenItem, op: str, value: Optional[str]) -> GoldenItem:
+    """One queued action applied to one item, as a new item.
+
+    Every branch here weakens a claim or edits prose. None of them can set `sql_confirmed`, and
+    that is the property the whole door exists to keep: confirmation is earned by running the item
+    and accepting the result, never by editing a page. `model_copy` rather than mutation in place,
+    so a batch that is refused half way leaves the items it already touched untouched.
+    """
+    if op == "add-tag":
+        return item.model_copy(update={"tags": sorted({*item.tags, value})})
+    if op == "remove-tag":
+        return item.model_copy(update={"tags": [t for t in item.tags if t != value]})
+    if op == "set-match":
+        return item.model_copy(update={"match": value})
+    if op == "edit-question":
+        return item.model_copy(update={"query": value})
+    # withdraw-confirmation. The statement stays: it is what somebody wrote down, and the claim
+    # being withdrawn is that anyone verified it. `confirmed_by` goes with it, because a signature
+    # on an unconfirmed item names a person for a claim the file no longer makes.
+    expected = item.expected.model_copy(update={"sql_confirmed": False})
+    return item.model_copy(update={"expected": expected, "confirmed_by": None})
+
+
+def _apply(
+    profile: str,
+    stem: str,
+    ops_path: str,
+    *,
+    confirm_replace: bool,
+    description: Optional[str],
+) -> int:
+    """Apply one dataset's worth of queued actions from the explorer page.
+
+    The ops come from `parse_golden_feedback.py`, which has already refused anything that would
+    grant confirmation. This re-checks the verb against `_QUEUEABLE` anyway: the parser is a
+    sibling script a caller may or may not have run, and the rule is worth more than the one line
+    it costs to keep it here as well.
+    """
+    payload = json.loads(Path(ops_path).expanduser().read_text(encoding="utf-8"))
+    # The parser's whole document, its `data` block, or a bare list. The first is what the skill
+    # actually pipes in, because redirecting the parser's stdout is the obvious thing to do and
+    # asking a caller to unwrap it first is a step nobody would remember.
+    if isinstance(payload, dict):
+        inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        ops = inner["ops"]
+    else:
+        ops = payload
+
+    # A block the parser refused applies nothing, whichever door reads it next. It refuses at the
+    # block level rather than per op, so half of one is not a smaller version of it.
+    needs = payload.get("needs_judgment") if isinstance(payload, dict) else None
+    if needs:
+        _stop(
+            f"the parser refused this block ({needs.get('kind')}), so none of it may be applied: "
+            f"{needs.get('ask', '')}"
+        )
+        return _CANNOT_START
+
+    datasets, res = load_golden_datasets(profile)
+    prior = _our_faults(res, stem)
+    if prior:
+        _stop(
+            f"{stem}.yaml cannot be read as it stands, so nothing may be applied to it: {prior[0]}"
+        )
+        return _CANNOT_START
+    found = next((dataset for dataset in datasets if dataset.name == stem), None)
+    if found is None:
+        _stop(f"this profile has no dataset called {stem!r}")
+        return _CANNOT_START
+
+    by_id = {item.id: item for item in found.test_cases}
+    edited: dict[str, GoldenItem] = {}
+    remove: list[str] = []
+
+    for op in ops:
+        name, item_id = op.get("op"), op.get("id")
+        if name not in _QUEUEABLE:
+            _stop(f"{name!r} is not something the page may queue")
+            return _CANNOT_START
+        if item_id not in by_id:
+            _stop(f"{stem}.yaml holds no item with the id {item_id!r} — re-render the page")
+            return _CANNOT_START
+        if name == "remove-item":
+            remove.append(item_id)
+            continue
+        # Folded onto the running edit, not the file's copy, so two ops on one item both land.
+        edited[item_id] = _mutate(edited.get(item_id, by_id[item_id]), name, op.get("value"))
+
+    both = sorted(set(remove) & set(edited))
+    if both:
+        _stop(f"{both[0]!r} is queued for removal and for an edit — queue one or the other")
+        return _CANNOT_START
+
+    return _write_items(
+        profile,
+        stem,
+        list(edited.values()),
+        confirm_replace=confirm_replace,
+        description=description,
+        remove=remove,
+    )
+
+
 def _add_write_args(cmd: argparse.ArgumentParser) -> None:
     """The flags both write doors take. They go through one funnel, so they take one set."""
     cmd.add_argument("--profile", required=True, help="the profile whose dataset to write")
@@ -716,10 +852,19 @@ def _dispatch(args: argparse.Namespace) -> int:
             description=args.description,
         )
 
-    return _save(
+    if args.cmd == "save":
+        return _save(
+            args.profile,
+            args.dataset,
+            args.item,
+            confirm_replace=args.confirm_replace,
+            description=args.description,
+        )
+
+    return _apply(
         args.profile,
         args.dataset,
-        args.item,
+        args.ops,
         confirm_replace=args.confirm_replace,
         description=args.description,
     )
@@ -739,6 +884,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     save_cmd = sub.add_parser("save", help="Write one confirmed answer, statement and receipt.")
     save_cmd.add_argument("--item", required=True, help="the accepted answer, as JSON")
     _add_write_args(save_cmd)
+
+    apply_cmd = sub.add_parser("apply", help="Apply the explorer page's queued actions.")
+    apply_cmd.add_argument("--ops", required=True, help="the parsed back-channel ops, as JSON")
+    _add_write_args(apply_cmd)
 
     args = parser.parse_args(argv)
 

@@ -91,7 +91,10 @@ def test_a_question_bank_imports_unconfirmed_and_one_verified_answer_confirms_it
     """
     # --- 1. the import door: a sheet becomes items, and not one of them is confirmed ---
     parse_code, parsed = _run(
-        tmp_path, monkeypatch, capsys, ["parse", "--csv", _write(tmp_path, "bank.csv", QUESTION_BANK)]
+        tmp_path,
+        monkeypatch,
+        capsys,
+        ["parse", "--csv", _write(tmp_path, "bank.csv", QUESTION_BANK)],
     )
     assert parse_code == 0
     assert parsed["summary"] == {"parsed": 3, "skipped": 0}
@@ -103,11 +106,20 @@ def test_a_question_bank_imports_unconfirmed_and_one_verified_answer_confirms_it
         tmp_path,
         monkeypatch,
         capsys,
-        ["import", "--profile", PROFILE, "--dataset", DATASET, "--rows", rows_file,
-         "--description", "Order-volume questions over the sample store database."],
+        [
+            "import",
+            "--profile",
+            PROFILE,
+            "--dataset",
+            DATASET,
+            "--rows",
+            rows_file,
+            "--description",
+            "Order-volume questions over the sample store database.",
+        ],
     )
     assert import_code == 0
-    assert imported["summary"] == {"added": 3, "replaced": 0}
+    assert imported["summary"] == {"added": 3, "replaced": 0, "removed": 0}
 
     datasets, res = load_golden_datasets(PROFILE, tmp_path)
     items = {item.id: item for item in next(d.test_cases for d in datasets if d.name == DATASET)}
@@ -153,7 +165,7 @@ def test_a_question_bank_imports_unconfirmed_and_one_verified_answer_confirms_it
 
     saved_code, saved = _run(tmp_path, monkeypatch, capsys, [*save_argv, "--confirm-replace"])
     assert saved_code == 0
-    assert saved["summary"] == {"added": 0, "replaced": 1}
+    assert saved["summary"] == {"added": 0, "replaced": 1, "removed": 0}
 
     # --- 3. imported and saved together, read back through the reader the runner uses ---
     datasets, res = load_golden_datasets(PROFILE, tmp_path)
@@ -249,7 +261,7 @@ def test_an_agreeing_row_promotes_and_scores_on_its_own_next_run(tmp_path, monke
         ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item", item_file],
     )
     assert code == 0
-    assert saved["summary"] == {"added": 1, "replaced": 0}
+    assert saved["summary"] == {"added": 1, "replaced": 0, "removed": 0}
 
     datasets, res = load_golden_datasets(PROFILE, tmp_path)
     assert res.ok, res.errors
@@ -374,7 +386,7 @@ def test_a_promotion_onto_an_existing_question_stops_until_it_is_confirmed(
         tmp_path, monkeypatch, capsys, [*argv, second, "--confirm-replace"]
     )
     assert replaced_code == 0
-    assert replaced["summary"] == {"added": 0, "replaced": 1}
+    assert replaced["summary"] == {"added": 0, "replaced": 1, "removed": 0}
 
     datasets, res = load_golden_datasets(PROFILE, tmp_path)
     assert res.ok, res.errors
@@ -389,7 +401,15 @@ def test_a_promotion_onto_an_existing_question_stops_until_it_is_confirmed(
 # The keys `_save` actually reads off a promotion payload. A documented key outside this set is a
 # key the door drops in silence, which is the drift the test below exists to catch.
 _KEYS_THE_DOOR_READS = {
-    "id", "query", "sql", "match", "bounds", "must_filter", "recorded", "tags", "confirmed_by",
+    "id",
+    "query",
+    "sql",
+    "match",
+    "bounds",
+    "must_filter",
+    "recorded",
+    "tags",
+    "confirmed_by",
 }
 
 RECONCILE_SKILL = (
@@ -426,11 +446,18 @@ def test_the_item_the_skill_documents_is_the_item_the_save_door_reads(
         tmp_path,
         monkeypatch,
         capsys,
-        ["save", "--profile", PROFILE, "--dataset", RECONCILED, "--item",
-         _write(tmp_path, "documented.json", json.dumps(item))],
+        [
+            "save",
+            "--profile",
+            PROFILE,
+            "--dataset",
+            RECONCILED,
+            "--item",
+            _write(tmp_path, "documented.json", json.dumps(item)),
+        ],
     )
     assert code == 0
-    assert saved["summary"] == {"added": 1, "replaced": 0}
+    assert saved["summary"] == {"added": 1, "replaced": 0, "removed": 0}
 
     datasets, res = load_golden_datasets(PROFILE, tmp_path)
     assert res.ok, res.errors
@@ -448,3 +475,191 @@ def test_the_item_the_skill_documents_is_the_item_the_save_door_reads(
     assert promoted.recorded.rows == [list(row) for row in item["recorded"]["rows"]]
     assert promoted.tags == item["tags"]
     assert promoted.confirmed_by.method == item["confirmed_by"]["method"]
+
+
+# --- AH-112: the explorer page's queued actions reach the file -------------
+#
+# The page queues, the parser reads the block back, and this door writes it. The two criteria the
+# round trip exists to prove are that a queued change survives all three, and that a removal shows
+# what is about to be lost before it goes.
+
+
+def _seed(tmp_path, monkeypatch, capsys) -> None:
+    """One confirmed item with a receipt, and one unconfirmed one to remove."""
+    rows = [
+        {"id": "orders-count", "query": "How many orders?", "tags": ["smoke"]},
+        {"id": "orders-stale", "query": "An old question nobody kept", "tags": []},
+    ]
+    rows_path = _write(tmp_path, "rows.json", json.dumps({"rows": rows}))
+    code, _ = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        ["import", "--profile", PROFILE, "--dataset", DATASET, "--rows", rows_path],
+    )
+    assert code == 0
+
+
+def _block(*ops: dict) -> str:
+    """The back-channel block exactly as the page's `generateFeedback()` builds it."""
+    return f"profile: {PROFILE}\ngolden-ops:\n{json.dumps(list(ops))}\ndone\n"
+
+
+def test_a_queued_tag_change_round_trips_from_the_page_to_the_file(tmp_path, monkeypatch, capsys):
+    """AH-112 SC7. Queued in the page, parsed from the block, applied through this door, and back
+    out of the reader the runner uses — the whole path, not the three halves of it."""
+    import parse_golden_feedback
+
+    _seed(tmp_path, monkeypatch, capsys)
+
+    # --- 1. The page hands back a block, and the parser reads it.
+    data, anomalies, needs = parse_golden_feedback.parse(
+        _block({"op": "add-tag", "dataset": DATASET, "id": "orders-count", "value": "nightly"})
+    )
+    assert anomalies == [] and needs is None
+    assert data["profile"] == PROFILE
+
+    # --- 2. The parser's own document goes through the write door, byte for byte as the skill
+    # redirects it. Re-wrapping it here would test a shape nothing produces, and would have hidden
+    # the door reading `ops` from the top level while the parser puts it under `data`.
+    ops_path = _write(
+        tmp_path,
+        "ops.json",
+        json.dumps({"ok": True, "data": data, "anomalies": anomalies, "needs_judgment": needs}),
+    )
+    code, payload = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        [
+            "apply",
+            "--profile",
+            PROFILE,
+            "--dataset",
+            DATASET,
+            "--ops",
+            ops_path,
+            "--confirm-replace",
+        ],
+    )
+    assert code == 0
+    assert payload["summary"] == {"added": 0, "replaced": 1, "removed": 0}
+
+    # --- 3. And it is there on the next read, which is what a re-render would show.
+    datasets, res = load_golden_datasets(PROFILE, tmp_path)
+    assert res.ok
+    item = next(i for i in datasets[0].test_cases if i.id == "orders-count")
+    assert item.tags == ["nightly", "smoke"]
+
+
+def test_a_queued_removal_shows_the_item_before_it_is_applied(tmp_path, monkeypatch, capsys):
+    """AH-112 SC10. A removal has no `after`, so the `before` is the whole of what somebody is
+    agreeing to lose. Deciding from an id alone is deciding from a slug."""
+    _seed(tmp_path, monkeypatch, capsys)
+    ops_path = _write(
+        tmp_path,
+        "ops.json",
+        json.dumps({"ops": [{"op": "remove-item", "dataset": DATASET, "id": "orders-stale"}]}),
+    )
+    argv = ["apply", "--profile", PROFILE, "--dataset", DATASET, "--ops", ops_path]
+
+    code, payload = _run(tmp_path, monkeypatch, capsys, argv)
+
+    assert code == 1
+    shown = payload["needs_confirmation_removals"]
+    assert [row["id"] for row in shown] == ["orders-stale"]
+    assert shown[0]["before"]["query"] == "An old question nobody kept"
+    # Nothing went yet: a preview that had already deleted the item would not be a preview.
+    assert {i.id for i in load_golden_datasets(PROFILE, tmp_path)[0][0].test_cases} == {
+        "orders-count",
+        "orders-stale",
+    }
+
+    code, payload = _run(tmp_path, monkeypatch, capsys, [*argv, "--confirm-replace"])
+
+    assert code == 0
+    assert payload["removed"] == ["orders-stale"]
+    assert {i.id for i in load_golden_datasets(PROFILE, tmp_path)[0][0].test_cases} == {
+        "orders-count"
+    }
+
+
+def test_the_page_cannot_confirm_an_item_through_this_door_either(tmp_path, monkeypatch, capsys):
+    """The rule holds at all three layers. The parser refuses the block, and if a caller skipped
+    the parser and hand-wrote the ops, `withdraw-confirmation` is the only verb touching the flag
+    and it only ever clears it."""
+    import parse_golden_feedback
+
+    _seed(tmp_path, monkeypatch, capsys)
+    data, _, needs = parse_golden_feedback.parse(
+        _block(
+            {
+                "op": "add-tag",
+                "dataset": DATASET,
+                "id": "orders-count",
+                "value": "t",
+                "sql_confirmed": True,
+            }
+        )
+    )
+
+    assert needs["kind"] == "confirmation_cannot_be_granted"
+    assert data["ops"] == []
+
+    # And the door itself knows no verb that could grant it.
+    assert "sql_confirmed" not in golden_author._QUEUEABLE
+    for verb in golden_author._QUEUEABLE:
+        assert verb != "confirm"
+
+
+def test_a_block_the_parser_refused_applies_nothing_at_the_door_either(
+    tmp_path, monkeypatch, capsys
+):
+    """The parser refuses at the block level, and the door reads that verdict rather than the ops
+    beside it. A caller who piped the refusal straight through would otherwise apply the neighbours
+    of the op that was refused."""
+    import parse_golden_feedback
+
+    _seed(tmp_path, monkeypatch, capsys)
+    data, anomalies, needs = parse_golden_feedback.parse(
+        _block(
+            {"op": "add-tag", "dataset": DATASET, "id": "orders-count", "value": "keep"},
+            {
+                "op": "add-tag",
+                "dataset": DATASET,
+                "id": "orders-count",
+                "value": "x",
+                "sql_confirmed": True,
+            },
+        )
+    )
+    assert needs["kind"] == "confirmation_cannot_be_granted"
+    ops_path = _write(
+        tmp_path,
+        "ops.json",
+        json.dumps({"ok": True, "data": data, "anomalies": anomalies, "needs_judgment": needs}),
+    )
+
+    code, _ = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        [
+            "apply",
+            "--profile",
+            PROFILE,
+            "--dataset",
+            DATASET,
+            "--ops",
+            ops_path,
+            "--confirm-replace",
+        ],
+    )
+
+    assert code == 2
+    item = next(
+        i
+        for i in load_golden_datasets(PROFILE, tmp_path)[0][0].test_cases
+        if i.id == "orders-count"
+    )
+    assert "keep" not in item.tags
