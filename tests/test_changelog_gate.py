@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 GATE = REPO / "dev" / "changelog_gate.py"
 
@@ -135,3 +137,43 @@ def test_cli_ignores_blank_lines():
     # `git diff --name-only` output piped through a shell can carry a trailing newline.
     r = _run(["plugins/agami/scripts/sm", "", "  ", CHANGELOG])
     assert r.returncode == 0
+
+
+# --- the workflow that drives it ---------------------------------------------------------------
+#
+# Two properties of the YAML decide whether the gate works at all, and neither is visible from the
+# Python. Both were review findings against the first version of this PR.
+
+
+def _workflow() -> dict:
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load((REPO / ".github" / "workflows" / "changelog.yml").read_text())
+
+
+def _triggers(wf: dict) -> dict:
+    """The workflow's `on:` block. YAML 1.1 resolves a bare `on` to the boolean True, so PyYAML
+    keys it under `True` and not `"on"` — GitHub reads it correctly either way, but a test that
+    looked up `"on"` would KeyError on a perfectly good workflow."""
+    return wf["on"] if "on" in wf else wf[True]
+
+
+def test_the_waiver_label_can_actually_clear_the_check():
+    # `on: pull_request` defaults to [opened, synchronize, reopened]. Without `labeled`, applying
+    # `no-changelog` queues no run and the red check stands; re-running from the UI replays the
+    # original payload, where the label is still absent. The documented escape hatch would then have
+    # no way to clear the gate short of an empty commit.
+    types = _triggers(_workflow())["pull_request"]["types"]
+    assert "labeled" in types and "unlabeled" in types
+
+
+def test_the_gate_cannot_fail_open_on_a_broken_git_diff():
+    # A bare `run:` is `bash -e {0}` with NO pipefail, so `git diff | python3` reports only python's
+    # status. A failed diff would feed empty stdin, print "nothing shipped changed" and exit 0 — the
+    # gate passing while having checked nothing.
+    step = next(
+        s
+        for s in _workflow()["jobs"]["changelog"]["steps"]
+        if "changelog_gate.py" in str(s.get("run", ""))
+    )
+    assert step.get("shell") == "bash", "pipefail only applies under an explicit shell"
+    assert "pipefail" in step["run"]
