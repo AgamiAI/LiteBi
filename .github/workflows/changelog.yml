@@ -1,0 +1,48 @@
+name: Changelog
+
+# A PR that changes what we ship must say so in CHANGELOG.md. Written after 0.7.0, where 90 commits
+# landed with an empty [Unreleased] section and a minor release — two new skills, four new library
+# modules, a new CI exit contract — reached the cut with no notes at all.
+#
+# The decision lives in dev/changelog_gate.py so it is unit-tested (tests/test_changelog_gate.py)
+# rather than asserted in YAML; this workflow only supplies the changed paths.
+#
+# SEPARATE from ci.yml on purpose. The waiver is a label, and a label change only re-runs a workflow
+# that subscribes to `labeled` — but subscribing ci.yml to label events would re-run the whole test
+# matrix and both safety-corpus legs every time anyone touches any label. This job takes seconds, so
+# it can afford the extra triggers that make the waiver actually work.
+
+on:
+  pull_request:
+    # `labeled` / `unlabeled` are the point: without them, applying `no-changelog` queues no new run
+    # and the red check stands forever. Re-running from the UI does not help either — it replays the
+    # original event payload, in which the label is still absent — so the documented escape hatch
+    # would have had no way to clear the gate short of an empty commit.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    name: changelog entry
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.pull_request.labels.*.name, 'no-changelog')"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0 # need the base commit to diff against
+
+      - name: changed files must include CHANGELOG.md
+        # `shell: bash` is load-bearing, not style. A bare `run:` uses `bash -e {0}` WITHOUT
+        # pipefail, so a pipeline's status is the last command's alone: if `git diff` failed, python
+        # would read empty stdin, print "nothing shipped changed" and exit 0 — the gate going green
+        # having checked nothing, while its own message claimed otherwise. An explicit shell is what
+        # lets `set -o pipefail` apply.
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Three dots: compare against the MERGE BASE, so files main changed under us aren't
+          # attributed to this PR. `origin/<base>` is fetched by the full-depth checkout above.
+          git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+            | python3 dev/changelog_gate.py
