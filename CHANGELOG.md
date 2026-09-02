@@ -56,7 +56,7 @@ Everything below is additive. No argument, return shape, refusal rule, receipt k
 
 - **`/agami-eval` — run a dataset and read the verdicts, failures first.** The developer surface for
   all of the above: no admin, no server, no browser. `plugins/agami/scripts/run_golden_eval.py`
-  takes `--profile`, `--dataset`, `--tag`, `--rerun-failures`, `--timeout-s` and `--out`, and
+  takes `--profile`, `--dataset`, `--tag`, `--rerun-failures`, `--top-k` and `--timeout-s`, and
   `--list` answers "what is there" with no database, no generator and no credentials.
 
   **The generating context never holds the answer key.** A model grading itself against a key it can
