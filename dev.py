@@ -30,7 +30,9 @@ RUFF = ["uvx", "ruff@0.15.19"]
 # The suite imports the agami-core library, so install it editable with the [model]
 # extra (pydantic/pyyaml/sqlglot). DB drivers are omitted on purpose — those tests skip without a DB.
 TEST_DEPS = ["--with", "pytest-cov", "--with-editable", "packages/agami-core[model,server]"]
-TARGETS = ["plugins", "packages", "tests", "dev.py"]
+# `dev/` is here because it holds gate logic CI executes (changelog_gate.py), not just local
+# helpers — code the build depends on should be linted like the code it guards.
+TARGETS = ["plugins", "packages", "tests", "dev.py", "dev"]
 
 _ROOT = Path(__file__).resolve().parent
 # The plugin's runtime scripts import a small stdlib-only slice of the agami-core library. The

@@ -149,6 +149,24 @@ release is cut with a `v<version>` tag matching `packages/agami-core/pyproject.t
 
 Record notable user-visible changes in [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog format) under the version that ships them.
 
+### CI requires a changelog entry — write it in the PR that ships the change
+
+A PR that touches `plugins/` or `packages/` must also touch `CHANGELOG.md`, or the **changelog
+entry** check fails. Add your entry under `## [Unreleased]`; the release PR later renames that
+heading to the version.
+
+Tests, docs, `dev/` tooling and workflows are **not** gated — none of them reach a user's machine on
+an install. If a shipped change genuinely has nothing user-visible to say (an internal refactor, a
+comment, a docstring typo), apply the **`no-changelog`** label to the PR and the check passes.
+
+The rule exists because of what 0.7.0 cost: 90 commits landed between v0.6.9 and v0.7.0 with an
+empty `[Unreleased]` section, so a minor release — two new skills, four new library modules, a new
+CI exit contract — reached the cut with no notes at all. Reconstructing them from nine merged PRs
+was slow, and worse, it was wrong in a way writing-at-the-time wouldn't have been: the notes shipped
+a CLI flag that does not exist, because a summary written weeks later describes what someone
+remembers building rather than what shipped. You are the only person who will ever have the context
+to write your entry correctly, and that moment is the PR.
+
 ## A community Discord will land soon
 
 Once it's live, the link will appear here and in [`agami-connect/SKILL.md`](plugins/agami/skills/agami-connect/SKILL.md).
