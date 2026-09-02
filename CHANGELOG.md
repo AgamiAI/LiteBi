@@ -15,13 +15,13 @@ below corresponds to one such version.
 ## [0.7.0] — 2026-09-02
 
 The release is one feature: **golden datasets** — a way to write down questions whose answers you
-have already agreed, and then find out, on demand or in CI, whether the model still answers them.
+have already agreed on, and then find out, on demand or in CI, whether the model still answers them.
 Everything below is additive. No argument, return shape, refusal rule, receipt key or CLI flag from
 0.6.x moves.
 
 ### Added
 
-- **A golden dataset: the questions you have agreed, and the answer key for each.** A golden dataset
+- **A golden dataset: the questions you have agreed on, and the answer key for each.** A golden dataset
   is a file of questions where an author has written the question, the SQL they accept as the answer,
   and how strictly a run has to match it. Datasets live under the profile and are read by
   `semantic_model.golden`, whose whole job is to hand a runner records it can trust — and to say out
