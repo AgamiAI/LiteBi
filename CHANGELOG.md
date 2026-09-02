@@ -12,6 +12,118 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-02
+
+The release is one feature: **golden datasets** — a way to write down questions whose answers you
+have already agreed, and then find out, on demand or in CI, whether the model still answers them.
+Everything below is additive. No argument, return shape, refusal rule, receipt key or CLI flag from
+0.6.x moves.
+
+### Added
+
+- **A golden dataset: the questions you have agreed, and the answer key for each.** A golden dataset
+  is a file of questions where an author has written the question, the SQL they accept as the answer,
+  and how strictly a run has to match it. Datasets live under the profile and are read by
+  `semantic_model.golden`, whose whole job is to hand a runner records it can trust — and to say out
+  loud which files and cases it dropped getting there.
+
+  Two properties hold and are the reason it can be trusted. **One bad file does not cost you the
+  run:** a malformed file, or one malformed case inside a good file, becomes a finding and the read
+  continues. **Nothing returned carries a filesystem path** — not on a record, not in a finding — so
+  a runner downstream cannot forward a dataset location into a subprocess.
+
+  `plugins/agami/shared/golden-dataset-shape.md` is the authoring reference, and a test parses its
+  own example through the real reader, so the document cannot drift from the parser that has to
+  accept it. Its hard rule against reading a sibling profile to learn the shape binds harder here
+  than anywhere else: a golden dataset holds the business definitions *and* the answer key in one
+  file, so a glob across profiles reads another tenant's questions together with the SQL that
+  answers them.
+
+- **Scoring is deterministic, not a model's opinion (`semantic_model.comparator`).** Given the answer
+  key's result set and the one the generated SQL produced, `compare_result_sets` returns a score. It
+  executes nothing, writes nothing, opens no connection, and cannot make a model call. That is what
+  makes a run reproducible rather than a second opinion.
+
+  Three decisions in it are worth knowing, because they decide what counts as the same answer.
+  **Columns match on their values, never on name or position** — a correct statement that renames and
+  reorders its projection is still correct, and that is precisely the case a name-matched comparator
+  fails. **Cells canonicalize to a `(type_tag, value)` key**, which is not stylistic: Python collapses
+  `True`, `1`, `1.0` and `Decimal(1)` into one bucket, so without the tag a boolean column would
+  compare equal to an integer column of zeroes and ones. **Ordering is read from the golden statement
+  alone**, parsed rather than pattern-matched, so a generated statement that drops the `ORDER BY`
+  still scores order-sensitively — and an `ORDER BY` inside a subquery, a CTE, an `OVER (…)` or an
+  aggregate does not make a result ordered.
+
+- **`/agami-eval` — run a dataset and read the verdicts, failures first.** The developer surface for
+  all of the above: no admin, no server, no browser. `plugins/agami/scripts/run_golden_eval.py`
+  takes `--profile`, `--dataset`, `--tag`, `--rerun-failures`, `--timeout-s` and `--out`, and
+  `--list` answers "what is there" with no database, no generator and no credentials.
+
+  **The generating context never holds the answer key.** A model grading itself against a key it can
+  see reports a pass rate that means nothing, and no assertion over the scores would reveal it. The
+  generation runs in a sandboxed child process, and this is the one path in the product that does not
+  generate SQL in the caller's own context — the isolation is the point. The child's flags **are** the
+  sandbox and are asserted present by a test, because in that client the absence of a flag is the
+  permissive default.
+
+  **Both statements execute through the guarded chokepoint**, with an injected executor rather than a
+  raw connection — so a golden run is bound by the same read-only guard, row cap and statement
+  timeout as any other query, and works on every engine rather than one.
+
+- **An exit code CI can gate on.** `0` every confirmed case passed, `1` a confirmed case failed, `2`
+  no verdict could be produced. `2` means *go look at the harness*, never *the model regressed*: it
+  covers a preflight refusal, a run that stopped partway, a run where every generation errored, and a
+  selector that matched nothing. A run that is both incomplete *and* carries failures reports `2`,
+  because sending someone to debug a model change against a run that never happened is the expensive
+  mistake.
+
+  The verdict rests on **confirmed** cases only. An unconfirmed item's answer key is one nobody has
+  reviewed, and gating CI on it would fail a build over a case no human has agreed to.
+
+- **`/agami-save-golden` — two doors into a dataset, kept apart on purpose.** A dataset that has to be
+  hand-written stays empty, and an empty dataset gates nothing. The **import** door turns a CSV
+  question bank into items written unverified — volume arrives here and it gates nothing. The **save**
+  door writes one answer a person just accepted, with the statement that produced it and the result
+  as its receipt, marked verified.
+
+  They are separate because a spreadsheet holds questions, not the statement that answers them. An
+  import that marked its own rows verified would forge the gate: the suite would fail on its own
+  errors and teach people to ignore it.
+
+  Every write is **append-only** — a write that would change an existing item renders the before and
+  the after and stops for an explicit yes — and every write funnels through one function, so the rule
+  holds for both doors. A write proves itself by re-reading the file through the runner's own reader
+  and rolling back if that read refuses.
+
+- **A report for a run, and a page for a dataset.** When a golden question stops matching, the useful
+  artifact is the confirmed statement and the generated one read against each other, which does not
+  fit in a chat message. A run now writes a self-contained HTML report with both statements side by
+  side — no rows, no network — beside its machine-readable artifact, sharing one filename stamp so the
+  pair is findable by name.
+
+  The **golden dataset explorer** answers the other question: not what broke, but what the dataset
+  *is* — how many items exist, how many can actually gate a run, which have rotted. Four tabs (Items ·
+  Coverage · Lint · Queued) with live search, and edits queued in the page and handed back as one
+  block a deterministic parser applies. **The Coverage tab is the reason the page exists:** forty
+  questions that never touch the revenue metric read as coverage they do not have, and the model
+  change that breaks revenue passes clean. Coverage is computed from what the statements actually
+  read, so that gap is a fact rather than a judgement.
+
+### Changed
+
+- **A reconcile run keeps the answers it already proved.** A run that matched nine of twelve numbers
+  has produced nine verified answers — a person read each one and accepted it — and then threw them
+  away: the statement that produced each number lived only inside the report HTML, and the row record
+  never held it. The row record now keeps the statement and the result (additive; every existing key
+  stays), and after the run's summary the rows that agreed are offered once for promotion into a
+  golden dataset. It writes through the save door above and nothing else. Declining writes nothing.
+
+  Only rows that actually matched at the run's own tolerance are eligible, and a promoted item is
+  written as a **band around the observed value** rather than an exact match, so it passes its own
+  next run by arithmetic rather than by hope. A promotion edits the question and never re-anchors the
+  statement to `CURRENT_DATE`: the band was drawn around today's value of a window that slides, so
+  anchoring it would drift the item out of its own band and fail later as a false alarm.
+
 ## [0.6.9] — 2026-08-27
 
 ### Added
