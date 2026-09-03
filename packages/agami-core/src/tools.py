@@ -482,9 +482,7 @@ def _resolve_units(profile: str, sql: str) -> dict[str, str]:
 # A ContextVar rather than a module global because tool handlers run on parallel worker threads
 # (`mcp_http` off-loads them), and it holds `None` outside a scope so a caller that never opens one
 # (a direct handler call, a test) behaves exactly as it did before this cache existed.
-_request_cache: ContextVar[dict[str, Any] | None] = ContextVar(
-    "agami_request_cache", default=None
-)
+_request_cache: ContextVar[dict[str, Any] | None] = ContextVar("agami_request_cache", default=None)
 
 
 def begin_request_cache() -> Token[dict[str, Any] | None]:
@@ -698,12 +696,21 @@ def _context_sources(profile: str, org_id: str) -> "tuple[str, str | None, Any, 
         from model_store import load_memory, load_organization_record
 
         try:
-            mem = load_memory(store, profile, org_id=org_id)  # per-datasource datasource.md + USER_MEMORY.md
+            mem = load_memory(
+                store, profile, org_id=org_id
+            )  # per-datasource datasource.md + USER_MEMORY.md
             record = load_organization_record(store, org_id)  # the deployment company record
-            company = load_memory(store, "", org_id=org_id)  # company narrative rides the datasource='' row
+            company = load_memory(
+                store, "", org_id=org_id
+            )  # company narrative rides the datasource='' row
         finally:
             store.close()
-        return mem.get("datasource") or "", mem.get("user"), record, (company.get("datasource") or "")
+        return (
+            mem.get("datasource") or "",
+            mem.get("user"),
+            record,
+            (company.get("datasource") or ""),
+        )
 
     from semantic_model import org_record as OR
 
@@ -789,9 +796,7 @@ def _resolve_receipt(profile: str, sql: str, *, bounded: bool = False) -> Receip
         from semantic_model import runtime as RT
 
         assemble = RT.assemble_refusal_receipt if bounded else RT.assemble_receipt
-        return receipt_from_assembled(
-            assemble(org, sql, model_version=_model_version(profile))
-        )
+        return receipt_from_assembled(assemble(org, sql, model_version=_model_version(profile)))
     except Exception:
         # A model that loaded and an assembler that then broke IS a fault, and the operator is the
         # only one who can act on it. Same split, and the same two log levels, as `_receipt_for`.
@@ -1155,8 +1160,13 @@ def _table_contexts(org, table_names: list[str], L, index=None) -> dict[str, Any
             # whose two tables land in different area groups arrives once per group. Dedupe on the
             # endpoints rather than the whole dict: two genuinely distinct edges between the same
             # pair differ by their join columns, which are part of the key.
-            key = (rel.get("from_table"), rel.get("to_table"),
-                   rel.get("from_column"), rel.get("to_column"), rel.get("on"))
+            key = (
+                rel.get("from_table"),
+                rel.get("to_table"),
+                rel.get("from_column"),
+                rel.get("to_column"),
+                rel.get("on"),
+            )
             if key not in seen:
                 seen.add(key)
                 relationships.append(rel)
@@ -1184,9 +1194,9 @@ class Scope(NamedTuple):
     scoping bug is invisible when they travel separately.
     """
 
-    level: str                   # "datasource" | "area" | "table"
-    area: "str | None"           # the declared area; None at datasource scope
-    tables: tuple[str, ...]      # bare names, schema stripped; empty unless level == "table"
+    level: str  # "datasource" | "area" | "table"
+    area: "str | None"  # the declared area; None at datasource scope
+    tables: tuple[str, ...]  # bare names, schema stripped; empty unless level == "table"
 
 
 def _resolve_scope(args: dict[str, Any]) -> Scope:
@@ -1277,8 +1287,14 @@ def _areas_owning(org, tables: set[str]) -> set[str]:
 
 
 def _schema_payload(
-    org, profile: str, mode: str, matched: list[str], metrics: dict[str, tuple[Any, str | None]], L,
-    scope: Scope, index=None,
+    org,
+    profile: str,
+    mode: str,
+    matched: list[str],
+    metrics: dict[str, tuple[Any, str | None]],
+    L,
+    scope: Scope,
+    index=None,
 ) -> dict[str, Any]:
     """Build the structured schema payload at the given verbosity, WITHIN `scope`.
 
@@ -1320,8 +1336,7 @@ def _schema_payload(
                 "to_table": r.to_table,
             }
             for r in org.cross_subject_area_relationships
-            if scope.level == "datasource"
-            or scope.area in (r.from_subject_area, r.to_subject_area)
+            if scope.level == "datasource" or scope.area in (r.from_subject_area, r.to_subject_area)
         ],
         "metric_index": {n: (m.description or n) for n, (m, _a) in metrics.items()},
         "large_tables": _large_tables(org),
@@ -1419,28 +1434,45 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
         # A table that is not in the declared area makes the two halves contradict each other, and
         # answering anyway would echo a scope the response does not have.
         misplaced = [
-            tbl for tbl in scope.tables
+            tbl
+            for tbl in scope.tables
             if not any(
                 sa.name == scope.area
-                and (any(_bare_name(d.name) == tbl for d in sa.tables_defined)
-                     or any(_bare_name(getattr(r, "table", "")) == tbl for r in sa.tables))
+                and (
+                    any(_bare_name(d.name) == tbl for d in sa.tables_defined)
+                    or any(_bare_name(getattr(r, "table", "")) == tbl for r in sa.tables)
+                )
                 for sa in org.subject_areas
             )
         ]
         if misplaced:
-            return json.dumps({"error": {"kind": "not_found", "remediation":
-                              f"Table(s) {', '.join(sorted(misplaced))} are not in subject area "
-                              f"{scope.area!r}. Drop `area` to scope by table alone, or name "
-                              f"tables from that area."}}, indent=2)
+            return json.dumps(
+                {
+                    "error": {
+                        "kind": "not_found",
+                        "remediation": f"Table(s) {', '.join(sorted(misplaced))} are not in subject area "
+                        f"{scope.area!r}. Drop `area` to scope by table alone, or name "
+                        f"tables from that area.",
+                    }
+                },
+                indent=2,
+            )
     if scope.area and not any(sa.name == scope.area for sa in org.subject_areas):
         # Fail loudly. "Nothing in your scope is hidden" is vacuously true of a scope that does not
         # exist, and an empty model reads to an agent as "this datasource has none" — after which
         # it invents table names. Every neighbouring surface names the miss: `get_table_context`
         # returns `{"error": "not found in scope"}` per table, `get_subject_area_bundle` raises.
         known = ", ".join(sorted(sa.name for sa in org.subject_areas))
-        return json.dumps({"error": {"kind": "not_found", "remediation":
-                          f"No subject area named {scope.area!r} in {profile!r}. "
-                          f"Known areas: {known}."}}, indent=2)
+        return json.dumps(
+            {
+                "error": {
+                    "kind": "not_found",
+                    "remediation": f"No subject area named {scope.area!r} in {profile!r}. "
+                    f"Known areas: {known}.",
+                }
+            },
+            indent=2,
+        )
     # Never-hide, within the scope the caller DECLARED. `metric_index` and the full `metrics`
     # block are both projected from this one set, so they cannot disagree about what is in scope.
     metrics = _scoped_metrics(org, _all_metrics(org), scope)
@@ -1472,9 +1504,7 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
             # through `_metric_full` rather than shipped raw, because the loader's dump carries the
             # whole per-dialect `bindings` dict and this surface sends one engine's binding.
             "relationships": ctx["relationships"],
-            "metrics": [
-                _metric_full(metrics[n][0], metrics[n][1], engine) for n in selected
-            ],
+            "metrics": [_metric_full(metrics[n][0], metrics[n][1], engine) for n in selected],
             "metric_index": {n: (m.description or n) for n, (m, _a) in metrics.items()},
             "large_tables": _large_tables(org),
         }
@@ -1500,8 +1530,7 @@ def tool_get_datasource_schema(args: dict[str, Any]) -> str:
         index = L.build_table_index(org) if mode == "full" else None
         truncated = False
         while True:
-            result = _schema_payload(org, profile, mode, matched, metrics, L, scope,
-                                     index=index)
+            result = _schema_payload(org, profile, mode, matched, metrics, L, scope, index=index)
             if len(json.dumps(result, default=str)) <= _SCHEMA_CHAR_BUDGET:
                 break
             nxt = _SCHEMA_MODE_DOWNGRADE[mode]
@@ -1745,7 +1774,8 @@ def _child_failure_message(returncode: int, stderr: str | None) -> str:
         # to debug a child that died in a way it could not classify.
         _LOG.error(
             "forked executor exited %s with no relayable diagnostic; raw stderr: %s",
-            returncode, text,
+            returncode,
+            text,
         )
     return UNEXPECTED_FAILURE_MESSAGE
 
@@ -1775,7 +1805,12 @@ def set_injected_executor(executor: Any | None) -> None:
 
 
 def _finalize_execution(
-    columns: list, data_rows: list, *, profile: str, sql: str, execution_ms: int,
+    columns: list,
+    data_rows: list,
+    *,
+    profile: str,
+    sql: str,
+    execution_ms: int,
 ) -> str:
     """Shape a successful result (units + exact-render markdown) and return the result JSON. Shared
     by both execution paths — the subprocess fork and the in-process executor — so a successful query
@@ -1889,8 +1924,11 @@ def _emit(
         rows = [["" if v is None else str(v) for v in row] for row in env.data.rows]
         payload = json.loads(
             _finalize_execution(
-                columns, rows,
-                profile=profile or "", sql=sql or "", execution_ms=execution_ms or 0,
+                columns,
+                rows,
+                profile=profile or "",
+                sql=sql or "",
+                execution_ms=execution_ms or 0,
             )
         )
         body: dict[str, Any] = {"status": "ok", **payload}
@@ -2094,9 +2132,7 @@ def _record_execution(
     _record_query(
         {
             "id": env.audit_id,
-            "error_detail": (
-                raw_detail[:AUDIT_ERROR_DETAIL_MAX_CHARS] if raw_detail else None
-            ),
+            "error_detail": (raw_detail[:AUDIT_ERROR_DETAIL_MAX_CHARS] if raw_detail else None),
             "ts": _now_iso(),
             "profile": profile or "",
             "question": (args or {}).get("raw_query"),
@@ -2130,9 +2166,7 @@ def _record_execution(
     )
 
 
-def _run_in_process(
-    sql: str, profile: str, area: str | None, executor: Any
-) -> Envelope:
+def _run_in_process(sql: str, profile: str, area: str | None, executor: Any) -> Envelope:
     """Run through the in-process executor behind the shared guarded envelope (no subprocess, no CSV
     round-trip) and return the `Envelope` it produced — unmodified.
 
@@ -2154,9 +2188,14 @@ def _run_in_process(
         # down the host; it becomes a fail-closed `failed` Envelope instead. The exit code is
         # deliberately ignored: a driver's exit status is not this module's exit-code contract, and
         # every reachable case is a datasource-configuration problem.
-        return _envelope("failed", failure=Failure(
-            kind="dsn", message="Datasource configuration error.",
-        ), receipt=_resolve_receipt(profile, sql, bounded=True))
+        return _envelope(
+            "failed",
+            failure=Failure(
+                kind="dsn",
+                message="Datasource configuration error.",
+            ),
+            receipt=_resolve_receipt(profile, sql, bounded=True),
+        )
 
 
 def tool_execute_sql(args: dict[str, Any]) -> str:
@@ -2201,7 +2240,10 @@ def _pass_child_env() -> dict[str, str]:
     """
     from execute_sql import _model_pass_disabled
 
-    return {**os.environ, "AGAMI_GOVERNANCE_ENFORCED": "false" if _model_pass_disabled() else "true"}
+    return {
+        **os.environ,
+        "AGAMI_GOVERNANCE_ENFORCED": "false" if _model_pass_disabled() else "true",
+    }
 
 
 def _tool_execute_sql(args: dict[str, Any]) -> str:
@@ -2230,9 +2272,14 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
         # (we decided nothing about a statement — there is no statement) and `other` is the
         # catch-all kind for exactly this.
         return _emit(
-            _envelope("failed", failure=Failure(
-                kind="other", message="Pass a non-empty `sql` string.",
-            ), receipt=undetermined_receipt(RECEIPT_NO_STATEMENT)),
+            _envelope(
+                "failed",
+                failure=Failure(
+                    kind="other",
+                    message="Pass a non-empty `sql` string.",
+                ),
+                receipt=undetermined_receipt(RECEIPT_NO_STATEMENT),
+            ),
             sql=None,
             execution_ms=None,
         )
@@ -2252,9 +2299,11 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
         # nothing a model could have been asked about this statement, and asking one anyway would put
         # a fresh unpooled database round-trip on the cheapest outcome an attacker can trigger at will.
         return _emit(
-            _envelope("refused", refusal=refusal,
-                      receipt=_refusal_receipt(profile, sql, refusal)),
-            sql=sql, execution_ms=None, profile=profile, args=args,
+            _envelope("refused", refusal=refusal, receipt=_refusal_receipt(profile, sql, refusal)),
+            sql=sql,
+            execution_ms=None,
+            profile=profile,
+            args=args,
         )
 
     area = str(args["area"]) if args.get("area") else None
@@ -2267,7 +2316,11 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
         env = _run_in_process(sql, profile, area, _INJECTED_EXECUTOR)
         execution_ms = int((time.monotonic() - started) * 1000)
         return _emit(
-            env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
+            env,
+            sql=sql,
+            execution_ms=execution_ms,
+            profile=profile,
+            args=args,
         )
 
     # The model safety pass (fan/chasm pre-flight + scope + PII) runs inside execute_sql.py;
@@ -2317,10 +2370,14 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
         # cancel to the statement because it is the thing it cancelled. The two bounds coexist, and
         # this one must not borrow the other's rule.)
         return _emit(
-            _envelope("failed", failure=Failure(
-                kind="timeout",
-                message="The executor did not respond within the supervisor's bound and was stopped.",
-            ), receipt=_resolve_receipt(profile, sql, bounded=True)),
+            _envelope(
+                "failed",
+                failure=Failure(
+                    kind="timeout",
+                    message="The executor did not respond within the supervisor's bound and was stopped.",
+                ),
+                receipt=_resolve_receipt(profile, sql, bounded=True),
+            ),
             sql=sql,
             execution_ms=None,
             profile=profile,
@@ -2337,21 +2394,30 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
         refusal = _stderr_refusal(proc.returncode, proc.stderr)
         if refusal is not None:
             rebuilt = Refusal(**refusal)
-            env = _envelope("refused", refusal=rebuilt,
-                            receipt=_refusal_receipt(profile, sql, rebuilt))
+            env = _envelope(
+                "refused", refusal=rebuilt, receipt=_refusal_receipt(profile, sql, rebuilt)
+            )
         else:
             # Not raw stderr: see `_child_failure_message` for which of the two the caller gets and
             # why. This field is shown to the caller, so a traceback must never reach it.
-            env = _envelope("failed", failure=Failure(
-                kind=_classify_exit(proc.returncode),
-                message=_child_failure_message(proc.returncode, proc.stderr),
-            ), receipt=_resolve_receipt(profile, sql, bounded=True))
+            env = _envelope(
+                "failed",
+                failure=Failure(
+                    kind=_classify_exit(proc.returncode),
+                    message=_child_failure_message(proc.returncode, proc.stderr),
+                ),
+                receipt=_resolve_receipt(profile, sql, bounded=True),
+            )
         # `profile` and `args` travel with the non-ok outcomes too. Omitting them wrote the audit row
         # with `datasource=''` and `question=NULL` on exactly the rows a reviewer of a refusal most
         # needs them on — and only on the fork path, which is the default, so the two paths disagreed
         # about the record of the same decision.
         return _emit(
-            env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
+            env,
+            sql=sql,
+            execution_ms=execution_ms,
+            profile=profile,
+            args=args,
         )
 
     # Parse the RFC-4180 CSV emitted on stdout. A result that exceeded the ceiling never reaches
@@ -2363,12 +2429,20 @@ def _tool_execute_sql(args: dict[str, Any]) -> str:
 
     from execute_sql import ExecResult
 
-    env = _envelope("ok", data=ExecResult(
-        columns=columns,
-        rows=[tuple(r) for r in data_rows],
-    ), receipt=_resolve_receipt(profile, sql))
+    env = _envelope(
+        "ok",
+        data=ExecResult(
+            columns=columns,
+            rows=[tuple(r) for r in data_rows],
+        ),
+        receipt=_resolve_receipt(profile, sql),
+    )
     return _emit(
-        env, sql=sql, execution_ms=execution_ms, profile=profile, args=args,
+        env,
+        sql=sql,
+        execution_ms=execution_ms,
+        profile=profile,
+        args=args,
     )
 
 
@@ -2691,7 +2765,9 @@ def record_tool_call(
         "refusal_detail": derived_refusal_detail,
         "refusal_remediation": derived_refusal_remediation,
         "user_question": user_question if user_question is not None else args.get("user_question"),
-        "agent_query": args.get("raw_query"),  # the existing arg is the agent's framing of the query
+        "agent_query": args.get(
+            "raw_query"
+        ),  # the existing arg is the agent's framing of the query
         # The choices behind the query, bounded here rather than by the caller — a bound the caller
         # applies is not a bound. Joins the two self-reported columns above: same provenance, same
         # trust.
@@ -2779,6 +2855,65 @@ _USER_QUESTION_PROP = {
     "description": "The user's question, VERBATIM, that this call helps answer — recorded so an admin "
     "sees what was actually asked. Keep it the SAME across the calls answering one question.",
 }
+
+#: Off by default. `1/true/yes/on` promotes `thread_id` from an optional property to a REQUIRED one
+#: on every tool declaring it. Flagged rather than simply switched on because the change cannot fail
+#: softly — see `require_thread_id`.
+THREAD_ID_REQUIRED_ENV = "AGAMI_REQUIRE_THREAD_ID"
+
+
+def thread_id_is_required() -> bool:
+    """Whether this deployment enforces `thread_id`. Read at build time, not at import, so a test or
+    an embedding process can set it without re-importing the module."""
+    return os.environ.get(THREAD_ID_REQUIRED_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_thread_id(registry: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return `registry` with `thread_id` marked required on every tool that declares it.
+
+    **What this fixes.** `thread_id` is what groups a conversation's calls, and it is entirely
+    self-reported: the activity-log directive in `SERVER_INSTRUCTIONS` asks for it on every call and
+    ends "Best-effort; omit if unknown". Models take the omission. Measured on one deployment across
+    two consecutive conversations: 2 of 10 calls carried one, then 0 of 8 — not one, including the
+    first. Calls without it group into no conversation, so an activity view either fragments them
+    into singletons (this server's behaviour) or, for a consumer that filters them, loses them.
+
+    **Why the schema rather than better wording.** The directive is prose on a surface where the
+    CLIENT supplies the prompt, and it has now produced 20% and then 0% compliance. The input schema
+    is the one channel the server controls: the MCP SDK validates `arguments` against `inputSchema`
+    before dispatch, and a model populates a field marked required. Measured after the change on the
+    same client: 9 of 9 calls carried it, with distinct per-turn `correlation_id`s.
+
+    **Why it is flagged, and why the default is off.** That same validation is the risk. A call
+    omitting a required property never reaches its handler — it returns "Input validation error". So
+    this either works, or it takes the tool out of service for that client. There is no degraded
+    middle, and the measured omission rate before the change was up to 100%. A deployment should turn
+    it on somewhere observed, confirm calls still land, and only then roll it forward. Existing
+    deployments and every other consumer of this registry are unaffected until they opt in.
+
+    **Why not derive the id server-side instead.** There is nothing to derive it from. The OAuth
+    `sid` identifies one *authorization* and survives token rotation by design, so it would file
+    every conversation a user ever has under a single thread; and the streamable-HTTP transport runs
+    `stateless=True`, so there is no `mcp-session-id` either. The server holds no per-conversation
+    fact — which is why the directive asks the model for one.
+
+    Copy-on-write and name-preserving: `TOOLS` itself is never mutated, so a process that builds more
+    than one server (tests do) cannot leak the requirement into a registry that did not ask for it. A
+    tool that declares no `thread_id` is passed through untouched rather than having the property
+    invented for it — marking a non-existent property required would fail every call to that tool
+    forever.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for name, meta in registry.items():
+        schema = meta.get("inputSchema") or {}
+        properties = schema.get("properties") or {}
+        required = list(schema.get("required") or ())
+        if "thread_id" not in properties or "thread_id" in required:
+            out[name] = meta
+            continue
+        out[name] = {**meta, "inputSchema": {**schema, "required": [*required, "thread_id"]}}
+    return out
+
 
 TOOLS: dict[str, dict[str, Any]] = {
     "list_datasources": {
