@@ -12,6 +12,23 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Added
+
+- **A deployment can require `thread_id`, so conversations stop fragmenting in the activity log.**
+  The id that groups a conversation's calls is self-reported — the activity-log directive asks for it
+  on every call and ends "Best-effort; omit if unknown" — and models take the omission. Measured on
+  one deployment across two consecutive conversations: 2 of 10 calls carried one, then 0 of 8, not
+  one including the first. `list_sessions` degrades gracefully (each orphan becomes its own
+  singleton, so the Activity view stays audit-complete), but the conversation those calls belonged to
+  is gone. Setting `AGAMI_REQUIRE_THREAD_ID` promotes the property from optional to **required** on
+  every tool declaring it, which the MCP SDK enforces before dispatch; the same client then sent it
+  on 9 of 9 calls. Deriving it server-side is not available — the OAuth `sid` identifies one
+  authorization and survives token rotation, so it would file every conversation under one thread,
+  and the streamable-HTTP transport is stateless, so there is no `mcp-session-id`. **Default off**,
+  because the change cannot fail softly: a call omitting a required property returns an input
+  validation error rather than a degraded record, so it should be turned on somewhere observed before
+  being rolled forward. Existing deployments are unaffected until they opt in.
+
 ## [0.7.0] — 2026-09-02
 
 The release is one feature: **golden datasets** — a way to write down questions whose answers you
