@@ -12,6 +12,12 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-09-04
+
+One opt-in change, off by default: a deployment can require the `thread_id` that links a
+conversation's tool calls together. Nothing about the served tool surface moves unless the flag is
+set.
+
 ### Added
 
 - **A deployment can require `thread_id`, so conversations stop fragmenting in the activity log.**
