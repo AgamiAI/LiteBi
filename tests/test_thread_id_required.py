@@ -12,6 +12,8 @@ observed on a real client rather than asserted here.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 from tools import TOOLS, require_thread_id, thread_id_is_required
 
@@ -57,8 +59,15 @@ def test_it_is_idempotent():
 
 def test_the_shared_registry_is_never_mutated():
     """Copy-on-write, and it is load-bearing: a process that builds more than one server (the tests
-    do) must not leak the requirement into a registry that never asked for it."""
-    before = {name: dict(meta.get("inputSchema") or {}) for name, meta in TOOLS.items()}
+    do) must not leak the requirement into a registry that never asked for it.
+
+    **`deepcopy`, not `dict(...)`** — raised in review, and the distinction is the whole test. A
+    shallow copy shares the nested `required` LIST with the original, so an implementation that
+    appended in place (`schema["required"].append("thread_id")` — the obvious way to write this
+    wrong) would mutate both sides and the comparison would be a list against itself. The one bug
+    this test exists to catch is precisely the one it would have missed.
+    """
+    before = {name: deepcopy(meta.get("inputSchema") or {}) for name, meta in TOOLS.items()}
     require_thread_id(TOOLS)
     for name, meta in TOOLS.items():
         assert (meta.get("inputSchema") or {}).get("required") == before[name].get("required")
