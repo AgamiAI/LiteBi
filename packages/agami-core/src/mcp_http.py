@@ -51,11 +51,13 @@ from tools import (
     _current_org_ctx,
     bootstrap_paths,
     record_tool_call,
+    require_thread_id,
     reset_typed_outcome,
     resolved_org_id,
     server_instructions,
     server_version,
     set_injected_executor,
+    thread_id_is_required,
     typed_outcome_overrides,
 )
 
@@ -385,6 +387,15 @@ def build_server(
     from mcp.server.lowlevel import Server
 
     registry = TOOLS if registry is None else registry
+    # Applied to whatever registry is being served, consumer tools included: a conversation is
+    # reconstructed from ALL of a turn's calls, so a tool exempt from the requirement would punch a
+    # hole in exactly the grouping this enforces. No-op unless AGAMI_REQUIRE_THREAD_ID is set; see
+    # `tools.require_thread_id` for why that gate exists and why the default is off.
+    #
+    # Before `_visible`, because this reshapes a schema while that one only filters names — running
+    # it after would mean a hidden tool still had its schema rewritten, which is work for nothing.
+    if thread_id_is_required():
+        registry = require_thread_id(registry)
 
     def _visible(name: str) -> bool:
         """Applied at BOTH seams. Listing alone would leave an unlisted tool callable by name, which is
