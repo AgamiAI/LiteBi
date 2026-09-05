@@ -2824,9 +2824,18 @@ def _conversation_id_for(store: Any, org_id: str, actor: str | None, ts: str) ->
     if not actor:
         return fresh
     try:
+        # **No `conversation_id IS NOT NULL` here, and that is a performance decision** (raised in
+        # review). Filtering on it forces the engine to walk back through the actor's history looking
+        # for a stamped row — and during the rollout window EVERY row behind them is unstamped, so
+        # the seek this index exists to give degenerates into a scan of their whole past, on the
+        # write path, exactly when the table is least prepared for it.
+        #
+        # Taking the newest row unconditionally is one seek, always. The semantics are unchanged: if
+        # that row carries no conversation the answer is a boundary, which is what the filtered query
+        # would have produced anyway — a stamped row cannot be older than an unstamped one, because
+        # nothing writes conversations backwards.
         rows = store.query(
-            "SELECT conversation_id, ts FROM tool_calls "
-            "WHERE org_id = ? AND actor = ? AND conversation_id IS NOT NULL "
+            "SELECT conversation_id, ts FROM tool_calls WHERE org_id = ? AND actor = ? "
             "ORDER BY ts DESC LIMIT 1",
             (org_id, actor),
         )
@@ -2836,6 +2845,10 @@ def _conversation_id_for(store: Any, org_id: str, actor: str | None, ts: str) ->
     if not rows:
         return fresh
     previous = dict(rows[0])
+    # An unstamped previous call is a boundary, not an error: it is a row from before this column
+    # existed, and there is no conversation on it to continue.
+    if not previous.get("conversation_id"):
+        return fresh
     gap = _minutes_between(previous["ts"], ts)
     if gap is None or gap > CONVERSATION_IDLE_MINUTES:
         return fresh

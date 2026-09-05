@@ -242,3 +242,29 @@ def test_a_row_written_before_the_column_still_groups_the_old_way():
             ]
 
     assert len(list_sessions(_Rows(), org_id="acme")) == 1
+
+
+def test_an_unstamped_previous_call_is_a_boundary():
+    """The lookup takes the newest row unconditionally — filtering on `conversation_id IS NOT NULL`
+    would make the engine walk an actor's whole pre-021 history to prove there is no stamped row,
+    on the write path, during exactly the window where every row behind them is unstamped. So the
+    NULL is handled here instead, and it means the same thing: nothing to continue."""
+    store = _Store([{"conversation_id": None, "ts": "2026-09-05T10:00:00Z"}])
+    assert _conversation_id_for(store, "acme", "you@example.com", "2026-09-05T10:00:30Z")
+    empty = _Store([{"conversation_id": "", "ts": "2026-09-05T10:00:00Z"}])
+    assert _conversation_id_for(empty, "acme", "you@example.com", "2026-09-05T10:00:30Z")
+
+
+def test_the_lookup_does_not_filter_on_the_new_column():
+    """Asserted on the SQL because the cost is invisible from the result: the filtered form returns
+    the same answer and reads an actor's entire history to do it."""
+    seen: list[str] = []
+
+    class _Recording(_Store):
+        def query(self, sql: str, params: tuple):  # noqa: ARG002
+            seen.append(sql)
+            return []
+
+    _conversation_id_for(_Recording(), "acme", "you@example.com", "2026-09-05T10:00:00Z")
+    assert "conversation_id IS NOT NULL" not in seen[0]
+    assert "ORDER BY ts DESC LIMIT 1" in seen[0]
