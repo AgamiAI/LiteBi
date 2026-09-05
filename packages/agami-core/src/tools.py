@@ -2787,6 +2787,97 @@ def record_tool_call(
     _record_tool_call(rec)
 
 
+#: How long a pause ends a conversation. Measured on a real deployment: of one person's consecutive
+#: calls, 131 of 142 fell inside two minutes — working through a single question — and the rest were
+#: a sparse tail at 38 minutes and beyond, with only three landing between. Thirty holds every one of
+#: the 131 together and splits every clear break, which is the shape the data actually has rather
+#: than a round number chosen for looking like one. It is a judgement and not a fact; re-measure it
+#: before treating it as settled.
+CONVERSATION_IDLE_MINUTES = 30
+
+
+def _conversation_id_for(store: Any, org_id: str, actor: str | None, ts: str) -> str:
+    """The conversation this call belongs to: the actor's most recent one, or a new one after a pause.
+
+    **Why the server decides this and does not ask.** `thread_id` is the model's answer to the same
+    question and cannot be relied on — asked in prose it arrives on a minority of calls, made
+    required it arrives on all of them and collides, and handed back for echoing it is ignored. See
+    `021_tool_calls_conversation.sql` for the measurements. This value is computed from the
+    authenticated actor, their organization and the clock, none of which a caller can influence.
+
+    **One indexed query per recorded call, on a connection that is already open.** The recorder holds
+    a `Store` to write the row; this reads through the same one, so the cost is a lookup rather than a
+    round trip. `idx_tool_calls_actor_recent` is `(org_id, actor, ts)` precisely so "the newest row
+    for this actor" is a seek rather than a scan of their history.
+
+    **An actor is required to continue a conversation, and `None` never continues one.** Presence auth
+    records no actor, so every such call would otherwise chain onto the last one from anybody — which
+    is the cross-person merge this design exists to make impossible. A row with no actor gets a fresh
+    id each time: over-splitting, which is the safe direction.
+
+    **Never raises.** A conversation id is an annotation on the audit row; the row is the thing that
+    matters, and losing the whole record because the lookup failed would be a far worse trade. A
+    failure mints a new id, which reads as a conversation boundary — visible and wrong, rather than
+    silently attaching this call to somebody else's.
+    """
+    fresh = uuid.uuid4().hex
+    if not actor:
+        return fresh
+    try:
+        # **No `conversation_id IS NOT NULL` here, and that is a performance decision** (raised in
+        # review). Filtering on it forces the engine to walk back through the actor's history looking
+        # for a stamped row — and during the rollout window EVERY row behind them is unstamped, so
+        # the seek this index exists to give degenerates into a scan of their whole past, on the
+        # write path, exactly when the table is least prepared for it.
+        #
+        # Taking the newest row unconditionally is one seek, always. The semantics are unchanged: if
+        # that row carries no conversation the answer is a boundary, which is what the filtered query
+        # would have produced anyway — a stamped row cannot be older than an unstamped one, because
+        # nothing writes conversations backwards.
+        rows = store.query(
+            "SELECT conversation_id, ts FROM tool_calls WHERE org_id = ? AND actor = ? "
+            "ORDER BY ts DESC LIMIT 1",
+            (org_id, actor),
+        )
+    except Exception:  # noqa: BLE001 — see the docstring: the row outranks its annotation
+        _LOG.warning("could not read the previous call to continue a conversation", exc_info=True)
+        return fresh
+    if not rows:
+        return fresh
+    previous = dict(rows[0])
+    # An unstamped previous call is a boundary, not an error: it is a row from before this column
+    # existed, and there is no conversation on it to continue.
+    if not previous.get("conversation_id"):
+        return fresh
+    gap = _minutes_between(previous["ts"], ts)
+    if gap is None or gap > CONVERSATION_IDLE_MINUTES:
+        return fresh
+    return str(previous["conversation_id"])
+
+
+def _minutes_between(earlier: str, later: str) -> "float | None":
+    """Minutes between two stored timestamps, or None if either cannot be read.
+
+    None means "cannot tell", and every caller treats that as a boundary rather than as zero — a
+    timestamp this function cannot parse is not evidence that two calls belong together.
+    """
+    from datetime import datetime
+
+    try:
+        a = datetime.fromisoformat(earlier.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(later.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    minutes = (b - a).total_seconds() / 60.0
+    # **A negative gap is unknown, not small** (raised in review). `abs()` here would fold a clock
+    # that went backwards — an NTP correction, a rolled-back VM, rows arriving out of order — into a
+    # small positive number, and a small gap CONTINUES a conversation. So a stored time later than
+    # the call being recorded would silently attach it to whatever came before. Time not moving
+    # forward is exactly the case where the rule has no evidence, and the caller reads None as a
+    # boundary: a new conversation, which is the direction that cannot merge anything.
+    return None if minutes < 0 else minutes
+
+
 def _record_tool_call(rec: dict[str, Any]) -> None:
     """Write a tool-call record through the DB sink (AGAMI_DB_URL) or the local jsonl.
 
@@ -2822,6 +2913,12 @@ def _record_tool_call(rec: dict[str, Any]) -> None:
             from model_store import DbActivitySink
 
             rec.setdefault("org_id", _current_org_id())  # stamp the calling tenant onto the log row
+            # Decided here rather than by the caller, on the store that is already open. It is the
+            # one field on this row that neither the model nor the consumer can influence.
+            rec.setdefault(
+                "conversation_id",
+                _conversation_id_for(store, rec["org_id"], rec.get("actor"), rec["ts"]),
+            )
             DbActivitySink(store).record_tool_call(ToolCallRecord(**rec))
         finally:
             store.close()
