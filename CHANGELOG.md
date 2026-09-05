@@ -12,6 +12,12 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-05
+
+One change: the server decides which tool calls belong to one conversation, instead of asking the
+model for an id it cannot supply reliably. `tool_calls` gains a column and the Activity view groups
+by it; nothing existing is removed and no argument, return shape or refusal rule moves.
+
 ### Added
 
 - **The server decides which tool calls are one conversation, instead of asking the model.**
