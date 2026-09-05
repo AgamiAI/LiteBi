@@ -34,6 +34,10 @@ below corresponds to one such version.
   mistake it can make is bounded to one person's own back-to-back conversations — it can never merge
   two people and never join two days.
 
+  `list_sessions` groups by it, falling back to the old `(actor, thread_id)` pairing for rows written
+  before the column existed — so the Activity view stops blending two conversations that reported the
+  same self-reported id, without turning history into singletons.
+
   `thread_id` is unchanged and still recorded; this is an addition. Deriving the value costs one
   indexed lookup per recorded call, on the connection the recorder already holds.
 

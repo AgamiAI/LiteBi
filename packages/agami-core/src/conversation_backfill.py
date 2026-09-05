@@ -79,13 +79,20 @@ def apply(store: Any, assignments: list[tuple[str, str]]) -> int:
     """Write the plan. Guarded on `conversation_id IS NULL` in the UPDATE itself, not just in the
     plan: a call recorded between planning and applying already has an authoritative id from the
     write path, and this must not overwrite it."""
+    stamped = 0
     for row_id, conversation_id in assignments:
-        store.execute(
+        cursor = store.execute(
             "UPDATE tool_calls SET conversation_id = ? WHERE id = ? AND conversation_id IS NULL",
             (conversation_id, row_id),
         )
+        # **Counted from the cursor, not from the plan** (raised in review). The guard above means a
+        # row stamped by the write path between planning and applying is skipped — correctly — and
+        # reporting the plan's length would then claim to have written rows it deliberately left
+        # alone. On a long backfill that is the difference between "it worked" and a number nobody
+        # can reconcile against the table afterwards.
+        stamped += getattr(cursor, "rowcount", 0) or 0
     store.commit()
-    return len(assignments)
+    return stamped
 
 
 def main(argv: list[str] | None = None) -> int:

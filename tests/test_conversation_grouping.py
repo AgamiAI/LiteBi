@@ -226,3 +226,109 @@ def test_applying_it_cannot_overwrite_an_id_the_write_path_already_decided():
     store = _RowStore([])
     backfill.apply(store, [("row-1", "conv-1")])
     assert store.updates == [("conv-1", "row-1")]
+
+
+# --- the Activity view reads it, or the column is a feature nothing consumes -------------------
+
+
+def test_a_negative_gap_is_unknown_rather_than_small():
+    """Raised in review. `abs()` would fold a clock that went backwards — an NTP correction, a
+    rolled-back VM, rows arriving out of order — into a SMALL positive number, and a small gap
+    CONTINUES a conversation. Time not moving forward is exactly where the rule has no evidence."""
+    assert _minutes_between("2026-09-05T10:30:00Z", "2026-09-05T10:00:00Z") is None
+    store = _Store([{"conversation_id": "conv-1", "ts": "2026-09-05T10:30:00Z"}])
+    assert (
+        _conversation_id_for(store, "acme", "you@example.com", "2026-09-05T10:00:00Z") != "conv-1"
+    )
+
+
+def test_the_activity_view_groups_by_the_servers_answer_not_the_models():
+    """The column would be a feature nothing consumes if `list_sessions` still keyed on `thread_id`.
+    Here two calls carry DIFFERENT self-reported thread ids and the same server-decided conversation:
+    one session, because the server's answer wins."""
+    from model_store import list_sessions
+
+    class _Rows:
+        def query(self, sql: str, params: tuple):  # noqa: ARG002
+            return [
+                {
+                    "id": "c1",
+                    "ts": "2026-09-05T10:00:00Z",
+                    "actor": "you@example.com",
+                    "tool_name": "execute_sql",
+                    "datasource": "d",
+                    "sql": "SELECT 1",
+                    "row_count": 1,
+                    "execution_ms": 5,
+                    "success": 1,
+                    "error_kind": None,
+                    "user_question": "q",
+                    "agent_query": None,
+                    "thread_id": "t1",
+                    "correlation_id": "x",
+                    "source": "mcp_server",
+                    "refusal_detail": None,
+                    "refusal_remediation": None,
+                    "basis": None,
+                    "conversation_id": "server-1",
+                },
+                {
+                    "id": "c2",
+                    "ts": "2026-09-05T10:01:00Z",
+                    "actor": "you@example.com",
+                    "tool_name": "execute_sql",
+                    "datasource": "d",
+                    "sql": "SELECT 2",
+                    "row_count": 1,
+                    "execution_ms": 5,
+                    "success": 1,
+                    "error_kind": None,
+                    "user_question": "q",
+                    "agent_query": None,
+                    "thread_id": "DIFFERENT",
+                    "correlation_id": "y",
+                    "source": "mcp_server",
+                    "refusal_detail": None,
+                    "refusal_remediation": None,
+                    "basis": None,
+                    "conversation_id": "server-1",
+                },
+            ]
+
+    assert len(list_sessions(_Rows(), org_id="acme")) == 1
+
+
+def test_a_row_written_before_the_column_still_groups_the_old_way():
+    """The fallback is not politeness — every row written before 021 has no conversation, and
+    `thread_id` is the only grouping those have. Dropping it would make the whole history singletons
+    on a view whose promise is that every call appears."""
+    from model_store import list_sessions
+
+    class _Rows:
+        def query(self, sql: str, params: tuple):  # noqa: ARG002
+            return [
+                {
+                    "id": f"c{n}",
+                    "ts": f"2026-09-05T10:0{n}:00Z",
+                    "actor": "you@example.com",
+                    "tool_name": "execute_sql",
+                    "datasource": "d",
+                    "sql": "SELECT 1",
+                    "row_count": 1,
+                    "execution_ms": 5,
+                    "success": 1,
+                    "error_kind": None,
+                    "user_question": "q",
+                    "agent_query": None,
+                    "thread_id": "legacy-thread",
+                    "correlation_id": "x",
+                    "source": "mcp_server",
+                    "refusal_detail": None,
+                    "refusal_remediation": None,
+                    "basis": None,
+                    "conversation_id": None,
+                }
+                for n in (1, 2)
+            ]
+
+    assert len(list_sessions(_Rows(), org_id="acme")) == 1

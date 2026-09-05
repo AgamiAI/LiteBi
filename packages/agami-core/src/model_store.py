@@ -600,7 +600,10 @@ class DbActivitySink:
 _TOOL_CALL_COLS = (
     "id, ts, actor, tool_name, datasource, sql, row_count, execution_ms, success, error_kind, "
     "user_question, agent_query, thread_id, correlation_id, source, "
-    "refusal_detail, refusal_remediation, basis"
+    # The conversation the SERVER decided this call belongs to (021), which is what `list_sessions`
+    # groups by now. `thread_id` stays selected beside it: it is still recorded, a consumer may still
+    # read it, and on a row written before 021 it is the only grouping there is.
+    "refusal_detail, refusal_remediation, basis, conversation_id"
 )
 
 
@@ -674,10 +677,25 @@ def list_sessions(
     sessions: dict[Any, dict[str, Any]] = {}
     order: list[Any] = []
     for r in rows:
-        # Scope the group by the (audit-grade) actor as well as the (self-reported, untrusted) thread_id:
-        # two different users colliding on one thread_id must NOT blend into a single, misattributed
-        # conversation. A call with no thread_id stays its own singleton (grouped on its id).
-        key = (r["actor"], r["thread_id"]) if r["thread_id"] else r["id"]
+        # **`conversation_id` first, because it is the only one of the three that is a FACT.** It is
+        # decided by the server from the authenticated actor and the clock (021), so it cannot be
+        # influenced, cannot collide between two people, and does not depend on the model having
+        # remembered anything. `thread_id` is the model's answer to the same question and was
+        # measured colliding across two days of real traffic — two conversations arriving as `t1`
+        # and blending into one row here.
+        #
+        # It stays as the fallback rather than being dropped: every row written before 021 has no
+        # conversation, and the old grouping is the only one those have. The actor is still paired
+        # with it there for the reason the original comment gives — two people colliding on one
+        # self-reported id must not blend — and a call with neither stays its own singleton, which is
+        # what keeps this view audit-complete.
+        conversation = r["conversation_id"] if "conversation_id" in r.keys() else None
+        if conversation:
+            key = ("conversation", conversation)
+        elif r["thread_id"]:
+            key = (r["actor"], r["thread_id"])
+        else:
+            key = r["id"]
         s = sessions.get(key)
         if s is None:
             s = {

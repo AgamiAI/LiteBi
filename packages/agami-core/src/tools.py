@@ -2855,7 +2855,14 @@ def _minutes_between(earlier: str, later: str) -> "float | None":
         b = datetime.fromisoformat(later.replace("Z", "+00:00"))
     except (AttributeError, TypeError, ValueError):
         return None
-    return abs((b - a).total_seconds()) / 60.0
+    minutes = (b - a).total_seconds() / 60.0
+    # **A negative gap is unknown, not small** (raised in review). `abs()` here would fold a clock
+    # that went backwards — an NTP correction, a rolled-back VM, rows arriving out of order — into a
+    # small positive number, and a small gap CONTINUES a conversation. So a stored time later than
+    # the call being recorded would silently attach it to whatever came before. Time not moving
+    # forward is exactly the case where the rule has no evidence, and the caller reads None as a
+    # boundary: a new conversation, which is the direction that cannot merge anything.
+    return None if minutes < 0 else minutes
 
 
 def _record_tool_call(rec: dict[str, Any]) -> None:
