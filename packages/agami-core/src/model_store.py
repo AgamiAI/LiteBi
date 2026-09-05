@@ -549,8 +549,9 @@ class DbActivitySink:
         self._store.execute(
             "INSERT INTO tool_calls (id, ts, org_id, actor, tool_name, datasource, sql, row_count, "
             "execution_ms, success, error_kind, source, user_question, agent_query, thread_id, "
-            "correlation_id, refusal_detail, refusal_remediation, audit_id, basis) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "correlation_id, refusal_detail, refusal_remediation, audit_id, basis, "
+            "conversation_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 uuid4().hex,
                 record.ts,
@@ -582,6 +583,11 @@ class DbActivitySink:
                 # serialized by the writer. `getattr`-guarded like the three above, and NULL is
                 # ordinary here too: the argument is optional and most calls omit it.
                 getattr(record, "basis", None),
+                # The conversation the server decided this call belongs to (021). `getattr`-guarded
+                # like the four above so an embedder on an older record shape writes NULL rather
+                # than raising — and NULL is a real value here: the local single-user path has no
+                # store to read a previous call from, so it derives nothing.
+                getattr(record, "conversation_id", None),
             ),
         )
         self._store.commit()

@@ -293,6 +293,13 @@ class ToolCallRecord(_Contract):
     agent_query: str | None = None
     thread_id: str | None = None
     correlation_id: str | None = None  # the turn: one user question -> N agent sub-queries
+    # **The conversation, decided by the server** (021). `thread_id` above answers the same question
+    # and is the MODEL's answer, which cannot be relied on — asked in prose it arrives on a minority
+    # of calls, made required it arrives on all of them and collides. This is computed from the
+    # authenticated actor, their organization and the clock, so no caller can influence it. NULL on a
+    # row written before 021 and on the local single-user path, which has no store to read a previous
+    # call from.
+    conversation_id: str | None = None
     # This call's execution, where it ran one (019) — `query_executions.id`, the same id `_emit` puts
     # on the envelope the caller receives. `correlation_id` identifies the turn, which may run several
     # statements; this identifies the statement. NULL wherever none ran.

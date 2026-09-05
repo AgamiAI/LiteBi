@@ -12,6 +12,36 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Added
+
+- **The server decides which tool calls are one conversation, instead of asking the model.**
+  `tool_calls` gains `conversation_id`, worked out when the call is recorded from the authenticated
+  actor, their organization and the clock: calls by one person continue a conversation until a pause
+  longer than `CONVERSATION_IDLE_MINUTES` (30), and the next call after that pause starts a new one.
+  Nothing a caller sends can influence it.
+
+  `thread_id` was meant to be this and is minted by the model, which cannot be relied on. Measured on
+  one deployment: asked in prose it arrived on 2 of 10 calls and then 0 of 8; made a required
+  property (0.7.1) it arrived on 9 of 9 **and collided** — a model forced to invent an id it does not
+  otherwise track emits the shortest string the schema accepts, so two conversations two days apart
+  both arrived as `t1` and were shown as one, with their turns merged. Handing it a server-minted id
+  to echo back was ignored as well; nothing carried in prose is honoured, wherever the prose sits.
+  The transport cannot supply one either — MCP removed `MCP-Session-Id` in the 2026-07-28 revision,
+  and this server already runs stateless for the reason the spec dropped it.
+
+  The rule is a judgement, not a fact: two conversations a minute apart are one row. What it
+  guarantees is that the answer is the SAME every time, computed rather than remembered, and that the
+  mistake it can make is bounded to one person's own back-to-back conversations — it can never merge
+  two people and never join two days.
+
+  `thread_id` is unchanged and still recorded; this is an addition. Deriving the value costs one
+  indexed lookup per recorded call, on the connection the recorder already holds.
+
+- **`python -m conversation_backfill`** stamps `conversation_id` onto calls written before the column
+  existed, under the same rule imported from the live code rather than restated. It prints what it
+  would do and writes nothing without `--apply`, because grouping rows that were never grouped is a
+  judgement about what happened and belongs to a person rather than to an upgrade.
+
 ## [0.7.1] — 2026-09-04
 
 One opt-in change, off by default: a deployment can require the `thread_id` that links a

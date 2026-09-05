@@ -1,0 +1,228 @@
+"""The server decides which calls are one conversation, and the model has no say in it.
+
+`thread_id` answers the same question and is the model's answer. Measured on one deployment: asked in
+prose it arrived on 2 of 10 calls and then 0 of 8; made a required property it arrived on 9 of 9 and
+the values collided — two conversations two days apart both came through as `t1` and were shown as
+one. Handed a server-minted id to echo back, it ignored that too.
+
+So these tests are about a value no caller can influence. What they pin is the rule, its edges, and
+the two properties that make it safe: it never merges two people, and it never continues after a
+pause.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages/agami-core/src"))
+
+from tools import CONVERSATION_IDLE_MINUTES, _conversation_id_for, _minutes_between  # noqa: E402
+
+
+class _Store:
+    """The one query the rule makes, answered from a list. A real store is not needed to pin a rule
+    about ordering and gaps, and a fake makes the boundary cases writable."""
+
+    def __init__(self, rows: list[dict] | None = None, raises: bool = False) -> None:
+        self.rows = rows or []
+        self.raises = raises
+        self.queries = 0
+
+    def query(self, sql: str, params: tuple):  # noqa: ARG002
+        self.queries += 1
+        if self.raises:
+            raise RuntimeError("database is unreachable")
+        return self.rows
+
+
+def test_a_call_close_behind_another_continues_its_conversation():
+    store = _Store([{"conversation_id": "conv-1", "ts": "2026-09-05T10:00:00Z"}])
+    got = _conversation_id_for(store, "acme", "you@example.com", "2026-09-05T10:01:00Z")
+    assert got == "conv-1"
+
+
+def test_a_call_after_a_long_pause_starts_a_new_one():
+    store = _Store([{"conversation_id": "conv-1", "ts": "2026-09-05T10:00:00Z"}])
+    got = _conversation_id_for(store, "acme", "you@example.com", "2026-09-05T14:00:00Z")
+    assert got != "conv-1"
+
+
+def test_the_boundary_is_inclusive_and_the_minute_after_it_is_not():
+    """Exactly at the threshold still continues; one minute past does not. Stated as a test because
+    "longer than" and "at least" are one character apart and the difference is invisible in prose."""
+    at = _Store([{"conversation_id": "conv-1", "ts": "2026-09-05T10:00:00Z"}])
+    assert (
+        _conversation_id_for(
+            at, "acme", "you@example.com", f"2026-09-05T10:{CONVERSATION_IDLE_MINUTES:02d}:00Z"
+        )
+        == "conv-1"
+    )
+    past = _Store([{"conversation_id": "conv-1", "ts": "2026-09-05T10:00:00Z"}])
+    assert (
+        _conversation_id_for(
+            past,
+            "acme",
+            "you@example.com",
+            f"2026-09-05T10:{CONVERSATION_IDLE_MINUTES + 1:02d}:00Z",
+        )
+        != "conv-1"
+    )
+
+
+def test_the_first_call_anybody_makes_starts_a_conversation():
+    assert _conversation_id_for(_Store([]), "acme", "you@example.com", "2026-09-05T10:00:00Z")
+
+
+def test_a_call_with_no_actor_never_continues_anything():
+    """**The property that makes this safe.** Presence auth records no actor, so chaining those
+    together would file everyone who ever called anonymously into one conversation — the
+    cross-person merge the whole design exists to make impossible. Each gets its own id, and the
+    store is not even asked."""
+    store = _Store([{"conversation_id": "conv-1", "ts": "2026-09-05T10:00:00Z"}])
+    first = _conversation_id_for(store, "acme", None, "2026-09-05T10:00:10Z")
+    second = _conversation_id_for(store, "acme", "", "2026-09-05T10:00:20Z")
+    assert first != second != "conv-1"
+    assert store.queries == 0, "an actorless call has nothing to look up"
+
+
+def test_an_unreadable_database_costs_the_grouping_and_never_the_row():
+    """A conversation id is an annotation on an audit row. Losing the row because the lookup failed
+    would be the worse trade by a distance, so a failure mints a new id — which reads as a
+    conversation boundary: visible and wrong, rather than silently attaching this call to somebody
+    else's conversation."""
+    got = _conversation_id_for(
+        _Store(raises=True), "acme", "you@example.com", "2026-09-05T10:00:00Z"
+    )
+    assert got
+
+
+def test_a_timestamp_that_cannot_be_read_is_a_boundary_not_a_zero():
+    """`None` from the gap means "cannot tell", and cannot-tell must not be treated as no-time-passed
+    — an unparseable timestamp is not evidence that two calls belong together."""
+    assert _minutes_between("not a date", "2026-09-05T10:00:00Z") is None
+    store = _Store([{"conversation_id": "conv-1", "ts": "not a date"}])
+    assert (
+        _conversation_id_for(store, "acme", "you@example.com", "2026-09-05T10:00:00Z") != "conv-1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later", "expected"),
+    [
+        ("2026-09-05T10:00:00Z", "2026-09-05T10:30:00Z", 30.0),
+        ("2026-09-05T10:00:00+00:00", "2026-09-05T10:01:30Z", 1.5),
+        ("2026-09-05T10:00:00.500Z", "2026-09-05T10:00:00.500Z", 0.0),
+    ],
+)
+def test_the_gap_reads_the_timestamp_shapes_this_codebase_writes(earlier, later, expected):
+    """Both resolutions and both spellings of UTC — `_now_iso` writes `Z`, and other writers use the
+    offset form. A gap function that understood only one would silently return None for the other and
+    split every conversation."""
+    assert _minutes_between(earlier, later) == pytest.approx(expected)
+
+
+def test_two_people_in_one_company_are_never_one_conversation():
+    """The lookup is scoped by actor in the SQL, so this is really a test that the scoping is asked
+    for — the fake returns whatever it is given regardless. It reads the parameters to check."""
+    seen: list[tuple] = []
+
+    class _Recording(_Store):
+        def query(self, sql: str, params: tuple):
+            seen.append(params)
+            return []
+
+    _conversation_id_for(_Recording(), "acme", "you@example.com", "2026-09-05T10:00:00Z")
+    assert seen == [("acme", "you@example.com")], "both the company and the person must scope it"
+
+
+# --- the backfill, which stamps history under the same rule ------------------------------------
+
+
+class _RowStore:
+    """Enough of a store for the backfill: it answers the one SELECT and records the UPDATEs."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+        self.updates: list[tuple] = []
+
+    def query(self, sql: str, params: tuple):  # noqa: ARG002
+        return self.rows
+
+    def execute(self, sql: str, params: tuple):  # noqa: ARG002
+        self.updates.append(params)
+
+    def commit(self) -> None:
+        pass
+
+
+def _row(rid, actor, ts, org="acme"):
+    return {"id": rid, "org_id": org, "actor": actor, "ts": ts}
+
+
+def test_the_backfill_groups_history_by_the_same_rule_the_server_uses():
+    """Imported, never restated. Two copies of this rule would drift, and the drift would be
+    invisible: history and new rows grouped by two slightly different definitions on one screen."""
+    import conversation_backfill as backfill
+
+    store = _RowStore(
+        [
+            _row("a", "you@example.com", "2026-09-05T10:00:00Z"),
+            _row("b", "you@example.com", "2026-09-05T10:01:00Z"),
+            # ...a long pause, so a second conversation.
+            _row("c", "you@example.com", "2026-09-05T14:00:00Z"),
+        ]
+    )
+    assignments = backfill.plan(store)
+    conversations = {conversation for _, conversation in assignments}
+    assert len(assignments) == 3
+    assert len(conversations) == 2, "the pause splits them"
+    assert assignments[0][1] == assignments[1][1], "the two close calls are one conversation"
+
+
+def test_the_backfill_never_merges_two_people():
+    """The property that matters most, asserted on the backfill as well as on the live rule — a
+    single pass over rows ordered by actor could otherwise chain the last call of one person onto
+    the first of the next."""
+    import conversation_backfill as backfill
+
+    store = _RowStore(
+        [
+            _row("a", "alice@example.com", "2026-09-05T10:00:00Z"),
+            _row("b", "bob@example.com", "2026-09-05T10:00:30Z"),
+        ]
+    )
+    got = {conversation for _, conversation in backfill.plan(store)}
+    assert len(got) == 2
+
+
+def test_the_backfill_gives_every_actorless_call_its_own_conversation():
+    import conversation_backfill as backfill
+
+    store = _RowStore(
+        [_row("a", None, "2026-09-05T10:00:00Z"), _row("b", None, "2026-09-05T10:00:10Z")]
+    )
+    got = {conversation for _, conversation in backfill.plan(store)}
+    assert len(got) == 2, "presence auth records nobody; those must not chain together"
+
+
+def test_the_backfill_writes_nothing_unless_asked():
+    """It prints a plan and changes nothing without `--apply`. Rewriting history is a judgement about
+    what happened, so it is an explicit act rather than something that runs on upgrade."""
+    import conversation_backfill as backfill
+
+    store = _RowStore([_row("a", "you@example.com", "2026-09-05T10:00:00Z")])
+    backfill.plan(store)
+    assert store.updates == []
+
+
+def test_applying_it_cannot_overwrite_an_id_the_write_path_already_decided():
+    """Guarded in the UPDATE itself, not only in the plan: a call recorded between planning and
+    applying already carries an authoritative id, and history must not stamp over it."""
+    import conversation_backfill as backfill
+
+    store = _RowStore([])
+    backfill.apply(store, [("row-1", "conv-1")])
+    assert store.updates == [("conv-1", "row-1")]

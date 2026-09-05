@@ -1,0 +1,42 @@
+-- The conversation a tool call belongs to, decided by the SERVER.
+--
+-- `thread_id` was supposed to be this, and it is minted by the MODEL. Measured across four ways of
+-- asking on one deployment: asked in prose it arrived on 2 of 10 calls and then 0 of 8; made a
+-- required property in the tool schema it arrived on 9 of 9 — and the ids collided, because a model
+-- forced to invent a value it does not otherwise track emits the shortest string that satisfies the
+-- schema. Two conversations two days apart both arrived as `t1` and were shown as one, with their
+-- turns merged, on the screen whose whole job is to say what the product did.
+--
+-- Handing the model a server-minted id and asking it to echo one back does not work either: tried in
+-- a tool result, it was ignored (and `audit_id`, which the schema already asks callers to copy from
+-- a result, is likewise absent from real rows). Nothing carried in prose is honoured, wherever the
+-- prose sits.
+--
+-- The transport cannot supply one: MCP removed `MCP-Session-Id` in the 2026-07-28 revision, and this
+-- server already runs `stateless=True` for the same reason the spec dropped it — any instance serves
+-- any request, with no sticky sessions.
+--
+-- So the server decides, from what it holds and nobody can influence: the authenticated actor, their
+-- organization, and the time. Calls by one person in one organization continue a conversation until
+-- there is a pause; the next call after that pause starts a new one. It will not always be right —
+-- two chats a minute apart are one row — but it is the SAME every time, computed from facts rather
+-- than from a model's memory, and the mistake it can make is bounded to one person's own
+-- back-to-back conversations. It can never merge two people, and never join two days.
+--
+-- `thread_id` stays exactly as it is. It is still recorded, still self-reported, and a consumer that
+-- reads it keeps reading it; this column is an addition and nothing is taken away.
+--
+-- NULL means the row was written before this column existed, or by the local single-user path, which
+-- has no store to look a previous call up in. `conversation_backfill` stamps history under the same
+-- rule; it is a separate, explicit act rather than something a migration does silently.
+ALTER TABLE tool_calls ADD COLUMN conversation_id TEXT;
+
+-- **The lookup this column needs, and the reason the order is what it is.** Deriving the value costs
+-- one query per recorded call — "the most recent call by this actor in this organization" — so the
+-- index has to serve exactly that: equality on the two scoping columns, then `ts` to make the newest
+-- row the first one read rather than a sort over the actor's whole history. `idx_tool_calls_org`
+-- cannot: it stops at the organization, which on a busy tenant is every call anyone has made.
+CREATE INDEX IF NOT EXISTS idx_tool_calls_actor_recent ON tool_calls (org_id, actor, ts);
+
+-- Reading a conversation back. `idx_tool_calls_thread` is `thread_id`'s and does not serve this one.
+CREATE INDEX IF NOT EXISTS idx_tool_calls_conversation ON tool_calls (org_id, conversation_id);
