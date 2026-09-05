@@ -27,8 +27,19 @@
 -- reads it keeps reading it; this column is an addition and nothing is taken away.
 --
 -- NULL means the row was written before this column existed, or by the local single-user path, which
--- has no store to look a previous call up in. `conversation_backfill` stamps history under the same
--- rule; it is a separate, explicit act rather than something a migration does silently.
+-- has no store to look a previous call up in.
+--
+-- **History is deliberately left alone, and there is no backfill.** Applying this rule backwards was
+-- written and then dropped: it would overwrite a record of what was actually reported with a
+-- computed guess, and the guess is not uniformly better. It would separate two conversations that
+-- collided on one `thread_id` — but it would also SPLIT a real conversation that paused for lunch
+-- and resumed, which the recorded id had right. Trading a known-wrong grouping for a
+-- plausible-looking one, with no way afterwards to tell which rows were recorded and which were
+-- computed, is the thing this column exists to stop.
+--
+-- So the boundary stays visible in the data: `conversation_id IS NULL` is exactly "grouped the way
+-- the model reported it", and a reader can tell the two apart. `list_sessions` keeps the old
+-- `(actor, thread_id)` pairing for those rows.
 ALTER TABLE tool_calls ADD COLUMN conversation_id TEXT;
 
 -- **The lookup this column needs, and the reason the order is what it is.** Deriving the value costs

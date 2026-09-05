@@ -41,11 +41,6 @@ below corresponds to one such version.
   `thread_id` is unchanged and still recorded; this is an addition. Deriving the value costs one
   indexed lookup per recorded call, on the connection the recorder already holds.
 
-- **`python -m conversation_backfill`** stamps `conversation_id` onto calls written before the column
-  existed, under the same rule imported from the live code rather than restated. It prints what it
-  would do and writes nothing without `--apply`, because grouping rows that were never grouped is a
-  judgement about what happened and belongs to a person rather than to an upgrade.
-
 ## [0.7.1] — 2026-09-04
 
 One opt-in change, off by default: a deployment can require the `thread_id` that links a
