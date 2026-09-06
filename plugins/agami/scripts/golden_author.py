@@ -95,6 +95,22 @@ except ImportError as exc:
 # about itself.
 _PREFIX = "agami-save-golden:"
 
+# The semantic-model CLI, beside this script in every layout the plugin ships in. Shelled out to
+# rather than called in-process for the reason `run_golden_eval` gives: `agami-query` reaches the
+# ranker THROUGH this CLI, and an in-process call would be a second route to the same library.
+_SM = Path(__file__).resolve().parent / "sm"
+
+# How many curated examples the convention check reads per subject area. One is enough: the check
+# asks whether this statement departs from the way the team already answers questions like it, and
+# the nearest example is the answer to that. More would be a survey.
+_CONVENTION_TOP_K = 1
+
+# Which claims a divergence from convention is reported for. Deliberately not all seven: two
+# statements answering one question legitimately differ in ordering, limit and grouping, and
+# reporting those would make the check noise a person learns to click through. These three are the
+# ones that change WHICH ROWS are counted, which is what an answer key is for.
+_CONVENTION_CLAIMS = ("tables", "filter_predicates", "date_window")
+
 # What an exit code means. `_NEEDS_CONFIRMATION` belongs to the write door: a change the person has
 # not agreed to yet is neither a success nor a breakage, and a pipeline that treats it as either
 # would be wrong in both directions.
@@ -644,12 +660,122 @@ def _import(
     )
 
 
+def _nearest_example(profile: str, question: str) -> Optional[dict]:
+    """The curated example nearest this question, across every subject area, or None.
+
+    `sm examples --query` is the product's own ranker and the one `agami-query` reaches through, so
+    the example this returns is the one the generator would most likely be shown when the question
+    is asked for real. Every area is ranked and the best kept, because the CLI reads one library at
+    a time and a save is not told which area a question belongs to.
+
+    Total by construction. Every failure here — no model, no CLI, a profile mid-rebuild — returns
+    None, because this check exists to inform a write and must never be the reason one cannot
+    happen.
+    """
+    root = agami_paths.profile_dir(profile)
+    try:
+        areas = _sm_json("areas", str(root))
+        if not isinstance(areas, list):
+            return None
+        best: tuple[float, dict] = (0.0, {})
+        for area in areas:
+            name = (area or {}).get("name") if isinstance(area, dict) else None
+            if not name:
+                continue
+            ranked = _sm_json(
+                "examples", str(root), "--area", str(name),
+                "--query", question, "--top-k", str(_CONVENTION_TOP_K),
+            )
+            for match in (ranked or {}).get("matches") or []:
+                score = match.get("score") or 0.0
+                if score > best[0] and (match.get("example") or {}).get("sql"):
+                    best = (score, match["example"])
+        return best[1] or None
+    except Exception:
+        return None
+
+
+def _sm_json(*args: str) -> Any:
+    """One semantic-model CLI command, or None if it did not answer with JSON."""
+    import subprocess
+
+    done = subprocess.run(
+        ["bash", str(_SM), *args], capture_output=True, text=True, check=False, timeout=120
+    )
+    if done.returncode != 0:
+        return None
+    try:
+        return json.loads(done.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _dialect(profile: str) -> str:
+    """The profile's own engine, or the generic grammar when it cannot be resolved.
+
+    Falling back rather than giving up, because the alternative is worse than a slightly less
+    precise parse: resolving the dialect needs the whole model to load, and a profile mid-rebuild
+    would silently switch this check OFF at exactly the moment somebody is authoring against it.
+    Both statements are parsed the same way either way, which is what the comparison needs.
+    """
+    try:
+        from semantic_model import loader
+        from semantic_model.sql_dialect import resolve_datasource_dialect
+
+        return resolve_datasource_dialect(loader.load_datasource(agami_paths.profile_dir(profile)))
+    except Exception:
+        return ""
+
+
+def _convention_divergence(profile: str, question: str, sql: str) -> Optional[dict]:
+    """How this statement departs from the way the team already answers questions like it.
+
+    The gap this closes was measured rather than imagined. On the first real dataset authored
+    against a live warehouse, fifteen items were written and nine failed — six of them one mistake:
+    the answer keys filtered on one timestamp column where that profile's own examples used another,
+    24 times out of 36. The generator read those examples, followed the convention, and was marked
+    wrong six times by a key that had never looked at them. Nothing in the write path had.
+
+    Reported and never enforced. A golden item may legitimately depart from convention — that is
+    sometimes exactly why one is written — so this returns what differs and the caller asks. And it
+    is total for the same reason `_nearest_example` is: a check that could refuse a save would be a
+    new way to fail to write down a correct answer.
+    """
+    try:
+        example = _nearest_example(profile, question)
+    except Exception:
+        return None
+    if not example:
+        return None
+    try:
+        from semantic_model.golden_claims import compare_statements
+
+        diff = compare_statements(sql, str(example["sql"]), dialect=_dialect(profile))
+        claims = diff.as_dict().get("claims") or []
+    except Exception:
+        return None
+
+    differing = [
+        claim
+        for claim in claims
+        if claim.get("name") in _CONVENTION_CLAIMS and claim.get("status") == "differs"
+    ]
+    if not differing:
+        return None
+    return {
+        "example_question": str(example.get("question") or ""),
+        "example_sql": str(example["sql"]),
+        "claims": differing,
+    }
+
+
 def _save(
     profile: str,
     stem: str,
     item_path: str,
     *,
     confirm_replace: bool,
+    confirm_convention: bool,
     description: Optional[str],
 ) -> int:
     """Write one answer somebody looked at and accepted.
@@ -698,6 +824,25 @@ def _save(
     for key in ("match", "bounds", "must_filter"):
         if payload.get(key):
             fields[key] = payload[key]
+
+    # Before the write and not after it. A warning that arrives once the answer key is on disk is a
+    # warning about a file the reader now has to decide whether to undo, and the append-only rule
+    # makes undoing it a second confirmation. This is the only door it runs on: an import writes no
+    # statement, and curation may not write one.
+    if not confirm_convention:
+        divergence = _convention_divergence(profile, payload["query"], payload["sql"])
+        if divergence:
+            print(
+                json.dumps(
+                    {
+                        "dataset": stem,
+                        "added": [],
+                        "needs_confirmation_convention": divergence,
+                    },
+                    indent=2,
+                )
+            )
+            return _NEEDS_CONFIRMATION
 
     return _write_items(
         profile,
@@ -858,6 +1003,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.dataset,
             args.item,
             confirm_replace=args.confirm_replace,
+            confirm_convention=args.confirm_convention,
             description=args.description,
         )
 
@@ -883,6 +1029,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     save_cmd = sub.add_parser("save", help="Write one confirmed answer, statement and receipt.")
     save_cmd.add_argument("--item", required=True, help="the accepted answer, as JSON")
+    save_cmd.add_argument(
+        "--confirm-convention",
+        action="store_true",
+        help="write it even though it departs from the profile's own examples",
+    )
     _add_write_args(save_cmd)
 
     apply_cmd = sub.add_parser("apply", help="Apply the explorer page's queued actions.")

@@ -1119,3 +1119,118 @@ def test_a_dataset_name_carrying_a_separator_is_refused_by_this_door_too(
     assert code == 2
     assert "dataset" in err
     assert neighbour.exists()
+
+
+# --- The convention check (#264) ----------------------------------------------------------------
+#
+# Measured rather than imagined. On the first real dataset authored against a live warehouse, nine
+# of fifteen items failed and six were one mistake: the answer keys filtered on one timestamp column
+# where that profile's own examples used another, 24 times out of 36. The generator read those
+# examples, followed the convention, and was marked wrong by a key that had never looked at them.
+
+
+def _example(sql: str, question: str = QUERY):
+    """Stand in for the ranker, which shells out to a CLI these tests do not have."""
+    return {"question": question, "sql": sql}
+
+
+def test_a_key_that_departs_from_the_profiles_examples_stops_before_writing(
+    tmp_path, monkeypatch, capsys
+):
+    """The write is held, not undone. A warning that arrives once the answer key is on disk is a
+    warning about a file the reader now has to decide whether to undo — and the append-only rule
+    makes undoing it a second confirmation."""
+    monkeypatch.setattr(
+        golden_author,
+        "_nearest_example",
+        lambda profile, question: _example(
+            "SELECT COUNT(*) AS order_count FROM orders WHERE created_at >= '2024-01-01'"
+        ),
+    )
+    item = _item_file(
+        tmp_path,
+        sql="SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= '2024-01-01'",
+    )
+
+    code, payload, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
+
+    assert code == golden_author._NEEDS_CONFIRMATION
+    assert payload["added"] == []
+    divergence = payload["needs_confirmation_convention"]
+    assert divergence["example_sql"].count("created_at")
+    assert [claim["name"] for claim in divergence["claims"]] == ["filter_predicates"]
+    # Nothing reached disk, so there is nothing for the person to undo if they say no.
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+def test_the_departure_is_written_once_somebody_says_it_is_deliberate(
+    tmp_path, monkeypatch, capsys
+):
+    """Reported and never enforced. A golden item may legitimately depart from convention — that is
+    sometimes exactly why one is written — so the check asks and the person decides."""
+    monkeypatch.setattr(
+        golden_author,
+        "_nearest_example",
+        lambda profile, question: _example(
+            "SELECT COUNT(*) AS order_count FROM orders WHERE created_at >= '2024-01-01'"
+        ),
+    )
+    item = _item_file(
+        tmp_path,
+        sql="SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= '2024-01-01'",
+    )
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(item, "orders", "--confirm-convention"))
+
+    assert code == 0
+    assert _items(tmp_path)[0].expected.sql.count("placed_at")
+
+
+def test_a_key_that_matches_the_convention_is_written_without_a_question(
+    tmp_path, monkeypatch, capsys
+):
+    """The check has to be silent when there is nothing to say, or it becomes a prompt people learn
+    to click through."""
+    monkeypatch.setattr(
+        golden_author, "_nearest_example", lambda profile, question: _example(SQL)
+    )
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+
+    assert code == 0 and _items(tmp_path)[0].expected.sql == SQL
+
+
+def test_the_check_never_costs_a_save_when_it_cannot_run(tmp_path, monkeypatch, capsys):
+    """Total by construction. No model, no CLI, a profile mid-rebuild — every one of them returns no
+    opinion, because a check that could refuse a save would be a new way to fail to write down a
+    correct answer."""
+
+    def _explodes(profile, question):
+        raise RuntimeError("no model here")
+
+    monkeypatch.setattr(golden_author, "_nearest_example", _explodes)
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+
+    assert code == 0 and _items(tmp_path)[0].expected.sql == SQL
+
+
+def test_only_the_claims_that_change_which_rows_are_counted_are_reported(
+    tmp_path, monkeypatch, capsys
+):
+    """Two statements answering one question legitimately differ in ordering and limit, and
+    reporting those would make the check noise a person learns to click through."""
+    monkeypatch.setattr(
+        golden_author,
+        "_nearest_example",
+        lambda profile, question: _example(
+            "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY n DESC LIMIT 5"
+        ),
+    )
+    item = _item_file(
+        tmp_path, sql="SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY status"
+    )
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
+
+    assert code == 0, "ordering and limit alone are not a departure worth stopping for"

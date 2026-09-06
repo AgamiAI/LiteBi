@@ -163,6 +163,16 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
   > /tmp/agami-golden-save-<ts>.json
 ```
 
+**A statement that departs from this profile's own examples stops here too**, with exit `1` and a `needs_confirmation_convention` payload. The library of curated examples is where a team's conventions live — which of two equally correct date columns they answer with, how they phrase a join — and it is what agami reads when it answers the question for real. An answer key that contradicts it will fail every future run and blame the model.
+
+The payload carries the nearest example's question and statement, and the claims that differ. **Show both statements and ask**, in one line:
+
+> Your examples for this kind of question filter on `created`; this one uses `opened`. Save it anyway?
+
+**It is a question and never a refusal.** A golden item may legitimately depart from convention — that is sometimes exactly why one is written. On an explicit yes, re-run the same command with `--confirm-convention` appended. On a no, nothing was written, and the fix is usually to the statement rather than to the dataset.
+
+Only three claims can stop a save this way — the tables read, the filters written, and the resolved date window — because those are the ones that change *which rows are counted*. Two statements answering one question differ in ordering and limit all the time, and stopping for those would make this a prompt people learn to click through.
+
 **A relative question over a frozen answer key is refused here**, with exit `2`: *"how many orders in the last 7 days?"* names a window that slides forward and SQL pinned to a fixed date does not. Either anchor the statement to the current date (`CURRENT_DATE - INTERVAL '7 days'`, the dialect's spelling) or rewrite the question to name the window it means (`…in Q1 2024?`), then re-invoke. Do not save it and plan to fix it later — the whole point of refusing at save time is that the one person who can still fix it is here.
 
 ---
@@ -211,7 +221,7 @@ Exit codes are Phase 4's, unchanged. On `1` the payload carries `needs_confirmat
 **Read the exit code before the payload.** Both write doors share it:
 
 - **`0`** — written. Report `added` / `replaced` and the path.
-- **`1`** — **needs confirmation.** Nothing was written. Not a failure and not a success; a pipeline that treated it as either would be wrong in both directions. **This is the only thing that produces `1`** — every other outcome, expected or not, is `2` with a sentence on stderr — so a `1` always carries a `needs_confirmation` payload and is never a crash. If you ever see `1` with no such payload, stop and report it rather than re-running with `--confirm-replace`.
+- **`1`** — **needs confirmation.** Nothing was written. Not a failure and not a success; a pipeline that treated it as either would be wrong in both directions. **This is the only thing that produces `1`** — every other outcome, expected or not, is `2` with a sentence on stderr — so a `1` always carries one of the two confirmation payloads (`needs_confirmation` for a replacement or removal, `needs_confirmation_convention` for a departure from the profile's examples) and is never a crash. If you ever see `1` with neither, stop and report it rather than re-running with a confirm flag.
 - **`2`** — cannot start. The stderr line (prefix `agami-save-golden:`) says why. Nothing was written, or a failed write was rolled back to the bytes that were there before.
 
 On `1`, the payload carries `needs_confirmation`: a list of `{id, before, after}`. **Render both sides** — a markdown table or two fenced blocks per id, the existing item and the one that would take its place. "This id already exists" is not enough for anyone to decide with: the thing being overwritten is an answer key, and they have to see what they would lose.
