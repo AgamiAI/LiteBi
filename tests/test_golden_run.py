@@ -636,14 +636,28 @@ def test_the_child_can_authenticate_as_the_operator_who_started_the_run(spawn, m
 
 def test_the_child_environment_stays_an_allowlist(spawn, monkeypatch):
     """Whatever is added for the client's benefit, nothing that names the key or the warehouse may
-    ride along. `USER` widened this tuple once; this is the guard that keeps the widening honest."""
+    ride along. `USER` widened this tuple once; this is the guard that keeps the widening honest.
+
+    The tuple is pinned LITERALLY, because asserting the child's environment is a subset of it
+    proves nothing — `_child_env` builds that dict by comprehension over this very tuple, so no
+    widening could ever fail such a check. Naming the members is what makes adding one a deliberate
+    edit to a test rather than a line nobody reads.
+    """
+    assert gr._CHILD_ENV_KEYS == ("PATH", "HOME", "LANG", "LC_ALL", "USER", "ANTHROPIC_API_KEY")
+    # And the shape of what may ever join them. The module's own docstring claims no datasource
+    # credential has a name that could reach this tuple; this is that claim as a test, so a future
+    # `PGPASSWORD` or `SNOWFLAKE_PASSWORD` fails here rather than shipping.
+    leaky = ("PASSWORD", "SECRET", "TOKEN", "_URL", "DSN", "CREDENTIAL")
+    assert not [
+        key for key in gr._CHILD_ENV_KEYS if any(mark in key.upper() for mark in leaky)
+    ], "a credential-shaped name reached the child's environment allowlist"
+
     monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", "/artifacts/tenant")
     monkeypatch.setenv("DATASOURCE_URL__ACME", "postgresql://user:pw@warehouse.example/db")
 
     _cli_generator().generate(QUESTION, ORG, DATASOURCE)
 
     _, kwargs = spawn.invocations[0]
-    assert set(kwargs["env"]) <= set(gr._CHILD_ENV_KEYS)
     assert "AGAMI_ARTIFACTS_DIR" not in kwargs["env"]
     assert not any(key.startswith("DATASOURCE_URL") for key in kwargs["env"])
 
