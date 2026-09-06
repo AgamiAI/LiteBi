@@ -182,16 +182,36 @@ def _mixed() -> list[dict[str, Any]]:
             question="How many payments have been taken?",
             score={"status": "scored", "accuracy": 0.0, "reason": "no row matched"},
         ),
-        # The one case where the score and the verdict disagree on purpose: every row agreed, and
-        # the statement still did not answer the question the dataset requires. It is the only path
-        # on which a genuine 1.000 is printed beside "Did not reproduce the answer key".
+        # The one case where reproducing and passing disagree on purpose: every row agreed, and the
+        # statement still did not answer the question the dataset requires. It is the shape a
+        # `must_filter` catch always takes, and the shape the page used to describe as a failure to
+        # reproduce the answer key.
         _item(
             item_key="orders-by-status-scoped",
             section="failure",
             passed=False,
             gated=True,
             question="How many orders are there, by status?",
-            score={"status": "scored", "accuracy": 1.0, "reason": "every row matched"},
+            score={"status": "scored", "accuracy": 1.0, "reason": ""},
+            claims={
+                "claims": [
+                    {"name": "tables", "status": "agrees", "generated": ["orders"], "golden": ["orders"]},
+                    {
+                        "name": "filter_predicates",
+                        "status": "differs",
+                        "generated": [],
+                        "golden": ["eq(channel, 'web')"],
+                    },
+                ],
+                "gates": [
+                    {
+                        "kind": "must_filter",
+                        "column": "channel",
+                        "reason": "the dataset requires this column to be filtered",
+                    }
+                ],
+                "gated": True,
+            },
         ),
         _item(),
     ]
@@ -260,6 +280,13 @@ def test_no_result_row_reaches_the_report():
     item["rows"] = rows
     item["row_preview"] = rows
     item["score"] = {**item["score"], "rows": rows}
+    # A claim's side too. Its only producer compares two SQL strings and can never hold a row, but
+    # the projection now flattens nested sequences that it used to drop — so this is the shape that
+    # would have started travelling if one ever did.
+    item["claims"] = {
+        "claims": [{"name": "tables", "status": "differs", "generated": rows, "golden": rows}],
+        "gates": [],
+    }
     run = _run([item])
     run["rows"] = rows
 
@@ -365,16 +392,23 @@ def test_every_item_carries_its_question_and_verdict():
     items = _payload(html)["items"]
     assert len(items) == 6
     for item in items:
-        assert item["question"] and item["status"] and item["reason"]
+        assert item["question"] and item["status"]
         assert item["section"] in SECTIONS
-        assert set(item) >= {"passed", "confirmed", "gated", "accuracy"}
+        assert set(item) >= {"passed", "confirmed", "gated", "reproduced", "claims", "gates"}
+    # A `reason` is what the comparator wrote when it had something to say, so an item that agreed
+    # on every row carries none — the gated case included, which is exactly why its verdict has to
+    # be built from `reproduced` and `gates` rather than from a sentence that is not there.
+    reasons = {item["item_key"]: item["reason"] for item in items}
+    assert reasons["customers-count"] == "no row matched"
+    assert reasons["orders-by-status-scoped"] == ""
     assert "How many orders have been placed?" in html
 
 
 def test_an_unscored_item_and_an_errored_item_are_told_apart():
-    """Both carry `accuracy: null` and neither is a failure, and they are not the same thing: one
-    produced no statement, the other produced two result sets with nothing to compare. Each keeps
-    its own section and its own reason."""
+    """Neither reproduced an answer key and neither is a failure, and they are not the same thing:
+    one produced no statement, the other produced two result sets with nothing to compare. Each
+    keeps its own section and its own reason — which is the whole of how a reader tells them
+    apart, now that no number is printed beside either."""
     items = {
         item["item_key"]: item
         for item in _payload(render(title="x", profile="demo", run=_run(_mixed())))["items"]
@@ -386,41 +420,62 @@ def test_an_unscored_item_and_an_errored_item_are_told_apart():
     assert items["unused-status"]["section"] == "unscored"
     assert items["unused-status"]["status"] == "unscored"
     assert "empty" in items["unused-status"]["reason"]
-    assert items["products-count"]["accuracy"] is None
-    assert items["unused-status"]["accuracy"] is None
+    assert items["products-count"]["reproduced"] is False
+    assert items["unused-status"]["reproduced"] is False
 
 
-def test_a_score_of_zero_is_not_a_score_of_nothing():
-    """0.0 is a comparison that ran and found no agreement; None is a comparison that never ran.
-    Collapsing them would report a wrong answer and an unrunnable case as the same thing."""
+def test_a_comparison_that_disagreed_is_not_a_comparison_that_never_ran():
+    """A comparison that ran and found no agreement is not one that never ran at all. The number
+    that used to separate them is gone, so the separation has to live where a reader looks: the
+    section, the status and the sentence."""
     items = {
         item["item_key"]: item
         for item in _payload(render(title="x", profile="demo", run=_run(_mixed())))["items"]
     }
 
-    assert items["customers-count"]["accuracy"] == 0.0
-    assert items["products-count"]["accuracy"] is None
+    assert items["customers-count"]["section"] == "failure"
+    assert items["customers-count"]["status"] == "scored"
+    assert items["customers-count"]["reason"] == "no row matched"
+    assert items["products-count"]["section"] == "error"
+    assert items["products-count"]["status"] == "error"
 
 
-def test_the_accuracy_is_shown_to_three_decimals():
-    """The score is deliberately unrounded upstream — an item passes at exactly 1.0, and rounding
-    there would hand the pass mark to a near miss. 3995 of 4000 rows is one such near miss, and
-    presenting it to a person is this renderer's job."""
+def test_no_accuracy_reaches_the_page():
+    """The score is not projected, and this is the guard on that.
+
+    Over a real fifteen-case run every accuracy was exactly 1.0 or exactly 0.0, which is structural
+    rather than luck: a row-count difference, an unpaired column and an extra column each
+    short-circuit before an overlap is computed, and columns pair only on equal value vectors. On
+    the narrow occasion a value in between is reachable, the comparator already writes the same
+    fact in words and `reason` carries it. So the number was redundant when it meant something and
+    actively misleading otherwise — printed as `accuracy 1.000` beside a gated item that had
+    reproduced its answer key perfectly.
+    """
     near_miss = _item(
-        passed=False, section="failure", score={"status": "scored", "accuracy": 3995 / 4000}
+        passed=False,
+        section="failure",
+        score={
+            "status": "scored",
+            "accuracy": 3995 / 4000,
+            "reason": "3995 of the answer key's 4000 rows matched",
+        },
     )
 
     payload = _payload(render(title="x", profile="demo", run=_run([near_miss])))
 
-    assert payload["items"][0]["accuracy"] == 0.999
-    assert "0.99875" not in json.dumps(payload)
+    assert "accuracy" not in payload["items"][0]
+    assert "0.99875" not in json.dumps(payload) and "0.999" not in json.dumps(payload)
+    # What the reader gets instead, and the reason removing the number costs nothing: the same
+    # fact, in words, already written by the comparator.
+    assert payload["items"][0]["reason"] == "3995 of the answer key's 4000 rows matched"
 
 
-def test_a_near_miss_is_never_shown_as_a_perfect_score():
-    """4002 of 4004 rows rounds to 1.000 at three decimals, and an item passes at exactly 1.0. So
-    rounding alone would print a perfect-looking score beside the sentence saying the statement did
-    not reproduce the answer key — the one confusion this report exists to remove. Only a real 1.0
-    may read as 1.000."""
+def test_reproducing_the_answer_key_is_carried_apart_from_passing():
+    """The two are not the same question, and the page needs both to describe a gated item.
+
+    Only an exact 1.0 counts as reproducing the key: a near miss that would once have ROUNDED to
+    1.000 must not read as agreement now that the rounding is gone.
+    """
     near_miss = _item(
         passed=False, section="failure", score={"status": "scored", "accuracy": 4002 / 4004}
     )
@@ -428,36 +483,96 @@ def test_a_near_miss_is_never_shown_as_a_perfect_score():
 
     payload = _payload(render(title="x", profile="demo", run=_run([near_miss, perfect])))
 
-    assert payload["items"][0]["accuracy"] == 0.999, "a near miss must not reach the pass mark"
-    assert payload["items"][1]["accuracy"] == 1.0, "a real pass still shows as one"
+    assert payload["items"][0]["reproduced"] is False, "a near miss is not a reproduction"
+    assert payload["items"][1]["reproduced"] is True
 
 
-def test_the_table_set_delta_is_rendered_above_the_statements():
-    """The table-set delta is usually the whole finding — "generated read `orders`, the answer key
-    read `customers`" — so it is one line above the two statements rather than something to be
-    spotted in them."""
+def test_every_claim_reaches_the_page_and_not_just_the_table_set():
+    """The page used to receive `claims[0]` — the table set — and nothing else.
+
+    That is reliably the claim that says the least: in a structural failure both statements read
+    the same tables, which is why the comparison got far enough to gate on something else at all.
+    The claim that explains such a failure is `filter_predicates`, and it was computed, written to
+    the JSON artifact beside the page, and never rendered — leaving a reader to diff two SQL
+    statements by eye to recover a difference the run had already worked out.
+    """
     items = {
         item["item_key"]: item
         for item in _payload(render(title="x", profile="demo", run=_run(_mixed())))["items"]
     }
 
-    assert items["customers-count"]["tables"] == {
+    claims = {claim["name"]: claim for claim in items["customers-count"]["claims"]}
+    assert set(claims) == {
+        "tables",
+        "filter_predicates",
+        "date_window",
+        "group_keys",
+        "join_keys",
+        "ordering",
+        "limit",
+    }
+    assert claims["tables"] == {
         "name": "tables",
         "status": "differs",
-        "generated": ["orders"],
-        "golden": ["customers"],
+        "generated": "orders",
+        "golden": "customers",
     }
-    assert items["orders-count"]["tables"]["status"] == "agrees"
+    assert items["orders-count"]["claims"][0]["status"] == "agrees"
     # A case that never produced a statement has no difference to show, and the page has to render
-    # the absence rather than assume the claim is there.
-    assert items["products-count"]["tables"] is None
+    # the absence rather than assume the claims are there.
+    assert items["products-count"]["claims"] == []
 
 
-def test_a_claim_that_is_not_a_list_of_names_cannot_reach_the_page():
-    """Each side of the claim is joined into a sentence by the page. A bare string arriving where a
-    list was promised makes that join undefined, throws, and — since the whole body is built by that
-    script — leaves the report blank with no error on it. Nothing on this side of the handoff
-    enforces the comparator's shape, so the projection coerces instead of trusting it."""
+def test_a_resolved_date_window_is_flattened_to_an_interval_a_person_reads():
+    """One of the two claims that can gate, and the only one whose sides are objects.
+
+    The page received lists alone and called `Array.join` on them, so an object arriving here would
+    have thrown and left the whole report blank. Flattening happens on this side for that reason,
+    and the interval is printed half-open because that is the whole point of resolving one.
+    """
+    run = _run(
+        [
+            _item(
+                claims={
+                    "claims": [
+                        {
+                            "name": "date_window",
+                            "status": "differs",
+                            "generated": {
+                                "column": "created",
+                                "start": "2024-01-01",
+                                "start_inclusive": True,
+                                "end": "2025-01-01",
+                                "end_inclusive": False,
+                            },
+                            "golden": {
+                                "column": "opened",
+                                "start": "2024-01-01",
+                                "start_inclusive": True,
+                                "end": "2025-01-01",
+                                "end_inclusive": False,
+                            },
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+
+    claim = _payload(render(title="x", profile="demo", run=run))["items"][0]["claims"][0]
+
+    assert claim["generated"] == "created in [2024-01-01, 2025-01-01)"
+    assert claim["golden"] == "opened in [2024-01-01, 2025-01-01)"
+
+
+def test_a_claim_side_that_is_not_a_list_of_names_cannot_reach_the_page():
+    """Nothing on this side of the handoff enforces the comparator's shape, so each side of a claim
+    is coerced to the string the page prints rather than trusted to be a list.
+
+    A nested sequence is dropped under `tables`, which never writes one — only `ordering` and
+    `join_keys` do, and the claims that may nest are named rather than inferred from the shape. A
+    dict nested inside a side is dropped everywhere: it would print its own punctuation.
+    """
     run = _run(
         [
             _item(
@@ -475,29 +590,34 @@ def test_a_claim_that_is_not_a_list_of_names_cannot_reach_the_page():
         ]
     )
 
-    tables = _payload(render(title="x", profile="demo", run=run))["items"][0]["tables"]
+    claim = _payload(render(title="x", profile="demo", run=run))["items"][0]["claims"][0]
 
-    assert tables["generated"] == ["orders", "7"]
-    assert tables["golden"] == []
-    assert "nested" not in json.dumps(tables)
+    assert claim["generated"] == "orders, 7"
+    assert claim["golden"] == "customers"
+    # A dict nested inside a side would print its own punctuation, so it is still dropped.
+    assert '"a"' not in json.dumps(claim)
 
 
-def test_a_gated_item_shows_a_perfect_score_beside_a_failing_verdict():
-    """The one case where the score and the verdict disagree, and the reason the page never derives
-    one from the other: every row agreed, so the accuracy really is 1.0, and the statement still did
-    not write the filter the dataset requires. A renderer that recomputed `passed` from the accuracy
-    would turn this run's only real failure into a pass."""
+def test_a_gated_item_is_not_described_as_failing_to_reproduce_the_answer_key():
+    """Every row agreed and the statement still did not write the filter the dataset requires.
+
+    The page derived its verdict from `passed`, which a gate turns false, so it announced "Did not
+    reproduce the answer key" over an item that had reproduced it exactly — a contradiction of the
+    perfect score printed beside it. Reproducing and passing are different questions, which is the
+    whole reason structure gates separately from rows, and both facts now travel.
+    """
     items = {
         item["item_key"]: item
         for item in _payload(render(title="x", profile="demo", run=_run(_mixed())))["items"]
     }
 
     gated = items["orders-by-status-scoped"]
-    assert gated["accuracy"] == 1.0 and gated["passed"] is False
+    assert gated["reproduced"] is True and gated["passed"] is False
     assert gated["gated"] is True and gated["section"] == "failure"
-    # …and the page says which of the two it is, rather than leaving a reader to reconcile them.
-    assert "if (item.gated)" in TEMPLATE
-    assert "the dataset requires a filter this statement does not write" in TEMPLATE
+    assert gated["gates"] == [{"kind": "must_filter", "column": "channel"}]
+    # …and the page says both, rather than picking one and contradicting the other.
+    assert "Same rows as the answer key, but not the same question" in TEMPLATE
+    assert "no filter on " in TEMPLATE
 
 
 def test_the_sections_keep_the_order_the_run_wrote_them_in():
@@ -648,16 +768,200 @@ def test_the_template_draws_both_statements_on_every_case():
 
 def test_the_template_draws_the_question_the_verdict_and_the_delta_for_a_case():
     """One case is a question, what the run decided about it, the table-set difference and the two
-    statements. The delta is between the verdict and the statements on purpose: "generated read one
-    table and the answer key read another" is usually the whole finding, so it is read before them
-    rather than spotted inside them."""
+    statements. The differences are between the verdict and the statements on purpose: "the
+    generated statement filtered on one column and the answer key filtered on another" is usually
+    the whole finding, so it is read before them rather than spotted inside them."""
     assert 'class: "question", text: item.question' in TEMPLATE
     assert "text: SECTION_LABEL[item.section] || item.section" in TEMPLATE
 
     verdict = TEMPLATE.index("verdictLine(item),")
-    delta = TEMPLATE.index("deltaLine(item),")
+    delta = TEMPLATE.index("deltaLines(item))")
     statements = TEMPLATE.index('el("div", { class: "statements" }')
     assert verdict < delta < statements
+
+
+def test_a_claim_reads_the_way_a_person_writes_it():
+    """The claim reader writes `gte(created, '2024-01-01')`, and that functional form is deliberate
+    WHERE IT IS WRITTEN: a claim rides on tool output a model reads as server-authored, and
+    something that looked like SQL would be read as SQL.
+
+    That reasoning is about a model's context. This report is a local page a person opens, built
+    with `textContent`, so the argument does not reach it while the cost of it does — a reader had
+    to decode both sides before they could compare them.
+    """
+    from render_golden_run import _side
+
+    assert _side(["gte(placed_at, '2024-01-01')"]) == "placed_at >= '2024-01-01'"
+    assert _side(["neq(status, 'cancelled')"]) == "status <> 'cancelled'"
+    assert (
+        _side(["between(placed_at, '2024-01-01', '2024-12-31')"])
+        == "placed_at BETWEEN '2024-01-01' AND '2024-12-31'"
+    )
+    # A literal may hold the separator the split runs on, so the split respects quoting.
+    assert _side(["eq(customer.name, 'Smith, John')"]) == "customer.name = 'Smith, John'"
+    # A subquery's whole parse tree is rendered inline. That it is there is the readable part; the
+    # statements are printed underneath for the rest.
+    assert _side(["in(customer_id, subquery(select(id, from(table(customers)))))"]) == (
+        "customer_id IN (subquery)"
+    )
+    # Anything the lookup does not know keeps the shape it arrived in rather than being guessed at.
+    assert _side(["coalesce(a, b)"]) == "coalesce(a, b)"
+    # A keyword arrives as a zero-argument call; without it the operand keeps a bracket and the
+    # guard refuses the whole comparison, which is what kept `IS` from ever rendering.
+    assert _side(["is(orders.deleted_at, null())"]) == "orders.deleted_at IS NULL"
+    # A single-value IN has two operands and no brackets of its own. `status IN 'paid'` is not SQL.
+    assert _side(["in(orders.status, 'paid')"]) == "orders.status IN ('paid')"
+    # A multi-value IN has three, so it is left in the form it arrived in rather than half-rewritten.
+    assert _side(["in(orders.status, 'paid', 'refunded')"]).startswith("in(")
+
+
+def test_a_join_key_and_an_ordering_survive_their_nesting():
+    """`join_keys` writes the two sides of an equality as a pair of pairs and `ordering` writes a
+    column with its direction, so both are nested. Dropping nested entries rendered the two claims
+    most likely to differ as empty sides."""
+    from render_golden_run import _side
+
+    assert _side([[["customers", "id"], ["orders", "customer_id"]]], nested=True) == (
+        "customers.id = orders.customer_id"
+    )
+    assert _side([["order_count", "desc"]], nested=True) == "order_count desc"
+    # And nowhere else. A join key and a two-column result row are the same shape, so the claims
+    # that may nest are named rather than inferred — this is what stops a row rendering if one ever
+    # reached a claim it has no way to reach today.
+    assert _side([["Ada Lovelace", "1234"]]) == ""
+
+
+def test_an_ordinal_group_key_is_labelled_and_a_row_limit_is_not():
+    """`GROUP BY 1` reaches the claim as the bare string "1", and "grouped by 1" against "grouped by
+    status" tells a reader nothing.
+
+    It is labelled rather than resolved — the claim carries no projection to resolve it against —
+    and ONLY under `group_keys`: a `limit` of 100 is a row count, and calling it "column 100 of the
+    select list" would be worse than the bare digit this exists to fix.
+    """
+    run = _run(
+        [
+            _item(
+                claims={
+                    "claims": [
+                        {"name": "group_keys", "status": "differs", "generated": ["1"], "golden": ["channel"]},
+                        {"name": "limit", "status": "differs", "generated": ["100"], "golden": ["10"]},
+                    ]
+                }
+            )
+        ]
+    )
+
+    claims = {c["name"]: c for c in _payload(render(title="x", profile="demo", run=run))["items"][0]["claims"]}
+
+    assert claims["group_keys"]["generated"] == "column 1 of the select list"
+    assert claims["limit"]["generated"] == "100"
+
+
+def test_an_open_ended_date_window_does_not_print_the_word_none():
+    """Either bound may be open — `placed_at >= '2024-01-01'` on its own resolves to a start and no
+    end, which is an ordinary shape rather than a corner. An interval printed with one side missing
+    put the word `None` on the report."""
+    from render_golden_run import _side
+
+    lower = {"column": "placed_at", "start": "2024-01-01", "start_inclusive": True,
+             "end": None, "end_inclusive": False}
+    upper = {"column": "placed_at", "start": None, "start_inclusive": True,
+             "end": "2025-01-01", "end_inclusive": False}
+
+    assert _side(lower) == "placed_at >= 2024-01-01"
+    assert _side(upper) == "placed_at < 2025-01-01"
+    assert "None" not in _side(lower) + _side(upper)
+
+
+def test_a_gate_with_no_kind_is_dropped_rather_than_rendered_as_none():
+    """`gate.get("kind", "")` returns None for a key that is present and null, and `str()` would
+    then put the literal "None" on the page, matching no branch that names a gate."""
+    run = _run([_item(claims={"claims": [], "gates": [{"kind": None, "column": "channel"},
+                                                      {"kind": "must_filter", "column": "channel"}]})])
+
+    gates = _payload(render(title="x", profile="demo", run=run))["items"][0]["gates"]
+
+    assert gates == [{"kind": "must_filter", "column": "channel"}]
+
+
+def test_a_case_with_statements_and_no_claims_is_not_called_a_generation_failure():
+    """An item can carry both statements and no claims — a hand-edited artifact, or a claims block
+    the projection refused. Telling that reader "no statement was read" sends them looking for a
+    generator failure that did not happen."""
+    assert 'text: "no statement was generated, so there was nothing to compare"' in TEMPLATE
+    assert 'text: "the two statements were not compared — read them below"' in TEMPLATE
+    assert "if (!item.generated_sql) {" in TEMPLATE
+
+
+def test_a_failure_whose_statements_agree_everywhere_says_where_to_look():
+    """The one shape where the difference table is empty and the item still failed.
+
+    Everything the comparison examines agrees, because the difference is in the projected columns —
+    the one thing it deliberately never compares, since two statements can compute the same value
+    with a predicate in the WHERE clause or inside the aggregate. Saying "the two statements make
+    the same claims" there is a shrug; the reader needs to be sent to the statements.
+    """
+    assert 'text: "The selected columns differ."' in TEMPLATE
+    # And when the same thing happens on a PASS there is nothing to say, so nothing is drawn.
+    assert 'if (item.passed || item.status !== "scored" || (item.gates || []).length) return [];' in TEMPLATE
+
+
+def test_the_claims_are_drawn_as_a_table_with_plain_english_labels():
+    """A run of separator-joined text is hard to compare against the line beside it, and
+    `filter_predicates` is a field name rather than something a reader should have to know."""
+    assert 'CLAIM_LABEL[claim.name] || claim.name' in TEMPLATE
+    assert 'filter_predicates: "Filters"' in TEMPLATE
+    assert 'group_keys: "Grouped by"' in TEMPLATE
+    # A table, with the answer key first because it is the thing being compared against.
+    assert 'class: "delta-table"' in TEMPLATE
+    assert TEMPLATE.index('text: "Answer key"') < TEMPLATE.index('text: "Generated"')
+
+
+def test_the_run_stamp_reads_as_a_date_somebody_would_say():
+    """It read `2026-09-06T11:47:38+00:00`. That is a sortable key, and the page has no second
+    place where the timestamp is a key — so it is spelled as a sentence, with the zone named
+    because the reader is not necessarily in it."""
+    import datetime
+
+    from render_golden_run import _run_stamp
+
+    stamp = _run_stamp(datetime.datetime(2026, 9, 6, 11, 47, 38, tzinfo=datetime.timezone.utc))
+
+    assert stamp == "6 September 2026 at 11:47 UTC"
+    assert "T11:47" not in stamp
+
+
+def test_a_bucket_with_nothing_in_it_is_not_given_a_tile():
+    """Five tiles on every run put three zeroes beside the two numbers that matter.
+
+    The two conditional ones are NOT merged into "failed", and must not be: a run of nothing but
+    errors would then read as `0 failed`, indistinguishable from green, which is precisely the
+    distinction the `1` / `2` exit codes exist to make. They are hidden when empty and given a
+    sentence when they are not, because that is the moment a reader needs to know what they mean.
+    """
+    assert '["total", "Cases", "", true' in TEMPLATE
+    assert '["passed", "Passed", "pass", true' in TEMPLATE
+    assert '["failed", "Failed", "failure", true' in TEMPLATE
+    assert '["unscored", "Not compared", "", false' in TEMPLATE
+    assert '["errored", "Couldn\'t run", "", false' in TEMPLATE
+    assert "if (!always && !n) return;" in TEMPLATE
+
+
+def test_the_page_can_be_filtered_by_outcome():
+    """A corpus-sized run is hundreds of cases, and finding the failures in a flat scroll is the
+    difference between a report and a wall.
+
+    Display only: the filter hides sections and recounts nothing, so the tiles and the section
+    headings keep describing the whole run however it is set.
+    """
+    assert "renderFilters();" in TEMPLATE
+    assert 'section.hidden = active !== "all" && name !== active;' in TEMPLATE
+    # Drawn after the sections exist, or there would be nothing to hide.
+    assert TEMPLATE.index("renderSections();") < TEMPLATE.index("renderFilters();")
+    # One control per section that actually has cases, and no control at all when there is nothing
+    # to choose between.
+    assert "if (present.length < 2) return;" in TEMPLATE
 
 
 def test_the_page_draws_its_banners_its_counts_and_its_sections():
@@ -687,35 +991,49 @@ def test_an_unscored_case_and_an_errored_case_do_not_look_alike():
 # failure with no recourse.
 
 
-def test_a_non_dict_claims_block_costs_the_delta_line_and_not_the_page():
+def test_a_non_dict_claims_block_costs_the_delta_lines_and_not_the_page():
     items = _mixed()
     items[0]["claims"] = ["tables", "differs"]
     payload = _payload(render(title="x", profile="demo", run=_run(items)))
-    assert payload["items"][0]["tables"] is None
+    assert payload["items"][0]["claims"] == [] and payload["items"][0]["gates"] == []
     assert len(payload["items"]) == len(items)
 
 
-def test_a_non_dict_first_claim_costs_the_delta_line_and_not_the_page():
+def test_a_claim_that_is_not_a_dict_is_dropped_and_its_siblings_survive():
+    """One malformed claim costs that line, not the whole difference and not the page."""
     items = _mixed()
-    items[0]["claims"] = {"claims": ["tables"]}
+    items[0]["claims"] = {
+        "claims": ["tables", {"name": "ordering", "status": "differs", "generated": [], "golden": []}],
+        "gates": ["must_filter", {"kind": "must_filter", "column": "channel"}],
+    }
     payload = _payload(render(title="x", profile="demo", run=_run(items)))
-    assert payload["items"][0]["tables"] is None
+    assert [claim["name"] for claim in payload["items"][0]["claims"]] == ["ordering"]
+    assert payload["items"][0]["gates"] == [{"kind": "must_filter", "column": "channel"}]
 
 
-def test_a_non_numeric_accuracy_reads_as_unscored_rather_than_throwing():
-    """`_shown` compares against 1.0, so a string here would raise and take the report with it."""
+def test_a_non_numeric_accuracy_does_not_read_as_a_reproduction():
+    """A hand-edited artifact must not talk its way into "Reproduced the answer key". The check is
+    a numeric equality against 1.0, so a string has to fail it rather than raise."""
     items = _mixed()
-    items[0]["score"] = {"status": "scored", "accuracy": "0.0", "reason": "hand-edited"}
+    items[0]["score"] = {"status": "scored", "accuracy": "1.0", "reason": "hand-edited"}
     payload = _payload(render(title="x", profile="demo", run=_run(items)))
-    assert payload["items"][0]["accuracy"] is None
+    assert payload["items"][0]["reproduced"] is False
     assert payload["items"][0]["reason"] == "hand-edited"
+
+
+def test_a_boolean_accuracy_does_not_read_as_a_reproduction():
+    """`True == 1.0` in Python, and `bool` is an `int` subclass, so the one value that would slip
+    through a naive numeric check is excluded explicitly."""
+    items = _mixed()
+    items[0]["score"] = {"status": "scored", "accuracy": True, "reason": "hand-edited"}
+    assert _payload(render(title="x", profile="demo", run=_run(items)))["items"][0]["reproduced"] is False
 
 
 def test_a_non_dict_score_reads_as_unscored_rather_than_throwing():
     items = _mixed()
     items[0]["score"] = "scored"
     payload = _payload(render(title="x", profile="demo", run=_run(items)))
-    assert payload["items"][0]["accuracy"] is None
+    assert payload["items"][0]["reproduced"] is False
     assert payload["items"][0]["status"] == ""
 
 

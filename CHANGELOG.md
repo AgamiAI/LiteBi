@@ -12,6 +12,60 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The golden run report shows the difference it already worked out.** Reading a failure meant
+  diffing two SQL statements by eye, from a page that had computed the answer and kept it in a file
+  beside itself. Six things changed, all in the renderer and its template, none of them touching the
+  comparator, the claim reader or the contract:
+
+  - **A gated item is no longer described as failing to reproduce the answer key.** The verdict was
+    derived from `passed`, which a gate turns false — so an item whose rows matched the answer key
+    exactly was announced as not having reproduced it, next to a perfect score. Reproducing and
+    passing are different questions, which is why structure gates separately from rows, and the page
+    now says both: *"Same rows as the answer key, but not the same question."* The verdict is also
+    phrased as what happened to the data rather than in the dataset's own vocabulary — the pill
+    beside the question already says passed or failed, so the line's one job is whether the rows
+    matched.
+  - **The accuracy is gone from the page.** Over a real fifteen-case run every value was exactly
+    1.0 or exactly 0.0, which is structural: a row-count difference, an unpaired column and an extra
+    column each short-circuit before an overlap is computed, and columns pair only on equal value
+    vectors. On the narrow occasion a value in between is reachable, the comparator already writes
+    the same fact in words. So the number was redundant when it meant something and misleading
+    otherwise. The score itself is unchanged and still decides the verdict.
+  - **A gate names the column it fired on**, instead of one fixed sentence saying that *a* filter
+    was missing. It also stops describing a differing date window as a missing filter: structure
+    gates twice, and the page assumed one.
+  - **Every claim that differs is drawn, not just the table set.** The page kept `claims[0]` and
+    dropped the other six. In a structural failure the table set reliably *agrees* — both statements
+    read the same table, which is why the comparison got far enough to gate on something else — so
+    the page reliably showed the claim that said nothing while `filter_predicates`, which explains
+    the failure, was written to the JSON artifact and never rendered.
+  - **The run timestamp reads as a date** rather than `2026-09-06T11:47:38+00:00`.
+  - **The summary shows three tiles, not five**, surfacing "not compared" and "couldn't run" only
+    when they are non-zero and giving them a sentence when they appear. They are deliberately not
+    folded into "failed": a run of nothing but errors would then read as green, which is exactly
+    what the `1` / `2` exit codes exist to tell apart.
+
+- **A claim reads the way a person writes it, in a table rather than a run of text.** A
+  difference was one separator-joined line per claim, holding the claim reader's own field names
+  (`filter_predicates`) and its functional rendering (`gte(created, '2024-01-01')`). Both are
+  deliberate where they are written — a claim rides on tool output a model reads as
+  server-authored, and something that looked like SQL would be read as SQL — but that argument is
+  about a model's context and does not reach a local page a person opens.
+
+  So the report now prints `created >= '2024-01-01'`, labels each claim in English ("Filters",
+  "Grouped by", "Date range"), and lays the two sides out as a table so they line up under one
+  another. Three shapes that rendered as nothing or as noise are handled: a join key
+  (`customers.id = orders.customer_id`), an ordering with its direction, and a subquery, which
+  arrives as its whole parse tree and now reads `customer_id IN (subquery)`. `GROUP BY 1` is
+  labelled "column 1 of the select list" rather than shown as a bare digit — under `group_keys`
+  only, since a `limit` of 100 is a row count.
+
+- **A golden run report can be filtered by outcome.** A corpus-sized run is hundreds of cases and
+  was a flat scroll. Display only — nothing is recounted or re-sorted, so the tiles and the section
+  headings keep describing the whole run.
+
 ## [0.8.0] — 2026-09-05
 
 One change: the server decides which tool calls belong to one conversation, instead of asking the

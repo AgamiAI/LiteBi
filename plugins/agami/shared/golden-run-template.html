@@ -78,6 +78,18 @@
       letter-spacing: 0.04em; }
     .count-tile.failure .n { color: var(--bad-fg); }
     .count-tile.pass .n { color: var(--ok-fg); }
+    /* Only the two conditional tiles carry a note, and they only appear when non-zero — so this
+       never widens a healthy run's header. */
+    .count-tile .tile-note { font-size: 11px; color: var(--muted); margin-top: 6px; max-width: 30ch; }
+
+    /* Show one outcome at a time. Display only: nothing is recounted or re-sorted. */
+    .filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 22px; }
+    .filter {
+      font: inherit; font-size: 12px; cursor: pointer; padding: 5px 12px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--bg-elev); color: var(--muted);
+    }
+    .filter:hover { color: var(--fg); }
+    .filter.on { background: var(--code-bg); color: var(--fg); border-color: var(--fg); }
 
     /* Sections */
     .section { margin-bottom: 30px; }
@@ -112,13 +124,33 @@
     .pill.pass { background: var(--ok-bg); color: var(--ok-fg); border: 1px solid var(--ok-border); }
 
     .verdict { font-size: 13px; color: var(--fg); margin-top: 8px; }
-    .verdict .score { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .verdict .gate { color: var(--bad-fg); }
+    .deltas { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
     .delta {
-      font-size: 12px; margin-top: 10px; padding: 7px 12px; border-radius: 8px;
+      font-size: 12px; padding: 7px 12px; border-radius: 8px;
       background: var(--code-bg); color: var(--fg);
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     }
     .delta.differs { background: var(--bad-bg); color: var(--bad-fg); }
+    /* The differences, as a table so the two sides line up under one another. */
+    .delta-table {
+      width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .delta-table th, .delta-table td {
+      text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border);
+      vertical-align: top; word-break: break-word;
+    }
+    .delta-table thead th {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+      font-family: inherit; font-weight: 600;
+    }
+    .delta-table tbody th {
+      font-family: inherit; font-weight: 600; white-space: nowrap; color: var(--muted);
+      width: 1%;
+    }
+    .delta-table tbody td { color: var(--bad-fg); }
+    .delta-table tr:last-child th, .delta-table tr:last-child td { border-bottom: none; }
 
     /* The two statements, side by side */
     .statements { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
@@ -164,6 +196,7 @@
 
     <div id="banners"></div>
     <div class="counts" id="counts"></div>
+    <div class="filters" id="filters"></div>
     <main id="sections"></main>
 
     <footer class="page-footer">
@@ -181,8 +214,8 @@
     // RUN.summary.sections is written in it — so nothing here re-sorts anything.
     const SECTION_LABEL = {
       failure: "Failed",
-      error: "Errored",
-      unscored: "Unscored",
+      error: "Couldn't run",
+      unscored: "Not compared",
       unconfirmed: "Unconfirmed",
       pass: "Passed",
     };
@@ -207,11 +240,36 @@
       return n;
     };
 
-    const names = list => (list && list.length ? list.join(", ") : "none");
+    const names = text => (text ? text : "none");
 
-    // Already rounded by the renderer; this only pads it to a fixed width so a column of scores
-    // lines up. A null accuracy is a comparison that never ran, and never a zero.
-    const score = a => (a === null || a === undefined) ? "—" : Number(a).toFixed(3);
+    // What each claim is called on the page. The comparator's own names are field names — a reader
+    // should not have to know that "filter_predicates" means the WHERE clause to read their own
+    // report. A claim added later and not named here falls back to its own name rather than
+    // vanishing.
+    const CLAIM_LABEL = {
+      tables: "Tables read",
+      filter_predicates: "Filters",
+      date_window: "Date range",
+      group_keys: "Grouped by",
+      join_keys: "Joined on",
+      ordering: "Sorted by",
+      limit: "Row limit",
+    };
+
+    // Which gate fired, in words, naming the column it fired on. Structure gates exactly twice, so
+    // there are exactly two sentences here; the fallback exists so a third one added later reads as
+    // itself rather than as a missing filter.
+    function gateText(gate) {
+      if (gate.kind === "must_filter") {
+        return gate.column
+          ? "no filter on " + gate.column + ", which the dataset requires"
+          : "a filter the dataset requires is missing";
+      }
+      if (gate.kind === "date_window") {
+        return "a different date range from the answer key";
+      }
+      return gate.column ? gate.kind + " · " + gate.column : gate.kind;
+    }
 
     function verdictLine(item) {
       const line = el("div", { class: "verdict" });
@@ -223,46 +281,87 @@
         line.appendChild(el("span", { text: "Nothing could be compared — " + item.reason }));
         return line;
       }
-      const verdict = item.passed ? "Reproduced the answer key" : "Did not reproduce the answer key";
-      line.appendChild(el("span", { text: verdict + " · accuracy " }));
-      line.appendChild(el("span", { class: "score", text: score(item.accuracy) }));
+      // Built from what the comparison decided and what the gates decided, never from `passed`
+      // alone. An item can reproduce its answer key exactly and still fail a gate, and the page
+      // used to call that "Did not reproduce the answer key", which was simply untrue.
+      // What the comparison did to the DATA, in those words. The pill beside the question already
+      // says passed or failed, so this line has one job: whether the rows matched. "Reproduced the
+      // answer key" said that in two pieces of vocabulary a reader has to learn first.
+      const verdict = item.reproduced
+        ? (item.gated ? "Same rows as the answer key, but not the same question"
+                      : "Same rows as the answer key")
+        : "Different rows from the answer key";
+      line.appendChild(el("span", { text: verdict }));
       if (item.reason) line.appendChild(el("span", { text: " — " + item.reason }));
-      if (item.gated) {
-        line.appendChild(el("span", {
-          text: " · the dataset requires a filter this statement does not write",
-        }));
-      }
+      (item.gates || []).forEach(gate => {
+        line.appendChild(el("span", { class: "gate", text: " · " + gateText(gate) }));
+      });
       if (!item.confirmed) {
         line.appendChild(el("span", { text: " · unconfirmed, so it cannot fail the run" }));
       }
       return line;
     }
 
-    function deltaLine(item) {
-      const claim = item.tables;
-      if (!claim) {
-        return el("div", {
+    // What the two statements actually assert differently. Only the claims that DIFFER are drawn:
+    // the page used to show the table set and nothing else, and in a structural failure that claim
+    // reliably agrees — both statements read the same table, which is why the comparison got far
+    // enough to gate on something else. The claim that explains such a failure was computed, kept
+    // in the JSON beside this page, and never rendered.
+    function deltaLines(item) {
+      const claims = item.claims || [];
+      if (!claims.length) {
+        // Two different situations, and saying the wrong one is worse than saying nothing. A case
+        // whose generation produced no statement genuinely has nothing to compare. A case that HAS
+        // both statements and no claims lost them somewhere else — a hand-edited artifact, a
+        // claims block the projection refused — and telling that reader "no statement was read"
+        // sends them looking for a generator failure that did not happen.
+        if (!item.generated_sql) {
+          return [el("div", {
+            class: "delta",
+            text: "no statement was generated, so there was nothing to compare",
+          })];
+        }
+        return [el("div", {
           class: "delta",
-          text: "tables: no statement was read, so there was nothing to compare",
-        });
+          text: "the two statements were not compared — read them below",
+        })];
       }
-      if (claim.status === "unknown") {
-        return el("div", {
-          class: "delta",
-          text: claim.name + ": one of the statements could not be read",
-        });
+      const differing = claims.filter(c => c.status === "differs");
+      if (!differing.length) {
+        const unknown = claims.filter(c => c.status === "unknown").length;
+        if (unknown === claims.length) {
+          return [el("div", {
+            class: "delta",
+            text: "one of the statements could not be read, so nothing could be compared",
+          })];
+        }
+        // Nothing to say, so nothing is drawn. Three cases, not one: a pass, an item that was
+        // never scored (both sides empty — its columns were not compared, let alone different),
+        // and a gated failure, where the columns are identical and the gate named in the verdict
+        // above is the whole finding.
+        if (item.passed || item.status !== "scored" || (item.gates || []).length) return [];
+        // Structurally identical and it FAILED, which narrows the difference to one place:
+        // projected columns are the only thing this comparison never examines. The verdict above
+        // already names the column, and the statements are directly below, so this says the one
+        // thing neither of them does and stops.
+        return [el("div", { class: "delta", text: "The selected columns differ." })];
       }
-      if (claim.status === "differs") {
-        return el("div", {
-          class: "delta differs",
-          text: claim.name + ": generated read " + names(claim.generated)
-            + " · the answer key read " + names(claim.golden),
-        });
-      }
-      return el("div", {
-        class: "delta",
-        text: claim.name + ": both read " + names(claim.golden),
-      });
+      // A table rather than a run of separator-joined text. Three columns, and the two that matter
+      // sit one above the other in the same column so a reader compares by looking down rather than
+      // by reading across a sentence.
+      const rows = differing.map(claim => el("tr", {}, [
+        el("th", { scope: "row", text: CLAIM_LABEL[claim.name] || claim.name }),
+        el("td", { text: names(claim.golden) }),
+        el("td", { text: names(claim.generated) }),
+      ]));
+      return [el("table", { class: "delta-table" }, [
+        el("thead", {}, [el("tr", {}, [
+          el("th", { scope: "col", text: "" }),
+          el("th", { scope: "col", text: "Answer key" }),
+          el("th", { scope: "col", text: "Generated" }),
+        ])]),
+        el("tbody", {}, rows),
+      ])];
     }
 
     function statement(label, sql, absentText) {
@@ -283,9 +382,10 @@
           el("span", { class: "pill " + item.section, text: SECTION_LABEL[item.section] || item.section }),
         ]),
         verdictLine(item),
-        // One line above the statements, because "generated read one table and the answer key
-        // read another" is usually the whole finding.
-        deltaLine(item),
+        // Above the statements, because "the generated statement filtered on one column and the
+        // answer key filtered on another" is usually the whole finding — and reading it here is
+        // the difference between being handed the diagnosis and being handed two SQL statements.
+        el("div", { class: "deltas" }, deltaLines(item)),
         el("div", { class: "statements" }, [
           statement("Answer key", item.expected_sql, "this case has no answer key"),
           statement("Generated", item.generated_sql, "no statement was generated"),
@@ -301,7 +401,7 @@
         const cases = (RUN.items || []).filter(item => item.section === name);
         if (!cases.length) return;
         drawn += cases.length;
-        const section = el("div", { class: "section" }, [
+        const section = el("div", { class: "section", "data-section": name }, [
           el("div", { class: "section-head" }, [
             el("h2", { text: SECTION_LABEL[name] || name }),
             el("span", { class: "n", text: cases.length + (cases.length === 1 ? " case" : " cases") }),
@@ -332,17 +432,28 @@
       const s = RUN.summary;
       // Straight from the run's own summary. Nothing here recounts the items: the run decides
       // what it did, and this page only shows it.
-      [
-        ["total", "Cases", ""],
-        ["passed", "Passed", "pass"],
-        ["failed", "Did not match", "failure"],
-        ["unscored", "Unscored", ""],
-        ["errored", "Errored", ""],
-      ].forEach(([key, label, cls]) => {
+      // Three tiles always, two more only when they have something to say. Unscored and errored are
+      // load-bearing and must never be folded into "failed" — a run of nothing but errors would
+      // then read as green, which is exactly the shape the `1` / `2` exit codes exist to tell
+      // apart — but on a healthy run they are zeroes competing for attention with the numbers that
+      // matter. When they do appear they get a sentence, because that is the moment a reader needs
+      // to know what they mean.
+      const TILES = [
+        ["total", "Cases", "", true, ""],
+        ["passed", "Passed", "pass", true, ""],
+        ["failed", "Failed", "failure", true, ""],
+        ["unscored", "Not compared", "", false,
+          "Both sides ran and there was no value to check — not agreement."],
+        ["errored", "Couldn't run", "", false,
+          "No statement was produced, so nothing was judged."],
+      ];
+      TILES.forEach(([key, label, cls, always, note]) => {
         const n = s[key];
-        counts.appendChild(el("div", { class: "count-tile " + cls }, [
+        if (!always && !n) return;
+        counts.appendChild(el("div", { class: "count-tile " + cls, title: note }, [
           el("div", { class: "n", text: (n === null || n === undefined) ? "—" : String(n) }),
           el("div", { class: "label", text: label }),
+          note ? el("div", { class: "tile-note", text: note }) : null,
         ]));
       });
     }
@@ -370,11 +481,46 @@
       }
     }
 
+    // Show one outcome at a time, or all of them. A corpus-sized run is hundreds of cases, and
+    // finding the failures in a flat scroll is the difference between a report and a wall. Purely
+    // a display toggle: nothing is recounted and nothing is re-sorted, so the tiles and the section
+    // headings keep describing the whole run however this is set.
+    function renderFilters() {
+      const bar = document.getElementById("filters");
+      const present = Object.keys(RUN.summary.sections || {})
+        .filter(name => (RUN.items || []).some(item => item.section === name));
+      if (present.length < 2) return;
+
+      const buttons = [];
+      function select(active) {
+        buttons.forEach(([button, name]) => {
+          const on = name === active;
+          button.className = "filter" + (on ? " on" : "");
+          button.setAttribute("aria-pressed", on ? "true" : "false");
+        });
+        document.querySelectorAll(".section").forEach(section => {
+          const name = section.getAttribute("data-section");
+          section.hidden = active !== "all" && name !== active;
+        });
+      }
+      [["all", "All"]].concat(present.map(n => [n, SECTION_LABEL[n] || n])).forEach(([name, label]) => {
+        const count = name === "all"
+          ? (RUN.items || []).length
+          : (RUN.items || []).filter(item => item.section === name).length;
+        const button = el("button", { class: "filter", type: "button", text: label + " (" + count + ")" });
+        button.addEventListener("click", () => select(name));
+        buttons.push([button, name]);
+        bar.appendChild(button);
+      });
+      select("all");
+    }
+
     document.getElementById("dataset-name").textContent = RUN.dataset || "";
     document.getElementById("run-id").textContent = RUN.run_id || "";
     renderBanners();
     renderCounts();
     renderSections();
+    renderFilters();
   </script>
 </body>
 </html>
