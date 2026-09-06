@@ -262,11 +262,11 @@
     function gateText(gate) {
       if (gate.kind === "must_filter") {
         return gate.column
-          ? "the dataset requires this statement to filter on " + gate.column + ", and it does not"
-          : "the dataset requires a filter this statement does not write";
+          ? "no filter on " + gate.column + ", which the dataset requires"
+          : "a filter the dataset requires is missing";
       }
       if (gate.kind === "date_window") {
-        return "this statement resolves a different date window than the answer key";
+        return "a different date range from the answer key";
       }
       return gate.column ? gate.kind + " · " + gate.column : gate.kind;
     }
@@ -284,10 +284,13 @@
       // Built from what the comparison decided and what the gates decided, never from `passed`
       // alone. An item can reproduce its answer key exactly and still fail a gate, and the page
       // used to call that "Did not reproduce the answer key", which was simply untrue.
+      // What the comparison did to the DATA, in those words. The pill beside the question already
+      // says passed or failed, so this line has one job: whether the rows matched. "Reproduced the
+      // answer key" said that in two pieces of vocabulary a reader has to learn first.
       const verdict = item.reproduced
-        ? (item.gated ? "Reproduced the answer key, but did not answer the question asked"
-                      : "Reproduced the answer key")
-        : "Did not reproduce the answer key";
+        ? (item.gated ? "Same rows as the answer key, but not the same question"
+                      : "Same rows as the answer key")
+        : "Different rows from the answer key";
       line.appendChild(el("span", { text: verdict }));
       if (item.reason) line.appendChild(el("span", { text: " — " + item.reason }));
       (item.gates || []).forEach(gate => {
@@ -315,12 +318,19 @@
       const differing = claims.filter(c => c.status === "differs");
       if (!differing.length) {
         const unknown = claims.filter(c => c.status === "unknown").length;
-        return [el("div", {
-          class: "delta",
-          text: unknown === claims.length
-            ? "one of the statements could not be read, so nothing could be compared"
-            : "the two statements make the same claims about the data they read",
-        })];
+        if (unknown === claims.length) {
+          return [el("div", {
+            class: "delta",
+            text: "one of the statements could not be read, so nothing could be compared",
+          })];
+        }
+        // Structurally identical and it passed: there is nothing to say, so nothing is drawn.
+        if (item.passed) return [];
+        // Structurally identical and it FAILED, which narrows the difference to one place:
+        // projected columns are the only thing this comparison never examines. The verdict above
+        // already names the column, and the statements are directly below, so this says the one
+        // thing neither of them does and stops.
+        return [el("div", { class: "delta", text: "The selected columns differ." })];
       }
       // A table rather than a run of separator-joined text. Three columns, and the two that matter
       // sit one above the other in the same column so a reader compares by looking down rather than

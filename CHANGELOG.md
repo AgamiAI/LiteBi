@@ -23,7 +23,10 @@ below corresponds to one such version.
     derived from `passed`, which a gate turns false — so an item whose rows matched the answer key
     exactly was announced as not having reproduced it, next to a perfect score. Reproducing and
     passing are different questions, which is why structure gates separately from rows, and the page
-    now says both: *"Reproduced the answer key, but did not answer the question asked."*
+    now says both: *"Same rows as the answer key, but not the same question."* The verdict is also
+    phrased as what happened to the data rather than in the dataset's own vocabulary — the pill
+    beside the question already says passed or failed, so the line's one job is whether the rows
+    matched.
   - **The accuracy is gone from the page.** Over a real fifteen-case run every value was exactly
     1.0 or exactly 0.0, which is structural: a row-count difference, an unpaired column and an extra
     column each short-circuit before an overlap is computed, and columns pair only on equal value

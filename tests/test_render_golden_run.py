@@ -609,8 +609,8 @@ def test_a_gated_item_is_not_described_as_failing_to_reproduce_the_answer_key():
     assert gated["gated"] is True and gated["section"] == "failure"
     assert gated["gates"] == [{"kind": "must_filter", "column": "channel"}]
     # …and the page says both, rather than picking one and contradicting the other.
-    assert "Reproduced the answer key, but did not answer the question asked" in TEMPLATE
-    assert "the dataset requires this statement to filter on" in TEMPLATE
+    assert "Same rows as the answer key, but not the same question" in TEMPLATE
+    assert "no filter on " in TEMPLATE
 
 
 def test_the_sections_keep_the_order_the_run_wrote_them_in():
@@ -838,6 +838,19 @@ def test_an_ordinal_group_key_is_labelled_and_a_row_limit_is_not():
 
     assert claims["group_keys"]["generated"] == "column 1 of the select list"
     assert claims["limit"]["generated"] == "100"
+
+
+def test_a_failure_whose_statements_agree_everywhere_says_where_to_look():
+    """The one shape where the difference table is empty and the item still failed.
+
+    Everything the comparison examines agrees, because the difference is in the projected columns —
+    the one thing it deliberately never compares, since two statements can compute the same value
+    with a predicate in the WHERE clause or inside the aggregate. Saying "the two statements make
+    the same claims" there is a shrug; the reader needs to be sent to the statements.
+    """
+    assert 'text: "The selected columns differ."' in TEMPLATE
+    # And when the same thing happens on a PASS there is nothing to say, so nothing is drawn.
+    assert "if (item.passed) return [];" in TEMPLATE
 
 
 def test_the_claims_are_drawn_as_a_table_with_plain_english_labels():
