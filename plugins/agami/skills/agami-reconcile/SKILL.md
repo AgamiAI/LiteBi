@@ -288,6 +288,8 @@ The method line is what somebody consults a year later to find out where this it
 
 #### If the item already exists
 
+**Read which payload the `1` carries before you answer it — there are two, and the wrong flag clears neither.** A `needs_confirmation_convention` payload means the statement departs from the profile's own curated examples; on a promotion that is expected and not interesting, because the statement being saved is the one agami generated *from* those examples minutes ago. Pass `--confirm-convention` for it. Everything below is the other payload.
+
 Exit `1`, a `needs_confirmation` payload, and **nothing written**. Render the `before` AND the `after` for every id — the item on disk and the one that would take its place — ask, and only on an explicit yes re-run the **same command with `--confirm-replace` appended**. **Never pass `--confirm-replace` pre-emptively**: the flag means one thing, that a person saw both sides and said yes, and passing it before that has happened makes the stop decorative.
 
 A replacement is wholesale — the item sent is the item written — so read the `before` and carry forward whatever it holds that still applies (its `tags`, a `must_filter`) into the item JSON before you re-run. On a no, say the file is untouched and stop.
@@ -328,6 +330,7 @@ End the turn. The user typically:
 | User says "reconcile my dashboard" but attaches nothing | Ask for the screenshot (or CSV / pasted numbers) per Phase 0.4 — don't proceed without the expected numbers. |
 | A promotion exits `0` | Written. Report `added` / `replaced` and the path, and say the dataset can be run with "run the evals". |
 | A promotion exits `1` with `needs_confirmation` | Nothing was written. Render the `before` and the `after` for every id, carry forward the `tags` / `must_filter` the `before` holds, ask, and re-run with `--confirm-replace` only on an explicit yes. On a no, the file is untouched. |
+| A promotion exits `1` with `needs_confirmation_convention` | The statement departs from the profile's own examples. On a promotion this is expected — the statement is the one agami generated from those examples — so re-run with `--confirm-convention`. Do not render it as a decision for the user; it is a decision this skill has already made. |
 | A promotion exits `2` | Cannot start. The `agami-save-golden:` line on stderr names the cause. Nothing was written; a rolled-back write left the previous bytes exactly as they were. |
 | A promotion exits `2` saying the question moves with time and the answer key doesn't | **Rename the question, don't re-anchor the statement.** Ask which window it meant, rewrite the question to name it ("…in August 2026"), and re-run with the SQL exactly as it ran. Anchoring the SQL to `CURRENT_DATE` clears the lint and bands a sliding window around one day's value — a false alarm at the next run. |
 

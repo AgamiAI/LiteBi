@@ -175,6 +175,16 @@ End the turn.
 
 ---
 
+## What a pass rate is, and is not
+
+**A run measures regression, not accuracy.** Say so if anyone asks "how accurate is agami?" and reaches for this number.
+
+Two reasons, and both are structural rather than fixable here. The generator in a run is handed the question and the model's context in one prompt, with **every tool switched off** and one attempt to answer — that isolation is what stops it reading the answer key, and it is the whole reason a score means anything. An agent answering the same question for real has `get_datasource_schema`, `get_prompt_examples`, `execute_sql` and `list_datasources`, and can look something up, try a statement and refine it. So a run scores a strictly weaker generator than the one that ships, and an item can fail here that production would get right on its second look.
+
+And a golden dataset is not a random sample. It is the questions somebody would be embarrassed to get wrong, which is exactly what makes it useful and exactly what makes its pass rate unrepresentative. "12 of 15 passed" means *those twelve still work*. It does not mean 80%.
+
+---
+
 ## Hard rules
 
 1. **Never paste SQL in chat.** The script prints no statement, and the artifact is a path you hand over, not a source to quote — **do not read it out of the artifact** to show the user what the model wrote. They open the file.

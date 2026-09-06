@@ -12,6 +12,41 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Added
+
+- **Saving a golden item checks it against the profile's own examples first.** The curated example
+  library is where a team's conventions live — which of two equally correct date columns they answer
+  with, how they phrase a join — and it is what agami reads when it answers a question for real.
+  Nothing in the write path had ever looked at it, so an answer key could contradict the convention
+  and then fail every future run while blaming the model.
+
+  That is measured rather than imagined. On the first real dataset authored against a live
+  warehouse, nine of fifteen items failed and six were one mistake: the keys filtered on one
+  timestamp column where that profile's examples used another, 24 times out of 36.
+
+  The save door now ranks the nearest example for the question, reads both statements, and stops
+  with exit `1` and a `needs_confirmation_convention` payload when they disagree — before writing,
+  because a warning that arrives after the key is on disk is a warning about a file somebody now has
+  to decide whether to undo. `--confirm-convention` writes it anyway: a golden item may legitimately
+  depart from convention, and that is sometimes exactly why one is written.
+
+  Only three claims can stop a save — the tables read, the filters written, the resolved date window
+  — because those are the ones that change which rows are counted. A save only stops when the CLI
+  itself reports `high_confidence`, so a library that does not cover the question has no opinion to
+  hold anyone to. And the check is total: no model, no CLI, a profile mid-rebuild, all return no
+  opinion rather than blocking a correct answer from being written down, and the whole check is
+  bounded by one wall-clock budget rather than a timeout per subject area.
+
+  `agami-reconcile` is taught the second meaning of exit `1` in the same change, since a promotion
+  that met it and answered with `--confirm-replace` would loop on a payload with no before and
+  after to render.
+
+- **`/agami-eval` says what a pass rate is not.** A run scores a generator with every tool switched
+  off and one attempt, because that isolation is what keeps it from reading the answer key. The
+  agent that answers the same question in production has four tools and can iterate. A dataset is
+  also deliberately not a random sample. So a run measures regression, and quoting its pass rate as
+  agami's accuracy is wrong in both directions.
+
 ## [0.8.0] — 2026-09-05
 
 One change: the server decides which tool calls belong to one conversation, instead of asking the

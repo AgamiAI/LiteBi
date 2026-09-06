@@ -1119,3 +1119,180 @@ def test_a_dataset_name_carrying_a_separator_is_refused_by_this_door_too(
     assert code == 2
     assert "dataset" in err
     assert neighbour.exists()
+
+
+# --- The convention check (#264) ----------------------------------------------------------------
+#
+# Measured rather than imagined. On the first real dataset authored against a live warehouse, nine
+# of fifteen items failed and six were one mistake: the answer keys filtered on one timestamp column
+# where that profile's own examples used another, 24 times out of 36. The generator read those
+# examples, followed the convention, and was marked wrong by a key that had never looked at them.
+
+
+def _example(sql: str, question: str = QUERY):
+    """Stand in for the ranker, which shells out to a CLI these tests do not have."""
+    return {"question": question, "sql": sql}
+
+
+def test_a_key_that_departs_from_the_profiles_examples_stops_before_writing(
+    tmp_path, monkeypatch, capsys
+):
+    """The write is held, not undone. A warning that arrives once the answer key is on disk is a
+    warning about a file the reader now has to decide whether to undo — and the append-only rule
+    makes undoing it a second confirmation."""
+    monkeypatch.setattr(
+        golden_author,
+        "_nearest_example",
+        lambda profile, question: _example(
+            "SELECT COUNT(*) AS order_count FROM orders WHERE created_at >= '2024-01-01'"
+        ),
+    )
+    item = _item_file(
+        tmp_path,
+        sql="SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= '2024-01-01'",
+    )
+
+    code, payload, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
+
+    assert code == golden_author._NEEDS_CONFIRMATION
+    assert payload["added"] == []
+    divergence = payload["needs_confirmation_convention"]
+    assert divergence["example_sql"].count("created_at")
+    assert [claim["name"] for claim in divergence["claims"]] == ["filter_predicates"]
+    # Nothing reached disk, so there is nothing for the person to undo if they say no.
+    assert not (tmp_path / PROFILE / "golden_datasets").exists()
+
+
+def test_the_departure_is_written_once_somebody_says_it_is_deliberate(
+    tmp_path, monkeypatch, capsys
+):
+    """Reported and never enforced. A golden item may legitimately depart from convention — that is
+    sometimes exactly why one is written — so the check asks and the person decides."""
+    monkeypatch.setattr(
+        golden_author,
+        "_nearest_example",
+        lambda profile, question: _example(
+            "SELECT COUNT(*) AS order_count FROM orders WHERE created_at >= '2024-01-01'"
+        ),
+    )
+    item = _item_file(
+        tmp_path,
+        sql="SELECT COUNT(*) AS order_count FROM orders WHERE placed_at >= '2024-01-01'",
+    )
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(item, "orders", "--confirm-convention"))
+
+    assert code == 0
+    assert _items(tmp_path)[0].expected.sql.count("placed_at")
+
+
+def test_a_key_that_matches_the_convention_is_written_without_a_question(
+    tmp_path, monkeypatch, capsys
+):
+    """The check has to be silent when there is nothing to say, or it becomes a prompt people learn
+    to click through."""
+    monkeypatch.setattr(
+        golden_author, "_nearest_example", lambda profile, question: _example(SQL)
+    )
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+
+    assert code == 0 and _items(tmp_path)[0].expected.sql == SQL
+
+
+def test_the_check_never_costs_a_save_when_it_cannot_run(tmp_path, monkeypatch, capsys):
+    """Total at the caller. No model, no CLI, a profile mid-rebuild — every one returns no opinion,
+    because a check that could refuse a save would be a new way to fail to write down a correct
+    answer.
+
+    Aimed at the real path rather than at `_nearest_example`: the CLI itself is what is absent on a
+    machine this fails on, so the failure is injected at the subprocess and allowed to propagate up
+    through the ranking exactly as it would in the field.
+    """
+
+    def _no_cli(*args, **kwargs):
+        raise FileNotFoundError("bash: no such file")
+
+    monkeypatch.setattr(golden_author, "_sm_json", _no_cli)
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+
+    assert code == 0 and _items(tmp_path)[0].expected.sql == SQL
+
+
+def test_the_question_reaches_the_ranker_as_one_argument_and_never_a_shell_string(monkeypatch):
+    """The one place user text crosses into a subprocess in this file.
+
+    A dashboard label reaches the promotion path from a screenshot, so a question can carry a quote,
+    a backtick or a `$(…)`. Pinned rather than trusted: correct-and-unpinned is how the eval's own
+    environment allowlist shipped missing a name it needed.
+    """
+    import subprocess
+
+    seen = {}
+
+    def _record(argv, **kwargs):
+        seen["argv"], seen["kwargs"] = argv, kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _record)
+    hostile = "How many `whoami` orders $(id) in 'Q1'?"
+
+    golden_author._sm_json("examples", "/root", "--query", hostile, timeout_s=1.0)
+
+    assert seen["argv"][0] == "bash", "a list argv, so no shell parses any of this"
+    assert hostile in seen["argv"], "the question is one element, not spliced into a string"
+    assert seen["kwargs"].get("shell") is not True
+    assert seen["kwargs"]["timeout"] == 1.0
+
+
+def test_an_unrelated_example_is_not_treated_as_the_convention(tmp_path, monkeypatch, capsys):
+    """The check needs a relevance floor or it stops every save.
+
+    The ranker scores every example and returns its top-k unconditionally, so a question sharing
+    nothing but its shape still comes back as the winner. `tables` is one of the claims that can
+    stop a save and an unrelated example differs on tables essentially always — so without the
+    floor, a profile with no near-identical curated question stops on every write and asks the
+    author about a question they were not answering.
+    """
+    calls = []
+
+    def _ranked(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "areas":
+            return [{"name": "orders"}]
+        # What the CLI returns for a question its library does not cover: a best match, and its own
+        # judgement that the match is not close enough to be one.
+        return {
+            "high_confidence": False,
+            "matches": [{"score": 0.606, "example": {"question": "Anything else?",
+                                                     "sql": "SELECT COUNT(*) FROM suppliers"}}],
+        }
+
+    monkeypatch.setattr(golden_author, "_sm_json", _ranked)
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+
+    assert code == 0, "an unrelated example is not a convention to be held to"
+    assert _items(tmp_path)[0].expected.sql == SQL
+
+
+def test_only_the_claims_that_change_which_rows_are_counted_are_reported(
+    tmp_path, monkeypatch, capsys
+):
+    """Two statements answering one question legitimately differ in ordering and limit, and
+    reporting those would make the check noise a person learns to click through."""
+    monkeypatch.setattr(
+        golden_author,
+        "_nearest_example",
+        lambda profile, question: _example(
+            "SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY n DESC LIMIT 5"
+        ),
+    )
+    item = _item_file(
+        tmp_path, sql="SELECT status, COUNT(*) AS n FROM orders GROUP BY status ORDER BY status"
+    )
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(item))
+
+    assert code == 0, "ordering and limit alone are not a departure worth stopping for"
