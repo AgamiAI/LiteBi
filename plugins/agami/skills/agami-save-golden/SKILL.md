@@ -1,6 +1,6 @@
 ---
 name: agami-save-golden
-description: "Writes golden-dataset items for a profile through two doors. The import door turns a question bank — a spreadsheet, a CSV, or a table pasted into chat — into items written unconfirmed, after the parsed rows have been shown and agreed to. The save door writes one question, the statement that answered it and the result the person accepted, as a confirmed item with its receipt. The curation door applies the changes queued on the golden-dataset explorer page, which may weaken a claim and may never grant one. Every write goes through agami-core's writer, is re-read by the runner's own reader before it is kept, and is append-only: a write that would change an item that already exists stops and shows the before and the after. This skill writes only; it never runs or scores a dataset."
+description: "Writes golden-dataset items for a profile through three doors. The import door turns a question bank — a spreadsheet, a CSV, or a table pasted into chat — into items written unconfirmed, after the parsed rows have been shown and agreed to. The save door writes one question, the statement that answered it and the result the person accepted, as a confirmed item with its receipt. The curation door applies the changes queued on the golden-dataset explorer page, which may weaken a claim and may never grant one. Every write goes through agami-core's writer, is re-read by the runner's own reader before it is kept, and is append-only: a write that would change an item that already exists stops and shows the before and the after. This skill writes only; it never runs or scores a dataset."
 when_to_use: "Use when the user says 'save this as a golden question', 'add this to the golden dataset', 'import my question bank', 'turn this spreadsheet into a golden dataset', 'this answer is correct — remember it as ground truth', 'show me the golden datasets', 'what does this dataset not test', 'apply my queued changes', or '/agami-save-golden <dataset>' — any ask to record a question, or a bank of questions, that the model should be scored against later. Also use when the user replies with a back-channel block from a previously-rendered golden-dataset explorer page (first line `profile: <name>`, then `golden-ops:` and a JSON array, ending `done`) — paste it and nothing else is needed. Requires agami-connect to have been run first (needs a profile with a semantic model). To RUN a dataset and see the verdicts, use `/agami-eval` instead: that skill reads and scores, this one writes and never runs or scores."
 argument-hint: "[dataset-name]"
 ---
@@ -13,8 +13,9 @@ You are writing to the answer key. Goal: get a question — or a bank of them �
 
 | Door | Input | What it writes | Can it gate a run? |
 |---|---|---|---|
-| **Import** | A CSV of questions, or a table pasted into chat | Items with `sql_confirmed: false` | No |
+| **Import** | A spreadsheet or CSV of questions, or a table pasted into chat | Items with `sql_confirmed: false` | No |
 | **Save** | One question, the statement that answered it, the result the person accepted | One item with `sql_confirmed: true`, its statement and its receipt | Yes |
+| **Curation** | The back-channel block from the explorer page | Tags, strictness, question edits, removals, and the **withdrawal** of confirmation | No — it can weaken a claim and may never grant one |
 
 An imported item **has no statement until somebody runs it and saves the answer through the save door.** That is the intended shape, not a gap to close: an import is a list of the questions this team cares about, and a question with no verified answer is an honest in-progress case that reports and cannot gate.
 
@@ -78,7 +79,7 @@ The **script** reads one format, and that is deliberate: one parser is one place
   - **More than one sheet holds data → ask which.** Name the sheets and let the user pick. Never guess: importing the wrong tab writes a bank of questions nobody meant to ask, under ids derived from them, and the append-only rule then makes each one a confirmation prompt to undo.
   - **Flatten formulas to their values.** A question column is text and a cell holding a formula is not a question. If a cell resolves to an error, treat that row as unreadable and let the parser skip it rather than importing the error text.
 
-  This is [`agami-connect`](../agami-connect/SKILL.md)'s stance on the same problem — Claude reads the document, the deterministic step never opens it — rather than a new one.
+  The pattern is [`agami-connect`](../agami-connect/SKILL.md)'s — Claude reads a customer's existing definitions with the Read tool and the deterministic step never opens the file. It is the *pattern* that is borrowed and not the coverage: connect asks for a PDF when handed a workbook and proceeds without it, so `.xlsx` is not already read there. Reading one here is new; doing the reading in the skill rather than in the script is not.
 
 The sheet needs a header row with a **question column** — `question`, `query`, `nl question`, `prompt` or `ask` (case, underscores and hyphens all fold). Optional columns: `id`, `expected` / `expected value` / `answer`, `sql` / `statement`, `tags`. A header the contract does not know is left alone — matching is exact, never fuzzy, so an analyst's note column costs nothing.
 
