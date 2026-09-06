@@ -214,8 +214,8 @@
     // RUN.summary.sections is written in it — so nothing here re-sorts anything.
     const SECTION_LABEL = {
       failure: "Failed",
-      error: "Errored",
-      unscored: "Unscored",
+      error: "Couldn't run",
+      unscored: "Not compared",
       unconfirmed: "Unconfirmed",
       pass: "Passed",
     };
@@ -335,8 +335,11 @@
             text: "one of the statements could not be read, so nothing could be compared",
           })];
         }
-        // Structurally identical and it passed: there is nothing to say, so nothing is drawn.
-        if (item.passed) return [];
+        // Nothing to say, so nothing is drawn. Three cases, not one: a pass, an item that was
+        // never scored (both sides empty — its columns were not compared, let alone different),
+        // and a gated failure, where the columns are identical and the gate named in the verdict
+        // above is the whole finding.
+        if (item.passed || item.status !== "scored" || (item.gates || []).length) return [];
         // Structurally identical and it FAILED, which narrows the difference to one place:
         // projected columns are the only thing this comparison never examines. The verdict above
         // already names the column, and the statements are directly below, so this says the one

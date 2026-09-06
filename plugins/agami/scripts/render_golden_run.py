@@ -72,6 +72,17 @@ _SUMMARY_COUNTS = ("total", "passed", "failed", "unscored", "errored")
 # `Array.join`, so anything else is a broken page rather than a wrong word.
 _SCALAR = (str, int, float)
 
+# The only two claims whose entries are themselves sequences: `ordering` writes a column with its
+# direction and `join_keys` writes the two sides of an equality as a pair of pairs. Everywhere else
+# an entry is one scalar, and a nested entry is something this projection has no reason to render.
+#
+# Named rather than inferred from the shape, because the shape cannot tell them apart: a join key
+# and a two-column result row are both a sequence of two strings. No producer can put a row here —
+# a claim comes from `compare_statements`, which sees two SQL strings and no data — but the rule
+# this file exists to keep is that no result row reaches the page, and a projection that would
+# render one if it arrived is not keeping it.
+_NESTED_CLAIMS = ("ordering", "join_keys")
+
 
 # Spelled out rather than taken from `%B`, which reads the process locale: a report is a file
 # somebody sends to somebody else, and the month it carries should not depend on whose machine
@@ -93,7 +104,7 @@ def _run_stamp(now: Optional[datetime.datetime] = None) -> str:
     return f"{stamp.day} {_MONTHS[stamp.month - 1]} {stamp.year} at {stamp:%H:%M} UTC"
 
 
-def _names(value: Any, *, ordinals: bool = False) -> list[str]:
+def _names(value: Any, *, ordinals: bool = False, nested: bool = False) -> list[str]:
     """The entries of one claim's side, flattened to the strings the page prints.
 
     The claim is written by the statement comparator and its shape is promised by a docstring, not
@@ -113,7 +124,7 @@ def _names(value: Any, *, ordinals: bool = False) -> list[str]:
         if isinstance(name, _SCALAR):
             entry = _readable(str(name))
             flattened.append(_ordinal(entry) if ordinals else entry)
-        elif isinstance(name, (list, tuple)):
+        elif nested and isinstance(name, (list, tuple)):
             entry = _nested(name)
             if entry:
                 flattened.append(entry)
@@ -147,7 +158,7 @@ def _nested(entry: Any) -> str:
 def _ordinal(entry: str) -> str:
     """`GROUP BY 1` reaches the claim as the bare string "1", which reads as a number.
 
-    "grouped by 1" against "grouped by service_criticality" tells a reader nothing at all, and the
+    "grouped by 1" against "grouped by status" tells a reader nothing at all, and the
     ordinal cannot be resolved here — the claim carries no projection to resolve it against. So it
     is labelled rather than decoded, which is honest and readable where a bare digit is neither.
     Resolving it properly belongs to the claim reader, which does hold the select list.
@@ -170,6 +181,11 @@ _INFIX = {
     "is": "IS",
     "in": "IN",
 }
+
+# Zero-argument calls the claim reader writes for a keyword. Rendered as the keyword so `IS NULL`
+# reads as `IS NULL`; without them the operand keeps a `(` and the guard below refuses the whole
+# comparison, which is what kept the `is` entry above from ever firing.
+_KEYWORDS = {"null()": "NULL", "true()": "TRUE", "false()": "FALSE"}
 
 
 def _split(inner: str, *, expected: int) -> Optional[list[str]]:
@@ -217,6 +233,8 @@ def _readable(key: str) -> str:
     anything else is returned untouched. A nested predicate is left alone rather than half-rewritten
     into something that reads like SQL and is not.
     """
+    if key in _KEYWORDS:
+        return _KEYWORDS[key]
     if not key.endswith(")"):
         return key
     head, _, rest = key.partition("(")
@@ -244,6 +262,10 @@ def _readable(key: str) -> str:
     operands = [_readable(operand) if operand.endswith(")") else operand for operand in operands]
     if any("(" in operand and not operand.startswith("(") for operand in operands):
         return key
+    if operator == "IN" and not operands[1].startswith("("):
+        # A single-value `IN` reaches here with two operands and no brackets of its own, and
+        # `status IN 'paid'` is not SQL anybody writes. The subquery case already carries its own.
+        operands[1] = f"({operands[1]})"
     return f"{operands[0]} {operator} {operands[1]}"
 
 
@@ -271,7 +293,7 @@ def _window(value: dict) -> str:
     return f"{column} in {open_bracket}{start}, {end}{close_bracket}"
 
 
-def _side(value: Any, *, ordinals: bool = False) -> str:
+def _side(value: Any, *, ordinals: bool = False, nested: bool = False) -> str:
     """One side of one claim, flattened to the string the page prints.
 
     Flattened HERE rather than in the template, because the sides are not one shape: a table set is
@@ -286,7 +308,7 @@ def _side(value: Any, *, ordinals: bool = False) -> str:
             f"{key} {item}" for key, item in sorted(value.items()) if isinstance(item, _SCALAR)
         )
     if isinstance(value, list):
-        return ", ".join(_names(value, ordinals=ordinals))
+        return ", ".join(_names(value, ordinals=ordinals, nested=nested))
     if isinstance(value, _SCALAR):
         return str(value)
     return ""
@@ -317,6 +339,7 @@ def _claims(item: dict) -> list[dict[str, Any]]:
         if not isinstance(claim, dict):
             continue
         ordinals = claim.get("name") == "group_keys"
+        nested = claim.get("name") in _NESTED_CLAIMS
         projected.append(
             {
                 # Carried rather than assumed: the page labels each line from the claim's own name,
@@ -327,8 +350,8 @@ def _claims(item: dict) -> list[dict[str, Any]]:
                 # An ordinal is only an ordinal under `group_keys`. A `limit` of 100 is a row
                 # count, and labelling it "column 100 of the select list" would be worse than the
                 # bare digit this exists to fix.
-                "generated": _side(claim.get("generated"), ordinals=ordinals),
-                "golden": _side(claim.get("golden"), ordinals=ordinals),
+                "generated": _side(claim.get("generated"), ordinals=ordinals, nested=nested),
+                "golden": _side(claim.get("golden"), ordinals=ordinals, nested=nested),
             }
         )
     return projected

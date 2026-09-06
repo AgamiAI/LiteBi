@@ -280,6 +280,13 @@ def test_no_result_row_reaches_the_report():
     item["rows"] = rows
     item["row_preview"] = rows
     item["score"] = {**item["score"], "rows": rows}
+    # A claim's side too. Its only producer compares two SQL strings and can never hold a row, but
+    # the projection now flattens nested sequences that it used to drop — so this is the shape that
+    # would have started travelling if one ever did.
+    item["claims"] = {
+        "claims": [{"name": "tables", "status": "differs", "generated": rows, "golden": rows}],
+        "gates": [],
+    }
     run = _run([item])
     run["rows"] = rows
 
@@ -562,9 +569,9 @@ def test_a_claim_side_that_is_not_a_list_of_names_cannot_reach_the_page():
     """Nothing on this side of the handoff enforces the comparator's shape, so each side of a claim
     is coerced to the string the page prints rather than trusted to be a list.
 
-    A nested sequence is joined rather than dropped, because `ordering` genuinely writes one — a
-    column and a direction together. A dict nested inside a side is still dropped: it would print
-    its own punctuation.
+    A nested sequence is dropped under `tables`, which never writes one — only `ordering` and
+    `join_keys` do, and the claims that may nest are named rather than inferred from the shape. A
+    dict nested inside a side is dropped everywhere: it would print its own punctuation.
     """
     run = _run(
         [
@@ -585,7 +592,7 @@ def test_a_claim_side_that_is_not_a_list_of_names_cannot_reach_the_page():
 
     claim = _payload(render(title="x", profile="demo", run=run))["items"][0]["claims"][0]
 
-    assert claim["generated"] == "orders, nested list, 7"
+    assert claim["generated"] == "orders, 7"
     assert claim["golden"] == "customers"
     # A dict nested inside a side would print its own punctuation, so it is still dropped.
     assert '"a"' not in json.dumps(claim)
@@ -799,6 +806,13 @@ def test_a_claim_reads_the_way_a_person_writes_it():
     )
     # Anything the lookup does not know keeps the shape it arrived in rather than being guessed at.
     assert _side(["coalesce(a, b)"]) == "coalesce(a, b)"
+    # A keyword arrives as a zero-argument call; without it the operand keeps a bracket and the
+    # guard refuses the whole comparison, which is what kept `IS` from ever rendering.
+    assert _side(["is(orders.deleted_at, null())"]) == "orders.deleted_at IS NULL"
+    # A single-value IN has two operands and no brackets of its own. `status IN 'paid'` is not SQL.
+    assert _side(["in(orders.status, 'paid')"]) == "orders.status IN ('paid')"
+    # A multi-value IN has three, so it is left in the form it arrived in rather than half-rewritten.
+    assert _side(["in(orders.status, 'paid', 'refunded')"]).startswith("in(")
 
 
 def test_a_join_key_and_an_ordering_survive_their_nesting():
@@ -807,15 +821,19 @@ def test_a_join_key_and_an_ordering_survive_their_nesting():
     most likely to differ as empty sides."""
     from render_golden_run import _side
 
-    assert _side([[["customers", "id"], ["orders", "customer_id"]]]) == (
+    assert _side([[["customers", "id"], ["orders", "customer_id"]]], nested=True) == (
         "customers.id = orders.customer_id"
     )
-    assert _side([["order_count", "desc"]]) == "order_count desc"
+    assert _side([["order_count", "desc"]], nested=True) == "order_count desc"
+    # And nowhere else. A join key and a two-column result row are the same shape, so the claims
+    # that may nest are named rather than inferred — this is what stops a row rendering if one ever
+    # reached a claim it has no way to reach today.
+    assert _side([["Ada Lovelace", "1234"]]) == ""
 
 
 def test_an_ordinal_group_key_is_labelled_and_a_row_limit_is_not():
     """`GROUP BY 1` reaches the claim as the bare string "1", and "grouped by 1" against "grouped by
-    service_criticality" tells a reader nothing.
+    status" tells a reader nothing.
 
     It is labelled rather than resolved — the claim carries no projection to resolve it against —
     and ONLY under `group_keys`: a `limit` of 100 is a row count, and calling it "column 100 of the
@@ -886,7 +904,7 @@ def test_a_failure_whose_statements_agree_everywhere_says_where_to_look():
     """
     assert 'text: "The selected columns differ."' in TEMPLATE
     # And when the same thing happens on a PASS there is nothing to say, so nothing is drawn.
-    assert "if (item.passed) return [];" in TEMPLATE
+    assert 'if (item.passed || item.status !== "scored" || (item.gates || []).length) return [];' in TEMPLATE
 
 
 def test_the_claims_are_drawn_as_a_table_with_plain_english_labels():
