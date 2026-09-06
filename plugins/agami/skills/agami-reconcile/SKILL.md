@@ -221,7 +221,7 @@ bash "$AGAMI_PLUGIN_ROOT/scripts/sm" examples "$ROOT" --area <area> --query "<th
 Two adjustments, and both are about not splitting something too small to split:
 
 - **Fewer than four agreeing rows → all of them become golden items.** A split of three leaves too little on either side to be worth the explanation.
-- **An empty example library → teach with at least half.** A profile with nothing curated needs teaching more than gating, and every row will read as novel anyway.
+- **Never send more than half the batch to the examples.** This is a cap, not a preference, and it is the rule that makes the split survive an empty library: with nothing curated, every row reads as novel and the base rule would teach with all of them, leaving the golden dataset empty. That is exactly the profile reconcile is aimed at, and an onboarding run that writes no test at all has failed at the thing it was asked to do. When the cap bites, keep the highest-scoring rows as examples and the rest as tests.
 
 **Make the offer once, here, after the summary. Never per row.** A per-row prompt turns a twelve-number reconcile into twelve interruptions and buries the mismatches, which are the point of the run.
 

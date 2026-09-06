@@ -399,7 +399,11 @@ def test_a_batch_too_small_to_split_is_not_split():
     """A split of three leaves too little on either side to be worth the explanation, and a profile
     with nothing curated needs teaching more than gating."""
     assert "Fewer than four agreeing rows" in OFFER
-    assert "An empty example library" in OFFER
+    # A cap and not a preference: an empty library reads every row as novel, so a floor on the
+    # teaching side would send all of them there and write no test at all — on exactly the profile
+    # this skill is aimed at.
+    assert "Never send more than half the batch to the examples." in OFFER
+    assert "an onboarding run that writes no test at all has failed" in OFFER
 
 
 def test_the_user_makes_one_decision_and_it_is_not_the_split():
