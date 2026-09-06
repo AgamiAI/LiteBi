@@ -105,6 +105,13 @@ _SM = Path(__file__).resolve().parent / "sm"
 # the nearest example is the answer to that. More would be a survey.
 _CONVENTION_TOP_K = 1
 
+# One wall-clock bound for the WHOLE check, not per call. The ranking runs one `sm` invocation per
+# subject area, and each of those resolves an interpreter and may shell out to `pip install` on a
+# miss — so a per-call timeout multiplies by the number of areas and a save door can sit silently
+# for minutes before deciding it has no opinion. A few seconds is the right order for something
+# advisory standing between a person and a write they have already decided on.
+_CONVENTION_BUDGET_S = 8.0
+
 # Which claims a divergence from convention is reported for. Deliberately not all seven: two
 # statements answering one question legitimately differ in ordering, limit and grouping, and
 # reporting those would make the check noise a person learns to click through. These three are the
@@ -668,39 +675,61 @@ def _nearest_example(profile: str, question: str) -> Optional[dict]:
     is asked for real. Every area is ranked and the best kept, because the CLI reads one library at
     a time and a save is not told which area a question belongs to.
 
-    Total by construction. Every failure here — no model, no CLI, a profile mid-rebuild — returns
-    None, because this check exists to inform a write and must never be the reason one cannot
-    happen.
+    Allowed to raise. `_convention_divergence` is the single place that turns any failure here — no
+    model, no CLI, a profile mid-rebuild — into "no opinion", because this check exists to inform a
+    write and must never be the reason one cannot happen. Two guards would mean the outer one was
+    unreachable and the test aiming at it was testing nothing.
     """
+    import time
+
+    deadline = time.monotonic() + _CONVENTION_BUDGET_S
     root = agami_paths.profile_dir(profile)
-    try:
-        areas = _sm_json("areas", str(root))
-        if not isinstance(areas, list):
-            return None
-        best: tuple[float, dict] = (0.0, {})
-        for area in areas:
-            name = (area or {}).get("name") if isinstance(area, dict) else None
-            if not name:
-                continue
-            ranked = _sm_json(
-                "examples", str(root), "--area", str(name),
-                "--query", question, "--top-k", str(_CONVENTION_TOP_K),
-            )
-            for match in (ranked or {}).get("matches") or []:
-                score = match.get("score") or 0.0
-                if score > best[0] and (match.get("example") or {}).get("sql"):
-                    best = (score, match["example"])
-        return best[1] or None
-    except Exception:
+    areas = _sm_json("areas", str(root), timeout_s=_CONVENTION_BUDGET_S)
+    if not isinstance(areas, list):
         return None
+    best: tuple[float, dict] = (0.0, {})
+    for area in areas:
+        name = (area or {}).get("name") if isinstance(area, dict) else None
+        if not name:
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Out of budget with areas left to rank. Whatever was found so far still stands — a
+            # partial ranking can only under-report a departure, never invent one.
+            break
+        ranked = _sm_json(
+            "examples", str(root), "--area", str(name),
+            "--query", question, "--top-k", str(_CONVENTION_TOP_K),
+            timeout_s=remaining,
+        )
+        # `high_confidence` is the CLI's own answer to "does this library cover this question",
+        # computed from the same threshold `agami-query` trusts. Without it this check has no
+        # relevance floor at all: the ranker scores EVERY example and returns its top-k
+        # unconditionally, so an unrelated question comes back as the winner — measured at 0.606
+        # for two questions sharing nothing but their shape. `tables` is one of the claims that can
+        # stop a save, and an unrelated example differs on tables essentially always, so every save
+        # on a profile without a near-identical curated question would stop and ask the author to
+        # confirm a departure from a question they were not answering.
+        if not (ranked or {}).get("high_confidence"):
+            continue
+        for match in (ranked or {}).get("matches") or []:
+            score = match.get("score") or 0.0
+            if score > best[0] and (match.get("example") or {}).get("sql"):
+                best = (score, match["example"])
+    return best[1] or None
 
 
-def _sm_json(*args: str) -> Any:
-    """One semantic-model CLI command, or None if it did not answer with JSON."""
+def _sm_json(*args: str, timeout_s: float) -> Any:
+    """One semantic-model CLI command, or None if it did not answer with JSON in time.
+
+    The question reaches the child as one element of an argv LIST — never a shell string — so a
+    label carrying a quote, a backtick or a `$(…)` is one argument rather than something the shell
+    reads. `sm` itself passes `"$@"` through with no `eval`.
+    """
     import subprocess
 
     done = subprocess.run(
-        ["bash", str(_SM), *args], capture_output=True, text=True, check=False, timeout=120
+        ["bash", str(_SM), *args], capture_output=True, text=True, check=False, timeout=timeout_s
     )
     if done.returncode != 0:
         return None

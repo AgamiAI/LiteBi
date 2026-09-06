@@ -1201,18 +1201,80 @@ def test_a_key_that_matches_the_convention_is_written_without_a_question(
 
 
 def test_the_check_never_costs_a_save_when_it_cannot_run(tmp_path, monkeypatch, capsys):
-    """Total by construction. No model, no CLI, a profile mid-rebuild — every one of them returns no
-    opinion, because a check that could refuse a save would be a new way to fail to write down a
-    correct answer."""
+    """Total at the caller. No model, no CLI, a profile mid-rebuild — every one returns no opinion,
+    because a check that could refuse a save would be a new way to fail to write down a correct
+    answer.
 
-    def _explodes(profile, question):
-        raise RuntimeError("no model here")
+    Aimed at the real path rather than at `_nearest_example`: the CLI itself is what is absent on a
+    machine this fails on, so the failure is injected at the subprocess and allowed to propagate up
+    through the ranking exactly as it would in the field.
+    """
 
-    monkeypatch.setattr(golden_author, "_nearest_example", _explodes)
+    def _no_cli(*args, **kwargs):
+        raise FileNotFoundError("bash: no such file")
+
+    monkeypatch.setattr(golden_author, "_sm_json", _no_cli)
 
     code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
 
     assert code == 0 and _items(tmp_path)[0].expected.sql == SQL
+
+
+def test_the_question_reaches_the_ranker_as_one_argument_and_never_a_shell_string(monkeypatch):
+    """The one place user text crosses into a subprocess in this file.
+
+    A dashboard label reaches the promotion path from a screenshot, so a question can carry a quote,
+    a backtick or a `$(…)`. Pinned rather than trusted: correct-and-unpinned is how the eval's own
+    environment allowlist shipped missing a name it needed.
+    """
+    import subprocess
+
+    seen = {}
+
+    def _record(argv, **kwargs):
+        seen["argv"], seen["kwargs"] = argv, kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _record)
+    hostile = "How many `whoami` orders $(id) in 'Q1'?"
+
+    golden_author._sm_json("examples", "/root", "--query", hostile, timeout_s=1.0)
+
+    assert seen["argv"][0] == "bash", "a list argv, so no shell parses any of this"
+    assert hostile in seen["argv"], "the question is one element, not spliced into a string"
+    assert seen["kwargs"].get("shell") is not True
+    assert seen["kwargs"]["timeout"] == 1.0
+
+
+def test_an_unrelated_example_is_not_treated_as_the_convention(tmp_path, monkeypatch, capsys):
+    """The check needs a relevance floor or it stops every save.
+
+    The ranker scores every example and returns its top-k unconditionally, so a question sharing
+    nothing but its shape still comes back as the winner. `tables` is one of the claims that can
+    stop a save and an unrelated example differs on tables essentially always — so without the
+    floor, a profile with no near-identical curated question stops on every write and asks the
+    author about a question they were not answering.
+    """
+    calls = []
+
+    def _ranked(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "areas":
+            return [{"name": "orders"}]
+        # What the CLI returns for a question its library does not cover: a best match, and its own
+        # judgement that the match is not close enough to be one.
+        return {
+            "high_confidence": False,
+            "matches": [{"score": 0.606, "example": {"question": "Anything else?",
+                                                     "sql": "SELECT COUNT(*) FROM suppliers"}}],
+        }
+
+    monkeypatch.setattr(golden_author, "_sm_json", _ranked)
+
+    code, _, _ = _run(tmp_path, monkeypatch, capsys, _save_argv(_item_file(tmp_path)))
+
+    assert code == 0, "an unrelated example is not a convention to be held to"
+    assert _items(tmp_path)[0].expected.sql == SQL
 
 
 def test_only_the_claims_that_change_which_rows_are_counted_are_reported(

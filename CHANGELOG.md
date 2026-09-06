@@ -31,9 +31,15 @@ below corresponds to one such version.
   depart from convention, and that is sometimes exactly why one is written.
 
   Only three claims can stop a save — the tables read, the filters written, the resolved date window
-  — because those are the ones that change which rows are counted. And the check is total: no model,
-  no CLI, a profile mid-rebuild, all return no opinion rather than blocking a correct answer from
-  being written down.
+  — because those are the ones that change which rows are counted. A save only stops when the CLI
+  itself reports `high_confidence`, so a library that does not cover the question has no opinion to
+  hold anyone to. And the check is total: no model, no CLI, a profile mid-rebuild, all return no
+  opinion rather than blocking a correct answer from being written down, and the whole check is
+  bounded by one wall-clock budget rather than a timeout per subject area.
+
+  `agami-reconcile` is taught the second meaning of exit `1` in the same change, since a promotion
+  that met it and answered with `--confirm-replace` would loop on a payload with no before and
+  after to render.
 
 - **`/agami-eval` says what a pass rate is not.** A run scores a generator with every tool switched
   off and one attempt, because that isolation is what keeps it from reading the answer key. The
