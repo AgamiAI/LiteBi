@@ -12,6 +12,23 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`/agami-save-golden` reads a spreadsheet instead of asking you to convert one.** The import door
+  refused an `.xlsx` and told the user to open it in Excel and Save As → CSV. Now Claude reads the
+  workbook and writes the sheet out as a CSV itself, which is the same move the skill already made
+  for a table pasted into chat.
+
+  The reason for the old refusal was that `golden_author.py` cannot open a workbook — true, and
+  unchanged: it is stdlib-only, and a marketplace install ships the plugin with nothing to
+  pip-install into. But that was an argument about the script, not about the skill. `agami-connect`
+  has always read a customer's existing definitions this way, with the deterministic step never
+  opening the file. One parser, one place a column can be misread, and one less conversion for the
+  person whose question bank lives in Excel — which is where question banks live.
+
+  When more than one sheet holds data the skill asks which, rather than guessing, and formulas are
+  flattened to their values.
+
 ## [0.8.0] — 2026-09-05
 
 One change: the server decides which tool calls belong to one conversation, instead of asking the

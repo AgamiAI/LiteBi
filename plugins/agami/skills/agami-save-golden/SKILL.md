@@ -1,6 +1,6 @@
 ---
 name: agami-save-golden
-description: "Writes golden-dataset items for a profile through two doors. The import door turns a question bank — a CSV, or a table pasted into chat — into items written unconfirmed, after the parsed rows have been shown and agreed to. The save door writes one question, the statement that answered it and the result the person accepted, as a confirmed item with its receipt. The curation door applies the changes queued on the golden-dataset explorer page, which may weaken a claim and may never grant one. Every write goes through agami-core's writer, is re-read by the runner's own reader before it is kept, and is append-only: a write that would change an item that already exists stops and shows the before and the after. This skill writes only; it never runs or scores a dataset."
+description: "Writes golden-dataset items for a profile through two doors. The import door turns a question bank — a spreadsheet, a CSV, or a table pasted into chat — into items written unconfirmed, after the parsed rows have been shown and agreed to. The save door writes one question, the statement that answered it and the result the person accepted, as a confirmed item with its receipt. The curation door applies the changes queued on the golden-dataset explorer page, which may weaken a claim and may never grant one. Every write goes through agami-core's writer, is re-read by the runner's own reader before it is kept, and is append-only: a write that would change an item that already exists stops and shows the before and the after. This skill writes only; it never runs or scores a dataset."
 when_to_use: "Use when the user says 'save this as a golden question', 'add this to the golden dataset', 'import my question bank', 'turn this spreadsheet into a golden dataset', 'this answer is correct — remember it as ground truth', 'show me the golden datasets', 'what does this dataset not test', 'apply my queued changes', or '/agami-save-golden <dataset>' — any ask to record a question, or a bank of questions, that the model should be scored against later. Also use when the user replies with a back-channel block from a previously-rendered golden-dataset explorer page (first line `profile: <name>`, then `golden-ops:` and a JSON array, ending `done`) — paste it and nothing else is needed. Requires agami-connect to have been run first (needs a profile with a semantic model). To RUN a dataset and see the verdicts, use `/agami-eval` instead: that skill reads and scores, this one writes and never runs or scores."
 argument-hint: "[dataset-name]"
 ---
@@ -67,14 +67,18 @@ Route on what the user brought, and say which door you are opening:
 
 ### 2a — Get a CSV
 
-The parser reads **one format**, and that is deliberate: one parser is one place where a column can be misread.
+The **script** reads one format, and that is deliberate: one parser is one place where a column can be misread. Everything below therefore ends at a CSV on disk. What changes is who writes it.
 
 - **A `.csv` path** — use it as given.
-- **A `.xlsx` / `.xls` path** — refuse and say how to get past it. Do not try to read it, and do not guess at its contents:
-
-  > I can't read `.xlsx` directly. Open it in Excel (or Numbers / Google Sheets) and **Save As → CSV UTF-8**, then re-invoke me with the `.csv` path.
-
 - **A table pasted into chat** — write it out as a CSV with the **Write tool** and then parse that file. One parser, one code path, and the file is also the thing the user can fix and re-run. Per [`shared/invocation-conventions.md`](../../shared/invocation-conventions.md): **never a heredoc, never `python3 -c`, never a shell variable** — quoting mangles the commas and quotes that are the whole point of a CSV. Write it to `/tmp/agami-golden-pasted-<ts>.csv` and tell the user where it went.
+- **A `.xlsx` / `.xls` path** — **read the workbook yourself and write the sheet out as a CSV**, exactly as you would a pasted table, then parse that file. The script cannot open a workbook and is not being asked to: it is stdlib-only, and a marketplace install ships `plugins/agami/` with nothing to pip-install into. You can read one, and doing it here is the same move the pasted-table branch already makes — it keeps the single parser and asks nothing of the user.
+
+  Two things to get right, and they are the reason this is worth a paragraph:
+
+  - **More than one sheet holds data → ask which.** Name the sheets and let the user pick. Never guess: importing the wrong tab writes a bank of questions nobody meant to ask, under ids derived from them, and the append-only rule then makes each one a confirmation prompt to undo.
+  - **Flatten formulas to their values.** A question column is text and a cell holding a formula is not a question. If a cell resolves to an error, treat that row as unreadable and let the parser skip it rather than importing the error text.
+
+  This is [`agami-connect`](../agami-connect/SKILL.md)'s stance on the same problem — Claude reads the document, the deterministic step never opens it — rather than a new one.
 
 The sheet needs a header row with a **question column** — `question`, `query`, `nl question`, `prompt` or `ask` (case, underscores and hyphens all fold). Optional columns: `id`, `expected` / `expected value` / `answer`, `sql` / `statement`, `tags`. A header the contract does not know is left alone — matching is exact, never fuzzy, so an analyst's note column costs nothing.
 
@@ -251,7 +255,7 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
 | Exit `2` | Cannot start. Read the `agami-save-golden:` line on stderr — it names the cause. Nothing was written; a rolled-back write left the previous bytes exactly as they were. |
 | `agami-save-golden: this file is empty` / `no column here holds the question` / `this file has no header row` | The sheet's question column can't be identified. The refusal lists every header it read — quote it back, ask which column holds the question, and have them rename it (or add a header row) and re-invoke. Never guess at column 0: a bank of ids imported as questions fails every future run in a way that looks exactly like a model regression. |
 | `agami-save-golden: N row(s) were skipped` on a successful parse | A warning, not a stop. List every entry in `skipped` with its row number and reason before asking for the import — a question silently missing from a dataset is the failure this line exists to prevent. |
-| A `.xlsx` / `.xls` path | Refuse with the Save As → CSV UTF-8 instruction (Phase 2a). Do not attempt to read it and do not reconstruct its contents from memory. |
+| A `.xlsx` / `.xls` path | Read the workbook and write the chosen sheet out as a CSV, then parse that (Phase 2a). Ask which sheet when more than one holds data, and flatten formulas to values. Never reconstruct a workbook's contents from memory — if you cannot read the file, say so rather than inventing rows. |
 | `agami-save-golden: this item does not say how its answer was confirmed` | `confirmed_by.method` was blank. Ask how the result was checked and re-write the item JSON — provenance is most of what a receipt is for. |
 | `agami-save-golden: '<name>' is not a usable dataset name` / `profile name` | The stem or the profile was a path, not a name. Ask for the plain name (`orders`, not `orders/2024` or `../orders`) and re-invoke. Nothing was read and nothing was written. |
 | `agami-save-golden: dataset '<name>' names the file rather than the dataset` | The extension was typed too. The stem *is* the dataset's name, so pass `orders`, not `orders.yaml`. Re-invoke; nothing was written. |
