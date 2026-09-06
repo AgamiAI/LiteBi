@@ -840,6 +840,42 @@ def test_an_ordinal_group_key_is_labelled_and_a_row_limit_is_not():
     assert claims["limit"]["generated"] == "100"
 
 
+def test_an_open_ended_date_window_does_not_print_the_word_none():
+    """Either bound may be open — `placed_at >= '2024-01-01'` on its own resolves to a start and no
+    end, which is an ordinary shape rather than a corner. An interval printed with one side missing
+    put the word `None` on the report."""
+    from render_golden_run import _side
+
+    lower = {"column": "placed_at", "start": "2024-01-01", "start_inclusive": True,
+             "end": None, "end_inclusive": False}
+    upper = {"column": "placed_at", "start": None, "start_inclusive": True,
+             "end": "2025-01-01", "end_inclusive": False}
+
+    assert _side(lower) == "placed_at >= 2024-01-01"
+    assert _side(upper) == "placed_at < 2025-01-01"
+    assert "None" not in _side(lower) + _side(upper)
+
+
+def test_a_gate_with_no_kind_is_dropped_rather_than_rendered_as_none():
+    """`gate.get("kind", "")` returns None for a key that is present and null, and `str()` would
+    then put the literal "None" on the page, matching no branch that names a gate."""
+    run = _run([_item(claims={"claims": [], "gates": [{"kind": None, "column": "channel"},
+                                                      {"kind": "must_filter", "column": "channel"}]})])
+
+    gates = _payload(render(title="x", profile="demo", run=run))["items"][0]["gates"]
+
+    assert gates == [{"kind": "must_filter", "column": "channel"}]
+
+
+def test_a_case_with_statements_and_no_claims_is_not_called_a_generation_failure():
+    """An item can carry both statements and no claims — a hand-edited artifact, or a claims block
+    the projection refused. Telling that reader "no statement was read" sends them looking for a
+    generator failure that did not happen."""
+    assert 'text: "no statement was generated, so there was nothing to compare"' in TEMPLATE
+    assert 'text: "the two statements were not compared — read them below"' in TEMPLATE
+    assert "if (!item.generated_sql) {" in TEMPLATE
+
+
 def test_a_failure_whose_statements_agree_everywhere_says_where_to_look():
     """The one shape where the difference table is empty and the item still failed.
 

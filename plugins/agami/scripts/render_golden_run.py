@@ -73,6 +73,15 @@ _SUMMARY_COUNTS = ("total", "passed", "failed", "unscored", "errored")
 _SCALAR = (str, int, float)
 
 
+# Spelled out rather than taken from `%B`, which reads the process locale: a report is a file
+# somebody sends to somebody else, and the month it carries should not depend on whose machine
+# rendered it. It would also make the test for this a fixed string that only holds on some hosts.
+_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
 def _run_stamp(now: Optional[datetime.datetime] = None) -> str:
     """When the run was rendered, as a date somebody would say out loud.
 
@@ -81,7 +90,7 @@ def _run_stamp(now: Optional[datetime.datetime] = None) -> str:
     not necessarily in it, and the day is not zero-padded because nobody says "06 September".
     """
     stamp = now or datetime.datetime.now(datetime.timezone.utc)
-    return f"{stamp.day} {stamp:%B %Y} at {stamp:%H:%M} UTC"
+    return f"{stamp.day} {_MONTHS[stamp.month - 1]} {stamp.year} at {stamp:%H:%M} UTC"
 
 
 def _names(value: Any, *, ordinals: bool = False) -> list[str]:
@@ -250,6 +259,13 @@ def _window(value: dict) -> str:
     start, end = value.get("start"), value.get("end")
     if not column or (start is None and end is None):
         return ""
+    # Either bound may be open — `placed_at >= '2024-01-01'` on its own resolves to a start and no
+    # end, which is an ordinary shape rather than a corner. An interval printed with one side
+    # missing rendered the word `None` into the report.
+    if start is None:
+        return f"{column} {'<=' if value.get('end_inclusive', False) else '<'} {end}"
+    if end is None:
+        return f"{column} {'>=' if value.get('start_inclusive', True) else '>'} {start}"
     open_bracket = "[" if value.get("start_inclusive", True) else "("
     close_bracket = "]" if value.get("end_inclusive", False) else ")"
     return f"{column} in {open_bracket}{start}, {end}{close_bracket}"
@@ -334,10 +350,13 @@ def _gates(item: dict) -> list[dict[str, str]]:
     gates = block.get("gates") if isinstance(block, dict) else None
     if not isinstance(gates, list):
         return []
+    # `or ""` rather than a default, because a key that is PRESENT and null returns None from
+    # `.get(key, "")` — which `str()` would then render as the literal "None", matching no branch
+    # on the page and printing itself onto the report.
     return [
-        {"kind": str(gate.get("kind", "")), "column": str(gate.get("column") or "")}
+        {"kind": str(gate.get("kind") or ""), "column": str(gate.get("column") or "")}
         for gate in gates
-        if isinstance(gate, dict)
+        if isinstance(gate, dict) and gate.get("kind")
     ]
 
 

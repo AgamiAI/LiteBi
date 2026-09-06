@@ -310,9 +310,20 @@
     function deltaLines(item) {
       const claims = item.claims || [];
       if (!claims.length) {
+        // Two different situations, and saying the wrong one is worse than saying nothing. A case
+        // whose generation produced no statement genuinely has nothing to compare. A case that HAS
+        // both statements and no claims lost them somewhere else — a hand-edited artifact, a
+        // claims block the projection refused — and telling that reader "no statement was read"
+        // sends them looking for a generator failure that did not happen.
+        if (!item.generated_sql) {
+          return [el("div", {
+            class: "delta",
+            text: "no statement was generated, so there was nothing to compare",
+          })];
+        }
         return [el("div", {
           class: "delta",
-          text: "no statement was read, so there was nothing to compare",
+          text: "the two statements were not compared — read them below",
         })];
       }
       const differing = claims.filter(c => c.status === "differs");
