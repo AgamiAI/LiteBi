@@ -12,6 +12,35 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Changed
+
+- **A reconcile run now teaches as well as tests.** Its only write was promoting agreeing rows to a
+  golden dataset. Nothing went to the curated example library — the one path there was the referral
+  to `agami-save-correction` when a number *disagreed*. So a run that proved twelve statements
+  correct against the customer's own dashboard taught agami nothing from any of them, while an
+  argument taught it something.
+
+  Agreeing rows are now split between the two. They cannot go to both: an item that is also an
+  example ranks first for its own question, the model reproduces it, and the test can only ever
+  pass. They came from one dashboard, so they are the same family of question, which is exactly what
+  makes holding some back meaningful.
+
+  **The product does the splitting.** Which rows should teach depends on what the example library
+  already covers, and asking a user that is asking them to guess at a library they have never
+  opened. `sm examples --query` already answers it: its `high_confidence` flag is the product's own
+  judgement of "we have a close example for this", so a row it does not cover teaches and a row it
+  does becomes a test. Below four agreeing rows nothing is split, and a profile with an empty
+  library teaches with at least half.
+
+  **The user still makes one decision, and it is not the split** — one yes for the batch, with the
+  breakdown shown. Saying what went where is mandatory rather than decorative: adding examples
+  changes how agami answers future questions, and that must not happen silently behind a button
+  that says "keep these numbers".
+
+  A promoted row passes `--confirm-convention` to the save door. The statement being saved is the
+  one agami generated *from* those examples minutes earlier, so the convention check would ask the
+  person to confirm a departure they never made.
+
 ## [0.8.0] — 2026-09-05
 
 One change: the server decides which tool calls belong to one conversation, instead of asking the
