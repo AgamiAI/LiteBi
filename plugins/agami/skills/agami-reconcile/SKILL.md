@@ -1,7 +1,7 @@
 ---
 name: agami-reconcile
 description: "Reconciles known (label, expected_value) numbers from an existing dashboard against agami's answers. Input can be a SCREENSHOT of a Metabase / Power BI / Tableau / Looker dashboard (Claude's vision extracts the pairs), a CSV, or numbers pasted inline — the user doesn't need to know which; they can just ask. For each pair, the skill generates a matching NL question, runs it through the active profile's semantic model, diffs actual vs expected, and surfaces matches in green and mismatches in red with drill-down receipts. The strongest onboarding demo for a skeptical data engineer — either we agree with their numbers (trust earned via evidence) or we surface a real definitional disagreement (trust earned via transparency)."
-when_to_use: "Use when the user says 'reconcile against this dashboard', 'do these numbers match?', 'validate against my Tableau export', '/agami-reconcile <csv>', drops a screenshot of a BI dashboard (Metabase/Power BI/Tableau/Looker/spreadsheet) and asks agami to reproduce the numbers, or pastes a CSV / table of known numbers. Also use after a run, when the user says 'keep these as golden questions' or 'promote these to a golden dataset' — the rows that agreed become an answer key later runs are scored against. Requires agami-connect to have been run first (need a semantic model + examples library). A high-leverage validation surface for a skeptical data team — reproduce their dashboard numbers, or surface the definitional gap."
+when_to_use: "Use when the user says 'reconcile against this dashboard', 'do these numbers match?', 'validate against my Tableau export', '/agami-reconcile <csv>', drops a screenshot of a BI dashboard (Metabase/Power BI/Tableau/Looker/spreadsheet) and asks agami to reproduce the numbers, or pastes a CSV / table of known numbers. Also use after a run, when the user says 'keep these as golden questions' or 'promote these to a golden dataset' — the rows that agreed are split between the examples agami reads when answering and the answer key later runs are scored against. Requires agami-connect to have been run first (need a semantic model + examples library). A high-leverage validation surface for a skeptical data team — reproduce their dashboard numbers, or surface the definitional gap."
 argument-hint: "<screenshot | path-to-csv | pasted numbers>"
 ---
 
@@ -198,11 +198,41 @@ Don't dump every match's drill-down — they're not interesting. The matches bui
 
 ### 3e — Offer promotion
 
-The rows that agreed are the most reusable thing this run produced: a question, the statement that answered it, and a number the user's own dashboard already vouches for. That is what a golden dataset is made of — the answer key `/agami-eval` replays later to catch a regression — so offer to keep them.
+The rows that agreed are the most reusable thing this run produced: a question, the statement that answered it, and a number the user's own dashboard already vouches for. Nothing else in the product carries evidence from outside agami. So keep them — and keep them in **both** of the places they are worth keeping.
+
+**They are worth two different things, and one row cannot be both.**
+
+- A **golden item** tests the model: a later run tells you if that number drifts.
+- A **prompt example** teaches it: questions like it get answered this way from now on.
+
+A row written to both is a test grading its own study material — the example ranks first for its own question, the model reproduces it, and the item can only ever pass. So the batch is split rather than duplicated. They came from one dashboard, so they are the same family of question, which is exactly what makes holding some back meaningful.
+
+**You do the splitting, not the user.** Which rows should teach depends on what the example library already covers, which is not something anybody can answer without reading it. `sm examples --query` already answers it, and its `high_confidence` flag is the product's own judgement of "we have a close example for this".
+
+For each agreeing row, rank its question across the areas:
+
+```bash
+bash "$AGAMI_PLUGIN_ROOT/scripts/sm" examples "$ROOT" --area <area> --query "<the row's question>" --top-k 1
+```
+
+- **`high_confidence: false`** → the library does not cover this shape. **Teach with it** — it goes to the examples.
+- **`high_confidence: true`** → already covered, so another example adds nothing. **Test with it** — it goes to the golden dataset.
+
+Two adjustments, and both are about not splitting something too small to split:
+
+- **Fewer than four agreeing rows → all of them become golden items.** A split of three leaves too little on either side to be worth the explanation.
+- **Never send more than half the batch to the examples.** This is a cap, not a preference, and it is the rule that makes the split survive an empty library: with nothing curated, every row reads as novel and the base rule would teach with all of them, leaving the golden dataset empty. That is exactly the profile reconcile is aimed at, and an onboarding run that writes no test at all has failed at the thing it was asked to do. When the cap bites, keep the highest-scoring rows as examples and the rest as tests.
 
 **Make the offer once, here, after the summary. Never per row.** A per-row prompt turns a twelve-number reconcile into twelve interruptions and buries the mismatches, which are the point of the run.
 
-> Ten of these agreed. Want to keep them as golden questions? I'll write each one with the statement that produced it and a ±<the run's tolerance> band around the number, so a later run tells you if any of them drifts.
+**Say what goes where. This is not optional.** Writing to the examples changes how agami answers future questions, and that must not happen silently behind a button that says "keep these numbers". One line, in what it does for them:
+
+> Ten of these agreed — I'll keep all ten.
+> **Four as examples**, so questions like them get answered this way from now on.
+> **Six as tests**, with a ±<the run's tolerance> band, so you're told if any of those numbers move.
+> Save all ten?
+
+Someone who presses enter without reading gets the right outcome; someone who reads it learns the distinction by watching it happen, which is the only way anybody will. The override is one line — "let me choose" — and not twelve prompts.
 
 **Only rows whose `status` is `match` are offered.** That is the run's own tolerance — `reconcile.diff` decided it back in Phase 2c, and it is the only notion of agreement this skill has, so nothing here re-judges a number. One predicate drops `mismatch` and `error` together, and with them the `missing_expected` and `missing_actual` rows — those are `reconcile.diff`'s own reasons rather than a row status, and a row that could not be diffed never reached `match` either. **A row with no statement is never offered**: an error row carries `sql: null` (Phase 2d), so there is nothing to replay and nothing worth promoting.
 
@@ -229,7 +259,7 @@ So the offer edits the **question**, with the person's answer to "which window?"
 
 **Ask which window it means in the offer, before anything is written** — not after the refusal lands. A batch is written one row at a time (below), so a refusal on the seventh row arrives with six items already on disk: **items already written stay written, and nothing is rolled back**. The cheat sheet's exit-`2` row is the fallback for a question that slips through, not the plan.
 
-#### What gets written, per kept row
+#### What gets written, per row kept as a test
 
 Write the item with the **Write tool** — never a heredoc, never `python3 -c`, per [`shared/invocation-conventions.md`](../../shared/invocation-conventions.md) — to `/tmp/agami-golden-item-<ts>.json`:
 
@@ -269,6 +299,28 @@ python3 "$AGAMI_PLUGIN_ROOT/scripts/golden_author.py" save \
 `<stem>` is the dataset's **filename stem** — one plain name (`reconciled`), never a path and never `reconciled.yaml`. Ask which dataset once, for the whole batch.
 
 **One call per kept row.** The door takes one item, not an array — ten kept rows are ten runs of that command, each with its own item file. The dataset is asked once; the writing is a loop.
+
+**Pass `--confirm-convention` on a promoted row.** The save door checks a statement against the profile's own examples and stops when they disagree, which is right when somebody is authoring a key by hand. Here it is redundant and wrong: the statement being saved is the one agami itself generated *from* those examples minutes ago, and a stop would ask the person to confirm a convention they never departed from.
+
+#### What gets written, per row kept as an example
+
+Write the pair with the **Write tool** to `/tmp/agami-reconciled-example-<ts>.json` — a JSON **array**, one entry per row going to the examples:
+
+```json
+[{"question": "What was total revenue in Q3 2025?", "sql": "<the row's `sql`, verbatim>",
+  "tables": ["<from the row's statement>"], "source": "reconcile", "status": "confirmed",
+  "created_at": "<ISO8601 UTC>"}]
+```
+
+Then the packaged writer, which dedups by question and creates the library if it is absent:
+
+```bash
+bash "$AGAMI_PLUGIN_ROOT/scripts/sm" add-example "$ROOT" --area <area> --file /tmp/agami-reconciled-example-<ts>.json
+```
+
+`<area>` is the subject area whose tables the statement reads — the same choice `agami-save-correction` makes, and the same writer. **Do not hand-edit `examples.yaml`**, and do not invent a second way in.
+
+`status: "confirmed"` is honest here in a way it rarely is: the number was verified against a source outside agami. That is stronger evidence than the recollection behind most curated examples.
 
 #### `confirmed_by.method` — two shapes, kept apart
 
@@ -310,7 +362,7 @@ End the turn. The user typically:
 
 1. **No automatic question generation for ambiguous labels.** If the label is too short or too vague (e.g., `Total`, `Number`, `Value`), surface to the user: *"Row 5's label is just 'Total' — too ambiguous to translate to a question. Skipping. Add more context to the CSV (e.g., `Total Revenue Q3` instead of `Total`) and re-run."* Don't guess.
 2. **Receipt is non-optional.** Every per-row run MUST produce a chart-template HTML report with the trust receipt — that's what the drill-down link points at, and it's what makes mismatches actionable. If the underlying query path can't produce a receipt (legacy pre-trust-layer model), refuse with: *"This profile pre-dates the trust-layer launch. Re-run `/agami-connect` to enable receipts, then retry."*
-3. **Don't write to the semantic model from this skill.** Reconcile reads + diffs; it never mutates a metric, a join, a column or any other part of the model. If a definitional disagreement surfaces and the user wants to update the metric, route them through `/agami-save-correction`. **The one write this skill can make is Phase 3e's promotion, and it is not a model write:** a golden dataset is the answer key that *tests* the model, not the model itself. It goes through `golden_author.py save` — that door and nothing else, never a hand-edited YAML — by exactly two routes, with the person's yes in front of either: a row this run scored as agreeing, accepted through Phase 3e's offer, or a row it scored as a mismatch that the person has explicitly resolved in agami's favour.
+3. **Don't write to the semantic model from this skill.** Reconcile reads + diffs; it never mutates a metric, a join, a column or any other part of the model. If a definitional disagreement surfaces and the user wants to update the metric, route them through `/agami-save-correction`. **The writes this skill can make are Phase 3e's, and neither is a model write:** a golden dataset is the answer key that *tests* the model, and the prompt-example library is what the model *reads* — neither is the model's own definitions, and this skill still never touches a metric, a join, a column or a default filter. Both writes go through the packaged writers — `golden_author.py save` and `sm add-example`, those doors and nothing else, never a hand-edited YAML — and both need the person's yes in front of them. A row reaches either one by exactly two routes: this run scored it as agreeing, or it scored a mismatch that the person has explicitly resolved in agami's favour. **No row goes to both**, which is the whole reason Phase 3e splits the batch rather than duplicating it.
 4. **CSV stays local.** Don't upload, don't summarize-and-send. The reconcile run produces local artifacts (the per-query chart HTML, and `/tmp/agami-reconcile-results-*.jsonl`, which now carries the statement behind every row as well as its numbers) and nothing leaves the machine. A promoted row stays local too: the save door writes into the profile's own `golden_datasets/` directory on this machine.
 
 ---

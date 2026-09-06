@@ -126,7 +126,7 @@ def test_the_offer_carries_the_runs_own_tolerance_and_never_a_hardcoded_one():
     """The offer is told to pass the tolerance the run diffed with, so every literal in the section
     has to be that placeholder. A hardcoded ±1% in the sentence said out loud, in the provenance
     line or in the band command makes a `tolerance=5%` run offer a band it did not agree on."""
-    assert "±<the run's tolerance> band around the number" in OFFER
+    assert "±<the run's tolerance> band" in OFFER
     assert "agreed within ±<the run's tolerance>" in OFFER
     assert "--tolerance <the run's tolerance>" in OFFER
     assert "0.01" not in OFFER
@@ -276,13 +276,16 @@ def test_hard_rule_3_still_forbids_mutating_the_semantic_model():
     )[0]
     assert "never mutates a metric, a join, a column" in rule
     assert "/agami-save-correction" in rule
-    # …and the carve-out is exactly one door, with the person's yes in front of it. It names BOTH
+    # …and the carve-out is two doors now, with the person's yes in front of both. It names BOTH
     # routes: a hard rule is the most authoritative prose in a skill, so one that named only the
     # offer would have a model refuse the resolution write the rest of Phase 3e requires.
     assert "golden_author.py save" in rule
-    assert "with the person's yes in front of either" in rule
-    assert "a row this run scored as agreeing" in rule
+    assert "sm add-example" in rule
+    assert "both need the person's yes in front of them" in rule
+    assert "this run scored it as agreeing" in rule
     assert "resolved in agami's favour" in rule
+    # The split is what keeps a row out of both, and the hard rule is where that is unmissable.
+    assert "No row goes to both" in rule
 
 
 def test_the_roadmap_no_longer_promises_the_half_this_slice_shipped():
@@ -363,3 +366,72 @@ def test_phases_3a_to_3d_read_exactly_as_they_did():
         "Don't dump every match's drill-down — they're not interesting. The matches build the "
         "case; the mismatches drive the conversation." in SKILL
     )
+
+
+# --- The split (#265) ----------------------------------------------------------------------------
+#
+# A reconcile run proves statements correct against evidence from outside agami, and only half of
+# that value was kept: agreeing rows became tests and taught the model nothing. They cannot be both,
+# because an item that is also an example grades its own study material — so the batch is split.
+
+
+def test_the_agreeing_rows_are_split_between_teaching_and_testing():
+    """Both destinations, and the reason one row cannot be both."""
+    assert "**golden item** tests the model" in OFFER
+    assert "**prompt example** teaches it" in OFFER
+    assert "grading its own study material" in OFFER
+    assert "the batch is split rather than duplicated" in OFFER
+
+
+def test_the_product_does_the_splitting_and_not_the_user():
+    """Which rows should teach depends on what the example library already covers, which nobody can
+    answer without reading it. `high_confidence` is the product's own judgement of that, so the
+    split is a lookup rather than a question."""
+    assert "You do the splitting, not the user." in OFFER
+    assert "high_confidence" in OFFER
+    assert "sm" in OFFER and "--query" in OFFER
+    # Both directions are stated, or the rule is half a rule.
+    assert "`high_confidence: false`" in OFFER and "Teach with it" in OFFER
+    assert "`high_confidence: true`" in OFFER and "Test with it" in OFFER
+
+
+def test_a_batch_too_small_to_split_is_not_split():
+    """A split of three leaves too little on either side to be worth the explanation, and a profile
+    with nothing curated needs teaching more than gating."""
+    assert "Fewer than four agreeing rows" in OFFER
+    # A cap and not a preference: an empty library reads every row as novel, so a floor on the
+    # teaching side would send all of them there and write no test at all — on exactly the profile
+    # this skill is aimed at.
+    assert "Never send more than half the batch to the examples." in OFFER
+    assert "an onboarding run that writes no test at all has failed" in OFFER
+
+
+def test_the_user_makes_one_decision_and_it_is_not_the_split():
+    """A per-row prompt turns a twelve-number reconcile into twelve interruptions. The override
+    exists and is one line, not twelve."""
+    assert "Make the offer once, here, after the summary. Never per row." in OFFER
+    assert "Save all ten?" in OFFER
+    assert "let me choose" in OFFER
+
+
+def test_what_went_where_is_said_out_loud():
+    """Writing to the examples changes how agami answers future questions. The split may be
+    automatic; it must not be invisible."""
+    assert "Say what goes where. This is not optional." in OFFER
+    assert "so questions like them get answered this way from now on" in OFFER
+    assert "so you're told if any of those numbers move" in OFFER
+
+
+def test_a_promoted_row_does_not_re_ask_the_convention_question():
+    """The save door checks a statement against the profile's examples, which is right when somebody
+    is authoring a key by hand. Here the statement being saved is the one agami generated FROM those
+    examples minutes ago."""
+    assert "--confirm-convention" in OFFER
+    assert "a convention they never departed from" in OFFER
+
+
+def test_an_example_is_written_through_the_packaged_writer():
+    """One writer, and never a hand-edited library — the same door `agami-save-correction` uses."""
+    assert "add-example" in OFFER
+    assert "Do not hand-edit `examples.yaml`" in OFFER
+    assert '"source": "reconcile"' in OFFER

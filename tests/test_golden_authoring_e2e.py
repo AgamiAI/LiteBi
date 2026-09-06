@@ -419,7 +419,7 @@ RECONCILE_SKILL = (
 
 def _documented_promotion_item() -> dict:
     """The skill's own item block, with the two placeholders filled the way a run fills them."""
-    section = RECONCILE_SKILL.split("#### What gets written, per kept row")[1]
+    section = RECONCILE_SKILL.split("#### What gets written, per row kept as a test")[1]
     item = json.loads(section.split("```json")[1].split("```")[0])
     item["sql"] = Q3_REVENUE_SQL
     item["confirmed_by"]["method"] = item["confirmed_by"]["method"].replace(
