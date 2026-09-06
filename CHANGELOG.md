@@ -12,6 +12,21 @@ below corresponds to one such version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/agami-eval` can generate again for an operator who signed in rather than exporting an API
+  key.** The generator child is given an allowlisted environment, and `USER` was not on the list. On
+  macOS the client resolves its stored credential through it, so the child started, reported that it
+  was not logged in, and exited — every case in the run coming back "the generator exited without
+  answering" and the run exiting `2`.
+
+  Anyone with `ANTHROPIC_API_KEY` set was unaffected, which is why it shipped: that variable *is* on
+  the list, and a machine with one set never reaches the failure. The tests could not catch it
+  either, because they inject their own generator and never spawn the real client.
+
+  `USER` names the account and not a path, so it opens nothing the no-tools invocation had already
+  closed. The allowlist is still an allowlist, and a new test holds it to that.
+
 ## [0.8.0] — 2026-09-05
 
 One change: the server decides which tool calls belong to one conversation, instead of asking the

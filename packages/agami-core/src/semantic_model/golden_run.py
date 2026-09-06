@@ -490,7 +490,14 @@ _CLIENT_ARGV = (
 # inert only because of the flags above: the artifacts pointer, the dataset and the credentials file
 # are all under it, so this list withholds the NAME of a path the child has no tool to open. The two
 # halves are one decision — never add a tool without revisiting this tuple.
-_CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "ANTHROPIC_API_KEY")
+#
+# `USER` is here for the same reason as `HOME` and was missed for the same reason it is easy to miss:
+# an operator with `ANTHROPIC_API_KEY` set never needs it, and that is the machine this list was
+# written on. On macOS the client resolves its stored credential through it, so without it a
+# subscription operator's child starts, reports that it is not logged in, and exits — every item in
+# the run erroring with the one sentence that would explain it discarded by design. It names the
+# account rather than a path, so it opens nothing the flags above have not already closed.
+_CHILD_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "USER", "ANTHROPIC_API_KEY")
 
 # Why a generation produced no statement. Fixed sentences, and the fixedness is the point: a client
 # can echo the whole prompt on stderr, and this text is rendered beside the item and persisted with

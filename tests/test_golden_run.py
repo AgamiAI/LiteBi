@@ -614,6 +614,54 @@ def test_the_child_is_given_no_way_to_read_the_answer_key_off_disk(spawn, monkey
     assert _flag_value(args, "--setting-sources") == ""
 
 
+def test_the_child_can_authenticate_as_the_operator_who_started_the_run(spawn, monkeypatch):
+    """`USER` reaches the child, because on macOS the client resolves its stored credential
+    through it.
+
+    Without it a subscription operator — one who signed in rather than exporting a key — gets a
+    child that starts, reports that it is not logged in, and exits, so every item in the run errors.
+    The sentence that would explain it is discarded by design, which is what made the original
+    absence expensive to find rather than merely wrong. Asserted here rather than left to the
+    allowlist's own shape because the failure only ever appears on a machine with no
+    `ANTHROPIC_API_KEY` set, and CI is not one.
+    """
+    monkeypatch.setenv("USER", "operator")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    _, kwargs = spawn.invocations[0]
+    assert kwargs["env"]["USER"] == "operator"
+
+
+def test_the_child_environment_stays_an_allowlist(spawn, monkeypatch):
+    """Whatever is added for the client's benefit, nothing that names the key or the warehouse may
+    ride along. `USER` widened this tuple once; this is the guard that keeps the widening honest.
+
+    The tuple is pinned LITERALLY, because asserting the child's environment is a subset of it
+    proves nothing — `_child_env` builds that dict by comprehension over this very tuple, so no
+    widening could ever fail such a check. Naming the members is what makes adding one a deliberate
+    edit to a test rather than a line nobody reads.
+    """
+    assert gr._CHILD_ENV_KEYS == ("PATH", "HOME", "LANG", "LC_ALL", "USER", "ANTHROPIC_API_KEY")
+    # And the shape of what may ever join them. The module's own docstring claims no datasource
+    # credential has a name that could reach this tuple; this is that claim as a test, so a future
+    # `PGPASSWORD` or `SNOWFLAKE_PASSWORD` fails here rather than shipping.
+    leaky = ("PASSWORD", "SECRET", "TOKEN", "_URL", "DSN", "CREDENTIAL")
+    assert not [
+        key for key in gr._CHILD_ENV_KEYS if any(mark in key.upper() for mark in leaky)
+    ], "a credential-shaped name reached the child's environment allowlist"
+
+    monkeypatch.setenv("AGAMI_ARTIFACTS_DIR", "/artifacts/tenant")
+    monkeypatch.setenv("DATASOURCE_URL__ACME", "postgresql://user:pw@warehouse.example/db")
+
+    _cli_generator().generate(QUESTION, ORG, DATASOURCE)
+
+    _, kwargs = spawn.invocations[0]
+    assert "AGAMI_ARTIFACTS_DIR" not in kwargs["env"]
+    assert not any(key.startswith("DATASOURCE_URL") for key in kwargs["env"])
+
+
 def test_the_invocation_is_the_same_on_every_call(spawn):
     """One tuple, no branch: a flag that some runs get and others do not is a flag that will be
     missing on the run that mattered. The module-level constant is what makes that unrepresentable,
