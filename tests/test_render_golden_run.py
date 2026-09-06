@@ -773,6 +773,84 @@ def test_the_template_draws_the_question_the_verdict_and_the_delta_for_a_case():
     assert verdict < delta < statements
 
 
+def test_a_claim_reads_the_way_a_person_writes_it():
+    """The claim reader writes `gte(created, '2024-01-01')`, and that functional form is deliberate
+    WHERE IT IS WRITTEN: a claim rides on tool output a model reads as server-authored, and
+    something that looked like SQL would be read as SQL.
+
+    That reasoning is about a model's context. This report is a local page a person opens, built
+    with `textContent`, so the argument does not reach it while the cost of it does — a reader had
+    to decode both sides before they could compare them.
+    """
+    from render_golden_run import _side
+
+    assert _side(["gte(placed_at, '2024-01-01')"]) == "placed_at >= '2024-01-01'"
+    assert _side(["neq(status, 'cancelled')"]) == "status <> 'cancelled'"
+    assert (
+        _side(["between(placed_at, '2024-01-01', '2024-12-31')"])
+        == "placed_at BETWEEN '2024-01-01' AND '2024-12-31'"
+    )
+    # A literal may hold the separator the split runs on, so the split respects quoting.
+    assert _side(["eq(customer.name, 'Smith, John')"]) == "customer.name = 'Smith, John'"
+    # A subquery's whole parse tree is rendered inline. That it is there is the readable part; the
+    # statements are printed underneath for the rest.
+    assert _side(["in(customer_id, subquery(select(id, from(table(customers)))))"]) == (
+        "customer_id IN (subquery)"
+    )
+    # Anything the lookup does not know keeps the shape it arrived in rather than being guessed at.
+    assert _side(["coalesce(a, b)"]) == "coalesce(a, b)"
+
+
+def test_a_join_key_and_an_ordering_survive_their_nesting():
+    """`join_keys` writes the two sides of an equality as a pair of pairs and `ordering` writes a
+    column with its direction, so both are nested. Dropping nested entries rendered the two claims
+    most likely to differ as empty sides."""
+    from render_golden_run import _side
+
+    assert _side([[["customers", "id"], ["orders", "customer_id"]]]) == (
+        "customers.id = orders.customer_id"
+    )
+    assert _side([["order_count", "desc"]]) == "order_count desc"
+
+
+def test_an_ordinal_group_key_is_labelled_and_a_row_limit_is_not():
+    """`GROUP BY 1` reaches the claim as the bare string "1", and "grouped by 1" against "grouped by
+    service_criticality" tells a reader nothing.
+
+    It is labelled rather than resolved — the claim carries no projection to resolve it against —
+    and ONLY under `group_keys`: a `limit` of 100 is a row count, and calling it "column 100 of the
+    select list" would be worse than the bare digit this exists to fix.
+    """
+    run = _run(
+        [
+            _item(
+                claims={
+                    "claims": [
+                        {"name": "group_keys", "status": "differs", "generated": ["1"], "golden": ["channel"]},
+                        {"name": "limit", "status": "differs", "generated": ["100"], "golden": ["10"]},
+                    ]
+                }
+            )
+        ]
+    )
+
+    claims = {c["name"]: c for c in _payload(render(title="x", profile="demo", run=run))["items"][0]["claims"]}
+
+    assert claims["group_keys"]["generated"] == "column 1 of the select list"
+    assert claims["limit"]["generated"] == "100"
+
+
+def test_the_claims_are_drawn_as_a_table_with_plain_english_labels():
+    """A run of separator-joined text is hard to compare against the line beside it, and
+    `filter_predicates` is a field name rather than something a reader should have to know."""
+    assert 'CLAIM_LABEL[claim.name] || claim.name' in TEMPLATE
+    assert 'filter_predicates: "Filters"' in TEMPLATE
+    assert 'group_keys: "Grouped by"' in TEMPLATE
+    # A table, with the answer key first because it is the thing being compared against.
+    assert 'class: "delta-table"' in TEMPLATE
+    assert TEMPLATE.index('text: "Answer key"') < TEMPLATE.index('text: "Generated"')
+
+
 def test_the_run_stamp_reads_as_a_date_somebody_would_say():
     """It read `2026-09-06T11:47:38+00:00`. That is a sortable key, and the page has no second
     place where the timestamp is a key — so it is spelled as a sentence, with the zone named

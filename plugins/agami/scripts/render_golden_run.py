@@ -84,7 +84,7 @@ def _run_stamp(now: Optional[datetime.datetime] = None) -> str:
     return f"{stamp.day} {stamp:%B %Y} at {stamp:%H:%M} UTC"
 
 
-def _names(value: Any) -> list[str]:
+def _names(value: Any, *, ordinals: bool = False) -> list[str]:
     """The entries of one claim's side, flattened to the strings the page prints.
 
     The claim is written by the statement comparator and its shape is promised by a docstring, not
@@ -102,12 +102,140 @@ def _names(value: Any) -> list[str]:
     flattened = []
     for name in value:
         if isinstance(name, _SCALAR):
-            flattened.append(str(name))
+            entry = _readable(str(name))
+            flattened.append(_ordinal(entry) if ordinals else entry)
         elif isinstance(name, (list, tuple)):
-            parts = [str(part) for part in name if isinstance(part, _SCALAR)]
-            if parts:
-                flattened.append(" ".join(parts))
+            entry = _nested(name)
+            if entry:
+                flattened.append(entry)
     return flattened
+
+
+def _nested(entry: Any) -> str:
+    """One entry that is itself a sequence, of which two shapes reach this page.
+
+    `ordering` writes a column and a direction (`["order_count", "desc"]`), and `join_keys` writes
+    the two sides of an equality as a PAIR OF PAIRS —
+    `[["customers", "id"], ["orders", "customer_id"]]` — so the nesting is two deep there. The
+    earlier coercion dropped anything below the first level, which rendered the two claims most
+    likely to differ as empty sides.
+    """
+    parts = []
+    for part in entry:
+        if isinstance(part, _SCALAR):
+            parts.append(str(part))
+        elif isinstance(part, (list, tuple)):
+            # A qualified column arrives split into its parts rather than dotted.
+            qualified = [str(inner) for inner in part if isinstance(inner, _SCALAR)]
+            if qualified:
+                parts.append(".".join(qualified))
+    if len(parts) == 2 and all("." in part for part in parts):
+        # A join key is an equality, and reads as one.
+        return f"{parts[0]} = {parts[1]}"
+    return " ".join(parts)
+
+
+def _ordinal(entry: str) -> str:
+    """`GROUP BY 1` reaches the claim as the bare string "1", which reads as a number.
+
+    "grouped by 1" against "grouped by service_criticality" tells a reader nothing at all, and the
+    ordinal cannot be resolved here — the claim carries no projection to resolve it against. So it
+    is labelled rather than decoded, which is honest and readable where a bare digit is neither.
+    Resolving it properly belongs to the claim reader, which does hold the select list.
+    """
+    return f"column {entry} of the select list" if entry.isdigit() else entry
+
+
+# The infix spelling of each comparison the claim reader writes functionally. Its keys come from
+# sqlglot's node names, so this is a lookup rather than a grammar: anything not here is left in the
+# form it arrived in, which is already readable for a function call like `count(orders.id)`.
+_INFIX = {
+    "eq": "=",
+    "neq": "<>",
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<=",
+    "like": "LIKE",
+    "ilike": "ILIKE",
+    "is": "IS",
+    "in": "IN",
+}
+
+
+def _split(inner: str, *, expected: int) -> Optional[list[str]]:
+    """The operands of one rendered call, or None if there is not exactly the expected number.
+
+    Split rather than parsed, and only at depth zero and outside quotes: a literal is perfectly
+    entitled to contain a comma or a bracket (`eq(customer.name, 'Smith, John')`), and a split that
+    ignored that would cut a value in half and print the halves as two operands.
+    """
+    operands, depth, quoted, current = [], 0, False, []
+    for char in inner:
+        if quoted:
+            current.append(char)
+            if char == "'":
+                quoted = False
+            continue
+        if char == "'":
+            quoted = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            operands.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if quoted or depth:
+        return None
+    operands.append("".join(current).strip())
+    return operands if len(operands) == expected else None
+
+
+def _readable(key: str) -> str:
+    """One claim key as a person writes it: `gte(created, '2024-01-01')` → `created >= '2024-01-01'`.
+
+    The functional form is deliberate WHERE IT IS WRITTEN and must stay: a claim rides on tool
+    output the calling model reads as server-authored, and something that looked like SQL would be
+    read as SQL. That reasoning is about a model's context. This report is a local page a person
+    opens, built with `textContent` and rendering nothing — so the argument for the functional form
+    does not reach it, while the cost of it does. `gte(created, '2024-01-01')` is a shape a reader
+    has to decode before they can compare it to the one beside it.
+
+    Best effort by design: only a known comparison with exactly two operands is rewritten, and
+    anything else is returned untouched. A nested predicate is left alone rather than half-rewritten
+    into something that reads like SQL and is not.
+    """
+    if not key.endswith(")"):
+        return key
+    head, _, rest = key.partition("(")
+    inner = rest[:-1]
+    name = head.lower()
+
+    # A subquery's whole parse tree is rendered inline, so an `IN (SELECT …)` arrives as forty
+    # characters of nested calls. What a reader needs from it is that a subquery is there; the
+    # statements are printed underneath if they want the rest.
+    if name == "subquery":
+        return "(subquery)"
+
+    if name == "between":
+        parts = _split(inner, expected=3)
+        if parts:
+            return f"{parts[0]} BETWEEN {parts[1]} AND {parts[2]}"
+        return key
+
+    operator = _INFIX.get(name)
+    if operator is None:
+        return key
+    operands = _split(inner, expected=2)
+    if operands is None:
+        return key
+    operands = [_readable(operand) if operand.endswith(")") else operand for operand in operands]
+    if any("(" in operand and not operand.startswith("(") for operand in operands):
+        return key
+    return f"{operands[0]} {operator} {operands[1]}"
 
 
 def _window(value: dict) -> str:
@@ -127,7 +255,7 @@ def _window(value: dict) -> str:
     return f"{column} in {open_bracket}{start}, {end}{close_bracket}"
 
 
-def _side(value: Any) -> str:
+def _side(value: Any, *, ordinals: bool = False) -> str:
     """One side of one claim, flattened to the string the page prints.
 
     Flattened HERE rather than in the template, because the sides are not one shape: a table set is
@@ -142,7 +270,7 @@ def _side(value: Any) -> str:
             f"{key} {item}" for key, item in sorted(value.items()) if isinstance(item, _SCALAR)
         )
     if isinstance(value, list):
-        return ", ".join(_names(value))
+        return ", ".join(_names(value, ordinals=ordinals))
     if isinstance(value, _SCALAR):
         return str(value)
     return ""
@@ -172,6 +300,7 @@ def _claims(item: dict) -> list[dict[str, Any]]:
         # promise must cost one line rather than the whole page.
         if not isinstance(claim, dict):
             continue
+        ordinals = claim.get("name") == "group_keys"
         projected.append(
             {
                 # Carried rather than assumed: the page labels each line from the claim's own name,
@@ -179,8 +308,11 @@ def _claims(item: dict) -> list[dict[str, Any]]:
                 # instead of calling something else "tables".
                 "name": claim.get("name", ""),
                 "status": claim.get("status", ""),
-                "generated": _side(claim.get("generated")),
-                "golden": _side(claim.get("golden")),
+                # An ordinal is only an ordinal under `group_keys`. A `limit` of 100 is a row
+                # count, and labelling it "column 100 of the select list" would be worse than the
+                # bare digit this exists to fix.
+                "generated": _side(claim.get("generated"), ordinals=ordinals),
+                "golden": _side(claim.get("golden"), ordinals=ordinals),
             }
         )
     return projected

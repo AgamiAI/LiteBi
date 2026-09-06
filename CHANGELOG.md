@@ -44,6 +44,21 @@ below corresponds to one such version.
     folded into "failed": a run of nothing but errors would then read as green, which is exactly
     what the `1` / `2` exit codes exist to tell apart.
 
+- **A claim reads the way a person writes it, in a table rather than a run of text.** A
+  difference was one separator-joined line per claim, holding the claim reader's own field names
+  (`filter_predicates`) and its functional rendering (`gte(created, '2024-01-01')`). Both are
+  deliberate where they are written — a claim rides on tool output a model reads as
+  server-authored, and something that looked like SQL would be read as SQL — but that argument is
+  about a model's context and does not reach a local page a person opens.
+
+  So the report now prints `created >= '2024-01-01'`, labels each claim in English ("Filters",
+  "Grouped by", "Date range"), and lays the two sides out as a table so they line up under one
+  another. Three shapes that rendered as nothing or as noise are handled: a join key
+  (`customers.id = orders.customer_id`), an ordering with its direction, and a subquery, which
+  arrives as its whole parse tree and now reads `customer_id IN (subquery)`. `GROUP BY 1` is
+  labelled "column 1 of the select list" rather than shown as a bare digit — under `group_keys`
+  only, since a `limit` of 100 is a row count.
+
 - **A golden run report can be filtered by outcome.** A corpus-sized run is hundreds of cases and
   was a flat scroll. Display only — nothing is recounted or re-sorted, so the tiles and the section
   headings keep describing the whole run.

@@ -132,7 +132,25 @@
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     }
     .delta.differs { background: var(--bad-bg); color: var(--bad-fg); }
-    .delta .claim-name { font-weight: 600; }
+    /* The differences, as a table so the two sides line up under one another. */
+    .delta-table {
+      width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .delta-table th, .delta-table td {
+      text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border);
+      vertical-align: top; word-break: break-word;
+    }
+    .delta-table thead th {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+      font-family: inherit; font-weight: 600;
+    }
+    .delta-table tbody th {
+      font-family: inherit; font-weight: 600; white-space: nowrap; color: var(--muted);
+      width: 1%;
+    }
+    .delta-table tbody td { color: var(--bad-fg); }
+    .delta-table tr:last-child th, .delta-table tr:last-child td { border-bottom: none; }
 
     /* The two statements, side by side */
     .statements { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
@@ -224,6 +242,20 @@
 
     const names = text => (text ? text : "none");
 
+    // What each claim is called on the page. The comparator's own names are field names — a reader
+    // should not have to know that "filter_predicates" means the WHERE clause to read their own
+    // report. A claim added later and not named here falls back to its own name rather than
+    // vanishing.
+    const CLAIM_LABEL = {
+      tables: "Tables read",
+      filter_predicates: "Filters",
+      date_window: "Date range",
+      group_keys: "Grouped by",
+      join_keys: "Joined on",
+      ordering: "Sorted by",
+      limit: "Row limit",
+    };
+
     // Which gate fired, in words, naming the column it fired on. Structure gates exactly twice, so
     // there are exactly two sentences here; the fallback exists so a third one added later reads as
     // itself rather than as a missing filter.
@@ -290,11 +322,22 @@
             : "the two statements make the same claims about the data they read",
         })];
       }
-      return differing.map(claim => el("div", { class: "delta differs" }, [
-        el("span", { class: "claim-name", text: claim.name }),
-        el("span", { text: " · generated " + names(claim.generated) }),
-        el("span", { text: " · answer key " + names(claim.golden) }),
+      // A table rather than a run of separator-joined text. Three columns, and the two that matter
+      // sit one above the other in the same column so a reader compares by looking down rather than
+      // by reading across a sentence.
+      const rows = differing.map(claim => el("tr", {}, [
+        el("th", { scope: "row", text: CLAIM_LABEL[claim.name] || claim.name }),
+        el("td", { text: names(claim.golden) }),
+        el("td", { text: names(claim.generated) }),
       ]));
+      return [el("table", { class: "delta-table" }, [
+        el("thead", {}, [el("tr", {}, [
+          el("th", { scope: "col", text: "" }),
+          el("th", { scope: "col", text: "Answer key" }),
+          el("th", { scope: "col", text: "Generated" }),
+        ])]),
+        el("tbody", {}, rows),
+      ])];
     }
 
     function statement(label, sql, absentText) {
