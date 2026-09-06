@@ -46,16 +46,21 @@ TEMPLATE_PATH = SHARED_DIR / "golden-run-template.html"
 LOGO_DARK_PATH = SHARED_DIR / "agami-logo-dark.svg"
 LOGO_LIGHT_PATH = SHARED_DIR / "agami-logo-light.svg"
 
-# How precisely an accuracy is shown. The score itself is left unrounded where it is computed — an
-# item passes at exactly 1.0, and rounding there would hand the pass mark to a near miss — so the
-# rounding happens here instead, where it is presentation and no verdict rests on it.
-_ACCURACY_DECIMALS = 3
-
-# The largest accuracy that may be shown for an item that did not score exactly 1.0. Rounding alone
-# is not enough: 4002/4004 rounds to 1.000, so a near miss would read as a perfect score printed
-# beside the sentence saying it did not reproduce the answer key. That is the one confusion this
-# report exists to remove, so a score short of the mark is shown short of the mark.
-_NEARLY_ONE = 1.0 - 10.0**-_ACCURACY_DECIMALS
+# The accuracy is deliberately NOT projected, and this is the note that keeps it that way.
+#
+# It reached the page as a headline number and told a reader nothing. Over a real fifteen-case run
+# every value was exactly 1.0 or exactly 0.0, which is structural rather than luck: differing row
+# counts, an unpaired column and an extra column each short-circuit to 0.0 before any overlap is
+# computed, and `match_columns` pairs only on EQUAL value vectors, so a column that is wrong
+# anywhere does not pair at all. The one route to a value in between — every column carrying the
+# right set of values while the rows themselves do not line up — is real and rare.
+#
+# And on exactly that occasion the comparator already writes the same fact in words ("5 of the
+# answer key's 15 rows matched"), which `reason` carries. So the number was redundant when it meant
+# something and misleading the rest of the time: printed as "accuracy 1.000" beside a gated item
+# that had reproduced its answer key perfectly, it read as a contradiction of the sentence next to
+# it. What a reader can act on at 5-of-15 is WHICH ten rows differed, and the report cannot show
+# that — rows never reach a run result by design.
 
 # The counts the header reads. Taken from the run's own summary and never recounted from the
 # items: a report that recomputed one would be a second place that decides what a run looks like.
@@ -68,59 +73,140 @@ _SUMMARY_COUNTS = ("total", "passed", "failed", "unscored", "errored")
 _SCALAR = (str, int, float)
 
 
-def _shown(accuracy: float) -> float:
-    """One accuracy at the precision the page prints it, never rounded up to the pass mark.
+def _run_stamp(now: Optional[datetime.datetime] = None) -> str:
+    """When the run was rendered, as a date somebody would say out loud.
 
-    Only an accuracy of exactly 1.0 may be shown as 1.000, because that is the only value that
-    passes. Anything short of it is held below, so the number beside a failure never looks like
-    the number beside a pass.
+    It read `2026-09-06T11:47:38+00:00`, which is a sortable key rather than a sentence, and the
+    page has no second place where the timestamp is a key. UTC is spelled out because the reader is
+    not necessarily in it, and the day is not zero-padded because nobody says "06 September".
     """
-    if accuracy >= 1.0:
-        return round(accuracy, _ACCURACY_DECIMALS)
-    return min(round(accuracy, _ACCURACY_DECIMALS), _NEARLY_ONE)
+    stamp = now or datetime.datetime.now(datetime.timezone.utc)
+    return f"{stamp.day} {stamp:%B %Y} at {stamp:%H:%M} UTC"
 
 
 def _names(value: Any) -> list[str]:
-    """One side of the table-set claim, flattened to the strings the page prints.
+    """The entries of one claim's side, flattened to the strings the page prints.
 
     The claim is written by the statement comparator and its shape is promised by a docstring, not
-    by anything on this side of the handoff. The page joins the list into a sentence, so a bare
-    string arriving where a list was promised makes `.join` undefined, throws, and leaves the whole
-    page blank — the same silent failure a broken payload causes. Anything that is not a scalar is
-    dropped rather than rendered, because a nested structure would print its own punctuation.
+    by anything on this side of the handoff, so anything unexpected is dropped rather than rendered.
+
+    An entry may itself be a short sequence, and that is not an edge case: `ordering` writes a
+    column and a direction together, so `[["incident_count", "desc"]]` is the ordinary shape of an
+    ordering difference. Dropping nested entries rendered the one claim that most often differs as
+    an empty side — "generated none · answer key none" — which is worse than not drawing it at all.
+    A sequence of scalars is joined with a space; anything deeper is still dropped, because it
+    would print its own punctuation.
     """
     if not isinstance(value, list):
         return []
-    return [str(name) for name in value if isinstance(name, _SCALAR)]
+    flattened = []
+    for name in value:
+        if isinstance(name, _SCALAR):
+            flattened.append(str(name))
+        elif isinstance(name, (list, tuple)):
+            parts = [str(part) for part in name if isinstance(part, _SCALAR)]
+            if parts:
+                flattened.append(" ".join(parts))
+    return flattened
 
 
-def _tables_claim(item: dict) -> Optional[dict[str, Any]]:
-    """The table-set difference, which is the one line the page puts above the two statements.
+def _window(value: dict) -> str:
+    """A resolved date window as an interval a person reads at a glance.
 
-    "Generated read `orders`, the answer key read `customers`" is usually the whole finding. It is
-    the first of the seven claims the statement comparator writes, and an item whose generation
-    never produced a statement has no claims at all — so the absence is carried as None rather than
-    faked as an agreement.
+    Half-open is the whole point of resolving one — three spellings of the same year agree, and a
+    `BETWEEN` over a timestamp is caught for the off-by-one it is — so the brackets are printed
+    rather than described. This is one of the two claims that can gate, which is why its shape is
+    handled here instead of falling through to the generic rendering below.
+    """
+    column = value.get("column")
+    start, end = value.get("start"), value.get("end")
+    if not column or (start is None and end is None):
+        return ""
+    open_bracket = "[" if value.get("start_inclusive", True) else "("
+    close_bracket = "]" if value.get("end_inclusive", False) else ")"
+    return f"{column} in {open_bracket}{start}, {end}{close_bracket}"
+
+
+def _side(value: Any) -> str:
+    """One side of one claim, flattened to the string the page prints.
+
+    Flattened HERE rather than in the template, because the sides are not one shape: a table set is
+    a list, a resolved date window is an object, and a limit is a bare number. The page used to
+    receive lists alone and call `Array.join` on them, so anything else would have thrown and left
+    the whole report blank — the failure this function exists to make unrepresentable.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return _window(value) or ", ".join(
+            f"{key} {item}" for key, item in sorted(value.items()) if isinstance(item, _SCALAR)
+        )
+    if isinstance(value, list):
+        return ", ".join(_names(value))
+    if isinstance(value, _SCALAR):
+        return str(value)
+    return ""
+
+
+def _claims(item: dict) -> list[dict[str, Any]]:
+    """Every claim the statement comparator wrote, projected for the page.
+
+    The page previously received `claims[0]` — the table set — and nothing else. That is reliably
+    the claim that says the least: in a structural failure both statements almost always read the
+    same tables, which is why the comparison got far enough to gate on something else at all. The
+    claim that explains such a failure is `filter_predicates`, which was computed, written to the
+    JSON artifact beside the page, and never rendered. A reader was left to diff two SQL statements
+    by eye to recover a difference the run had already worked out.
+
+    Every claim is carried and the page decides what to draw, so the ordering the comparator chose
+    survives and a claim added later needs no change here.
     """
     block = item.get("claims")
     claims = block.get("claims") if isinstance(block, dict) else None
-    if not isinstance(claims, list) or not claims:
-        return None
-    claim = claims[0]
-    # The payload's shape is promised by a docstring on the far side of a `--items-file` handoff,
-    # not by anything here, and a hand-edited or third-party run that breaks the promise must
-    # cost this one line rather than the whole page.
-    if not isinstance(claim, dict):
-        return None
-    return {
-        # Carried rather than assumed: the page labels the line from the claim's own name, so a
-        # run that one day writes its claims in another order labels it correctly instead of
-        # calling something else "tables".
-        "name": claim.get("name", ""),
-        "status": claim.get("status", ""),
-        "generated": _names(claim.get("generated")),
-        "golden": _names(claim.get("golden")),
-    }
+    if not isinstance(claims, list):
+        return []
+    projected = []
+    for claim in claims:
+        # The payload's shape is promised by a docstring on the far side of a `--items-file`
+        # handoff, not by anything here, and a hand-edited or third-party run that breaks the
+        # promise must cost one line rather than the whole page.
+        if not isinstance(claim, dict):
+            continue
+        projected.append(
+            {
+                # Carried rather than assumed: the page labels each line from the claim's own name,
+                # so a run that one day writes its claims in another order labels them correctly
+                # instead of calling something else "tables".
+                "name": claim.get("name", ""),
+                "status": claim.get("status", ""),
+                "generated": _side(claim.get("generated")),
+                "golden": _side(claim.get("golden")),
+            }
+        )
+    return projected
+
+
+def _gates(item: dict) -> list[dict[str, str]]:
+    """Which gate fired, and on what.
+
+    The page used to print one hardcoded sentence — "the dataset requires a filter this statement
+    does not write" — that named no column, so a reader was told *a* filter was missing and left to
+    work out which. It was also written as though `must_filter` were the only gate; structure gates
+    twice, and a differing date window rendered as a missing filter.
+
+    The kind and the column are both on the item already. Neither carries a value from a result
+    set: a `must_filter` column is a name the dataset's author wrote down, and the date-window gate
+    names no boundary here.
+    """
+    block = item.get("claims")
+    gates = block.get("gates") if isinstance(block, dict) else None
+    if not isinstance(gates, list):
+        return []
+    return [
+        {"kind": str(gate.get("kind", "")), "column": str(gate.get("column") or "")}
+        for gate in gates
+        if isinstance(gate, dict)
+    ]
 
 
 def _item(item: dict) -> dict[str, Any]:
@@ -135,12 +221,14 @@ def _item(item: dict) -> dict[str, Any]:
     if not isinstance(score, dict):
         score = {}
     accuracy = score.get("accuracy")
-    # A string where a number was promised reaches `_shown`'s comparison and throws, and one
-    # malformed item would take the report down with it. Anything not numeric reads as unscored,
-    # which is what the absence of a usable score means. `bool` is excluded on purpose: it is an
-    # `int` subclass, and True is not an accuracy.
-    if isinstance(accuracy, bool) or not isinstance(accuracy, (int, float)):
-        accuracy = None
+    # Whether the rows agreed, kept as the one bit the verdict actually needs. `bool` is excluded
+    # from the numeric check on purpose: it is an `int` subclass, and True is not an accuracy.
+    # The value itself does not travel — see the note at the top of this file.
+    reproduced = (
+        not isinstance(accuracy, bool)
+        and isinstance(accuracy, (int, float))
+        and float(accuracy) == 1.0
+    )
     return {
         "item_key": item.get("item_key", ""),
         "question": item.get("question", ""),
@@ -149,13 +237,16 @@ def _item(item: dict) -> dict[str, Any]:
         "passed": bool(item.get("passed")),
         "gated": bool(item.get("gated")),
         "status": score.get("status", ""),
-        # None means nothing was scored and 0.0 is a score an item earned, so the two are kept
-        # apart here as carefully as they are where they were decided.
-        "accuracy": None if accuracy is None else _shown(accuracy),
+        # Whether the two result sets agreed, which is NOT whether the item passed: a statement can
+        # reproduce its answer key exactly and still fail a structural gate. The page said "did not
+        # reproduce the answer key" for precisely that case, which was simply false, so the two
+        # facts are carried separately and the verdict is built from both.
+        "reproduced": reproduced,
         "reason": score.get("reason", ""),
         "expected_sql": item.get("expected_sql", ""),
         "generated_sql": item.get("generated_sql", ""),
-        "tables": _tables_claim(item),
+        "claims": _claims(item),
+        "gates": _gates(item),
     }
 
 
@@ -227,10 +318,7 @@ def render(
     # — the report renders blank with nothing anywhere saying why.
     return (
         template.replace("{{REPORT_TITLE}}", title)
-        .replace(
-            "{{GENERATED_AT}}",
-            datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        )
+        .replace("{{GENERATED_AT}}", _run_stamp())
         .replace("{{PROFILE}}", profile or "")
         .replace("{{AGAMI_LOGO_DARK_TEXT}}", logo_dark_svg)
         .replace("{{AGAMI_LOGO_LIGHT_TEXT}}", logo_light_svg)
